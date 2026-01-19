@@ -1,0 +1,100 @@
+<?xml version="1.0"?>
+<launch>
+    <!-- 
+    USV Water Quality Monitoring System Bringup
+    水质监测无人船系统启动文件
+    
+    系统架构:
+      - pump_control_node: 蠕动泵控制 (串口 -> ESP32)
+      - spectrometer_node: 分光检测器采集 (NI DAQ)
+      - web_config_server: Web 配置界面 (HTTP)
+      - mavlink_trigger_node: MAVLink 指令触发
+    
+    工作流:
+      1. 岸边: 通过 Wi-Fi 连接 Web UI 配置参数
+      2. 下水: 通过数传电台发送 MAVLink 指令触发采样
+    -->
+
+    <!-- ==================== Arguments ==================== -->
+    <!-- 泵控制参数 -->
+    <arg name="pump_port" default="/dev/ttyUSB0" />
+    <arg name="pump_baudrate" default="115200" />
+    <arg name="pid_mode" default="true" />
+    <arg name="pid_precision" default="0.1" />
+    
+    <!-- 分光检测器参数 -->
+    <arg name="daq_device" default="Dev1" />
+    <arg name="daq_channel" default="ai0" />
+    <arg name="daq_sample_rate" default="100" />
+    <arg name="daq_auto_start" default="false" />
+    
+    <!-- Web 服务器参数 -->
+    <arg name="web_host" default="0.0.0.0" />
+    <arg name="web_port" default="5000" />
+    
+    <!-- MAVLink 触发参数 -->
+    <arg name="mavros_timeout" default="30.0" />
+    <arg name="auto_trigger_on_waypoint" default="true" />
+
+    <!-- 节点启用开关 -->
+    <arg name="enable_pump" default="true" />
+    <arg name="enable_spectrometer" default="true" />
+    <arg name="enable_web" default="true" />
+    <arg name="enable_mavlink_trigger" default="true" />
+
+    <!-- ==================== Load Parameters ==================== -->
+    <rosparam file="$(find usv_ros)/config/usv_params.yaml" command="load" />
+
+    <!-- ==================== Pump Control Node ==================== -->
+    <node name="pump_control_node" pkg="usv_ros" type="pump_control_node.py" 
+          output="screen" if="$(arg enable_pump)">
+        <param name="serial_port" value="$(arg pump_port)" />
+        <param name="baudrate" value="$(arg pump_baudrate)" />
+        <param name="timeout" value="1.0" />
+        <param name="pid_mode" value="$(arg pid_mode)" />
+        <param name="pid_precision" value="$(arg pid_precision)" />
+    </node>
+
+    <!-- ==================== Spectrometer Node ==================== -->
+    <node name="spectrometer_node" pkg="usv_ros" type="spectrometer_node.py" 
+          output="screen" if="$(arg enable_spectrometer)">
+        <param name="device_name" value="$(arg daq_device)" />
+        <param name="channel" value="$(arg daq_channel)" />
+        <param name="sample_rate" value="$(arg daq_sample_rate)" />
+        <param name="auto_start" value="$(arg daq_auto_start)" />
+    </node>
+
+    <!-- ==================== Web Config Server ==================== -->
+    <!-- 
+    Web 配置服务器 - 提供 HTTP 接口配置采样参数
+    访问地址: http://<nano_ip>:5000
+    
+    API:
+      GET  /api/config - 获取配置
+      POST /api/config - 保存配置
+      POST /api/mission/start - 启动采样
+      POST /api/mission/stop - 停止采样
+    -->
+    <node name="web_config_server" pkg="usv_ros" type="web_config_server.py" 
+          output="screen" if="$(arg enable_web)">
+        <param name="host" value="$(arg web_host)" />
+        <param name="port" value="$(arg web_port)" />
+    </node>
+
+    <!-- ==================== MAVLink Trigger Node ==================== -->
+    <!-- 
+    MAVLink 指令触发节点 - 监听航点到达和自定义指令
+    
+    MAVLink 指令:
+      31010: 开始采样
+      31011: 停止采样
+      31012: 暂停
+      31013: 恢复
+    -->
+    <node name="mavlink_trigger_node" pkg="usv_ros" type="mavlink_trigger_node.py" 
+          output="screen" if="$(arg enable_mavlink_trigger)">
+        <param name="mavros_timeout" value="$(arg mavros_timeout)" />
+        <param name="auto_trigger_on_waypoint" value="$(arg auto_trigger_on_waypoint)" />
+    </node>
+
+</launch>

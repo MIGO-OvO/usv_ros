@@ -1,0 +1,29 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>usv_ros</name>
+  <version>1.0.0</version>
+  <description>
+    USV Water Quality Monitoring System for Jetson Nano.
+    Controls microfluidic pumps and spectrometer, coordinates with Pixhawk via MAVROS.
+  </description>
+
+  <maintainer email="jetson@usv.local">USV Team</maintainer>
+  <license>MIT</license>
+
+  <url type="repository">https://github.com/usv-project/usv_ros</url>
+
+  <buildtool_depend>catkin</buildtool_depend>
+
+  <!-- Core ROS dependencies -->
+  <depend>rospy</depend>
+  <depend>std_msgs</depend>
+  <depend>std_srvs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>mavros_msgs</depend>
+
+  <!-- Python dependencies -->
+  <exec_depend>python3-serial</exec_depend>
+
+  <export>
+  </export>
+</package>

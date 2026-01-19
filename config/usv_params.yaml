@@ -1,0 +1,128 @@
+# USV Water Quality Monitoring System Parameters
+# 水质监测无人船系统参数配置
+
+# ==================== 泵控制参数 ====================
+pump:
+  serial_port: "/dev/ttyUSB0"    # ESP32 电机控制板串口
+  baudrate: 115200               # 波特率 (与下位机一致)
+  timeout: 1.0                   # 串口超时 (秒)
+  
+  # PID 闭环控制
+  pid_mode: true                 # 启用 PID 精确定位模式 (R 指令)
+  pid_precision: 0.1             # PID 定位精度 (度)
+  
+  # PID 参数 (发送到下位机)
+  pid_params:
+    kp: 0.14
+    ki: 0.015
+    kd: 0.06
+    out_min: 1.0
+    out_max: 8.0
+  
+  # 电机配置 (X/Y/Z/A 四轴蠕动泵)
+  motors:
+    X:
+      description: "水样泵"
+      default_speed: 5           # 默认转速 (RPM)
+    Y:
+      description: "试剂泵A"
+      default_speed: 5
+    Z:
+      description: "试剂泵B"
+      default_speed: 5
+    A:
+      description: "油相泵"
+      default_speed: 3
+
+# ==================== 自动化引擎参数 ====================
+automation:
+  pid_wait_timeout: 60.0         # PID 完成等待超时 (秒)
+  default_interval: 1000         # 默认步骤间隔 (毫秒)
+  
+  # 示例采样序列
+  sampling_sequence:
+    loop_count: 1                # 循环次数 (0=无限)
+    steps:
+      # 步骤1: 启动油相泵
+      - X: {enable: "D"}
+        Y: {enable: "D"}
+        Z: {enable: "D"}
+        A: {enable: "E", direction: "F", speed: "3", angle: "360", continuous: false}
+        interval: 2000
+      
+      # 步骤2: 启动水样泵和试剂泵
+      - X: {enable: "E", direction: "F", speed: "5", angle: "180"}
+        Y: {enable: "E", direction: "F", speed: "5", angle: "90"}
+        Z: {enable: "D"}
+        A: {enable: "E", direction: "F", speed: "3", angle: "180"}
+        interval: 5000
+      
+      # 步骤3: 停止所有泵
+      - X: {enable: "D"}
+        Y: {enable: "D"}
+        Z: {enable: "D"}
+        A: {enable: "D"}
+        interval: 1000
+
+# ==================== 分光检测器参数 ====================
+spectrometer:
+  device_name: "Dev1"            # NI DAQ 设备名
+  channel: "ai0"                 # 模拟输入通道
+  sample_rate: 100               # 采样率 (Hz)
+  auto_start: false              # 是否自动开始采集
+  
+  # 光学参数
+  baseline_voltage: 2.5          # 基线电压 (V)
+  path_length_cm: 1.0            # 光程长度 (cm)
+
+# ==================== 任务协调参数 ====================
+mission:
+  mavros_timeout: 30.0           # MAVROS 连接超时 (秒)
+  sampling_duration: 10.0        # 采样持续时间 (秒)
+  detection_duration: 5.0        # 检测持续时间 (秒)
+
+# ==================== MAVROS 参数 (参考) ====================
+mavros:
+  fcu_url: "/dev/ttyTHS1:57600"  # Pixhawk TELEM2 串口
+  gcs_url: ""
+  target_system_id: 1
+  target_component_id: 1
+
+# ==================== 通信协议参考 ====================
+# 
+# === 泵控制指令格式 (发送到 ESP32) ===
+#
+# 1. 传统开环模式 (J 指令):
+#    "{motor}E{dir}V{speed}J{angle}\r\n"
+#    示例: XEFV5J90.000  -> X轴启用、正转、5RPM、转90°
+#
+# 2. PID 闭环模式 (R 指令):
+#    "{motor}E{dir}R{angle}P{precision}\r\n"
+#    示例: XEFR90.0P0.1  -> X轴正转90°，精度0.1°
+#
+# 3. 连续转动模式:
+#    "{motor}E{dir}V{speed}JG\r\n"
+#    示例: XEFV5JG  -> X轴连续正转
+#
+# 4. 停止指令:
+#    "{motor}DFV0J0\r\n"
+#    示例: XDFV0J0  -> X轴停止
+#
+# 5. PID 配置:
+#    "PIDCFG:{Kp},{Ki},{Kd},{OutMin},{OutMax}\r\n"
+#    示例: PIDCFG:0.14,0.015,0.06,1.0,8.0
+#
+# 6. PID 停止:
+#    "PIDSTOP\r\n"
+#
+# === 下位机数据包格式 (从 ESP32 接收) ===
+#
+# 1. 角度数据包 [0x55][0xCC]:
+#    [0x55][0xCC][X:4B][Y:4B][Z:4B][A:4B][checksum][0x0A]
+#    - 4个 float (little-endian) 表示四轴角度
+#
+# 2. PID 数据包 [0x55][0xAA]:
+#    [0x55][0xAA][motor_id:1B][timestamp:4B][target:4B][actual:4B][theo:4B][pid_out:4B][error:4B][checksum][0x0A]
+#
+# 3. PID 测试结果包 [0x55][0xBB]:
+#    [0x55][0xBB][motor_id:1B][run_idx:1B][total:1B][conv_time:2B][overshoot:2B][error:2B][osc:1B][smooth:1B][jerk:2B][score:1B][checksum][0x0A]
