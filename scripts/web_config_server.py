@@ -3,13 +3,15 @@
 """
 Web Configuration Server (Web 配置服务器)
 ==========================================
-提供 HTTP 接口用于配置自动化采样参数。
+提供 HTTP 接口和 WebSocket 实时通信用于配置自动化采样参数。
+架构: 分离式前端 (static/) + Flask-SocketIO 后端
 
 功能:
   - 提供 Web UI 配置采样参数
+  - 实时转子角度监控 (WebSocket)
+  - 预设管理 (PresetManager)
   - 保存/加载配置文件 (JSON)
   - 提供 REST API 供其他节点调用
-  - 实时状态查询
 
 Target: Jetson Nano
 Python: 3.8
@@ -17,11 +19,7 @@ Python: 3.8
 访问地址: http://10.42.0.1:5000 (Nano 热点 IP)
 
 依赖:
-  pip3 install flask flask-cors
-
-运行模式:
-  1. ROS 模式: rosrun usv_ros web_config_server.py (需要 roscore)
-  2. 独立模式: python3 web_config_server.py (不需要 roscore)
+  pip3 install flask flask-cors flask-socketio eventlet
 """
 
 from __future__ import print_function
@@ -30,15 +28,17 @@ import json
 import os
 import sys
 import threading
+import time
 from datetime import datetime
 
 try:
-    from flask import Flask, request, jsonify, render_template_string
+    from flask import Flask, request, jsonify, send_from_directory
     from flask_cors import CORS
+    from flask_socketio import SocketIO, emit
     FLASK_AVAILABLE = True
 except ImportError:
     FLASK_AVAILABLE = False
-    print("警告: Flask 未安装，请运行: pip3 install flask flask-cors")
+    print("警告: Flask/SocketIO 未安装，请运行: pip3 install flask flask-cors flask-socketio eventlet")
 
 # 尝试导入 ROS，如果失败则以独立模式运行
 try:
@@ -51,37 +51,40 @@ except ImportError:
     print("警告: ROS 未导入，以独立模式运行 (无 ROS 集成)")
     # 创建 mock rospy 用于独立模式
     class MockRospy:
-        def init_node(self, *args, **kwargs):
-            pass
-        def get_param(self, name, default):
-            return default
-        def loginfo(self, msg, *args):
-            print("[INFO]", msg % args if args else msg)
-        def logwarn(self, msg, *args):
-            print("[WARN]", msg % args if args else msg)
-        def logerr(self, msg, *args):
-            print("[ERROR]", msg % args if args else msg)
-        def Subscriber(self, *args, **kwargs):
-            return None
+        def init_node(self, *args, **kwargs): pass
+        def get_param(self, name, default): return default
+        def loginfo(self, msg, *args): print("[INFO]", msg % args if args else msg)
+        def logwarn(self, msg, *args): print("[WARN]", msg % args if args else msg)
+        def logerr(self, msg, *args): print("[ERROR]", msg % args if args else msg)
+        def Subscriber(self, *args, **kwargs): return None
         def Publisher(self, *args, **kwargs):
             class MockPub:
-                def publish(self, msg):
-                    pass
+                def publish(self, msg): pass
             return MockPub()
-        def ServiceProxy(self, *args, **kwargs):
-            return None
-        def wait_for_service(self, *args, **kwargs):
-            raise Exception("ROS not available")
-        def ROSException(self):
-            return Exception
+        def ServiceProxy(self, *args, **kwargs): return None
+        def wait_for_service(self, *args, **kwargs): raise Exception("ROS not available")
+        def is_shutdown(self): return False
+        def spin(self): 
+            while True: time.sleep(1)
+        def Rate(self, hz):
+            class MockRate:
+                def sleep(self): time.sleep(1.0/hz)
+            return MockRate()
+            
     rospy = MockRospy()
     
     class String:
-        def __init__(self):
-            self.data = ""
+        def __init__(self): self.data = ""
     
     class Trigger:
         pass
+
+# 确保脚本目录在路径中
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.append(SCRIPT_DIR)
+
+from preset_manager import PresetManager
 
 # 配置文件路径
 CONFIG_DIR = os.path.expanduser("~/usv_ws/config")
@@ -135,314 +138,6 @@ DEFAULT_CONFIG = {
     }
 }
 
-# HTML 模板 - 配置页面
-HTML_TEMPLATE = '''
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>USV 水质监测系统 - 配置</title>
-    <style>
-        * { box-sizing: border-box; margin: 0; padding: 0; }
-        body { 
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-            background: #f5f5f5; 
-            padding: 20px;
-            max-width: 900px;
-            margin: 0 auto;
-        }
-        h1 { color: #333; margin-bottom: 20px; text-align: center; }
-        h2 { color: #555; margin: 20px 0 10px; border-bottom: 2px solid #007bff; padding-bottom: 5px; }
-        .card {
-            background: white;
-            border-radius: 8px;
-            padding: 20px;
-            margin-bottom: 20px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-        .form-group { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 5px; font-weight: 500; color: #333; }
-        input, select, textarea {
-            width: 100%;
-            padding: 10px;
-            border: 1px solid #ddd;
-            border-radius: 4px;
-            font-size: 14px;
-        }
-        input:focus, select:focus { border-color: #007bff; outline: none; }
-        .btn {
-            padding: 12px 24px;
-            border: none;
-            border-radius: 4px;
-            cursor: pointer;
-            font-size: 16px;
-            margin-right: 10px;
-            margin-top: 10px;
-        }
-        .btn-primary { background: #007bff; color: white; }
-        .btn-success { background: #28a745; color: white; }
-        .btn-danger { background: #dc3545; color: white; }
-        .btn-warning { background: #ffc107; color: #333; }
-        .btn:hover { opacity: 0.9; }
-        .status { padding: 10px; border-radius: 4px; margin-top: 10px; }
-        .status-success { background: #d4edda; color: #155724; }
-        .status-error { background: #f8d7da; color: #721c24; }
-        .status-info { background: #cce5ff; color: #004085; }
-        .step-item {
-            background: #f8f9fa;
-            border: 1px solid #dee2e6;
-            border-radius: 4px;
-            padding: 15px;
-            margin-bottom: 10px;
-        }
-        .step-header { display: flex; justify-content: space-between; align-items: center; }
-        .motor-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 10px; }
-        .motor-item { background: white; padding: 10px; border-radius: 4px; }
-        .motor-item label { font-size: 12px; }
-        .motor-item input, .motor-item select { padding: 5px; font-size: 12px; }
-        #log-output {
-            background: #1e1e1e;
-            color: #0f0;
-            font-family: monospace;
-            padding: 10px;
-            height: 200px;
-            overflow-y: auto;
-            border-radius: 4px;
-        }
-        .inline-group { display: flex; gap: 10px; }
-        .inline-group > div { flex: 1; }
-    </style>
-</head>
-<body>
-    <h1>🚤 USV 水质监测系统</h1>
-    
-    <div class="card">
-        <h2>📊 系统状态</h2>
-        <div id="system-status" class="status status-info">正在获取状态...</div>
-        <div style="margin-top: 15px;">
-            <button class="btn btn-success" onclick="startMission()">▶ 启动采样</button>
-            <button class="btn btn-danger" onclick="stopMission()">⏹ 停止</button>
-            <button class="btn btn-warning" onclick="pauseMission()">⏸ 暂停</button>
-            <button class="btn btn-primary" onclick="resumeMission()">⏵ 恢复</button>
-        </div>
-    </div>
-
-    <div class="card">
-        <h2>⚙️ 任务配置</h2>
-        <div class="form-group">
-            <label>任务名称</label>
-            <input type="text" id="mission-name" value="默认采样任务">
-        </div>
-        <div class="inline-group">
-            <div class="form-group">
-                <label>循环次数 (0=无限)</label>
-                <input type="number" id="loop-count" value="1" min="0">
-            </div>
-            <div class="form-group">
-                <label>PID 精度 (度)</label>
-                <input type="number" id="pid-precision" value="0.1" step="0.01" min="0.01">
-            </div>
-        </div>
-        <div class="form-group">
-            <label><input type="checkbox" id="pid-mode" checked> 启用 PID 闭环模式</label>
-        </div>
-    </div>
-
-    <div class="card">
-        <h2>📋 采样步骤</h2>
-        <div id="steps-container"></div>
-        <button class="btn btn-primary" onclick="addStep()">+ 添加步骤</button>
-    </div>
-
-    <div class="card">
-        <button class="btn btn-success" onclick="saveConfig()">💾 保存配置</button>
-        <button class="btn btn-primary" onclick="loadConfig()">📂 加载配置</button>
-        <button class="btn btn-warning" onclick="resetConfig()">🔄 重置默认</button>
-        <div id="save-status"></div>
-    </div>
-
-    <div class="card">
-        <h2>📜 实时日志</h2>
-        <div id="log-output"></div>
-    </div>
-
-    <script>
-        const API_BASE = '';
-        let steps = [];
-
-        // 初始化
-        document.addEventListener('DOMContentLoaded', () => {
-            loadConfig();
-            setInterval(updateStatus, 2000);
-            setInterval(updateLog, 1000);
-        });
-
-        function updateStatus() {
-            fetch(API_BASE + '/api/status')
-                .then(r => r.json())
-                .then(data => {
-                    const el = document.getElementById('system-status');
-                    el.className = 'status status-' + (data.automation_running ? 'success' : 'info');
-                    el.innerHTML = `
-                        <b>泵控制:</b> ${data.pump_connected ? '已连接' : '未连接'} | 
-                        <b>自动化:</b> ${data.automation_running ? '运行中' : '停止'} | 
-                        <b>角度:</b> X:${data.angles.X.toFixed(1)}° Y:${data.angles.Y.toFixed(1)}° Z:${data.angles.Z.toFixed(1)}° A:${data.angles.A.toFixed(1)}°
-                    `;
-                })
-                .catch(() => {
-                    document.getElementById('system-status').innerHTML = '无法连接到服务器';
-                    document.getElementById('system-status').className = 'status status-error';
-                });
-        }
-
-        function updateLog() {
-            fetch(API_BASE + '/api/log')
-                .then(r => r.json())
-                .then(data => {
-                    const el = document.getElementById('log-output');
-                    el.innerHTML = data.logs.map(l => `<div>${l}</div>`).join('');
-                    el.scrollTop = el.scrollHeight;
-                })
-                .catch(() => {});
-        }
-
-        function loadConfig() {
-            fetch(API_BASE + '/api/config')
-                .then(r => r.json())
-                .then(data => {
-                    document.getElementById('mission-name').value = data.mission.name || '';
-                    document.getElementById('loop-count').value = data.sampling_sequence.loop_count || 1;
-                    document.getElementById('pid-precision').value = data.pump_settings.pid_precision || 0.1;
-                    document.getElementById('pid-mode').checked = data.pump_settings.pid_mode !== false;
-                    steps = data.sampling_sequence.steps || [];
-                    renderSteps();
-                    showStatus('save-status', '配置已加载', 'info');
-                })
-                .catch(e => showStatus('save-status', '加载失败: ' + e, 'error'));
-        }
-
-        function saveConfig() {
-            const config = {
-                mission: { name: document.getElementById('mission-name').value },
-                pump_settings: {
-                    pid_mode: document.getElementById('pid-mode').checked,
-                    pid_precision: parseFloat(document.getElementById('pid-precision').value)
-                },
-                sampling_sequence: {
-                    loop_count: parseInt(document.getElementById('loop-count').value),
-                    steps: collectSteps()
-                }
-            };
-            fetch(API_BASE + '/api/config', {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(config)
-            })
-            .then(r => r.json())
-            .then(data => showStatus('save-status', data.message, 'success'))
-            .catch(e => showStatus('save-status', '保存失败: ' + e, 'error'));
-        }
-
-        function resetConfig() {
-            if (confirm('确定要重置为默认配置吗？')) {
-                fetch(API_BASE + '/api/config/reset', {method: 'POST'})
-                    .then(() => loadConfig())
-                    .catch(e => showStatus('save-status', '重置失败: ' + e, 'error'));
-            }
-        }
-
-        function startMission() {
-            fetch(API_BASE + '/api/mission/start', {method: 'POST'})
-                .then(r => r.json())
-                .then(data => showStatus('save-status', data.message, data.success ? 'success' : 'error'));
-        }
-
-        function stopMission() {
-            fetch(API_BASE + '/api/mission/stop', {method: 'POST'})
-                .then(r => r.json())
-                .then(data => showStatus('save-status', data.message, 'info'));
-        }
-
-        function pauseMission() {
-            fetch(API_BASE + '/api/mission/pause', {method: 'POST'})
-                .then(r => r.json())
-                .then(data => showStatus('save-status', data.message, 'info'));
-        }
-
-        function resumeMission() {
-            fetch(API_BASE + '/api/mission/resume', {method: 'POST'})
-                .then(r => r.json())
-                .then(data => showStatus('save-status', data.message, 'info'));
-        }
-
-        function renderSteps() {
-            const container = document.getElementById('steps-container');
-            container.innerHTML = steps.map((step, i) => `
-                <div class="step-item">
-                    <div class="step-header">
-                        <input type="text" value="${step.name || '步骤'+(i+1)}" 
-                               onchange="steps[${i}].name=this.value" style="width:200px">
-                        <div>
-                            <label>间隔(ms): <input type="number" value="${step.interval||1000}" 
-                                   onchange="steps[${i}].interval=parseInt(this.value)" style="width:80px"></label>
-                            <button class="btn btn-danger" onclick="removeStep(${i})" style="padding:5px 10px">删除</button>
-                        </div>
-                    </div>
-                    <div class="motor-grid">
-                        ${['X','Y','Z','A'].map(m => `
-                            <div class="motor-item">
-                                <label><b>${m}轴</b></label>
-                                <label><input type="checkbox" ${step[m]?.enable==='E'?'checked':''} 
-                                       onchange="steps[${i}]['${m}'].enable=this.checked?'E':'D'"> 启用</label>
-                                <label>方向: <select onchange="steps[${i}]['${m}'].direction=this.value">
-                                    <option value="F" ${step[m]?.direction==='F'?'selected':''}>正转</option>
-                                    <option value="B" ${step[m]?.direction==='B'?'selected':''}>反转</option>
-                                </select></label>
-                                <label>速度: <input type="number" value="${step[m]?.speed||5}" min="1" max="10"
-                                       onchange="steps[${i}]['${m}'].speed=this.value" style="width:50px"></label>
-                                <label>角度: <input type="number" value="${step[m]?.angle||90}" 
-                                       onchange="steps[${i}]['${m}'].angle=this.value" style="width:60px"></label>
-                            </div>
-                        `).join('')}
-                    </div>
-                </div>
-            `).join('');
-        }
-
-        function addStep() {
-            steps.push({
-                name: '新步骤',
-                X: {enable:'D', direction:'F', speed:'5', angle:'90'},
-                Y: {enable:'D', direction:'F', speed:'5', angle:'90'},
-                Z: {enable:'D', direction:'F', speed:'5', angle:'90'},
-                A: {enable:'D', direction:'F', speed:'5', angle:'90'},
-                interval: 1000
-            });
-            renderSteps();
-        }
-
-        function removeStep(i) {
-            steps.splice(i, 1);
-            renderSteps();
-        }
-
-        function collectSteps() {
-            return steps;
-        }
-
-        function showStatus(id, msg, type) {
-            const el = document.getElementById(id);
-            el.className = 'status status-' + type;
-            el.textContent = msg;
-            setTimeout(() => el.textContent = '', 5000);
-        }
-    </script>
-</body>
-</html>
-'''
-
-
 class ConfigManager(object):
     """配置文件管理器。"""
 
@@ -463,7 +158,6 @@ class ConfigManager(object):
             if os.path.exists(self.config_file):
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     loaded = json.load(f)
-                    # 合并默认配置
                     self._merge_config(loaded)
                 return True
         except Exception as e:
@@ -505,18 +199,6 @@ class ConfigManager(object):
         """获取当前配置。"""
         return self.config.copy()
 
-    def get_steps(self):
-        """获取采样步骤。"""
-        return self.config.get('sampling_sequence', {}).get('steps', [])
-
-    def get_loop_count(self):
-        """获取循环次数。"""
-        return self.config.get('sampling_sequence', {}).get('loop_count', 1)
-
-    def get_pid_settings(self):
-        """获取 PID 设置。"""
-        return self.config.get('pump_settings', {})
-
 
 class WebConfigServer(object):
     """Web 配置服务器 ROS 节点。"""
@@ -546,9 +228,10 @@ class WebConfigServer(object):
             self.host = '0.0.0.0'
             self.port = 5000
 
-        # 配置管理器
+        # 管理器
         self.config_manager = ConfigManager()
         self.config_manager.load()
+        self.preset_manager = PresetManager()
 
         # 日志缓冲
         self.log_buffer = []
@@ -570,14 +253,15 @@ class WebConfigServer(object):
             self.angles_sub = None
             self.steps_pub = None
 
-        # Flask 应用
+        # Flask & SocketIO
         self.app = None
+        self.socketio = None
         self.server_thread = None
 
         if FLASK_AVAILABLE:
             self._setup_flask()
         else:
-            rospy.logerr("Flask not available! Install with: pip3 install flask flask-cors")
+            rospy.logerr("Flask/SocketIO not available!")
 
         mode_str = "独立模式 (无 ROS)" if self.standalone else "ROS 模式"
         rospy.loginfo("Web Config Server initialized (%s)", mode_str)
@@ -590,7 +274,9 @@ class WebConfigServer(object):
         self.automation_running = 'automation' in status and 'running' not in status.replace('running', '')
         if 'automation' in status:
             self.automation_running = 'running' in status or '运行' in status
-        self._add_log("[状态] " + msg.data)
+        
+        # 只记录关键状态变化，避免刷屏
+        # self._add_log("[状态] " + msg.data)
 
     def _angles_cb(self, msg):
         """角度数据回调。"""
@@ -603,22 +289,42 @@ class WebConfigServer(object):
         except Exception:
             pass
 
-    def _add_log(self, message):
-        """添加日志。"""
+    def _add_log(self, message, level='info'):
+        """添加日志并推送到 WebSocket"""
         timestamp = datetime.now().strftime("%H:%M:%S")
+        log_entry = "[{}] {}".format(timestamp, message)
+        
         with self.log_lock:
-            self.log_buffer.append("[{}] {}".format(timestamp, message))
+            self.log_buffer.append(log_entry)
             if len(self.log_buffer) > self.max_logs:
                 self.log_buffer = self.log_buffer[-self.max_logs:]
+        
+        # 推送实时日志
+        if self.socketio:
+            self.socketio.emit('log', {
+                'message': message, 
+                'level': level, 
+                'timestamp': timestamp
+            })
 
     def _setup_flask(self):
-        """设置 Flask 应用。"""
-        self.app = Flask(__name__)
+        """设置 Flask 和 SocketIO 应用。"""
+        # 设置静态文件目录
+        static_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), '../static'))
+        self.app = Flask(__name__, static_folder=static_folder, static_url_path='/static')
+        
+        # 禁用浏览器缓存 (开发模式)
+        self.app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
+        
         CORS(self.app)
+        
+        # 使用 threading 模式以兼容 ROS
+        self.socketio = SocketIO(self.app, cors_allowed_origins="*", async_mode='threading')
 
+        # ================= HTTP 路由 =================
         @self.app.route('/')
         def index():
-            return render_template_string(HTML_TEMPLATE)
+            return send_from_directory(static_folder, 'index.html')
 
         @self.app.route('/api/config', methods=['GET'])
         def get_config():
@@ -628,51 +334,220 @@ class WebConfigServer(object):
         def save_config():
             data = request.get_json()
             if self.config_manager.update(data):
-                self._add_log("[配置] 配置已保存")
+                self._add_log("配置已保存", "success")
                 return jsonify({"success": True, "message": "配置已保存"})
             return jsonify({"success": False, "message": "保存失败"}), 500
 
         @self.app.route('/api/config/reset', methods=['POST'])
         def reset_config():
             self.config_manager.reset()
-            self._add_log("[配置] 配置已重置")
+            self._add_log("配置已重置", "warning")
             return jsonify({"success": True, "message": "已重置为默认配置"})
 
-        @self.app.route('/api/status', methods=['GET'])
-        def get_status():
-            return jsonify({
-                "pump_connected": self.pump_connected,
-                "automation_running": self.automation_running,
-                "angles": self.current_angles
-            })
-
-        @self.app.route('/api/log', methods=['GET'])
-        def get_log():
-            with self.log_lock:
-                return jsonify({"logs": self.log_buffer[-50:]})
-
+        # 任务控制 API
         @self.app.route('/api/mission/start', methods=['POST'])
-        def start_mission():
-            return self._trigger_mission('start')
+        def start_mission(): return self._trigger_mission('start')
 
         @self.app.route('/api/mission/stop', methods=['POST'])
-        def stop_mission():
-            return self._trigger_mission('stop')
+        def stop_mission(): return self._trigger_mission('stop')
 
         @self.app.route('/api/mission/pause', methods=['POST'])
-        def pause_mission():
-            return self._trigger_mission('pause')
+        def pause_mission(): return self._trigger_mission('pause')
 
         @self.app.route('/api/mission/resume', methods=['POST'])
-        def resume_mission():
-            return self._trigger_mission('resume')
+        def resume_mission(): return self._trigger_mission('resume')
+
+        # 预设管理 API (新)
+        @self.app.route('/api/presets/auto', methods=['GET'])
+        def get_auto_presets():
+            return jsonify({"success": True, "data": self.preset_manager.get_auto_preset_names()})
+            
+        @self.app.route('/api/preset/auto/<name>', methods=['GET'])
+        def load_auto_preset(name):
+            data = self.preset_manager.load_auto_preset(name)
+            if data:
+                return jsonify({"success": True, "data": data})
+            return jsonify({"success": False, "message": "预设不存在"}), 404
+
+        @self.app.route('/api/preset/auto/<name>', methods=['POST'])
+        def save_auto_preset(name):
+            data = request.get_json()
+            if self.preset_manager.save_auto_preset(name, data['steps'], data['loop_count']):
+                self._add_log(f"预设 '{name}' 已保存", "success")
+                return jsonify({"success": True, "message": "预设已保存"})
+            return jsonify({"success": False, "message": "保存失败"}), 500
+            
+        @self.app.route('/api/preset/auto/<name>', methods=['DELETE'])
+        def delete_auto_preset(name):
+            if self.preset_manager.delete_preset('auto', name):
+                self._add_log(f"预设 '{name}' 已删除", "warning")
+                return jsonify({"success": True, "message": "预设已删除"})
+            return jsonify({"success": False, "message": "删除失败"}), 500
+
+        # ================= 电机控制 API =================
+        @self.app.route('/api/motor/command', methods=['POST'])
+        def send_motor_command():
+            """发送电机控制指令"""
+            data = request.get_json()
+            command = data.get('command', '')
+            if not command:
+                return jsonify({"success": False, "message": "指令为空"})
+            
+            if self.standalone:
+                self._add_log(f"[模拟] 发送指令: {command}", "info")
+                return jsonify({"success": True, "message": "指令已发送 (模拟模式)"})
+            
+            try:
+                # 通过 ROS 服务发送指令
+                if hasattr(self, 'command_pub') and self.command_pub:
+                    self.command_pub.publish(command)
+                    self._add_log(f"指令已发送: {command}", "success")
+                    return jsonify({"success": True, "message": "指令已发送"})
+                else:
+                    return jsonify({"success": False, "message": "ROS Publisher 未初始化"})
+            except Exception as e:
+                return jsonify({"success": False, "message": str(e)}), 500
+
+        @self.app.route('/api/motor/stop', methods=['POST'])
+        def stop_all_motors():
+            """紧急停止所有电机"""
+            stop_command = "XDFV0J0YDFV0J0ZDFV0J0ADFV0J0\r\n"
+            if self.standalone:
+                self._add_log("[模拟] 紧急停止所有电机", "warning")
+                return jsonify({"success": True, "message": "已停止 (模拟模式)"})
+            
+            try:
+                if hasattr(self, 'command_pub') and self.command_pub:
+                    self.command_pub.publish(stop_command)
+                    self._add_log("紧急停止所有电机", "warning")
+                    return jsonify({"success": True, "message": "已停止"})
+                return jsonify({"success": False, "message": "ROS Publisher 未初始化"})
+            except Exception as e:
+                return jsonify({"success": False, "message": str(e)}), 500
+
+        # ================= PID 配置 API =================
+        @self.app.route('/api/pid/config', methods=['GET'])
+        def get_pid_config():
+            """获取当前 PID 参数"""
+            pid_config = getattr(self, 'pid_config', {
+                "Kp": 0.14, "Ki": 0.015, "Kd": 0.06,
+                "output_min": 1.0, "output_max": 8.0
+            })
+            return jsonify({"success": True, "data": pid_config})
+
+        @self.app.route('/api/pid/config', methods=['POST'])
+        def set_pid_config():
+            """设置 PID 参数"""
+            data = request.get_json()
+            self.pid_config = {
+                "Kp": data.get("Kp", 0.14),
+                "Ki": data.get("Ki", 0.015),
+                "Kd": data.get("Kd", 0.06),
+                "output_min": data.get("output_min", 1.0),
+                "output_max": data.get("output_max", 8.0)
+            }
+            
+            # 生成 PIDCFG 指令
+            cmd = "PIDCFG:{Kp},{Ki},{Kd},{output_min},{output_max}\r\n".format(**self.pid_config)
+            
+            if not self.standalone and hasattr(self, 'command_pub') and self.command_pub:
+                self.command_pub.publish(cmd)
+            
+            self._add_log(f"PID 参数已更新: Kp={self.pid_config['Kp']}", "success")
+            return jsonify({"success": True, "message": "PID 参数已更新"})
+
+        @self.app.route('/api/pid/test', methods=['POST'])
+        def start_pid_test():
+            """启动 PID 测试"""
+            data = request.get_json()
+            motor = data.get('motor', 'X')
+            direction = data.get('direction', 'F')
+            angle = data.get('angle', 90.0)
+            runs = data.get('runs', 5)
+            
+            cmd = f"PIDTEST:{motor},{direction},{angle},{runs}\r\n"
+            
+            if self.standalone:
+                self._add_log(f"[模拟] PID 测试: {cmd.strip()}", "info")
+                return jsonify({"success": True, "message": "测试已启动 (模拟模式)"})
+            
+            if hasattr(self, 'command_pub') and self.command_pub:
+                self.command_pub.publish(cmd)
+                self._add_log(f"PID 测试已启动: {motor}轴 {angle}°", "info")
+                return jsonify({"success": True, "message": "测试已启动"})
+            
+            return jsonify({"success": False, "message": "ROS Publisher 未初始化"})
+
+        # ================= 零点标定 API =================
+        @self.app.route('/api/calibration/zero', methods=['POST'])
+        def set_zero_point():
+            """设置零点"""
+            data = request.get_json()
+            motor = data.get('motor', '')
+            
+            if motor not in ['X', 'Y', 'Z', 'A']:
+                return jsonify({"success": False, "message": "无效的电机标识"})
+            
+            # 保存零点偏移
+            if not hasattr(self, 'zero_offsets'):
+                self.zero_offsets = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
+            
+            current_angle = self.current_angles.get(motor, 0.0)
+            self.zero_offsets[motor] = current_angle
+            
+            self._add_log(f"电机 {motor} 零点已设置: {current_angle:.2f}°", "success")
+            return jsonify({
+                "success": True, 
+                "message": f"电机 {motor} 零点已设置",
+                "offset": current_angle
+            })
+
+        @self.app.route('/api/calibration/reset', methods=['POST'])
+        def reset_zero_points():
+            """重置所有零点"""
+            self.zero_offsets = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
+            self._add_log("所有零点已重置", "warning")
+            return jsonify({"success": True, "message": "所有零点已重置"})
+
+        @self.app.route('/api/calibration/offsets', methods=['GET'])
+        def get_zero_offsets():
+            """获取零点偏移"""
+            offsets = getattr(self, 'zero_offsets', {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0})
+            return jsonify({"success": True, "data": offsets})
+
+        @self.app.route('/api/calibration/start', methods=['POST'])
+        def start_calibration():
+            """启动电机校准"""
+            data = request.get_json()
+            motors = data.get('motors', 'XYZA')
+            
+            cmd = f"CAL{motors}\r\n"
+            
+            if self.standalone:
+                self._add_log(f"[模拟] 校准: {motors}", "info")
+                return jsonify({"success": True, "message": "校准已启动 (模拟模式)"})
+            
+            if hasattr(self, 'command_pub') and self.command_pub:
+                self.command_pub.publish(cmd)
+                self._add_log(f"校准已启动: {motors}", "info")
+                return jsonify({"success": True, "message": "校准已启动"})
+            
+            return jsonify({"success": False, "message": "ROS Publisher 未初始化"})
+
+        # ================= WebSocket 事件 =================
+        @self.socketio.on('connect')
+        def handle_connect():
+            emit('status', {
+                "pump_connected": self.pump_connected,
+                "automation_running": self.automation_running
+            })
+            emit('angles', self.current_angles)
 
     def _trigger_mission(self, action):
         """触发任务动作。"""
-        # 独立模式下无法触发 ROS 服务
         if self.standalone:
             msg = "独立模式下无法触发任务 (需要 ROS 集成)"
-            self._add_log("[警告] " + msg)
+            self._add_log(msg, "warning")
             return jsonify({"success": False, "message": msg})
         
         service_map = {
@@ -683,9 +558,6 @@ class WebConfigServer(object):
         }
 
         service_name = service_map.get(action)
-        if not service_name:
-            return jsonify({"success": False, "message": "未知动作"})
-
         try:
             # 如果是启动，先发送最新配置
             if action == 'start':
@@ -696,12 +568,12 @@ class WebConfigServer(object):
             service = rospy.ServiceProxy(service_name, Trigger)
             resp = service()
 
-            self._add_log("[任务] {} - {}".format(action, resp.message))
+            self._add_log(f"任务 {action}: {resp.message}", "success" if resp.success else "error")
             return jsonify({"success": resp.success, "message": resp.message})
 
         except Exception as e:
-            msg = "服务不可用: {}".format(str(e))
-            self._add_log("[错误] " + msg)
+            msg = f"服务调用失败: {str(e)}"
+            self._add_log(msg, "error")
             return jsonify({"success": False, "message": msg})
 
     def _publish_steps(self):
@@ -719,12 +591,32 @@ class WebConfigServer(object):
         msg = String()
         msg.data = json.dumps(steps_data)
         self.steps_pub.publish(msg)
-        self._add_log("[配置] 步骤已发送到泵控制节点")
+        self._add_log("配置已发送到控制节点")
+
+    def _data_push_loop(self):
+        """后台线程：定时推送实时数据"""
+        rate = 20 # Hz
+        while not rospy.is_shutdown():
+            if self.socketio:
+                self.socketio.emit('status', {
+                    "pump_connected": self.pump_connected,
+                    "automation_running": self.automation_running
+                })
+                self.socketio.emit('angles', self.current_angles)
+            
+            if self.standalone:
+                # 独立模式模拟数据变化 (测试用)
+                if self.automation_running:
+                    for k in self.current_angles:
+                        self.current_angles[k] = (self.current_angles[k] + 1) % 360
+                time.sleep(1.0/rate)
+            else:
+                threading.Event().wait(1.0/rate)
 
     def run(self):
         """运行服务器。"""
         if not FLASK_AVAILABLE:
-            rospy.logerr("Flask not available, cannot start web server")
+            rospy.logerr("Flask/SocketIO not available, cannot start web server")
             if not self.standalone:
                 rospy.spin()
             return
@@ -732,72 +624,45 @@ class WebConfigServer(object):
         rospy.loginfo("Web server starting at http://%s:%d", self.host, self.port)
         self._add_log("Web 服务器启动中...")
 
-        if self.standalone:
-            # 独立模式：直接运行 Flask (阻塞)
-            rospy.loginfo("Running in standalone mode (blocking)")
-            try:
-                self.app.run(host=self.host, port=self.port, threaded=True, use_reloader=False)
-            except KeyboardInterrupt:
-                rospy.loginfo("Server stopped by user")
-        else:
-            # ROS 模式：在后台线程运行 Flask
-            def run_flask():
-                self.app.run(host=self.host, port=self.port, threaded=True, use_reloader=False)
+        # 启动数据推送线程
+        data_thread = threading.Thread(target=self._data_push_loop)
+        data_thread.daemon = True
+        data_thread.start()
 
-            self.server_thread = threading.Thread(target=run_flask, daemon=True)
-            self.server_thread.start()
-
-            rospy.loginfo("Web server started (background thread)")
-            self._add_log("Web 服务器已启动")
-
-            # ROS 主循环
-            try:
-                rospy.spin()
-            except KeyboardInterrupt:
-                rospy.loginfo("ROS node stopped")
-
+        # 启动 SocketIO 服务器
+        try:
+            self.socketio.run(self.app, host=self.host, port=self.port, use_reloader=False)
+        except Exception as e:
+            rospy.logerr(f"Server error: {e}")
+        except KeyboardInterrupt:
+            rospy.loginfo("Server stopped by user")
 
 def main():
-    """主函数 - 自动检测运行模式。"""
-    # 检测是否有 ROS 环境
+    """主函数"""
     standalone = not ROS_AVAILABLE
     
     if not standalone:
-        # 尝试连接 ROS master
         try:
             import socket
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(1)
-            # 尝试连接默认的 ROS master 端口
             result = sock.connect_ex(('localhost', 11311))
             sock.close()
             if result != 0:
-                print("警告: 无法连接到 ROS master (localhost:11311)")
-                print("  切换到独立模式运行")
-                print("  如需 ROS 集成，请先运行: roscore")
+                print("ROS MASTER 未运行，切换到独立模式")
                 standalone = True
         except Exception:
             standalone = True
     
     try:
-        mode_str = "独立模式" if standalone else "ROS 模式"
-        print("=" * 50)
-        print("USV Web 配置服务器")
-        print("运行模式: {}".format(mode_str))
-        print("=" * 50)
-        
         server = WebConfigServer(standalone=standalone)
         server.run()
     except KeyboardInterrupt:
-        print("\n服务器已停止")
+        pass
     except Exception as e:
-        if ROS_AVAILABLE and not standalone:
-            rospy.logerr("Web Config Server error: %s", str(e))
-        else:
-            print("错误:", str(e))
+        print(f"Error: {e}")
         import traceback
         traceback.print_exc()
-
 
 if __name__ == '__main__':
     main()

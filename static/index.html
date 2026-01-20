@@ -1,0 +1,234 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport"
+        content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>USV Pro Max Control</title>
+
+    <!-- Fonts -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Inter:wght@300;400;500;600;700&display=swap"
+        rel="stylesheet">
+
+    <!-- Styles -->
+    <link rel="stylesheet" href="/static/css/styles.css?v=2">
+
+    <!-- Libraries (Global Import for ECharts) -->
+    <script src="/static/js/lib/echarts.min.js"></script>
+    <!-- Socket.IO (Served by Flask-SocketIO) -->
+    <script src="/static/js/lib/socket.io.min.js"></script>
+</head>
+
+<body>
+    <div id="app" v-cloak>
+        <!-- App Header -->
+        <app-header :status="status" :connection="connection" @stop-mission="stopMission">
+        </app-header>
+
+        <div class="main-container">
+            <!-- Sidebar Navigation (Desktop) -->
+            <nav class="sidebar glass-panel show-desktop">
+                <a v-for="view in views" :key="view.id" :class="['nav-link', { active: currentView === view.id }]"
+                    @click="currentView = view.id">
+                    <span class="icon" v-html="view.icon"></span>
+                    {{ view.label }}
+                </a>
+            </nav>
+
+            <!-- Main Content -->
+            <main class="content-area">
+                <transition name="slide-up" mode="out-in">
+
+                    <!-- Dashboard View -->
+                    <dashboard-view v-if="currentView === 'dashboard'" :angles="angles" :status="status" :logs="logs"
+                        @control="handleMissionControl" @clear-log="clearLogs">
+                    </dashboard-view>
+
+                    <!-- Manual Control View -->
+                    <manual-control-view v-else-if="currentView === 'manual'" :connection="connection"
+                        @toast="addToast">
+                    </manual-control-view>
+
+                    <!-- PID Config View -->
+                    <pid-config-view v-else-if="currentView === 'pid'" @toast="addToast">
+                    </pid-config-view>
+
+                    <!-- Config View -->
+                    <config-view v-else-if="currentView === 'config'" :config="config" :is-dirty="isConfigDirty"
+                        :presets="presets" @save="saveConfig" @reset="resetConfig" @load-preset="loadPreset"
+                        @save-preset="savePreset" @delete-preset="deletePreset">
+                    </config-view>
+
+                    <!-- Log View (Mobile/Full) -->
+                    <log-view v-else-if="currentView === 'logs'" :logs="logs" @clear="clearLogs">
+                    </log-view>
+
+                </transition>
+            </main>
+        </div>
+
+        <!-- Mobile Bottom Nav -->
+        <nav class="bottom-nav glass-panel show-mobile">
+            <a v-for="view in views" :key="view.id" :class="['nav-item', { active: currentView === view.id }]"
+                @click="currentView = view.id">
+                <span class="icon" v-html="view.icon"></span>
+                <span class="label">{{ view.label }}</span>
+            </a>
+        </nav>
+
+        <!-- Global Toast Container -->
+        <div class="toast-container">
+            <transition-group name="list">
+                <div v-for="t in toasts" :key="t.id" :class="['toast', t.type]">
+                    {{ t.message }}
+                </div>
+            </transition-group>
+        </div>
+    </div>
+
+    <!-- Vue App Bootstrap -->
+    <script type="module" src="/static/js/main.js"></script>
+
+    <style>
+        [v-cloak] {
+            display: none;
+        }
+
+        /* Extra Styles for Layout inline for simplicity */
+        .sidebar {
+            width: var(--sidebar-width);
+            margin: var(--spacing-lg);
+            margin-right: 0;
+            display: flex;
+            flex-direction: column;
+            padding: var(--spacing-md);
+        }
+
+        .nav-link {
+            padding: 12px 16px;
+            color: var(--color-text-muted);
+            border-radius: var(--radius-sm);
+            cursor: pointer;
+            margin-bottom: 4px;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            transition: var(--trans-fast);
+        }
+
+        .nav-link:hover {
+            background: rgba(255, 255, 255, 0.05);
+            color: white;
+        }
+
+        .nav-link.active {
+            background: linear-gradient(90deg, rgba(0, 243, 255, 0.1) 0%, transparent 100%);
+            color: var(--color-primary);
+            border-left: 3px solid var(--color-primary);
+        }
+
+        .show-desktop {
+            display: flex;
+        }
+
+        .show-mobile {
+            display: none;
+        }
+
+        @media (max-width: 768px) {
+            .show-desktop {
+                display: none;
+            }
+
+            .show-mobile {
+                display: flex;
+            }
+
+            .main-container {
+                flex-direction: column;
+            }
+
+            .sidebar {
+                display: none;
+            }
+
+            .bottom-nav {
+                position: fixed;
+                bottom: 0;
+                left: 0;
+                right: 0;
+                height: 60px;
+                border-radius: 0;
+                margin: 0;
+                justify-content: space-around;
+                align-items: center;
+                z-index: 100;
+                backdrop-filter: blur(20px);
+                background: rgba(5, 10, 20, 0.9);
+            }
+
+            .nav-item {
+                display: flex;
+                flex-direction: column;
+                align-items: center;
+                font-size: 10px;
+                color: var(--color-text-muted);
+            }
+
+            .nav-item.active {
+                color: var(--color-primary);
+            }
+
+            .nav-item .icon svg {
+                width: 24px;
+                height: 24px;
+            }
+
+            .content-area {
+                padding-bottom: 80px;
+            }
+
+            /* Space for bottom nav */
+        }
+
+        /* Toast */
+        .toast-container {
+            position: fixed;
+            top: 20px;
+            right: 20px;
+            z-index: 999;
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+
+        .toast {
+            background: rgba(0, 0, 0, 0.8);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            color: white;
+            padding: 12px 24px;
+            border-radius: 8px;
+            backdrop-filter: blur(10px);
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+        }
+
+        .toast.success {
+            border-color: var(--color-success);
+            color: var(--color-success);
+        }
+
+        .toast.error {
+            border-color: var(--color-danger);
+            color: var(--color-danger);
+        }
+    </style>
+
+    <!-- Vue App -->
+    <script type="module" src="/static/js/main.js?v=2"></script>
+</body>
+
+</html>

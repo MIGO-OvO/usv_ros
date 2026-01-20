@@ -1,0 +1,45 @@
+/* CSS Variables - Cyberpunk Industrial Theme */
+:root {
+    /* --- Palette --- */
+    --bg-deep: #050a14;
+    --bg-overlay: rgba(10, 15, 30, 0.7);
+
+    /* Neon Accents */
+    --color-primary: #00f3ff;
+    /* Cyan Neon */
+    --color-primary-dim: rgba(0, 243, 255, 0.2);
+    --color-success: #00ff9d;
+    /* Green Neon */
+    --color-warning: #ffb800;
+    /* Amber Neon */
+    --color-danger: #ff0055;
+    /* Crimson Neon */
+    --color-text-main: #ffffff;
+    --color-text-muted: #8b9bb4;
+
+    /* --- Glassmorphism --- */
+    --glass-bg: rgba(255, 255, 255, 0.03);
+    --glass-border: 1px solid rgba(255, 255, 255, 0.08);
+    --glass-blur: blur(12px);
+    --glass-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.5);
+
+    /* --- Layout --- */
+    --header-height: 64px;
+    --sidebar-width: 260px;
+    --radius-sm: 8px;
+    --radius-md: 16px;
+    --spacing-xs: 4px;
+    --spacing-sm: 8px;
+    --spacing-md: 16px;
+    --spacing-lg: 24px;
+
+    /* --- Animation --- */
+    --trans-fast: 0.2s ease;
+    --trans-smooth: 0.4s cubic-bezier(0.25, 0.8, 0.25, 1);
+}
+
+/* Dark Mode Default */
+body {
+    background-color: var(--bg-deep);
+    color: var(--color-text-main);
+}
