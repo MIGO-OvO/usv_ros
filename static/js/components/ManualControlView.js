@@ -12,8 +12,10 @@ export default {
                 <div class="glass-header">
                     <div class="glass-title">电机 {{ motor }}</div>
                     <label class="toggle-switch">
-                        <input type="checkbox" v-model="motors[motor].enabled">
-                        <span class="slider"></span>
+                        <input type="checkbox" 
+                               v-model="motors[motor].enabled"
+                               aria-label="启用电机">
+                        <span class="slider" aria-hidden="true"></span>
                     </label>
                 </div>
                 <div class="glass-body" :class="{ disabled: !motors[motor].enabled }">
@@ -29,18 +31,34 @@ export default {
                     </div>
                     <!-- Speed -->
                     <div class="form-group">
-                        <label>速度 (RPM)</label>
-                        <input type="number" v-model.number="motors[motor].speed" class="input-glass" min="0" max="20" step="1">
+                        <label :for="`motor-${motor}-speed`">速度 (RPM)</label>
+                        <input :id="`motor-${motor}-speed`"
+                               type="number" 
+                               v-model.number="motors[motor].speed" 
+                               class="input-glass" 
+                               min="0" 
+                               max="20" 
+                               step="1"
+                               aria-label="电机速度">
                     </div>
                     <!-- Angle -->
                     <div class="form-group">
-                        <label>角度 (°)</label>
-                        <input type="number" v-model.number="motors[motor].angle" class="input-glass" min="0" max="3600" step="1">
+                        <label :for="`motor-${motor}-angle`">角度 (°)</label>
+                        <input :id="`motor-${motor}-angle`"
+                               type="number" 
+                               v-model.number="motors[motor].angle" 
+                               class="input-glass" 
+                               min="0" 
+                               max="3600" 
+                               step="1"
+                               aria-label="电机角度">
                     </div>
                     <!-- Continuous -->
                     <div class="form-group">
                         <label>
-                            <input type="checkbox" v-model="motors[motor].continuous"> 持续转动
+                            <input type="checkbox" 
+                                   v-model="motors[motor].continuous"
+                                   aria-label="持续转动"> 持续转动
                         </label>
                     </div>
                 </div>
@@ -50,13 +68,21 @@ export default {
         <!-- Control Buttons -->
         <div class="glass-panel control-panel">
             <div class="glass-body" style="display: flex; gap: 12px; flex-wrap: wrap; align-items: center;">
-                <button class="btn btn-success" @click="sendCommand" :disabled="!hasEnabledMotor">
-                    <svg viewBox="0 0 24 24" fill="currentColor" width="16"><polygon points="5,3 19,12 5,21"/></svg>
-                    发送指令
+                <button class="btn btn-success" @click="sendCommand" :disabled="!hasEnabledMotor || isLoading">
+                    <svg v-if="!isLoading" viewBox="0 0 24 24" fill="currentColor" width="16"><polygon points="5,3 19,12 5,21"/></svg>
+                    <svg v-else class="animate-spin" viewBox="0 0 24 24" fill="none" width="16">
+                        <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" opacity="0.25"/>
+                        <path fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" opacity="0.75"/>
+                    </svg>
+                    {{ isLoading ? '发送中...' : '发送指令' }}
                 </button>
-                <button class="btn btn-danger" @click="stopAll">
-                    <svg viewBox="0 0 24 24" fill="currentColor" width="16"><rect x="6" y="6" width="12" height="12"/></svg>
-                    紧急停止
+                <button class="btn btn-danger" @click="stopAll" :disabled="isLoading">
+                    <svg v-if="!isLoading" viewBox="0 0 24 24" fill="currentColor" width="16"><rect x="6" y="6" width="12" height="12"/></svg>
+                    <svg v-else class="animate-spin" viewBox="0 0 24 24" fill="none" width="16">
+                        <circle cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4" opacity="0.25"/>
+                        <path fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" opacity="0.75"/>
+                    </svg>
+                    {{ isLoading ? '停止中...' : '紧急停止' }}
                 </button>
                 
                 <div class="divider-v"></div>
@@ -94,12 +120,16 @@ export default {
     
     .motor-grid {
         display: grid;
-        grid-template-columns: repeat(2, 1fr);
+        grid-template-columns: repeat(2, minmax(200px, 1fr));
         gap: var(--spacing-lg, 16px);
         margin-bottom: var(--spacing-lg, 16px);
     }
     
-    @media (max-width: 600px) {
+    .motor-card {
+        min-width: 0;
+    }
+    
+    @media (max-width: 520px) {
         .motor-grid { grid-template-columns: 1fr; }
     }
     
@@ -177,6 +207,7 @@ export default {
 
         const hasEnabledMotor = ref(false);
         const commandPreview = ref('');
+        const isLoading = ref(false);  // 添加加载状态
 
         // Update command preview when motors change
         const updatePreview = () => {
@@ -211,6 +242,7 @@ export default {
                 return;
             }
 
+            isLoading.value = true;  // 开始加载
             try {
                 const res = await fetch('/api/motor/command', {
                     method: 'POST',
@@ -220,11 +252,16 @@ export default {
                 const data = await res.json();
                 emit('toast', data.message, data.success ? 'success' : 'error');
             } catch (e) {
-                emit('toast', '发送失败', 'error');
+                const errorMsg = `发送失败: ${e.message || '网络错误'}`;
+                emit('toast', errorMsg, 'error');
+                console.error('[Motor Command Error]', e);
+            } finally {
+                isLoading.value = false;  // 结束加载
             }
         };
 
         const stopAll = async () => {
+            isLoading.value = true;  // 开始加载
             try {
                 const res = await fetch('/api/motor/stop', { method: 'POST' });
                 const data = await res.json();
@@ -235,7 +272,11 @@ export default {
                     cancelTimedRun();
                 }
             } catch (e) {
-                emit('toast', '停止失败', 'error');
+                const errorMsg = `停止失败: ${e.message || '网络错误'}`;
+                emit('toast', errorMsg, 'error');
+                console.error('[Motor Stop Error]', e);
+            } finally {
+                isLoading.value = false;  // 结束加载
             }
         };
 
@@ -293,6 +334,7 @@ export default {
             timedRun,
             hasEnabledMotor,
             commandPreview,
+            isLoading,
             sendCommand,
             stopAll,
             startTimedRun,

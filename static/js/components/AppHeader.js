@@ -5,37 +5,43 @@ export default {
     props: ['status', 'connection'],
     emits: ['stop-mission'],
     template: `
-    <header class="app-header glass-header">
+    <header class="app-header glass-header" role="banner">
         <div class="logo-area">
-            <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:24px;height:24px;color:var(--color-primary)">
+            <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="width:24px;height:24px;color:var(--color-primary)" aria-hidden="true">
                 <path d="M12 2L2 7l10 5 10-5-10-5zM2 17l10 5 10-5M2 12l10 5 10-5" />
             </svg>
             <h1 style="margin-left:12px; font-weight:700; color:white; font-size:1.2rem;">USV <span style="color:var(--color-primary); font-weight:300;">PRO</span></h1>
         </div>
 
-        <div class="status-bar" style="display:flex; gap:16px; align-items:center;">
+        <div class="status-bar" style="display:flex; gap:16px; align-items:center;" role="status" aria-label="系统状态">
              <!-- Connection -->
-             <div class="status-pill" :class="{ active: connection.socket }">
-                <span class="dot"></span> 
+             <div class="status-pill" :class="{ active: connection.socket }" 
+                  role="status">
+                <span class="dot" aria-hidden="true"></span> 
                 <span class="label show-desktop">服务器</span>
              </div>
              
              <!-- Pump -->
-             <div class="status-pill" :class="{ active: connection.pump }">
-                <span class="dot"></span> 
+             <div class="status-pill" :class="{ active: connection.pump }"
+                  role="status">
+                <span class="dot" aria-hidden="true"></span> 
                 <span class="label show-desktop">泵连接</span>
              </div>
 
              <!-- Auto -->
-             <div class="status-pill" :class="{ active: connection.automation }">
-                <span class="dot"></span> 
+             <div class="status-pill" :class="{ active: connection.automation }"
+                  role="status">
+                <span class="dot" aria-hidden="true"></span> 
                 <span class="label show-desktop">自动化</span>
              </div>
         </div>
 
         <div class="emergency-area">
-             <button class="btn btn-danger btn-icon-only" @click="$emit('stop-mission')" title="EMERGENCY STOP">
-                <svg viewBox="0 0 24 24" fill="currentColor" style="width:20px;height:20px;">
+             <button class="btn btn-danger btn-icon-only" 
+                     @click="$emit('stop-mission')" 
+                     aria-label="紧急停止所有电机"
+                     title="紧急停止">
+                <svg viewBox="0 0 24 24" fill="currentColor" style="width:20px;height:20px;" aria-hidden="true">
                     <rect x="6" y="6" width="12" height="12" />
                 </svg>
              </button>

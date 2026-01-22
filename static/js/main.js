@@ -18,7 +18,15 @@ const Icons = {
 };
 
 const app = createApp({
-    components: { AppHeader, DashboardView, ConfigView, LogView, ManualControlView, PIDConfigView, CalibrationPanel },
+    components: {
+        AppHeader,
+        DashboardView,
+        ConfigView,
+        LogView,
+        ManualControlView,
+        'pid-config-view': PIDConfigView,
+        CalibrationPanel
+    },
     setup() {
         // --- State ---
         const state = reactive({

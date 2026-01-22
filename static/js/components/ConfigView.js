@@ -60,30 +60,47 @@ export default {
                 <transition-group name="list" tag="div">
                     <div v-for="(step, index) in config.sampling_sequence.steps" 
                          :key="index" 
-                         class="step-item glass-panel"
+                         class="step-item"
                          draggable="true"
                          @dragstart="dragStart($event, index)"
                          @dragover.prevent
                          @drop="onDrop($event, index)">
                         
+                        <!-- Delete button at top-right -->
+                        <button class="step-delete-btn" @click="removeStep(index)" title="删除步骤">×</button>
+                        
+                        <!-- Compact Header Row -->
                         <div class="step-header">
                             <span class="step-idx">{{ index + 1 }}</span>
-                            <input v-model="step.name" class="input-glass step-name">
-                            <input type="number" v-model.number="step.interval" class="input-glass step-interval" title="Interval (ms)"> ms
-                            <button class="btn-icon" @click="removeStep(index)">✕</button>
+                            <input v-model="step.name" class="input-glass step-name" placeholder="步骤名称">
+                            <div class="step-interval-group">
+                                <input type="number" v-model.number="step.interval" class="input-glass step-interval">
+                                <span class="interval-unit">ms</span>
+                            </div>
                         </div>
                         
+                        <!-- Axis Parameters Grid -->
                         <div class="step-motors">
-                            <div v-for="axis in ['X','Y','Z','A']" :key="axis" class="motor-conf" :class="{active: step[axis]?.enable === 'E'}">
-                                <div class="motor-label">
-                                    {{ axis }}
-                                    <input type="checkbox" 
-                                           :checked="step[axis]?.enable === 'E'"
-                                           @change="updateMotorEnable(step, axis, $event.target.checked)">
+                            <div v-for="axis in ['X','Y','Z','A']" :key="axis" 
+                                 class="motor-conf" 
+                                 :class="{active: step[axis]?.enable === 'E', inactive: step[axis]?.enable !== 'E'}">
+                                <div class="motor-header">
+                                    <label class="motor-checkbox">
+                                        <input type="checkbox" 
+                                               :checked="step[axis]?.enable === 'E'"
+                                               @change="updateMotorEnable(step, axis, $event.target.checked)">
+                                        <span class="axis-label">{{ axis }}</span>
+                                    </label>
                                 </div>
                                 <div v-if="step[axis]?.enable === 'E'" class="motor-params">
-                                    <input type="number" v-model.number="step[axis].speed" placeholder="Spd" title="Speed">
-                                    <input type="number" v-model.number="step[axis].angle" placeholder="Ang" title="Angle">
+                                    <div class="param-field">
+                                        <label>速度</label>
+                                        <input type="number" v-model.number="step[axis].speed" placeholder="5">
+                                    </div>
+                                    <div class="param-field">
+                                        <label>角度</label>
+                                        <input type="number" v-model.number="step[axis].angle" placeholder="90">
+                                    </div>
                                 </div>
                             </div>
                         </div>
@@ -118,29 +135,54 @@ export default {
     .step-motors { 
         display: grid; 
         grid-template-columns: repeat(4, 1fr); 
-        gap: 8px; 
+        gap: 12px; 
     }
-    @media (max-width: 600px) {
+    @media (max-width: 768px) {
         .step-motors { grid-template-columns: repeat(2, 1fr); }
+    }
+    @media (max-width: 480px) {
+        .step-motors { grid-template-columns: 1fr; }
     }
     .motor-conf { 
         background: rgba(255,255,255,0.02); 
-        border-radius: 4px; 
-        padding: 8px; 
+        border-radius: 6px; 
+        padding: 10px; 
         transition: 0.2s; 
-        border: 1px solid rgba(255,255,255,0.05); 
+        border: 1px solid rgba(255,255,255,0.08); 
     }
-    .motor-conf.active { border-color: var(--color-primary, #00f3ff); background: rgba(0,243,255,0.08); }
-    .motor-label { font-weight: bold; display: flex; justify-content: space-between; align-items: center; font-size: 0.9em; margin-bottom: 8px; }
-    .motor-params { display: flex; flex-direction: column; gap: 4px; }
+    .motor-conf.active { border-color: var(--color-primary, #00f3ff); background: rgba(0,243,255,0.1); }
+    .motor-label { 
+        font-weight: 600; 
+        display: flex; 
+        justify-content: space-between; 
+        align-items: center; 
+        font-size: 0.95em; 
+        margin-bottom: 10px; 
+        color: var(--color-text, #fff);
+    }
+    .motor-label input[type="checkbox"] {
+        width: 16px;
+        height: 16px;
+        cursor: pointer;
+    }
+    .motor-params { 
+        display: grid; 
+        grid-template-columns: 1fr 1fr; 
+        gap: 8px; 
+    }
     .motor-params input { 
         width: 100%; 
         font-size: 0.85em; 
-        padding: 4px 8px; 
-        background: rgba(255,255,255,0.05);
-        border: 1px solid rgba(255,255,255,0.1);
+        padding: 6px 8px; 
+        background: rgba(0,0,0,0.3);
+        border: 1px solid rgba(255,255,255,0.15);
         color: inherit;
-        border-radius: 3px;
+        border-radius: 4px;
+        text-align: center;
+    }
+    .motor-params input:focus {
+        border-color: var(--color-primary, #00f3ff);
+        outline: none;
     }
     
     /* Toggle Switch */

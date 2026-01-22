@@ -12,7 +12,6 @@ body {
   font-family: 'Fira Sans', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
   -webkit-font-smoothing: antialiased;
   overflow: hidden;
-  /* App-like feel */
   height: 100vh;
   font-size: 14px;
 }
@@ -38,7 +37,6 @@ select {
   position: relative;
 }
 
-/* Content Area */
 .content-area {
   flex: 1;
   overflow-y: auto;
@@ -195,4 +193,481 @@ select {
 .list-leave-active {
   position: absolute;
 }
-[v-cloak] { display: none !important; }
+
+[v-cloak] {
+  display: none !important;
+}
+
+/* --- Manual Control Page --- */
+.manual-control-container {
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.motor-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(280px, 1fr));
+  gap: var(--spacing-lg, 16px);
+  margin-bottom: var(--spacing-lg, 16px);
+}
+
+@media (max-width: 640px) {
+  .motor-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+.motor-card .glass-body.disabled {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+/* --- Config Page Steps --- */
+.config-container {
+  max-width: 900px;
+  margin: 0 auto;
+}
+
+.steps-list {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.step-item {
+  position: relative;
+  background: rgba(0, 0, 0, 0.25);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 8px;
+  padding: 16px;
+  padding-right: 40px;
+  /* Space for delete button */
+  transition: border-color 0.2s;
+}
+
+.step-item:hover {
+  border-color: rgba(255, 255, 255, 0.15);
+}
+
+/* Delete button - top right corner */
+.step-delete-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: rgba(255, 59, 48, 0.15);
+  color: var(--color-danger, #ff3b30);
+  border-radius: 50%;
+  font-size: 18px;
+  cursor: pointer;
+  transition: all 0.2s;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.step-delete-btn:hover {
+  background: var(--color-danger, #ff3b30);
+  color: white;
+}
+
+/* Compact header row */
+.step-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.step-idx {
+  min-width: 28px;
+  height: 28px;
+  background: var(--color-primary-dim, rgba(0, 243, 255, 0.15));
+  color: var(--color-primary, #00f3ff);
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-weight: 700;
+  font-size: 0.9em;
+}
+
+.step-name {
+  flex: 1;
+  min-width: 120px;
+  padding: 8px 12px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  color: inherit;
+  font-size: 0.95em;
+}
+
+.step-name:focus {
+  border-color: var(--color-primary, #00f3ff);
+  outline: none;
+}
+
+.step-interval-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.step-interval {
+  width: 80px;
+  padding: 8px 10px;
+  background: rgba(255, 255, 255, 0.03);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: 4px;
+  color: inherit;
+  text-align: right;
+  font-size: 0.95em;
+}
+
+.step-interval:focus {
+  border-color: var(--color-primary, #00f3ff);
+  outline: none;
+}
+
+.interval-unit {
+  color: var(--color-text-muted, #888);
+  font-size: 0.85em;
+}
+
+/* Motor/Axis grid */
+.step-motors {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 10px;
+}
+
+@media (max-width: 768px) {
+  .step-motors {
+    grid-template-columns: repeat(2, 1fr);
+  }
+}
+
+@media (max-width: 480px) {
+  .step-motors {
+    grid-template-columns: 1fr;
+  }
+}
+
+.motor-conf {
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 6px;
+  padding: 10px;
+  transition: all 0.2s;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.motor-conf.inactive {
+  opacity: 0.5;
+}
+
+.motor-conf.active {
+  opacity: 1;
+  border-color: var(--color-primary, #00f3ff);
+  background: rgba(0, 243, 255, 0.08);
+}
+
+.motor-header {
+  margin-bottom: 8px;
+}
+
+.motor-checkbox {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  cursor: pointer;
+}
+
+.motor-checkbox input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  cursor: pointer;
+  accent-color: var(--color-primary, #00f3ff);
+}
+
+.axis-label {
+  font-weight: 700;
+  font-size: 1em;
+  color: var(--color-text, #fff);
+}
+
+.motor-conf.active .axis-label {
+  color: var(--color-primary, #00f3ff);
+}
+
+.motor-params {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.param-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.param-field label {
+  font-size: 0.8em;
+  color: var(--color-text-muted, #888);
+  min-width: 32px;
+}
+
+.param-field input {
+  flex: 1;
+  padding: 6px 8px;
+  background: rgba(0, 0, 0, 0.3);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+  color: inherit;
+  font-size: 0.9em;
+  text-align: center;
+}
+
+.param-field input:focus {
+  border-color: var(--color-primary, #00f3ff);
+  outline: none;
+}
+
+/* --- PID Config Page --- */
+.pid-config-container {
+  max-width: 800px;
+  margin: 0 auto;
+  padding: 16px;
+}
+
+.pid-params-grid,
+.test-params-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 16px;
+}
+
+.command-preview {
+  display: block;
+  font-family: 'Fira Code', monospace;
+  background: rgba(0, 0, 0, 0.3);
+  padding: 12px;
+  border-radius: var(--radius-sm, 4px);
+  color: var(--color-primary, #00f3ff);
+}
+
+/* --- Form Groups --- */
+.form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 16px;
+}
+
+.form-group {
+  margin-bottom: 12px;
+}
+
+.form-group label {
+  display: block;
+  color: var(--color-text-muted, #888);
+  margin-bottom: 4px;
+  font-size: 0.9em;
+}
+
+/* --- Toggle Switch --- */
+.toggle-switch {
+  position: relative;
+  width: 44px;
+  height: 24px;
+  display: inline-block;
+}
+
+.toggle-switch input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.toggle-switch .slider,
+.toggle-switch label {
+  position: absolute;
+  cursor: pointer;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background-color: #555;
+  transition: .3s;
+  border-radius: 24px;
+}
+
+.toggle-switch .slider:before,
+.toggle-switch label:before {
+  position: absolute;
+  content: "";
+  height: 18px;
+  width: 18px;
+  left: 3px;
+  bottom: 3px;
+  background-color: white;
+  transition: .3s;
+  border-radius: 50%;
+}
+
+.toggle-switch input:checked+.slider,
+.toggle-switch input:checked+label {
+  background-color: var(--color-primary);
+}
+
+.toggle-switch input:checked+.slider:before,
+.toggle-switch input:checked+label:before {
+  transform: translateX(20px);
+}
+
+/* --- Button Groups --- */
+.btn-group {
+  display: flex;
+  gap: 4px;
+}
+
+.btn-group .btn {
+  flex: 1;
+}
+
+.btn-sm {
+  padding: 6px 12px;
+  font-size: 0.85em;
+}
+
+/* --- Reduced Motion Support (WCAG 2.1 Level AA) --- */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+  
+  /* 保留必要的状态过渡 */
+  .btn,
+  .input-glass,
+  .nav-link {
+    transition: background-color 0.15s ease, border-color 0.15s ease !important;
+  }
+}
+
+/* --- Spinner Animation --- */
+@keyframes spin {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+.animate-spin {
+  animation: spin 1s linear infinite;
+}
+
+/* --- Cursor Pointer for Interactive Elements --- */
+.nav-link,
+.nav-item,
+.btn,
+.toggle-switch,
+.motor-checkbox,
+[role="button"],
+[onclick],
+button {
+  cursor: pointer;
+}
+
+.btn:disabled,
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+
+/* --- Focus Visible (Keyboard Navigation) --- */
+*:focus {
+  outline: none;
+}
+
+*:focus-visible {
+  outline: 2px solid var(--color-primary);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+.btn:focus-visible {
+  box-shadow: 0 0 0 3px rgba(0, 243, 255, 0.3);
+}
+
+.input-glass:focus-visible {
+  outline: 2px solid var(--color-primary);
+  box-shadow: 0 0 8px rgba(0, 243, 255, 0.3);
+}
+
+/* --- Screen Reader Only (Accessibility) --- */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border-width: 0;
+}
+
+/* --- Touch Device Optimization --- */
+@media (hover: none) and (pointer: coarse) {
+  .btn,
+  .nav-link,
+  .nav-item,
+  .toggle-switch {
+    min-height: 44px;
+    min-width: 44px;
+  }
+  
+  .input-glass {
+    min-height: 44px;
+    font-size: 16px; /* 防止 iOS 自动缩放 */
+  }
+}
+
+/* --- Hover Effects (Only for devices with hover capability) --- */
+@media (hover: hover) and (pointer: fine) {
+  .nav-link:hover {
+    background: rgba(255, 255, 255, 0.05);
+    color: white;
+  }
+  
+  .btn:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.2);
+  }
+  
+  .btn-primary:hover:not(:disabled) {
+    background: var(--color-primary);
+    color: #000;
+    box-shadow: 0 0 15px var(--color-primary);
+  }
+  
+  .btn-danger:hover:not(:disabled) {
+    background: var(--color-danger);
+    color: white;
+    box-shadow: 0 0 15px var(--color-danger);
+  }
+  
+  .btn-success:hover:not(:disabled) {
+    background: var(--color-success);
+    color: #000;
+    box-shadow: 0 0 15px var(--color-success);
+  }
+}

@@ -31,10 +31,15 @@
 
         <div class="main-container">
             <!-- Sidebar Navigation (Desktop) -->
-            <nav class="sidebar glass-panel show-desktop">
+            <nav class="sidebar glass-panel show-desktop" role="navigation" aria-label="主导航">
                 <a v-for="view in views" :key="view.id" :class="['nav-link', { active: currentView === view.id }]"
-                    @click="currentView = view.id">
-                    <span class="icon" v-html="view.icon"></span>
+                    @click="currentView = view.id"
+                    role="button"
+                    :aria-current="currentView === view.id ? 'page' : undefined"
+                    tabindex="0"
+                    @keydown.enter="currentView = view.id"
+                    @keydown.space.prevent="currentView = view.id">
+                    <span class="icon" v-html="view.icon" aria-hidden="true"></span>
                     {{ view.label }}
                 </a>
             </nav>
@@ -72,19 +77,33 @@
         </div>
 
         <!-- Mobile Bottom Nav -->
-        <nav class="bottom-nav glass-panel show-mobile">
+        <nav class="bottom-nav glass-panel show-mobile" role="navigation" aria-label="移动端导航">
             <a v-for="view in views" :key="view.id" :class="['nav-item', { active: currentView === view.id }]"
-                @click="currentView = view.id">
-                <span class="icon" v-html="view.icon"></span>
+                @click="currentView = view.id"
+                role="button"
+                :aria-current="currentView === view.id ? 'page' : undefined"
+                tabindex="0"
+                @keydown.enter="currentView = view.id">
+                <span class="icon" v-html="view.icon" aria-hidden="true"></span>
                 <span class="label">{{ view.label }}</span>
             </a>
         </nav>
 
         <!-- Global Toast Container -->
-        <div class="toast-container">
+        <div class="toast-container" aria-live="polite" aria-atomic="true">
             <transition-group name="list">
-                <div v-for="t in toasts" :key="t.id" :class="['toast', t.type]">
-                    {{ t.message }}
+                <div v-for="t in toasts" :key="t.id" 
+                     :class="['toast', t.type]"
+                     role="alert">
+                    <div class="toast-content">
+                        <span class="toast-message">{{ t.message }}</span>
+                        <button v-if="t.action" 
+                                @click="t.action.handler" 
+                                class="toast-action"
+                                :aria-label="t.action.label">
+                            {{ t.action.label }}
+                        </button>
+                    </div>
                 </div>
             </transition-group>
         </div>
@@ -161,7 +180,7 @@
                 bottom: 0;
                 left: 0;
                 right: 0;
-                height: 60px;
+                height: var(--bottom-nav-height);
                 border-radius: 0;
                 margin: 0;
                 justify-content: space-around;
@@ -169,6 +188,7 @@
                 z-index: 100;
                 backdrop-filter: blur(20px);
                 background: rgba(5, 10, 20, 0.9);
+                padding-bottom: env(safe-area-inset-bottom, 0);
             }
 
             .nav-item {
@@ -177,6 +197,10 @@
                 align-items: center;
                 font-size: 10px;
                 color: var(--color-text-muted);
+                padding: 8px;
+                min-width: 60px;
+                min-height: 44px;
+                justify-content: center;
             }
 
             .nav-item.active {
@@ -189,7 +213,7 @@
             }
 
             .content-area {
-                padding-bottom: 80px;
+                padding-bottom: calc(var(--bottom-nav-height) + env(safe-area-inset-bottom, 0) + 16px);
             }
 
             /* Space for bottom nav */
@@ -214,21 +238,62 @@
             border-radius: 8px;
             backdrop-filter: blur(10px);
             box-shadow: 0 4px 12px rgba(0, 0, 0, 0.5);
+            min-width: 280px;
         }
 
         .toast.success {
             border-color: var(--color-success);
+            background: rgba(0, 255, 157, 0.1);
+        }
+        
+        .toast.success .toast-message {
             color: var(--color-success);
         }
 
         .toast.error {
             border-color: var(--color-danger);
+            background: rgba(255, 0, 85, 0.1);
+        }
+        
+        .toast.error .toast-message {
             color: var(--color-danger);
         }
+        
+        .toast.warning {
+            border-color: var(--color-warning);
+            background: rgba(255, 184, 0, 0.1);
+        }
+        
+        .toast.warning .toast-message {
+            color: var(--color-warning);
+        }
+        
+        .toast-content {
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            justify-content: space-between;
+        }
+        
+        .toast-message {
+            flex: 1;
+        }
+        
+        .toast-action {
+            background: rgba(255, 255, 255, 0.1);
+            border: 1px solid rgba(255, 255, 255, 0.2);
+            color: white;
+            padding: 4px 12px;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 0.85em;
+            transition: var(--trans-fast);
+        }
+        
+        .toast-action:hover {
+            background: rgba(255, 255, 255, 0.2);
+        }
     </style>
-
-    <!-- Vue App -->
-    <script type="module" src="/static/js/main.js?v=2"></script>
 </body>
 
 </html>
