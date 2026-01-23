@@ -1,0 +1,29 @@
+# ROS build artifacts
+build/
+devel/
+install/
+log/
+*.log
+*.bag
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+venv/
+.venv/
+env/
+
+# Node.js
+node_modules/
+npm-debug.log
+yarn-error.log
+.npm/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
