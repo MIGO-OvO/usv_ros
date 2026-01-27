@@ -310,7 +310,7 @@ class WebConfigServer(object):
     def _setup_flask(self):
         """设置 Flask 和 SocketIO 应用。"""
         # 设置静态文件目录
-        static_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), '../static'))
+        static_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), '../static/dist'))
         self.app = Flask(__name__, static_folder=static_folder, static_url_path='/static')
         
         # 禁用浏览器缓存 (开发模式)
