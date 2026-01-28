@@ -311,6 +311,7 @@ class PumpControlNode(object):
         self.angles_pub = rospy.Publisher('/usv/pump_angles', String, queue_size=10)
         self.status_pub = rospy.Publisher('/usv/pump_status', String, queue_size=10)
         self.pid_complete_pub = rospy.Publisher('/usv/pump_pid_complete', String, queue_size=10)
+        self.pid_error_pub = rospy.Publisher('/usv/pump_pid_error', String, queue_size=50)
 
         # Subscribers
         self.cmd_sub = rospy.Subscriber('/usv/pump_command', String, self._cmd_callback)
@@ -430,6 +431,13 @@ class PumpControlNode(object):
     def _on_pid_data_received(self, data):
         """PID 数据回调。"""
         rospy.logdebug("PID data: %s", data)
+        # Publish PID error
+        try:
+            msg = String()
+            msg.data = json.dumps(data)
+            self.pid_error_pub.publish(msg)
+        except Exception as e:
+            rospy.logwarn("Failed to publish PID error: %s", str(e))
 
     def _on_test_result_received(self, result):
         """测试结果回调。"""

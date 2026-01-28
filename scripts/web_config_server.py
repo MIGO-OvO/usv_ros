@@ -32,7 +32,7 @@ import time
 from datetime import datetime
 
 try:
-    from flask import Flask, request, jsonify, send_from_directory
+    from flask import Flask, request, jsonify, send_from_directory, abort
     from flask_cors import CORS
     from flask_socketio import SocketIO, emit
     FLASK_AVAILABLE = True
@@ -43,7 +43,7 @@ except ImportError:
 # 尝试导入 ROS，如果失败则以独立模式运行
 try:
     import rospy
-    from std_msgs.msg import String
+    from std_msgs.msg import String, Float64
     from std_srvs.srv import Trigger
     ROS_AVAILABLE = True
 except ImportError:
@@ -242,15 +242,24 @@ class WebConfigServer(object):
         self.pump_connected = False
         self.automation_running = False
         self.current_angles = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
+        self.current_voltage = 0.0
+        self.mission_status = "IDLE"
+        self.voltage_history = []  # List of {timestamp, value}
 
         # ROS 订阅 (仅在非独立模式)
         if not self.standalone:
             self.status_sub = rospy.Subscriber('/usv/pump_status', String, self._status_cb)
             self.angles_sub = rospy.Subscriber('/usv/pump_angles', String, self._angles_cb)
+            self.voltage_sub = rospy.Subscriber('/usv/spectrometer_voltage', Float64, self._voltage_cb)
+            self.mission_sub = rospy.Subscriber('/usv/mission_status', String, self._mission_status_cb)
+            self.pid_error_sub = rospy.Subscriber('/usv/pump_pid_error', String, self._pid_error_cb)
             self.steps_pub = rospy.Publisher('/usv/automation_steps', String, queue_size=1)
         else:
             self.status_sub = None
             self.angles_sub = None
+            self.voltage_sub = None
+            self.mission_sub = None
+            self.pid_error_sub = None
             self.steps_pub = None
 
         # Flask & SocketIO
@@ -289,6 +298,30 @@ class WebConfigServer(object):
         except Exception:
             pass
 
+    def _voltage_cb(self, msg):
+        """电压数据回调"""
+        self.current_voltage = msg.data
+        # 如果正在运行自动化任务，记录数据
+        if self.automation_running:
+            self.voltage_history.append({
+                "timestamp": datetime.now().isoformat(),
+                "voltage": self.current_voltage
+            })
+
+    def _mission_status_cb(self, msg):
+        """任务状态回调"""
+        self.mission_status = msg.data
+
+    def _pid_error_cb(self, msg):
+        """PID 误差回调"""
+        if self.socketio:
+            try:
+                # 透传 JSON 数据
+                data = json.loads(msg.data)
+                self.socketio.emit('pid_error', data)
+            except Exception:
+                pass
+
     def _add_log(self, message, level='info'):
         """添加日志并推送到 WebSocket"""
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -307,10 +340,30 @@ class WebConfigServer(object):
                 'timestamp': timestamp
             })
 
+    def _resolve_static_folder(self):
+        candidates = []
+        if ROS_AVAILABLE:
+            try:
+                import rospkg
+                pkg_path = rospkg.RosPack().get_path('usv_ros')
+                candidates.append(os.path.join(pkg_path, 'static'))
+            except Exception:
+                pass
+
+        candidates.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '../static')))
+
+        for folder in candidates:
+            if os.path.isdir(folder):
+                return folder
+        return candidates[-1]
+
     def _setup_flask(self):
         """设置 Flask 和 SocketIO 应用。"""
         # 设置静态文件目录
-        static_folder = os.path.abspath(os.path.join(os.path.dirname(__file__), '../static'))
+        static_folder = self._resolve_static_folder()
+        dist_folder = os.path.join(static_folder, 'dist')
+        dist_index = os.path.join(dist_folder, 'index.html')
+
         self.app = Flask(__name__, static_folder=static_folder, static_url_path='/static')
         
         # 禁用浏览器缓存 (开发模式)
@@ -322,9 +375,45 @@ class WebConfigServer(object):
         self.socketio = SocketIO(self.app, cors_allowed_origins="*", async_mode='threading')
 
         # ================= HTTP 路由 =================
+        def get_ui_mode():
+            ui_mode = None
+            try:
+                ui_mode = rospy.get_param('~web_ui', None)
+            except Exception:
+                ui_mode = None
+            if ui_mode:
+                return str(ui_mode).strip().lower()
+            env_mode = os.environ.get('USV_WEB_UI', '').strip().lower()
+            if env_mode in ('dist', 'vite'):
+                return env_mode
+            return 'auto'
+
         @self.app.route('/')
         def index():
+            ui_mode = get_ui_mode()
+            if ui_mode != 'static' and os.path.isfile(dist_index):
+                return send_from_directory(dist_folder, 'index.html')
             return send_from_directory(static_folder, 'index.html')
+
+        @self.app.route('/api/ui/debug', methods=['GET'])
+        def ui_debug():
+            ui_mode = get_ui_mode()
+            return jsonify({
+                "ui_mode": ui_mode,
+                "static_folder": static_folder,
+                "dist_index": dist_index,
+                "dist_index_exists": os.path.isfile(dist_index)
+            })
+
+        @self.app.route('/assets/<path:filename>')
+        def dist_assets(filename):
+            ui_mode = get_ui_mode()
+            if ui_mode == 'static':
+                abort(404)
+            assets_dir = os.path.join(dist_folder, 'assets')
+            if not os.path.isfile(os.path.join(assets_dir, filename)):
+                abort(404)
+            return send_from_directory(assets_dir, filename)
 
         @self.app.route('/api/config', methods=['GET'])
         def get_config():
@@ -539,9 +628,21 @@ class WebConfigServer(object):
         def handle_connect():
             emit('status', {
                 "pump_connected": self.pump_connected,
-                "automation_running": self.automation_running
+                "automation_running": self.automation_running,
+                "mission_status": self.mission_status
             })
             emit('angles', self.current_angles)
+            emit('voltage', {"value": self.current_voltage})
+
+        # ================= 数据 API =================
+        @self.app.route('/api/data/voltage', methods=['GET'])
+        def get_voltage_history():
+            return jsonify({"success": True, "data": self.voltage_history})
+
+        @self.app.route('/api/data/voltage/clear', methods=['POST'])
+        def clear_voltage_history():
+            self.voltage_history = []
+            return jsonify({"success": True, "message": "历史数据已清除"})
 
     def _trigger_mission(self, action):
         """触发任务动作。"""
@@ -600,15 +701,24 @@ class WebConfigServer(object):
             if self.socketio:
                 self.socketio.emit('status', {
                     "pump_connected": self.pump_connected,
-                    "automation_running": self.automation_running
+                    "automation_running": self.automation_running,
+                    "mission_status": self.mission_status
                 })
                 self.socketio.emit('angles', self.current_angles)
+                self.socketio.emit('voltage', {"value": self.current_voltage})
             
             if self.standalone:
                 # 独立模式模拟数据变化 (测试用)
                 if self.automation_running:
                     for k in self.current_angles:
                         self.current_angles[k] = (self.current_angles[k] + 1) % 360
+                    # 模拟电压变化
+                    self.current_voltage = (self.current_voltage + 0.1) % 5.0
+                    if self.automation_running:
+                         self.voltage_history.append({
+                            "timestamp": datetime.now().isoformat(),
+                            "voltage": self.current_voltage
+                        })
                 time.sleep(1.0/rate)
             else:
                 threading.Event().wait(1.0/rate)
