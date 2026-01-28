@@ -89,7 +89,56 @@ from preset_manager import PresetManager
 # 配置文件路径
 CONFIG_DIR = os.path.expanduser("~/usv_ws/config")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "sampling_config.json")
+CALIBRATION_FILE = os.path.join(CONFIG_DIR, "calibration.json")
 DATA_DIR = os.path.expanduser("~/usv_ws/data/missions")
+
+class CalibrationManager(object):
+    """零点校准管理器"""
+    def __init__(self, file_path=CALIBRATION_FILE):
+        self.file_path = file_path
+        self.offsets = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
+        self.load()
+
+    def load(self):
+        if os.path.exists(self.file_path):
+            try:
+                with open(self.file_path, 'r') as f:
+                    data = json.load(f)
+                    self.offsets.update(data.get('offsets', {}))
+            except Exception as e:
+                print(f"Error loading calibration: {e}")
+
+    def save(self):
+        try:
+            with open(self.file_path, 'w') as f:
+                json.dump({'offsets': self.offsets}, f, indent=2)
+        except Exception as e:
+            print(f"Error saving calibration: {e}")
+
+    def set_zero(self, axis, raw_angle):
+        """设置当前角度为零点 (Offset = Raw)"""
+        if axis in self.offsets:
+            self.offsets[axis] = raw_angle
+            self.save()
+
+    def reset(self, axis=None):
+        if axis:
+            if axis in self.offsets:
+                self.offsets[axis] = 0.0
+        else:
+            self.offsets = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
+        self.save()
+
+    def get_corrected_angle(self, axis, raw_angle):
+        """获取校准后的角度"""
+        offset = self.offsets.get(axis, 0.0)
+        corrected = raw_angle - offset
+        # Normalize to 0-360 if needed, or keep linear. 
+        # Usually angle is 0-360.
+        corrected = corrected % 360.0
+        if corrected < 0:
+            corrected += 360.0
+        return corrected
 
 class MissionDataManager(object):
     """任务数据管理器。"""
@@ -333,6 +382,7 @@ class WebConfigServer(object):
         self.config_manager.load()
         self.preset_manager = PresetManager()
         self.data_manager = MissionDataManager()
+        self.calibration_manager = CalibrationManager()
 
         # 日志缓冲
         self.log_buffer = []
@@ -389,15 +439,38 @@ class WebConfigServer(object):
         # self._add_log("[状态] " + msg.data)
 
     def _angles_cb(self, msg):
-        """角度数据回调。"""
+        """电机位置回调"""
         try:
-            for pair in msg.data.split(','):
-                if ':' in pair:
-                    key, val = pair.split(':')
-                    if key in self.current_angles:
-                        self.current_angles[key] = float(val)
-        except Exception:
-            pass
+            # 尝试解析 JSON，兼容旧格式
+            data = {}
+            try:
+                data = json.loads(msg.data)
+            except ValueError:
+                for pair in msg.data.split(','):
+                    if ':' in pair:
+                        key, val = pair.split(':')
+                        data[key] = float(val)
+
+            # 更新原始角度 (self.raw_angles 需要在 __init__ 中初始化，但这里直接用局部变量也行，或者加上)
+            if not hasattr(self, 'raw_angles'):
+                self.raw_angles = {}
+            self.raw_angles.update(data)
+            
+            # 应用校准偏移
+            corrected_angles = {}
+            for axis, angle in data.items():
+                # 确保只处理 X, Y, Z, A
+                if axis in ['X', 'Y', 'Z', 'A']:
+                    corrected_angles[axis] = self.calibration_manager.get_corrected_angle(axis, angle)
+            
+            self.current_angles.update(corrected_angles)
+            
+            if self.socketio:
+                self.socketio.emit('pump_angles', self.current_angles)
+                # 也可以选择推送 raw_angles 供前端调试
+                self.socketio.emit('raw_angles', self.raw_angles)
+        except Exception as e:
+            rospy.logerr(f"Error parsing angles: {e}")
 
     def _voltage_cb(self, msg):
         """电压数据回调"""
@@ -763,6 +836,37 @@ class WebConfigServer(object):
             if self.data_manager.delete_mission(mission_id):
                 return jsonify({"success": True, "message": "任务已删除"})
             return jsonify({"success": False, "message": "删除失败"}), 500
+
+        # ================= 零点校准 API =================
+        @self.app.route('/api/calibration/offsets', methods=['GET'])
+        def get_offsets():
+            return jsonify({"success": True, "data": self.calibration_manager.offsets})
+
+        @self.app.route('/api/calibration/zero', methods=['POST'])
+        def set_zero():
+            data = request.get_json()
+            axis = data.get('axis')
+            
+            if not axis:
+                # Set all
+                if hasattr(self, 'raw_angles'):
+                    for ax in ['X', 'Y', 'Z', 'A']:
+                        if ax in self.raw_angles:
+                            self.calibration_manager.set_zero(ax, self.raw_angles[ax])
+                return jsonify({"success": True, "message": "所有轴零点已设置"})
+            
+            if hasattr(self, 'raw_angles') and axis in self.raw_angles:
+                self.calibration_manager.set_zero(axis, self.raw_angles[axis])
+                return jsonify({"success": True, "message": f"{axis} 轴零点已设置"})
+            
+            return jsonify({"success": False, "message": "无法获取当前原始角度"}), 400
+
+        @self.app.route('/api/calibration/reset', methods=['POST'])
+        def reset_zero():
+            data = request.get_json()
+            axis = data.get('axis')
+            self.calibration_manager.reset(axis)
+            return jsonify({"success": True, "message": "零点已重置"})
 
     def _trigger_mission(self, action):
         """触发任务动作。"""

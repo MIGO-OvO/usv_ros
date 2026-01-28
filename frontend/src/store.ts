@@ -21,6 +21,7 @@ interface AppState {
   automationRunning: boolean
   missionStatus: string
   pumpAngles: PumpAngles
+  rawAngles: PumpAngles
   currentVoltage: number
   logs: LogEntry[]
   
@@ -35,6 +36,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   automationRunning: false,
   missionStatus: "IDLE",
   pumpAngles: { X: 0, Y: 0, Z: 0, A: 0 },
+  rawAngles: { X: 0, Y: 0, Z: 0, A: 0 },
   currentVoltage: 0,
   logs: [],
 
@@ -67,6 +69,10 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     socket.on('angles', (data: PumpAngles) => {
       set({ pumpAngles: data })
+    })
+
+    socket.on('raw_angles', (data: PumpAngles) => {
+      set({ rawAngles: data })
     })
 
     socket.on('voltage', (data: { value: number }) => {
