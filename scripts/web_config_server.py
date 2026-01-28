@@ -89,6 +89,106 @@ from preset_manager import PresetManager
 # 配置文件路径
 CONFIG_DIR = os.path.expanduser("~/usv_ws/config")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "sampling_config.json")
+DATA_DIR = os.path.expanduser("~/usv_ws/data/missions")
+
+class MissionDataManager(object):
+    """任务数据管理器。"""
+    
+    def __init__(self, data_dir=DATA_DIR):
+        self.data_dir = data_dir
+        self.current_mission_file = None
+        self.current_mission_data = []
+        self._ensure_dir()
+        
+    def _ensure_dir(self):
+        if not os.path.exists(self.data_dir):
+            os.makedirs(self.data_dir)
+            
+    def start_mission(self, mission_name=""):
+        """开始新任务记录。"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"mission_{timestamp}.json"
+        self.current_mission_file = os.path.join(self.data_dir, filename)
+        self.current_mission_data = {
+            "mission_id": timestamp,
+            "name": mission_name or f"Mission {timestamp}",
+            "start_time": datetime.now().isoformat(),
+            "end_time": None,
+            "data_points": []
+        }
+        self._save_current()
+        return filename
+        
+    def stop_mission(self):
+        """停止任务记录。"""
+        if self.current_mission_file:
+            self.current_mission_data["end_time"] = datetime.now().isoformat()
+            self._save_current()
+            self.current_mission_file = None
+            self.current_mission_data = []
+            
+    def add_data_point(self, voltage):
+        """添加数据点。"""
+        if self.current_mission_file:
+            point = {
+                "timestamp": datetime.now().isoformat(),
+                "voltage": voltage
+            }
+            self.current_mission_data["data_points"].append(point)
+            # 每 10 个点保存一次，防止数据丢失
+            if len(self.current_mission_data["data_points"]) % 10 == 0:
+                self._save_current()
+                
+    def _save_current(self):
+        """保存当前任务数据到文件。"""
+        if self.current_mission_file:
+            with open(self.current_mission_file, 'w', encoding='utf-8') as f:
+                json.dump(self.current_mission_data, f, ensure_ascii=False, indent=2)
+
+    def list_missions(self):
+        """列出所有任务。"""
+        missions = []
+        if not os.path.exists(self.data_dir):
+            return []
+            
+        for f in os.listdir(self.data_dir):
+            if f.endswith(".json") and f.startswith("mission_"):
+                path = os.path.join(self.data_dir, f)
+                try:
+                    with open(path, 'r', encoding='utf-8') as file:
+                        # 只读取元数据，不读取所有数据点
+                        # 为了效率，这里假设文件较小，或者只读前几行
+                        # 简单起见，这里读整个文件，但在生产环境中应该优化
+                        data = json.load(file)
+                        missions.append({
+                            "id": data.get("mission_id", f),
+                            "name": data.get("name", f),
+                            "start_time": data.get("start_time"),
+                            "end_time": data.get("end_time"),
+                            "point_count": len(data.get("data_points", []))
+                        })
+                except Exception:
+                    continue
+        # 按时间倒序
+        return sorted(missions, key=lambda x: x["start_time"] or "", reverse=True)
+
+    def get_mission(self, mission_id):
+        """获取指定任务详情。"""
+        filename = f"mission_{mission_id}.json"
+        path = os.path.join(self.data_dir, filename)
+        if os.path.exists(path):
+            with open(path, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        return None
+
+    def delete_mission(self, mission_id):
+        """删除任务。"""
+        filename = f"mission_{mission_id}.json"
+        path = os.path.join(self.data_dir, filename)
+        if os.path.exists(path):
+            os.remove(path)
+            return True
+        return False
 
 # 默认配置
 DEFAULT_CONFIG = {
@@ -232,6 +332,7 @@ class WebConfigServer(object):
         self.config_manager = ConfigManager()
         self.config_manager.load()
         self.preset_manager = PresetManager()
+        self.data_manager = MissionDataManager()
 
         # 日志缓冲
         self.log_buffer = []
@@ -303,6 +404,7 @@ class WebConfigServer(object):
         self.current_voltage = msg.data
         # 如果正在运行自动化任务，记录数据
         if self.automation_running:
+            self.data_manager.add_data_point(self.current_voltage)
             self.voltage_history.append({
                 "timestamp": datetime.now().isoformat(),
                 "voltage": self.current_voltage
@@ -644,6 +746,24 @@ class WebConfigServer(object):
             self.voltage_history = []
             return jsonify({"success": True, "message": "历史数据已清除"})
 
+        # ================= 任务数据 API =================
+        @self.app.route('/api/data/missions', methods=['GET'])
+        def list_missions():
+            return jsonify({"success": True, "data": self.data_manager.list_missions()})
+
+        @self.app.route('/api/data/mission/<mission_id>', methods=['GET'])
+        def get_mission_data(mission_id):
+            data = self.data_manager.get_mission(mission_id)
+            if data:
+                return jsonify({"success": True, "data": data})
+            return jsonify({"success": False, "message": "任务不存在"}), 404
+
+        @self.app.route('/api/data/mission/<mission_id>', methods=['DELETE'])
+        def delete_mission_data(mission_id):
+            if self.data_manager.delete_mission(mission_id):
+                return jsonify({"success": True, "message": "任务已删除"})
+            return jsonify({"success": False, "message": "删除失败"}), 500
+
     def _trigger_mission(self, action):
         """触发任务动作。"""
         if self.standalone:
@@ -663,6 +783,12 @@ class WebConfigServer(object):
             # 如果是启动，先发送最新配置
             if action == 'start':
                 self._publish_steps()
+                # 开始记录数据
+                self.data_manager.start_mission(self.config_manager.get().get('mission', {}).get('name', ''))
+            
+            # 如果是停止，停止记录
+            if action == 'stop':
+                self.data_manager.stop_mission()
 
             # 调用服务
             rospy.wait_for_service(service_name, timeout=2.0)
