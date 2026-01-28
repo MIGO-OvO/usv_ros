@@ -20,7 +20,7 @@ export default function Data() {
   }
 
   const clearData = async () => {
-      if (!confirm("Clear all data?")) return
+      if (!confirm("确定要清空所有数据吗？")) return
       await fetch('/api/data/voltage/clear', { method: 'POST' })
       fetchData()
   }
@@ -49,19 +49,19 @@ export default function Data() {
     <div className="p-4 md:p-8 space-y-6 max-w-7xl mx-auto pb-32">
       <header className="flex items-center justify-between">
         <div>
-            <h1 className="text-3xl font-bold tracking-tight">Data Center</h1>
-            <p className="text-muted-foreground">Historical spectrometer voltage data.</p>
+            <h1 className="text-3xl font-bold tracking-tight">数据中心</h1>
+            <p className="text-muted-foreground">历史分光计电压数据记录。</p>
         </div>
         <div className="flex gap-2">
-            <Button variant="outline" onClick={fetchData}><RefreshCw className="w-4 h-4 mr-2" /> Refresh</Button>
-            <Button variant="outline" onClick={exportData}><Download className="w-4 h-4 mr-2" /> Export CSV</Button>
-            <Button variant="destructive" onClick={clearData}><Trash2 className="w-4 h-4 mr-2" /> Clear</Button>
+            <Button variant="outline" onClick={fetchData}><RefreshCw className="w-4 h-4 mr-2" /> 刷新</Button>
+            <Button variant="outline" onClick={exportData}><Download className="w-4 h-4 mr-2" /> 导出 CSV</Button>
+            <Button variant="destructive" onClick={clearData}><Trash2 className="w-4 h-4 mr-2" /> 清空</Button>
         </div>
       </header>
 
       <Card>
           <CardHeader>
-              <CardTitle>Voltage History</CardTitle>
+              <CardTitle>电压历史曲线</CardTitle>
           </CardHeader>
           <CardContent className="h-[500px]">
              <ResponsiveContainer width="100%" height="100%">
@@ -81,8 +81,8 @@ export default function Data() {
               <table className="w-full text-sm">
                   <thead className="bg-muted sticky top-0">
                       <tr>
-                          <th className="p-2 text-left">Timestamp</th>
-                          <th className="p-2 text-left">Voltage (V)</th>
+                          <th className="p-2 text-left">时间戳</th>
+                          <th className="p-2 text-left">电压 (V)</th>
                       </tr>
                   </thead>
                   <tbody>

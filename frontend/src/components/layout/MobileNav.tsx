@@ -3,10 +3,10 @@ import { LayoutDashboard, PlayCircle, Database, Settings } from "lucide-react"
 import { cn } from "@/lib/utils"
 
 const navItems = [
-  { name: "Monitor", href: "/", icon: LayoutDashboard },
-  { name: "Auto", href: "/automation", icon: PlayCircle },
-  { name: "Data", href: "/data", icon: Database },
-  { name: "Settings", href: "/settings", icon: Settings },
+  { name: "监控", href: "/", icon: LayoutDashboard },
+  { name: "自动", href: "/automation", icon: PlayCircle },
+  { name: "数据", href: "/data", icon: Database },
+  { name: "设置", href: "/settings", icon: Settings },
 ]
 
 export function MobileNav() {

@@ -34,7 +34,7 @@ export default function Settings() {
               headers: {'Content-Type': 'application/json'},
               body: JSON.stringify(config)
           })
-          alert("PID Parameters updated")
+          alert("PID 参数已更新")
       } catch (e) {
           console.error(e)
       }
@@ -47,8 +47,8 @@ export default function Settings() {
   return (
     <div className="p-4 md:p-8 space-y-6 max-w-7xl mx-auto">
       <header>
-          <h1 className="text-3xl font-bold tracking-tight">System Settings</h1>
-          <p className="text-muted-foreground">Low-level control parameters.</p>
+          <h1 className="text-3xl font-bold tracking-tight">系统设置</h1>
+          <p className="text-muted-foreground">底层控制参数配置。</p>
       </header>
 
       <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
@@ -56,38 +56,38 @@ export default function Settings() {
             <CardHeader>
                 <CardTitle className="flex items-center gap-2">
                     <Zap className="w-5 h-5 text-yellow-500" />
-                    PID Parameters
+                    PID 参数
                 </CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
                 <div className="grid grid-cols-3 gap-4">
                     <div className="space-y-2">
-                        <Label>Kp (Proportional)</Label>
+                        <Label>Kp (比例)</Label>
                         <Input type="number" step="0.001" value={config.Kp} onChange={(e) => handleChange('Kp', e.target.value)} />
                     </div>
                     <div className="space-y-2">
-                        <Label>Ki (Integral)</Label>
+                        <Label>Ki (积分)</Label>
                         <Input type="number" step="0.001" value={config.Ki} onChange={(e) => handleChange('Ki', e.target.value)} />
                     </div>
                     <div className="space-y-2">
-                        <Label>Kd (Derivative)</Label>
+                        <Label>Kd (微分)</Label>
                         <Input type="number" step="0.001" value={config.Kd} onChange={(e) => handleChange('Kd', e.target.value)} />
                     </div>
                 </div>
 
                 <div className="grid grid-cols-2 gap-4">
                      <div className="space-y-2">
-                        <Label>Output Min (V)</Label>
+                        <Label>最小输出 (V)</Label>
                         <Input type="number" step="0.1" value={config.output_min} onChange={(e) => handleChange('output_min', e.target.value)} />
                     </div>
                     <div className="space-y-2">
-                        <Label>Output Max (V)</Label>
+                        <Label>最大输出 (V)</Label>
                         <Input type="number" step="0.1" value={config.output_max} onChange={(e) => handleChange('output_max', e.target.value)} />
                     </div>
                 </div>
 
                 <div className="flex gap-2 pt-4">
-                    <Button className="flex-1" onClick={saveConfig}><Save className="w-4 h-4 mr-2" /> Save Parameters</Button>
+                    <Button className="flex-1" onClick={saveConfig}><Save className="w-4 h-4 mr-2" /> 保存参数</Button>
                     <Button variant="outline" onClick={fetchConfig}><RefreshCw className="w-4 h-4" /></Button>
                 </div>
             </CardContent>
@@ -95,11 +95,11 @@ export default function Settings() {
 
         <Card>
             <CardHeader>
-                <CardTitle>Zero Calibration</CardTitle>
+                <CardTitle>零点校准</CardTitle>
             </CardHeader>
             <CardContent>
                 <div className="p-4 rounded-lg bg-muted text-sm text-muted-foreground">
-                    Calibration functionality coming soon.
+                    校准功能即将上线。
                 </div>
             </CardContent>
         </Card>
