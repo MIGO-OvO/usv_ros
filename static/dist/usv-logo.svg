@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <defs>
+    <linearGradient id="grad1" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#00c6ff;stop-opacity:1" />
+      <stop offset="100%" style="stop-color:#0072ff;stop-opacity:1" />
+    </linearGradient>
+  </defs>
+  <!-- Waves -->
+  <path d="M10 80 Q 30 70 50 80 T 90 80" fill="none" stroke="url(#grad1)" stroke-width="5" stroke-linecap="round" />
+  <path d="M15 88 Q 35 78 55 88 T 95 88" fill="none" stroke="url(#grad1)" stroke-width="3" stroke-opacity="0.6" stroke-linecap="round" />
+  
+  <!-- Boat Body -->
+  <path d="M20 60 L80 60 L70 75 L30 75 Z" fill="url(#grad1)" />
+  
+  <!-- Cabin/Upper Structure -->
+  <path d="M35 60 L40 45 L60 45 L65 60 Z" fill="#ffffff" stroke="url(#grad1)" stroke-width="2" />
+  
+  <!-- Antenna/Sensor -->
+  <line x1="50" y1="45" x2="50" y2="35" stroke="url(#grad1)" stroke-width="2" />
+  <circle cx="50" cy="32" r="3" fill="#ff4b2b" />
+</svg>
