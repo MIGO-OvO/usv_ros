@@ -29,19 +29,24 @@ from __future__ import print_function
 
 import json
 import os
+import struct
 import threading
 
 import rospy
 from std_msgs.msg import String
-from std_srvs.srv import Trigger
-from mavros_msgs.msg import State, WaypointReached, CommandCode
-from mavros_msgs.srv import SetMode, SetModeRequest, CommandLong, CommandLongRequest
+from std_srvs.srv import Trigger, TriggerResponse
+from mavros_msgs.msg import State, WaypointReached, Mavlink
+from mavros_msgs.srv import SetMode, SetModeRequest
 
 # 自定义 MAVLink 指令 ID
 CMD_START_SAMPLING = 31010
 CMD_STOP_SAMPLING = 31011
 CMD_PAUSE_SAMPLING = 31012
 CMD_RESUME_SAMPLING = 31013
+CMD_CALIBRATE = 31014
+
+# MAVLink 协议常量
+MAVLINK_MSG_ID_COMMAND_LONG = 76
 
 # 配置文件路径
 CONFIG_FILE = os.path.expanduser("~/usv_ws/config/sampling_config.json")
@@ -79,12 +84,15 @@ class MAVLinkTriggerNode(object):
         self.state_sub = rospy.Subscriber('/mavros/state', State, self._state_cb)
         self.waypoint_sub = rospy.Subscriber('/mavros/mission/reached', WaypointReached, self._waypoint_cb)
 
-        # 监听 MAVROS 的命令话题 (用于接收自定义指令)
-        # 注意: 实际实现可能需要使用 mavros/cmd/command 服务或自定义插件
-        self.cmd_sub = rospy.Subscriber('/mavros/cmd/command', CommandCode, self._cmd_cb, queue_size=10)
+        # 监听 MAVROS 原始 MAVLink 入站消息 (从飞控/GCS 收到的所有 MAVLink 帧)
+        # mavros_msgs/Mavlink 包含 msgid、payload64 等字段
+        self.mavlink_sub = rospy.Subscriber(
+            '/mavros/mavlink/from', Mavlink, self._mavlink_from_cb, queue_size=20
+        )
 
         rospy.loginfo("MAVLink Trigger Node initialized")
         rospy.loginfo("  Auto trigger on waypoint: %s", self.auto_trigger_on_waypoint)
+        rospy.loginfo("  Listening for COMMAND_LONG on /mavros/mavlink/from")
 
     def _state_cb(self, msg):
         """MAVROS 状态回调。"""
@@ -105,14 +113,67 @@ class MAVLinkTriggerNode(object):
                 rospy.loginfo("Auto-triggering sampling at waypoint %d", msg.wp_seq)
                 self._start_sampling_sequence()
 
-    def _cmd_cb(self, msg):
+    def _mavlink_from_cb(self, msg):
         """
-        MAVLink 命令回调。
-        注意: 这是一个简化实现，实际可能需要使用 mavros 插件或 pymavlink
+        MAVROS 原始 MAVLink 入站消息回调。
+
+        mavros_msgs/Mavlink 消息结构:
+          - msgid: uint32     MAVLink 消息 ID
+          - payload64: uint64[]  载荷数据 (8 字节对齐的 little-endian 块)
+          - sysid: uint8      发送方系统 ID
+          - compid: uint8     发送方组件 ID
         """
-        # 这里的实现取决于 MAVROS 的具体配置
-        # 通常需要通过 mavros/cmd/command 服务或自定义话题
-        pass
+        # 只处理 COMMAND_LONG (msgid=76)
+        if msg.msgid != MAVLINK_MSG_ID_COMMAND_LONG:
+            return
+
+        self._handle_command_long_payload(msg)
+
+    def _handle_command_long_payload(self, msg):
+        """
+        解析 COMMAND_LONG 的 payload64 并分发命令。
+
+        COMMAND_LONG 载荷格式 (33 bytes, little-endian):
+          offset 0:  param1  float32
+          offset 4:  param2  float32
+          offset 8:  param3  float32
+          offset 12: param4  float32
+          offset 16: param5  float32
+          offset 20: param6  float32
+          offset 24: param7  float32
+          offset 28: command uint16
+          offset 30: target_system    uint8
+          offset 31: target_component uint8
+          offset 32: confirmation     uint8
+        """
+        try:
+            # 将 payload64 (uint64 数组) 还原为连续字节流
+            payload_bytes = b''
+            for val in msg.payload64:
+                payload_bytes += struct.pack('<Q', val)
+
+            # COMMAND_LONG 载荷至少 33 字节
+            if len(payload_bytes) < 33:
+                return
+
+            # 解析关键字段
+            param1 = struct.unpack_from('<f', payload_bytes, 0)[0]
+            param2 = struct.unpack_from('<f', payload_bytes, 4)[0]
+            command = struct.unpack_from('<H', payload_bytes, 28)[0]
+
+            # 仅处理 USV 自定义命令范围 (31010~31014)
+            if command < CMD_START_SAMPLING or command > CMD_CALIBRATE:
+                return
+
+            rospy.loginfo(
+                "Received COMMAND_LONG from sysid=%d compid=%d: cmd=%d param1=%.1f param2=%.1f",
+                msg.sysid, msg.compid, command, param1, param2
+            )
+
+            self.handle_mavlink_command(command, param1, param2)
+
+        except Exception as e:
+            rospy.logerr("Error parsing COMMAND_LONG payload: %s", str(e))
 
     def _init_services(self):
         """初始化 MAVROS 服务。"""
@@ -275,29 +336,52 @@ class MAVLinkTriggerNode(object):
     def handle_mavlink_command(self, cmd_id, param1=0, param2=0):
         """
         处理 MAVLink 自定义指令。
-        
-        可以通过以下方式调用:
-        1. QGC 的 MAVLink Inspector
-        2. pymavlink 脚本
-        3. ROS 话题/服务
-        
+
+        调用来源:
+        1. QGC USVPayloadPanel 按钮 (COMMAND_LONG via MAVLink)
+        2. QGC MAVLink Inspector
+        3. pymavlink 脚本
+        4. ROS 服务 /usv/trigger_sampling
+
         Args:
-            cmd_id: 指令 ID
+            cmd_id: 指令 ID (31010~31014)
             param1: 参数1
             param2: 参数2
+
+        Returns:
+            bool: 命令是否被成功处理
         """
-        rospy.loginfo("Received MAVLink command: %d", cmd_id)
+        rospy.loginfo("Processing MAVLink command: %d", cmd_id)
 
         if cmd_id == CMD_START_SAMPLING:
-            self._start_sampling_sequence()
+            return self._start_sampling_sequence()
         elif cmd_id == CMD_STOP_SAMPLING:
             self._stop_sampling_sequence()
+            return True
         elif cmd_id == CMD_PAUSE_SAMPLING:
             self._pause_sampling()
+            return True
         elif cmd_id == CMD_RESUME_SAMPLING:
             self._resume_sampling()
+            return True
+        elif cmd_id == CMD_CALIBRATE:
+            rospy.logwarn("Calibration command (31014) received - not yet fully implemented")
+            self._publish_status("calibrate_requested")
+            return True
         else:
             rospy.logwarn("Unknown command: %d", cmd_id)
+            return False
+
+    def _trigger_srv_cb(self, req):
+        """
+        ROS 服务回调: 手动触发采样。
+        可通过 rosservice call /usv/trigger_sampling 或其他 ROS 节点调用。
+        """
+        success = self._start_sampling_sequence()
+        return TriggerResponse(
+            success=success,
+            message="Sampling triggered" if success else "Sampling already in progress"
+        )
 
     def run(self):
         """主循环。"""
@@ -310,14 +394,10 @@ class MAVLinkTriggerNode(object):
         self._publish_status("ready")
         rospy.loginfo("MAVLink Trigger Node ready")
 
-        # 创建一个简单的 ROS 服务来接收触发指令
-        # 这允许通过 rosservice call 或 Web 接口触发
-        def trigger_cb(req):
-            from std_srvs.srv import TriggerResponse
-            self._start_sampling_sequence()
-            return TriggerResponse(success=True, message="Sampling triggered")
-
-        trigger_srv = rospy.Service('/usv/trigger_sampling', Trigger, trigger_cb)
+        # ROS 服务入口: 允许通过 rosservice call 或其他 ROS 节点直接触发采样
+        self._trigger_srv = rospy.Service(
+            '/usv/trigger_sampling', Trigger, self._trigger_srv_cb
+        )
 
         rate = rospy.Rate(1)
         while not rospy.is_shutdown():
@@ -328,9 +408,6 @@ class MAVLinkTriggerNode(object):
 
             rospy.logdebug_throttle(10, "Mode: %s, Armed: %s, Sampling: %s",
                                     mode, armed, self.is_sampling)
-
-            # 检查采样完成 (通过监听泵状态)
-            # 这里可以添加更复杂的逻辑
 
             rate.sleep()
 

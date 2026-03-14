@@ -1,18 +1,20 @@
 <?xml version="1.0"?>
 <launch>
-    <!-- 
+    <!--
     USV Water Quality Monitoring System Bringup
     水质监测无人船系统启动文件
-    
+
     系统架构:
       - pump_control_node: 蠕动泵控制 (串口 -> ESP32)
       - spectrometer_node: 分光检测器采集 (NI DAQ)
       - web_config_server: Web 配置界面 (HTTP)
-      - mavlink_trigger_node: MAVLink 指令触发
-    
+      - mavlink_trigger_node: MAVLink 指令触发与任务编排
+      - usv_mavlink_bridge: 载荷遥测回传 QGC
+
     工作流:
       1. 岸边: 通过 Wi-Fi 连接 Web UI 配置参数
       2. 下水: 通过数传电台发送 MAVLink 指令触发采样
+      3. 遥测: 载荷数据通过 MAVLink 回传至 QGC 显示
     -->
 
     <!-- ==================== Arguments ==================== -->
@@ -41,6 +43,7 @@
     <arg name="enable_spectrometer" default="true" />
     <arg name="enable_web" default="true" />
     <arg name="enable_mavlink_trigger" default="true" />
+    <arg name="enable_mavlink_bridge" default="true" />
 
     <!-- ==================== Load Parameters ==================== -->
     <rosparam file="$(find usv_ros)/config/usv_params.yaml" command="load" />
@@ -82,19 +85,33 @@
     </node>
 
     <!-- ==================== MAVLink Trigger Node ==================== -->
-    <!-- 
-    MAVLink 指令触发节点 - 监听航点到达和自定义指令
-    
+    <!--
+    MAVLink 指令触发节点 - 唯一任务编排入口
+    监听 /mavros/mavlink/from 中的 COMMAND_LONG，解析 USV 自定义命令。
+
     MAVLink 指令:
       31010: 开始采样
       31011: 停止采样
       31012: 暂停
       31013: 恢复
+      31014: 零点校准
     -->
-    <node name="mavlink_trigger_node" pkg="usv_ros" type="mavlink_trigger_node.py" 
+    <node name="mavlink_trigger_node" pkg="usv_ros" type="mavlink_trigger_node.py"
           output="screen" if="$(arg enable_mavlink_trigger)">
         <param name="mavros_timeout" value="$(arg mavros_timeout)" />
         <param name="auto_trigger_on_waypoint" value="$(arg auto_trigger_on_waypoint)" />
     </node>
+
+    <!-- ==================== MAVLink Telemetry Bridge ==================== -->
+    <!--
+    载荷遥测桥接节点 - 将 ROS 载荷数据转为 MAVLink NAMED_VALUE_FLOAT 回传 QGC
+
+    回传遥测:
+      USV_VOLT : 分光检测器电压
+      PUMP_X/Y/Z/A : 泵角度
+      USV_STAT : 载荷状态码
+    -->
+    <node name="usv_mavlink_bridge" pkg="usv_ros" type="usv_mavlink_bridge.py"
+          output="screen" if="$(arg enable_mavlink_bridge)" />
 
 </launch>

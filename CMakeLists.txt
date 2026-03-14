@@ -33,6 +33,7 @@ catkin_install_python(PROGRAMS
   scripts/mission_coordinator_node.py
   scripts/web_config_server.py
   scripts/mavlink_trigger_node.py
+  scripts/usv_mavlink_bridge.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
