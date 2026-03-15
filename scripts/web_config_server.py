@@ -64,18 +64,18 @@ except ImportError:
         def ServiceProxy(self, *args, **kwargs): return None
         def wait_for_service(self, *args, **kwargs): raise Exception("ROS not available")
         def is_shutdown(self): return False
-        def spin(self): 
+        def spin(self):
             while True: time.sleep(1)
         def Rate(self, hz):
             class MockRate:
                 def sleep(self): time.sleep(1.0/hz)
             return MockRate()
-            
+
     rospy = MockRospy()
-    
+
     class String:
         def __init__(self): self.data = ""
-    
+
     class Trigger:
         pass
 
@@ -133,7 +133,7 @@ class CalibrationManager(object):
         """获取校准后的角度"""
         offset = self.offsets.get(axis, 0.0)
         corrected = raw_angle - offset
-        # Normalize to 0-360 if needed, or keep linear. 
+        # Normalize to 0-360 if needed, or keep linear.
         # Usually angle is 0-360.
         corrected = corrected % 360.0
         if corrected < 0:
@@ -142,17 +142,17 @@ class CalibrationManager(object):
 
 class MissionDataManager(object):
     """任务数据管理器。"""
-    
+
     def __init__(self, data_dir=DATA_DIR):
         self.data_dir = data_dir
         self.current_mission_file = None
         self.current_mission_data = []
         self._ensure_dir()
-        
+
     def _ensure_dir(self):
         if not os.path.exists(self.data_dir):
             os.makedirs(self.data_dir)
-            
+
     def start_mission(self, mission_name=""):
         """开始新任务记录。"""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -167,7 +167,7 @@ class MissionDataManager(object):
         }
         self._save_current()
         return filename
-        
+
     def stop_mission(self):
         """停止任务记录。"""
         if self.current_mission_file:
@@ -175,7 +175,7 @@ class MissionDataManager(object):
             self._save_current()
             self.current_mission_file = None
             self.current_mission_data = []
-            
+
     def add_data_point(self, voltage):
         """添加数据点。"""
         if self.current_mission_file:
@@ -187,7 +187,7 @@ class MissionDataManager(object):
             # 每 10 个点保存一次，防止数据丢失
             if len(self.current_mission_data["data_points"]) % 10 == 0:
                 self._save_current()
-                
+
     def _save_current(self):
         """保存当前任务数据到文件。"""
         if self.current_mission_file:
@@ -199,7 +199,7 @@ class MissionDataManager(object):
         missions = []
         if not os.path.exists(self.data_dir):
             return []
-            
+
         for f in os.listdir(self.data_dir):
             if f.endswith(".json") and f.startswith("mission_"):
                 path = os.path.join(self.data_dir, f)
@@ -355,12 +355,12 @@ class WebConfigServer(object):
     def __init__(self, standalone=False):
         """
         初始化 Web 配置服务器。
-        
+
         Args:
             standalone: 是否以独立模式运行 (不依赖 ROS)
         """
         self.standalone = standalone or not ROS_AVAILABLE
-        
+
         if not self.standalone:
             try:
                 rospy.init_node('web_config_server', anonymous=False)
@@ -395,23 +395,33 @@ class WebConfigServer(object):
         self.current_angles = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
         self.current_voltage = 0.0
         self.mission_status = "IDLE"
+        self.injection_pump_status = {
+            "enabled": False,
+            "speed": 0,
+            "last_response": "",
+            "last_error": "",
+        }
         self.voltage_history = []  # List of {timestamp, value}
 
         # ROS 订阅 (仅在非独立模式)
         if not self.standalone:
             self.status_sub = rospy.Subscriber('/usv/pump_status', String, self._status_cb)
             self.angles_sub = rospy.Subscriber('/usv/pump_angles', String, self._angles_cb)
+            self.injection_status_sub = rospy.Subscriber('/usv/injection_pump_status', String, self._injection_status_cb)
             self.voltage_sub = rospy.Subscriber('/usv/spectrometer_voltage', Float64, self._voltage_cb)
             self.mission_sub = rospy.Subscriber('/usv/mission_status', String, self._mission_status_cb)
             self.pid_error_sub = rospy.Subscriber('/usv/pump_pid_error', String, self._pid_error_cb)
             self.steps_pub = rospy.Publisher('/usv/automation_steps', String, queue_size=1)
+            self.command_pub = rospy.Publisher('/usv/pump_command', String, queue_size=10)
         else:
             self.status_sub = None
             self.angles_sub = None
+            self.injection_status_sub = None
             self.voltage_sub = None
             self.mission_sub = None
             self.pid_error_sub = None
             self.steps_pub = None
+            self.command_pub = None
 
         # Flask & SocketIO
         self.app = None
@@ -434,9 +444,24 @@ class WebConfigServer(object):
         self.automation_running = 'automation' in status and 'running' not in status.replace('running', '')
         if 'automation' in status:
             self.automation_running = 'running' in status or '运行' in status
-        
+
         # 只记录关键状态变化，避免刷屏
         # self._add_log("[状态] " + msg.data)
+
+    def _injection_status_cb(self, msg):
+        """进样泵状态回调。"""
+        try:
+            data = json.loads(msg.data)
+            self.injection_pump_status = {
+                "enabled": bool(data.get("enabled", False)),
+                "speed": int(data.get("speed", 0)),
+                "last_response": data.get("last_response", ""),
+                "last_error": data.get("last_error", ""),
+            }
+            if self.socketio:
+                self.socketio.emit('injection_pump_status', self.injection_pump_status)
+        except Exception as e:
+            rospy.logerr("Error parsing injection pump status: %s", str(e))
 
     def _angles_cb(self, msg):
         """电机位置回调"""
@@ -455,16 +480,16 @@ class WebConfigServer(object):
             if not hasattr(self, 'raw_angles'):
                 self.raw_angles = {}
             self.raw_angles.update(data)
-            
+
             # 应用校准偏移
             corrected_angles = {}
             for axis, angle in data.items():
                 # 确保只处理 X, Y, Z, A
                 if axis in ['X', 'Y', 'Z', 'A']:
                     corrected_angles[axis] = self.calibration_manager.get_corrected_angle(axis, angle)
-            
+
             self.current_angles.update(corrected_angles)
-            
+
             if self.socketio:
                 self.socketio.emit('pump_angles', self.current_angles)
                 # 也可以选择推送 raw_angles 供前端调试
@@ -501,17 +526,17 @@ class WebConfigServer(object):
         """添加日志并推送到 WebSocket"""
         timestamp = datetime.now().strftime("%H:%M:%S")
         log_entry = "[{}] {}".format(timestamp, message)
-        
+
         with self.log_lock:
             self.log_buffer.append(log_entry)
             if len(self.log_buffer) > self.max_logs:
                 self.log_buffer = self.log_buffer[-self.max_logs:]
-        
+
         # 推送实时日志
         if self.socketio:
             self.socketio.emit('log', {
-                'message': message, 
-                'level': level, 
+                'message': message,
+                'level': level,
                 'timestamp': timestamp
             })
 
@@ -540,12 +565,12 @@ class WebConfigServer(object):
         dist_index = os.path.join(dist_folder, 'index.html')
 
         self.app = Flask(__name__, static_folder=static_folder, static_url_path='/static')
-        
+
         # 禁用浏览器缓存 (开发模式)
         self.app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
-        
+
         CORS(self.app)
-        
+
         # 使用 threading 模式以兼容 ROS
         self.socketio = SocketIO(self.app, cors_allowed_origins="*", async_mode='threading')
 
@@ -625,7 +650,7 @@ class WebConfigServer(object):
         @self.app.route('/api/presets/auto', methods=['GET'])
         def get_auto_presets():
             return jsonify({"success": True, "data": self.preset_manager.get_auto_preset_names()})
-            
+
         @self.app.route('/api/preset/auto/<name>', methods=['GET'])
         def load_auto_preset(name):
             data = self.preset_manager.load_auto_preset(name)
@@ -640,7 +665,7 @@ class WebConfigServer(object):
                 self._add_log(f"预设 '{name}' 已保存", "success")
                 return jsonify({"success": True, "message": "预设已保存"})
             return jsonify({"success": False, "message": "保存失败"}), 500
-            
+
         @self.app.route('/api/preset/auto/<name>', methods=['DELETE'])
         def delete_auto_preset(name):
             if self.preset_manager.delete_preset('auto', name):
@@ -656,11 +681,11 @@ class WebConfigServer(object):
             command = data.get('command', '')
             if not command:
                 return jsonify({"success": False, "message": "指令为空"})
-            
+
             if self.standalone:
                 self._add_log(f"[模拟] 发送指令: {command}", "info")
                 return jsonify({"success": True, "message": "指令已发送 (模拟模式)"})
-            
+
             try:
                 # 通过 ROS 服务发送指令
                 if hasattr(self, 'command_pub') and self.command_pub:
@@ -679,7 +704,7 @@ class WebConfigServer(object):
             if self.standalone:
                 self._add_log("[模拟] 紧急停止所有电机", "warning")
                 return jsonify({"success": True, "message": "已停止 (模拟模式)"})
-            
+
             try:
                 if hasattr(self, 'command_pub') and self.command_pub:
                     self.command_pub.publish(stop_command)
@@ -710,13 +735,13 @@ class WebConfigServer(object):
                 "output_min": data.get("output_min", 1.0),
                 "output_max": data.get("output_max", 8.0)
             }
-            
+
             # 生成 PIDCFG 指令
             cmd = "PIDCFG:{Kp},{Ki},{Kd},{output_min},{output_max}\r\n".format(**self.pid_config)
-            
+
             if not self.standalone and hasattr(self, 'command_pub') and self.command_pub:
                 self.command_pub.publish(cmd)
-            
+
             self._add_log(f"PID 参数已更新: Kp={self.pid_config['Kp']}", "success")
             return jsonify({"success": True, "message": "PID 参数已更新"})
 
@@ -728,74 +753,38 @@ class WebConfigServer(object):
             direction = data.get('direction', 'F')
             angle = data.get('angle', 90.0)
             runs = data.get('runs', 5)
-            
+
             cmd = f"PIDTEST:{motor},{direction},{angle},{runs}\r\n"
-            
+
             if self.standalone:
                 self._add_log(f"[模拟] PID 测试: {cmd.strip()}", "info")
                 return jsonify({"success": True, "message": "测试已启动 (模拟模式)"})
-            
+
             if hasattr(self, 'command_pub') and self.command_pub:
                 self.command_pub.publish(cmd)
                 self._add_log(f"PID 测试已启动: {motor}轴 {angle}°", "info")
                 return jsonify({"success": True, "message": "测试已启动"})
-            
+
             return jsonify({"success": False, "message": "ROS Publisher 未初始化"})
 
-        # ================= 零点标定 API =================
-        @self.app.route('/api/calibration/zero', methods=['POST'])
-        def set_zero_point():
-            """设置零点"""
-            data = request.get_json()
-            motor = data.get('motor', '')
-            
-            if motor not in ['X', 'Y', 'Z', 'A']:
-                return jsonify({"success": False, "message": "无效的电机标识"})
-            
-            # 保存零点偏移
-            if not hasattr(self, 'zero_offsets'):
-                self.zero_offsets = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
-            
-            current_angle = self.current_angles.get(motor, 0.0)
-            self.zero_offsets[motor] = current_angle
-            
-            self._add_log(f"电机 {motor} 零点已设置: {current_angle:.2f}°", "success")
-            return jsonify({
-                "success": True, 
-                "message": f"电机 {motor} 零点已设置",
-                "offset": current_angle
-            })
-
-        @self.app.route('/api/calibration/reset', methods=['POST'])
-        def reset_zero_points():
-            """重置所有零点"""
-            self.zero_offsets = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
-            self._add_log("所有零点已重置", "warning")
-            return jsonify({"success": True, "message": "所有零点已重置"})
-
-        @self.app.route('/api/calibration/offsets', methods=['GET'])
-        def get_zero_offsets():
-            """获取零点偏移"""
-            offsets = getattr(self, 'zero_offsets', {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0})
-            return jsonify({"success": True, "data": offsets})
-
+        # ================= 校准启动 API =================
         @self.app.route('/api/calibration/start', methods=['POST'])
         def start_calibration():
             """启动电机校准"""
             data = request.get_json()
             motors = data.get('motors', 'XYZA')
-            
+
             cmd = f"CAL{motors}\r\n"
-            
+
             if self.standalone:
                 self._add_log(f"[模拟] 校准: {motors}", "info")
                 return jsonify({"success": True, "message": "校准已启动 (模拟模式)"})
-            
+
             if hasattr(self, 'command_pub') and self.command_pub:
                 self.command_pub.publish(cmd)
                 self._add_log(f"校准已启动: {motors}", "info")
                 return jsonify({"success": True, "message": "校准已启动"})
-            
+
             return jsonify({"success": False, "message": "ROS Publisher 未初始化"})
 
         # ================= WebSocket 事件 =================
@@ -808,6 +797,7 @@ class WebConfigServer(object):
             })
             emit('angles', self.current_angles)
             emit('voltage', {"value": self.current_voltage})
+            emit('injection_pump_status', self.injection_pump_status)
 
         # ================= 数据 API =================
         @self.app.route('/api/data/voltage', methods=['GET'])
@@ -846,19 +836,18 @@ class WebConfigServer(object):
         def set_zero():
             data = request.get_json()
             axis = data.get('axis')
-            
+
             if not axis:
-                # Set all
                 if hasattr(self, 'raw_angles'):
                     for ax in ['X', 'Y', 'Z', 'A']:
                         if ax in self.raw_angles:
                             self.calibration_manager.set_zero(ax, self.raw_angles[ax])
                 return jsonify({"success": True, "message": "所有轴零点已设置"})
-            
+
             if hasattr(self, 'raw_angles') and axis in self.raw_angles:
                 self.calibration_manager.set_zero(axis, self.raw_angles[axis])
                 return jsonify({"success": True, "message": f"{axis} 轴零点已设置"})
-            
+
             return jsonify({"success": False, "message": "无法获取当前原始角度"}), 400
 
         @self.app.route('/api/calibration/reset', methods=['POST'])
@@ -868,13 +857,85 @@ class WebConfigServer(object):
             self.calibration_manager.reset(axis)
             return jsonify({"success": True, "message": "零点已重置"})
 
+        # ================= 进样泵控制 API =================
+        @self.app.route('/api/injection-pump/status', methods=['POST'])
+        def get_injection_pump_status():
+            if self.standalone:
+                return jsonify({"success": True, "data": self.injection_pump_status, "message": "模拟模式"})
+
+            try:
+                service = rospy.ServiceProxy('/usv/injection_pump_get_status', Trigger)
+                resp = service()
+                if resp.success:
+                    data = json.loads(resp.message)
+                    self.injection_pump_status = {
+                        "enabled": bool(data.get("enabled", False)),
+                        "speed": int(data.get("speed", 0)),
+                        "last_response": data.get("last_response", ""),
+                        "last_error": data.get("last_error", ""),
+                    }
+                return jsonify({"success": resp.success, "data": self.injection_pump_status, "message": resp.message})
+            except Exception as e:
+                return jsonify({"success": False, "message": str(e), "data": self.injection_pump_status}), 500
+
+        @self.app.route('/api/injection-pump/on', methods=['POST'])
+        def turn_injection_pump_on():
+            if self.standalone:
+                self.injection_pump_status["enabled"] = True
+                return jsonify({"success": True, "data": self.injection_pump_status, "message": "模拟模式已开启"})
+
+            try:
+                service = rospy.ServiceProxy('/usv/injection_pump_on', Trigger)
+                resp = service()
+                return jsonify({"success": resp.success, "data": self.injection_pump_status, "message": resp.message})
+            except Exception as e:
+                return jsonify({"success": False, "message": str(e), "data": self.injection_pump_status}), 500
+
+        @self.app.route('/api/injection-pump/off', methods=['POST'])
+        def turn_injection_pump_off():
+            if self.standalone:
+                self.injection_pump_status["enabled"] = False
+                self.injection_pump_status["speed"] = 0
+                return jsonify({"success": True, "data": self.injection_pump_status, "message": "模拟模式已关闭"})
+
+            try:
+                service = rospy.ServiceProxy('/usv/injection_pump_off', Trigger)
+                resp = service()
+                return jsonify({"success": resp.success, "data": self.injection_pump_status, "message": resp.message})
+            except Exception as e:
+                return jsonify({"success": False, "message": str(e), "data": self.injection_pump_status}), 500
+
+        @self.app.route('/api/injection-pump/set', methods=['POST'])
+        def set_injection_pump_speed():
+            data = request.get_json() or {}
+            speed = int(data.get('speed', 0))
+            speed = max(0, min(100, speed))
+            command = f'PUMP:SET:{speed}'
+
+            if self.standalone:
+                self.injection_pump_status["enabled"] = speed > 0
+                self.injection_pump_status["speed"] = speed
+                self.injection_pump_status["last_response"] = command
+                self.injection_pump_status["last_error"] = ""
+                return jsonify({"success": True, "data": self.injection_pump_status, "message": "模拟模式已设置"})
+
+            if self.command_pub:
+                self.command_pub.publish(command)
+                self.injection_pump_status["enabled"] = speed > 0
+                self.injection_pump_status["speed"] = speed
+                self.injection_pump_status["last_response"] = command
+                self.injection_pump_status["last_error"] = ""
+                return jsonify({"success": True, "data": self.injection_pump_status, "message": "进样泵转速已发送"})
+
+            return jsonify({"success": False, "message": "ROS Publisher 未初始化", "data": self.injection_pump_status}), 500
+
     def _trigger_mission(self, action):
         """触发任务动作。"""
         if self.standalone:
             msg = "独立模式下无法触发任务 (需要 ROS 集成)"
             self._add_log(msg, "warning")
             return jsonify({"success": False, "message": msg})
-        
+
         service_map = {
             'start': '/usv/automation_start',
             'stop': '/usv/automation_stop',
@@ -889,7 +950,7 @@ class WebConfigServer(object):
                 self._publish_steps()
                 # 开始记录数据
                 self.data_manager.start_mission(self.config_manager.get().get('mission', {}).get('name', ''))
-            
+
             # 如果是停止，停止记录
             if action == 'stop':
                 self.data_manager.stop_mission()
@@ -911,7 +972,7 @@ class WebConfigServer(object):
         """发布采样步骤到 ROS。"""
         if self.standalone or not self.steps_pub:
             return
-            
+
         config = self.config_manager.get()
         steps_data = {
             "steps": config.get('sampling_sequence', {}).get('steps', []),
@@ -936,7 +997,7 @@ class WebConfigServer(object):
                 })
                 self.socketio.emit('angles', self.current_angles)
                 self.socketio.emit('voltage', {"value": self.current_voltage})
-            
+
             if self.standalone:
                 # 独立模式模拟数据变化 (测试用)
                 if self.automation_running:
@@ -980,7 +1041,7 @@ class WebConfigServer(object):
 def main():
     """主函数"""
     standalone = not ROS_AVAILABLE
-    
+
     if not standalone:
         try:
             import socket
@@ -993,7 +1054,7 @@ def main():
                 standalone = True
         except Exception:
             standalone = True
-    
+
     try:
         server = WebConfigServer(standalone=standalone)
         server.run()

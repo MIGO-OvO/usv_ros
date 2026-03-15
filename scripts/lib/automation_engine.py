@@ -51,6 +51,7 @@ class AutomationEngine(object):
         self.command_generator = command_generator
         self.send_command = send_command_func
         self.log = log_func or self._default_log
+        self.on_step_command = None  # func(step) -> bool，可选的步骤级发送钩子
 
         # 步骤和循环配置
         self.steps = []
@@ -307,6 +308,9 @@ class AutomationEngine(object):
             return False
 
         try:
+            if self.on_step_command:
+                return self.on_step_command(step)
+
             # 生成指令
             command = self.command_generator.generate_command(step, mode="auto")
 

@@ -5,12 +5,18 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Play, Square, Pause, Save, FolderOpen, Plus, Trash2, ArrowUp, ArrowDown } from 'lucide-react'
 import { useAppStore } from '@/store'
+import { InjectionPumpCard } from '@/components/injection-pump-card'
 
 interface PumpConfig {
-  enable: string // "E" or "D"
-  direction: string // "F" or "B"
+  enable: string
+  direction: string
   speed: string
   angle: string
+}
+
+interface InjectionPumpConfig {
+  enable: boolean
+  speed: number
 }
 
 interface Step {
@@ -20,16 +26,19 @@ interface Step {
   Y: PumpConfig
   Z: PumpConfig
   A: PumpConfig
+  pump?: InjectionPumpConfig
 }
 
-const DEFAULT_PUMP: PumpConfig = { enable: "D", direction: "F", speed: "5", angle: "0" }
+const DEFAULT_PUMP: PumpConfig = { enable: 'D', direction: 'F', speed: '5', angle: '0' }
+const DEFAULT_INJECTION_PUMP: InjectionPumpConfig = { enable: false, speed: 0 }
 const DEFAULT_STEP: Step = {
-    name: "新步骤",
-    interval: 1000,
-    X: { ...DEFAULT_PUMP },
-    Y: { ...DEFAULT_PUMP },
-    Z: { ...DEFAULT_PUMP },
-    A: { ...DEFAULT_PUMP }
+  name: '新步骤',
+  interval: 1000,
+  X: { ...DEFAULT_PUMP },
+  Y: { ...DEFAULT_PUMP },
+  Z: { ...DEFAULT_PUMP },
+  A: { ...DEFAULT_PUMP },
+  pump: { ...DEFAULT_INJECTION_PUMP },
 }
 
 export default function Automation() {
@@ -126,14 +135,17 @@ export default function Automation() {
 
   const updateStep = (index: number, field: string, value: any) => {
       const newSteps = [...steps]
-      // Support nested updates like "X.angle"
       if (field.includes('.')) {
           const [parent, child] = field.split('.')
-          // @ts-ignore
-          newSteps[index][parent][child] = value
+          if (parent === 'pump') {
+              const pump = newSteps[index].pump || { ...DEFAULT_INJECTION_PUMP }
+              ;(pump as any)[child] = value
+              newSteps[index].pump = pump
+          } else {
+              ;(newSteps[index] as any)[parent][child] = value
+          }
       } else {
-          // @ts-ignore
-          newSteps[index][field] = value
+          ;(newSteps[index] as any)[field] = value
       }
       setSteps(newSteps)
   }
@@ -162,7 +174,6 @@ export default function Automation() {
       </header>
 
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        {/* Presets & Config */}
         <Card className="lg:col-span-1 h-fit">
             <CardHeader>
                 <CardTitle>全局配置</CardTitle>
@@ -188,8 +199,11 @@ export default function Automation() {
             </CardContent>
         </Card>
 
-        {/* Steps Editor */}
-        <Card className="lg:col-span-2">
+        <div className="lg:col-span-2">
+          <InjectionPumpCard />
+        </div>
+
+        <Card className="lg:col-span-3">
             <CardHeader className="flex flex-row items-center justify-between">
                 <CardTitle>序列步骤</CardTitle>
                 <Button size="sm" onClick={addStep}><Plus className="w-4 h-4 mr-2" /> 添加步骤</Button>
@@ -211,38 +225,58 @@ export default function Automation() {
                                 <Button size="icon" variant="ghost" className="text-destructive" onClick={() => deleteStep(index)}><Trash2 className="w-4 h-4" /></Button>
                             </div>
                         </div>
-                        
-                        {/* Pump Config Grid */}
-                        <div className="grid grid-cols-4 gap-4 pt-2">
+
+                        <div className="grid grid-cols-1 xl:grid-cols-5 gap-4 pt-2">
                             {['X', 'Y', 'Z', 'A'].map((axis) => (
-                                <div key={axis} className="space-y-2 p-2 rounded bg-muted/20">
+                                <div key={axis} className="space-y-2 p-3 rounded-lg border border-border/60 bg-muted/20">
                                     <div className="font-bold text-center text-xs mb-2">{axis} 轴</div>
                                     <div className="flex items-center justify-between">
                                         <Label className="text-[10px]">启用</Label>
-                                        <input type="checkbox" 
-                                            // @ts-ignore
-                                            checked={step[axis].enable === 'E'} 
-                                            // @ts-ignore
-                                            onChange={(e) => updateStep(index, `${axis}.enable`, e.target.checked ? 'E' : 'D')} 
+                                        <input type="checkbox"
+                                            checked={(step as any)[axis].enable === 'E'}
+                                            onChange={(e) => updateStep(index, `${axis}.enable`, e.target.checked ? 'E' : 'D')}
                                         />
                                     </div>
-                                    {/* @ts-ignore */}
-                                    {step[axis].enable === 'E' && (
+                                    {(step as any)[axis].enable === 'E' && (
                                         <>
                                             <div className="grid grid-cols-2 gap-1">
                                                 <Label className="text-[10px]">角度</Label>
-                                                {/* @ts-ignore */}
-                                                <Input className="h-6 text-[10px] px-1" value={step[axis].angle} onChange={(e) => updateStep(index, `${axis}.angle`, e.target.value)} />
+                                                <Input className="h-6 text-[10px] px-1" value={(step as any)[axis].angle} onChange={(e) => updateStep(index, `${axis}.angle`, e.target.value)} />
                                             </div>
                                             <div className="grid grid-cols-2 gap-1">
                                                 <Label className="text-[10px]">速度</Label>
-                                                {/* @ts-ignore */}
-                                                <Input className="h-6 text-[10px] px-1" value={step[axis].speed} onChange={(e) => updateStep(index, `${axis}.speed`, e.target.value)} />
+                                                <Input className="h-6 text-[10px] px-1" value={(step as any)[axis].speed} onChange={(e) => updateStep(index, `${axis}.speed`, e.target.value)} />
                                             </div>
                                         </>
                                     )}
                                 </div>
                             ))}
+
+                            <div className="space-y-3 p-3 rounded-lg border border-cyan-500/20 bg-cyan-500/5">
+                                <div className="font-bold text-center text-xs text-cyan-600 dark:text-cyan-400">进样泵</div>
+                                <div className="flex items-center justify-between">
+                                    <Label className="text-[10px]">启用</Label>
+                                    <input
+                                      type="checkbox"
+                                      checked={!!step.pump?.enable}
+                                      onChange={(e) => updateStep(index, 'pump.enable', e.target.checked)}
+                                    />
+                                </div>
+                                <div className="grid grid-cols-2 gap-1">
+                                    <Label className="text-[10px]">转速%</Label>
+                                    <Input
+                                      className="h-6 text-[10px] px-1"
+                                      type="number"
+                                      min={0}
+                                      max={100}
+                                      value={step.pump?.speed ?? 0}
+                                      onChange={(e) => updateStep(index, 'pump.speed', parseInt(e.target.value || '0'))}
+                                    />
+                                </div>
+                                <p className="text-[10px] leading-4 text-muted-foreground">
+                                  步骤执行时将发送独立 `PUMP:SET` 或 `PUMP:OFF` 指令。
+                                </p>
+                            </div>
                         </div>
                     </div>
                 ))}

@@ -270,6 +270,8 @@ class PumpControlNode(object):
     集成指令生成器和自动化引擎。
     """
 
+    INJECTION_PUMP_PREFIX = "PUMP:"
+
     def __init__(self):
         """初始化节点。"""
         rospy.init_node('pump_control_node', anonymous=False)
@@ -298,6 +300,7 @@ class PumpControlNode(object):
         )
         self.automation_engine.on_status_update = self._on_automation_status
         self.automation_engine.on_error = self._on_automation_error
+        self.automation_engine.on_step_command = self._send_automation_step
 
         # 当前角度状态
         self.current_angles = {m: 0.0 for m in MOTOR_NAMES}
@@ -307,11 +310,18 @@ class PumpControlNode(object):
         self.pid_target_angles = {}
         self.pid_precision_threshold = self.pid_precision
 
+        # 进样泵状态
+        self.inject_pump_enabled = False
+        self.inject_pump_speed = 0
+        self.inject_pump_last_response = ""
+        self.inject_pump_last_error = ""
+
         # Publishers
         self.angles_pub = rospy.Publisher('/usv/pump_angles', String, queue_size=10)
         self.status_pub = rospy.Publisher('/usv/pump_status', String, queue_size=10)
         self.pid_complete_pub = rospy.Publisher('/usv/pump_pid_complete', String, queue_size=10)
         self.pid_error_pub = rospy.Publisher('/usv/pump_pid_error', String, queue_size=50)
+        self.injection_status_pub = rospy.Publisher('/usv/injection_pump_status', String, queue_size=10)
 
         # Subscribers
         self.cmd_sub = rospy.Subscriber('/usv/pump_command', String, self._cmd_callback)
@@ -324,6 +334,9 @@ class PumpControlNode(object):
         self.auto_stop_srv = rospy.Service('/usv/automation_stop', Trigger, self._auto_stop_callback)
         self.auto_pause_srv = rospy.Service('/usv/automation_pause', Trigger, self._auto_pause_callback)
         self.auto_resume_srv = rospy.Service('/usv/automation_resume', Trigger, self._auto_resume_callback)
+        self.injection_on_srv = rospy.Service('/usv/injection_pump_on', Trigger, self._injection_on_callback)
+        self.injection_off_srv = rospy.Service('/usv/injection_pump_off', Trigger, self._injection_off_callback)
+        self.injection_status_srv = rospy.Service('/usv/injection_pump_get_status', Trigger, self._injection_status_callback)
 
         rospy.loginfo("Pump Control Node initialized")
         rospy.loginfo("  Serial: %s @ %d", self.serial_port, self.baudrate)
@@ -340,6 +353,7 @@ class PumpControlNode(object):
             )
             self.serial_conn.reset_input_buffer()
             self.serial_conn.reset_output_buffer()
+            self._publish_injection_pump_status()
 
             # 启动读取器
             self.serial_reader = PumpSerialReader(self.serial_conn)
@@ -388,6 +402,9 @@ class PumpControlNode(object):
             return False
 
         try:
+            if self._is_injection_pump_command(command):
+                command = command.upper()
+
             with self.serial_lock:
                 if not command.endswith(COMMAND_TERMINATOR):
                     command += COMMAND_TERMINATOR
@@ -400,16 +417,146 @@ class PumpControlNode(object):
             rospy.logerr("Send failed: %s", str(e))
             return False
 
+    def _is_injection_pump_command(self, command):
+        """判断是否为进样泵直通指令。"""
+        return command.upper().startswith(self.INJECTION_PUMP_PREFIX)
+
+    def _build_injection_pump_command(self, enabled, speed=None):
+        """构建进样泵控制指令。"""
+        if speed is not None:
+            speed = max(0, min(100, int(speed)))
+            return "PUMP:SET:{}".format(speed)
+        return "PUMP:ON" if enabled else "PUMP:OFF"
+
+    def _publish_injection_pump_status(self):
+        """发布进样泵状态。"""
+        msg = String()
+        msg.data = json.dumps({
+            "enabled": self.inject_pump_enabled,
+            "speed": self.inject_pump_speed,
+            "last_response": self.inject_pump_last_response,
+            "last_error": self.inject_pump_last_error,
+        })
+        self.injection_status_pub.publish(msg)
+
+    def _update_injection_pump_state(self, enabled=None, speed=None, response=None, error=None):
+        """更新进样泵状态缓存并发布。"""
+        if enabled is not None:
+            self.inject_pump_enabled = enabled
+        if speed is not None:
+            self.inject_pump_speed = max(0, min(100, int(speed)))
+        if response is not None:
+            self.inject_pump_last_response = response
+        if error is not None:
+            self.inject_pump_last_error = error
+        self._publish_injection_pump_status()
+
+    def _send_injection_pump_command(self, enabled=None, speed=None):
+        """发送进样泵控制指令。"""
+        command = self._build_injection_pump_command(enabled=enabled, speed=speed)
+        success = self.send_command(command)
+        if success:
+            if speed is not None:
+                self._update_injection_pump_state(
+                    enabled=speed > 0,
+                    speed=speed,
+                    response=command,
+                    error=""
+                )
+            elif enabled is not None:
+                self._update_injection_pump_state(
+                    enabled=enabled,
+                    response=command,
+                    error=""
+                )
+        return success
+
+    def _handle_injection_pump_step(self, step, mode):
+        """处理步骤中的进样泵配置。"""
+        pump_cfg = step.get("pump", {}) or {}
+        if not isinstance(pump_cfg, dict) or "enable" not in pump_cfg:
+            return True
+
+        pump_enabled = bool(pump_cfg.get("enable", False))
+        pump_speed = pump_cfg.get("speed", 0)
+
+        try:
+            pump_speed = int(pump_speed)
+        except (TypeError, ValueError):
+            rospy.logerr("Invalid injection pump speed: %s", str(pump_speed))
+            return False
+
+        if pump_enabled and pump_speed > 0:
+            success = self._send_injection_pump_command(speed=pump_speed)
+            if success and mode == "auto":
+                rospy.loginfo("[Automation] Injection pump set to %s%%", pump_speed)
+            return success
+
+        if not pump_enabled and mode == "auto":
+            return self._send_injection_pump_command(enabled=False)
+
+        return True
+
+    def _send_automation_step(self, step):
+        """自动化引擎步骤发送钩子。"""
+        command = self.command_generator.generate_command(step, mode="auto")
+        if command and not self.send_command(command):
+            return False
+        if command:
+            rospy.loginfo("[Automation] 指令已发送: %s", command.strip())
+        return self._handle_injection_pump_step(step, mode="auto")
+
+    def _parse_injection_pump_text(self, text):
+        """解析进样泵文本响应。"""
+        if text.startswith("PUMP_OK:SET="):
+            payload = text[len("PUMP_OK:SET="):]
+            parts = payload.split(",", 1)
+            speed = int(parts[0]) if parts and parts[0].isdigit() else self.inject_pump_speed
+            enabled = len(parts) > 1 and parts[1].upper() == "ON"
+            self._update_injection_pump_state(enabled=enabled, speed=speed, response=text, error="")
+            return True
+
+        if text.startswith("PUMP_OK:SPD="):
+            speed_text = text[len("PUMP_OK:SPD="):]
+            speed = int(speed_text) if speed_text.isdigit() else self.inject_pump_speed
+            self._update_injection_pump_state(speed=speed, response=text, error="")
+            return True
+
+        if text.startswith("PUMP_OK:ON"):
+            self._update_injection_pump_state(enabled=True, response=text, error="")
+            return True
+
+        if text.startswith("PUMP_OK:OFF"):
+            self._update_injection_pump_state(enabled=False, speed=0, response=text, error="")
+            return True
+
+        if text.startswith("PUMP_STATUS:"):
+            payload = text[len("PUMP_STATUS:"):]
+            enabled = payload.upper().startswith("ON")
+            speed = self.inject_pump_speed
+            if "SPD=" in payload:
+                speed_text = payload.split("SPD=", 1)[1]
+                speed = int(speed_text) if speed_text.isdigit() else speed
+            self._update_injection_pump_state(enabled=enabled, speed=speed, response=text, error="")
+            return True
+
+        if text.startswith("PUMP_ERR:"):
+            self._update_injection_pump_state(response=text, error=text)
+            return True
+
+        return False
+
     def stop_all_pumps(self):
         """紧急停止所有泵。"""
         # 先停止 PID
         self.send_command(self.command_generator.generate_pid_stop_command())
         # 再停止电机
         success = self.send_command(self.command_generator.generate_stop_command())
+        injection_success = self._send_injection_pump_command(enabled=False)
         if success:
             rospy.logwarn("All pumps stopped!")
             self._publish_status("stopped")
-        return success
+        return success and injection_success
 
     def _on_angle_received(self, angles):
         """角度数据回调。"""
@@ -447,6 +594,9 @@ class PumpControlNode(object):
         """文本响应回调。"""
         rospy.logdebug("MCU: %s", text)
 
+        if self._parse_injection_pump_text(text):
+            return
+
         # 检查 PID 完成消息
         if text.startswith("PID_DONE:"):
             motor = text.split(":")[1] if ":" in text else ""
@@ -480,12 +630,18 @@ class PumpControlNode(object):
 
     def _cmd_callback(self, msg):
         """直接指令回调。"""
-        cmd = msg.data.strip().upper()
+        cmd = msg.data.strip()
+        cmd_upper = cmd.upper()
 
-        if cmd == "STOP":
+        if cmd_upper == "STOP":
             self.stop_all_pumps()
-        else:
-            self.send_command(cmd)
+            return
+
+        if self._is_injection_pump_command(cmd_upper):
+            self.send_command(cmd_upper)
+            return
+
+        self.send_command(cmd_upper)
 
     def _step_callback(self, msg):
         """
@@ -503,7 +659,11 @@ class PumpControlNode(object):
                         if target is not None:
                             self.pid_target_angles[motor] = target
 
-                self.send_command(command)
+                if not self.send_command(command):
+                    return
+
+            if not self._handle_injection_pump_step(step, mode="manual"):
+                rospy.logerr("Manual step injection pump command failed")
         except json.JSONDecodeError as e:
             rospy.logerr("Invalid step JSON: %s", str(e))
 
@@ -556,6 +716,27 @@ class PumpControlNode(object):
         """暂停自动化服务回调。"""
         self.automation_engine.pause()
         return TriggerResponse(success=True, message="Automation paused")
+
+    def _injection_on_callback(self, req):
+        """开启进样泵服务。"""
+        success = self._send_injection_pump_command(enabled=True)
+        return TriggerResponse(success=success, message="Injection pump on" if success else "Injection pump on failed")
+
+    def _injection_off_callback(self, req):
+        """关闭进样泵服务。"""
+        success = self._send_injection_pump_command(enabled=False)
+        return TriggerResponse(success=success, message="Injection pump off" if success else "Injection pump off failed")
+
+    def _injection_status_callback(self, req):
+        """获取进样泵状态服务。"""
+        success = self.send_command("PUMP:STATUS")
+        message = json.dumps({
+            "enabled": self.inject_pump_enabled,
+            "speed": self.inject_pump_speed,
+            "last_response": self.inject_pump_last_response,
+            "last_error": self.inject_pump_last_error,
+        })
+        return TriggerResponse(success=success, message=message)
 
     def _auto_resume_callback(self, req):
         """恢复自动化服务回调。"""
