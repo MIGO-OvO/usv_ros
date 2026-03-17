@@ -195,6 +195,9 @@ class SpectrometerNode(object):
         self.stop_srv = rospy.Service(
             '/usv/spectrometer_stop', Trigger, self._stop_callback
         )
+        self.reconfigure_srv = rospy.Service(
+            '/usv/spectrometer_reconfigure', Trigger, self._reconfigure_callback
+        )
 
         rospy.loginfo("Spectrometer Node initialized")
         rospy.loginfo("  Channel: %s", self.channel_name)
@@ -249,6 +252,42 @@ class SpectrometerNode(object):
             success=success,
             message="Acquisition stopped" if success else "Stop failed"
         )
+
+    def _reconfigure_callback(self, req):
+        """运行时重建 DAQ 设备服务回调。从 ROS 参数读取最新配置并重建。"""
+        try:
+            new_device = rospy.get_param('~device_name', self.device_name)
+            new_channel = rospy.get_param('~channel', self.channel)
+            new_rate = rospy.get_param('~sample_rate', self.sample_rate)
+
+            rospy.loginfo("Reconfiguring DAQ: %s/%s @ %d Hz (was %s/%s @ %d Hz)",
+                          new_device, new_channel, new_rate,
+                          self.device_name, self.channel, self.sample_rate)
+
+            was_acquiring = self.is_acquiring
+            if self.is_acquiring:
+                self.stop_acquisition()
+
+            self.device_name = new_device
+            self.channel = new_channel
+            self.sample_rate = new_rate
+            self.channel_name = "{}/{}".format(self.device_name, self.channel)
+
+            self.daq_reader = DAQReader(self.channel_name, self.sample_rate)
+
+            if was_acquiring:
+                self.start_acquisition()
+
+            msg = "Reconfigured to %s @ %d Hz" % (self.channel_name, self.sample_rate)
+            rospy.loginfo(msg)
+            self._publish_status("reconfigured")
+            return TriggerResponse(success=True, message=msg)
+
+        except Exception as e:
+            msg = "Reconfigure error: %s" % str(e)
+            rospy.logerr(msg)
+            self._publish_status("error: " + str(e))
+            return TriggerResponse(success=False, message=msg)
 
     def _publish_status(self, status):
         """发布状态消息。"""

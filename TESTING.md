@@ -234,7 +234,58 @@ sudo ./stop_hotspot.sh
 - 停止后显示 `STOPPED`
 - 重启后重新显示 `RUNNING`
 
-## 11. 故障排查
+## 11. 硬件连接设置测试
+### 11.1 Web 页面入口
+在浏览器打开 Settings 页面，应看到第三张卡片"硬件连接设置"。
+
+### 11.2 设备枚举
+点击"刷新设备"按钮：
+```bash
+curl http://127.0.0.1:5000/api/hardware/serial-ports
+curl http://127.0.0.1:5000/api/hardware/daq-devices
+```
+通过判据：
+- 串口列表返回 `success=true`，`ports` 数组包含当前已插入的 USB 串口
+- DAQ 列表返回 `success=true`，若无 NI-DAQ 驱动则 `simulation_mode=true`
+
+### 11.3 硬件配置读写
+```bash
+curl http://127.0.0.1:5000/api/hardware/config
+curl -X POST http://127.0.0.1:5000/api/hardware/config \
+  -H "Content-Type: application/json" \
+  -d '{"pump_serial_port":"/dev/ttyUSB1","pump_baudrate":115200}'
+```
+通过判据：
+- GET 返回当前硬件配置 JSON
+- POST 返回 `success=true`，配置已保存
+
+### 11.4 连接测试
+```bash
+curl -X POST http://127.0.0.1:5000/api/hardware/test-pump-port \
+  -H "Content-Type: application/json" \
+  -d '{"serial_port":"/dev/ttyUSB0","baudrate":115200,"timeout":1.0}'
+curl -X POST http://127.0.0.1:5000/api/hardware/test-daq \
+  -H "Content-Type: application/json" \
+  -d '{"device_name":"Dev1","channel":"ai0"}'
+```
+通过判据：
+- 正确串口返回 `success=true`
+- 错误串口返回 `success=false` 并附错误信息
+- DAQ 测试同理
+
+### 11.5 保存并应用（运行时热切换）
+```bash
+curl -X POST http://127.0.0.1:5000/api/hardware/apply \
+  -H "Content-Type: application/json" \
+  -d '{"pump_serial_port":"/dev/ttyUSB0","pump_baudrate":115200,"pump_timeout":1.0,"daq_device_name":"Dev1","daq_channel":"ai0","daq_sample_rate":100}'
+```
+通过判据：
+- 返回 `success=true`
+- `results.pump.success=true` 表示泵控节点已重连
+- `results.daq.success=true` 表示 DAQ 节点已重建
+- 错误时返回失败信息但 Web 仍可访问、节点进程不退出
+
+## 12. 故障排查
 - `serial` 模块缺失：安装 `pyserial`
 - Web 启动即退出：检查 `usv_system.log` 中 Werkzeug 报错
 - 5000 端口不通：检查 `ss -tuln | grep 5000`

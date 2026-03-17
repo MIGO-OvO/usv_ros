@@ -337,6 +337,7 @@ class PumpControlNode(object):
         self.injection_on_srv = rospy.Service('/usv/injection_pump_on', Trigger, self._injection_on_callback)
         self.injection_off_srv = rospy.Service('/usv/injection_pump_off', Trigger, self._injection_off_callback)
         self.injection_status_srv = rospy.Service('/usv/injection_pump_get_status', Trigger, self._injection_status_callback)
+        self.reconnect_srv = rospy.Service('/usv/pump_reconnect', Trigger, self._reconnect_callback)
 
         rospy.loginfo("Pump Control Node initialized")
         rospy.loginfo("  Serial: %s @ %d", self.serial_port, self.baudrate)
@@ -386,6 +387,38 @@ class PumpControlNode(object):
                 rospy.logwarn("Error closing serial: %s", str(e))
 
         rospy.loginfo("Disconnected from pump controller")
+
+    def _reconnect_callback(self, req):
+        """运行时重连串口服务回调。从 ROS 参数读取最新配置并重连。"""
+        try:
+            new_port = rospy.get_param('~serial_port', self.serial_port)
+            new_baud = rospy.get_param('~baudrate', self.baudrate)
+            new_timeout = rospy.get_param('~timeout', self.timeout)
+
+            rospy.loginfo("Reconnecting: %s @ %d (was %s @ %d)",
+                          new_port, new_baud, self.serial_port, self.baudrate)
+
+            with self.serial_lock:
+                self.disconnect()
+                self.serial_port = new_port
+                self.baudrate = new_baud
+                self.timeout = new_timeout
+
+            if self.connect():
+                msg = "Reconnected to %s @ %d" % (self.serial_port, self.baudrate)
+                rospy.loginfo(msg)
+                return TriggerResponse(success=True, message=msg)
+            else:
+                msg = "Failed to connect to %s" % self.serial_port
+                rospy.logerr(msg)
+                self._publish_status("disconnected")
+                return TriggerResponse(success=False, message=msg)
+
+        except Exception as e:
+            msg = "Reconnect error: %s" % str(e)
+            rospy.logerr(msg)
+            self._publish_status("error: " + str(e))
+            return TriggerResponse(success=False, message=msg)
 
     def send_command(self, command):
         """

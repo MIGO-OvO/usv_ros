@@ -284,6 +284,15 @@ DEFAULT_CONFIG = {
     "detection_settings": {
         "duration": 5.0,
         "sample_rate": 100
+    },
+    "hardware": {
+        "pump_serial_port": "/dev/ttyUSB0",
+        "pump_baudrate": 115200,
+        "pump_timeout": 1.0,
+        "daq_device_name": "Dev1",
+        "daq_channel": "ai0",
+        "daq_sample_rate": 100,
+        "daq_auto_start": False
     }
 }
 
@@ -929,7 +938,152 @@ class WebConfigServer(object):
 
             return jsonify({"success": False, "message": "ROS Publisher 未初始化", "data": self.injection_pump_status}), 500
 
-    def _trigger_mission(self, action):
+        # ================= 硬件配置 API =================
+        @self.app.route('/api/hardware/config', methods=['GET'])
+        def get_hardware_config():
+            hw = self.config_manager.get().get('hardware', DEFAULT_CONFIG['hardware'])
+            return jsonify({"success": True, "data": hw})
+
+        @self.app.route('/api/hardware/config', methods=['POST'])
+        def save_hardware_config():
+            data = request.get_json()
+            if not data:
+                return jsonify({"success": False, "message": "请求体为空"}), 400
+            current = self.config_manager.get()
+            hw = current.get('hardware', dict(DEFAULT_CONFIG['hardware']))
+            for key in DEFAULT_CONFIG['hardware']:
+                if key in data:
+                    hw[key] = data[key]
+            current['hardware'] = hw
+            if self.config_manager.update(current):
+                self._add_log("硬件配置已保存", "success")
+                return jsonify({"success": True, "message": "硬件配置已保存", "data": hw})
+            return jsonify({"success": False, "message": "保存失败"}), 500
+
+        @self.app.route('/api/hardware/serial-ports', methods=['GET'])
+        def list_serial_ports():
+            ports = []
+            try:
+                import serial.tools.list_ports as lp
+                for p in lp.comports():
+                    ports.append({
+                        "path": p.device,
+                        "description": p.description or "",
+                        "hwid": p.hwid or ""
+                    })
+            except Exception:
+                pass
+            # 补充 /dev/serial/by-id 映射
+            by_id_dir = "/dev/serial/by-id"
+            try:
+                import glob
+                for link in glob.glob(os.path.join(by_id_dir, "*")):
+                    real = os.path.realpath(link)
+                    found = False
+                    for p in ports:
+                        if p["path"] == real:
+                            p["by_id"] = link
+                            found = True
+                            break
+                    if not found:
+                        ports.append({"path": real, "description": os.path.basename(link), "hwid": "", "by_id": link})
+            except Exception:
+                pass
+            return jsonify({"success": True, "ports": ports})
+
+        @self.app.route('/api/hardware/daq-devices', methods=['GET'])
+        def list_daq_devices():
+            devices = []
+            simulation_mode = True
+            try:
+                import nidaqmx.system
+                system = nidaqmx.system.System.local()
+                for dev in system.devices:
+                    channels = [ch.name for ch in dev.ai_physical_chans]
+                    devices.append({
+                        "name": dev.name,
+                        "product_type": dev.product_type,
+                        "channels": channels
+                    })
+                simulation_mode = False
+            except Exception:
+                pass
+            return jsonify({"success": True, "devices": devices, "simulation_mode": simulation_mode})
+
+        @self.app.route('/api/hardware/test-pump-port', methods=['POST'])
+        def test_pump_port():
+            data = request.get_json() or {}
+            port = data.get('serial_port', '/dev/ttyUSB0')
+            baud = int(data.get('baudrate', 115200))
+            tout = float(data.get('timeout', 1.0))
+            try:
+                import serial as pyserial
+                conn = pyserial.Serial(port=port, baudrate=baud, timeout=tout)
+                conn.close()
+                return jsonify({"success": True, "message": f"串口 {port} 可打开"})
+            except Exception as e:
+                return jsonify({"success": False, "message": str(e)})
+
+        @self.app.route('/api/hardware/test-daq', methods=['POST'])
+        def test_daq():
+            data = request.get_json() or {}
+            dev_name = data.get('device_name', 'Dev1')
+            channel = data.get('channel', 'ai0')
+            try:
+                import nidaqmx
+                task = nidaqmx.Task()
+                task.ai_channels.add_ai_voltage_chan(f"{dev_name}/{channel}")
+                task.close()
+                return jsonify({"success": True, "message": f"DAQ {dev_name}/{channel} 可访问"})
+            except Exception as e:
+                return jsonify({"success": False, "message": str(e)})
+
+        @self.app.route('/api/hardware/apply', methods=['POST'])
+        def apply_hardware_config():
+            """保存硬件配置并通知节点运行时重连。"""
+            data = request.get_json() or {}
+            # 先保存
+            current = self.config_manager.get()
+            hw = current.get('hardware', dict(DEFAULT_CONFIG['hardware']))
+            for key in DEFAULT_CONFIG['hardware']:
+                if key in data:
+                    hw[key] = data[key]
+            current['hardware'] = hw
+            if not self.config_manager.update(current):
+                return jsonify({"success": False, "message": "保存失败"}), 500
+
+            results = {"pump": None, "daq": None}
+
+            # 通知 pump 节点重连
+            if not self.standalone:
+                try:
+                    rospy.set_param('/pump_control_node/serial_port', hw['pump_serial_port'])
+                    rospy.set_param('/pump_control_node/baudrate', int(hw['pump_baudrate']))
+                    rospy.set_param('/pump_control_node/timeout', float(hw['pump_timeout']))
+                    svc = rospy.ServiceProxy('/usv/pump_reconnect', Trigger)
+                    svc.wait_for_service(timeout=3.0)
+                    resp = svc()
+                    results["pump"] = {"success": resp.success, "message": resp.message}
+                except Exception as e:
+                    results["pump"] = {"success": False, "message": str(e)}
+
+                # 通知 spectrometer 节点重建
+                try:
+                    rospy.set_param('/spectrometer_node/device_name', hw['daq_device_name'])
+                    rospy.set_param('/spectrometer_node/channel', hw['daq_channel'])
+                    rospy.set_param('/spectrometer_node/sample_rate', int(hw['daq_sample_rate']))
+                    svc = rospy.ServiceProxy('/usv/spectrometer_reconfigure', Trigger)
+                    svc.wait_for_service(timeout=3.0)
+                    resp = svc()
+                    results["daq"] = {"success": resp.success, "message": resp.message}
+                except Exception as e:
+                    results["daq"] = {"success": False, "message": str(e)}
+            else:
+                results["pump"] = {"success": True, "message": "独立模式，跳过"}
+                results["daq"] = {"success": True, "message": "独立模式，跳过"}
+
+            self._add_log("硬件配置已应用", "info")
+            return jsonify({"success": True, "message": "硬件配置已应用", "data": hw, "results": results})
         """触发任务动作。"""
         if self.standalone:
             msg = "独立模式下无法触发任务 (需要 ROS 集成)"

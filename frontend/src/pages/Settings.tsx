@@ -3,20 +3,130 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Save, RefreshCw, Zap, Target, RotateCcw } from 'lucide-react'
+import { Save, RefreshCw, Zap, Target, RotateCcw, Usb, Activity } from 'lucide-react'
 import { useAppStore } from '@/store'
+
+interface SerialPort {
+  path: string
+  description: string
+  hwid: string
+  by_id?: string
+}
+
+interface DaqDevice {
+  name: string
+  product_type: string
+  channels: string[]
+}
+
+interface HardwareConfig {
+  pump_serial_port: string
+  pump_baudrate: number
+  pump_timeout: number
+  daq_device_name: string
+  daq_channel: string
+  daq_sample_rate: number
+  daq_auto_start: boolean
+}
+
+const DEFAULT_HW: HardwareConfig = {
+  pump_serial_port: '/dev/ttyUSB0',
+  pump_baudrate: 115200,
+  pump_timeout: 1.0,
+  daq_device_name: 'Dev1',
+  daq_channel: 'ai0',
+  daq_sample_rate: 100,
+  daq_auto_start: false,
+}
 
 export default function Settings() {
   const { pumpAngles, rawAngles } = useAppStore()
   const [config, setConfig] = useState({
       Kp: 0, Ki: 0, Kd: 0, output_min: -255, output_max: 255
   })
-  // const [offsets, setOffsets] = useState({ X: 0, Y: 0, Z: 0, A: 0 })
+
+  const [hw, setHw] = useState<HardwareConfig>({ ...DEFAULT_HW })
+  const [serialPorts, setSerialPorts] = useState<SerialPort[]>([])
+  const [daqDevices, setDaqDevices] = useState<DaqDevice[]>([])
+  const [hwLoading, setHwLoading] = useState(false)
+  const [hwMsg, setHwMsg] = useState('')
 
   useEffect(() => {
     fetchConfig()
-    // fetchOffsets()
+    fetchHardwareConfig()
   }, [])
+
+  const fetchHardwareConfig = async () => {
+    try {
+      const res = await fetch('/api/hardware/config')
+      const data = await res.json()
+      if (data.success) setHw({ ...DEFAULT_HW, ...data.data })
+    } catch (e) { console.error(e) }
+  }
+
+  const refreshDevices = async () => {
+    try {
+      const [sp, dq] = await Promise.all([
+        fetch('/api/hardware/serial-ports').then(r => r.json()),
+        fetch('/api/hardware/daq-devices').then(r => r.json()),
+      ])
+      if (sp.success) setSerialPorts(sp.ports || [])
+      if (dq.success) setDaqDevices(dq.devices || [])
+    } catch (e) { console.error(e) }
+  }
+
+  const testPumpPort = async () => {
+    setHwMsg('')
+    try {
+      const res = await fetch('/api/hardware/test-pump-port', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ serial_port: hw.pump_serial_port, baudrate: hw.pump_baudrate, timeout: hw.pump_timeout })
+      })
+      const data = await res.json()
+      setHwMsg(data.message)
+    } catch (e: any) { setHwMsg(e.message) }
+  }
+
+  const testDaq = async () => {
+    setHwMsg('')
+    try {
+      const res = await fetch('/api/hardware/test-daq', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ device_name: hw.daq_device_name, channel: hw.daq_channel })
+      })
+      const data = await res.json()
+      setHwMsg(data.message)
+    } catch (e: any) { setHwMsg(e.message) }
+  }
+
+  const saveAndApplyHardware = async () => {
+    setHwLoading(true)
+    setHwMsg('')
+    try {
+      const res = await fetch('/api/hardware/apply', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(hw)
+      })
+      const data = await res.json()
+      const msgs: string[] = [data.message || '']
+      if (data.results?.pump) msgs.push('泵控: ' + data.results.pump.message)
+      if (data.results?.daq) msgs.push('DAQ: ' + data.results.daq.message)
+      setHwMsg(msgs.join(' | '))
+    } catch (e: any) { setHwMsg(e.message) }
+    setHwLoading(false)
+  }
+
+  const saveHardwareOnly = async () => {
+    setHwMsg('')
+    try {
+      const res = await fetch('/api/hardware/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(hw)
+      })
+      const data = await res.json()
+      setHwMsg(data.message || '已保存')
+    } catch (e: any) { setHwMsg(e.message) }
+  }
 
   const fetchConfig = async () => {
     try {
@@ -172,6 +282,99 @@ export default function Settings() {
             </CardContent>
         </Card>
       </div>
+
+      {/* ==================== 硬件连接设置 ==================== */}
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2">
+            <Usb className="w-5 h-5 text-blue-500" />
+            硬件连接设置
+          </CardTitle>
+        </CardHeader>
+        <CardContent className="space-y-6">
+          <div className="flex gap-2 mb-2">
+            <Button variant="outline" size="sm" onClick={refreshDevices}><RefreshCw className="w-4 h-4 mr-1" />刷新设备</Button>
+          </div>
+
+          {/* 泵控板串口 */}
+          <div className="space-y-3">
+            <h4 className="font-medium text-sm">泵控板串口</h4>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="space-y-2">
+                <Label>串口路径</Label>
+                <select
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  value={hw.pump_serial_port}
+                  onChange={e => setHw(p => ({ ...p, pump_serial_port: e.target.value }))}
+                >
+                  <option value={hw.pump_serial_port}>{hw.pump_serial_port}</option>
+                  {serialPorts.filter(p => p.path !== hw.pump_serial_port).map(p => (
+                    <option key={p.by_id || p.path} value={p.by_id || p.path}>
+                      {p.by_id || p.path}{p.description ? ` (${p.description})` : ''}
+                    </option>
+                  ))}
+                </select>
+              </div>
+              <div className="space-y-2">
+                <Label>波特率</Label>
+                <Input type="number" value={hw.pump_baudrate} onChange={e => setHw(p => ({ ...p, pump_baudrate: parseInt(e.target.value) || 115200 }))} />
+              </div>
+              <div className="space-y-2">
+                <Label>超时 (秒)</Label>
+                <Input type="number" step="0.1" value={hw.pump_timeout} onChange={e => setHw(p => ({ ...p, pump_timeout: parseFloat(e.target.value) || 1.0 }))} />
+              </div>
+            </div>
+            <Button variant="outline" size="sm" onClick={testPumpPort}><Activity className="w-4 h-4 mr-1" />测试泵控连接</Button>
+          </div>
+
+          {/* DAQ 设备 */}
+          <div className="space-y-3">
+            <h4 className="font-medium text-sm">DAQ 数据采集卡</h4>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="space-y-2">
+                <Label>设备名</Label>
+                <select
+                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
+                  value={hw.daq_device_name}
+                  onChange={e => setHw(p => ({ ...p, daq_device_name: e.target.value }))}
+                >
+                  <option value={hw.daq_device_name}>{hw.daq_device_name}</option>
+                  {daqDevices.filter(d => d.name !== hw.daq_device_name).map(d => (
+                    <option key={d.name} value={d.name}>{d.name} ({d.product_type})</option>
+                  ))}
+                </select>
+              </div>
+              <div className="space-y-2">
+                <Label>通道</Label>
+                <Input value={hw.daq_channel} onChange={e => setHw(p => ({ ...p, daq_channel: e.target.value }))} />
+              </div>
+              <div className="space-y-2">
+                <Label>采样率 (Hz)</Label>
+                <Input type="number" value={hw.daq_sample_rate} onChange={e => setHw(p => ({ ...p, daq_sample_rate: parseInt(e.target.value) || 100 }))} />
+              </div>
+            </div>
+            <Button variant="outline" size="sm" onClick={testDaq}><Activity className="w-4 h-4 mr-1" />测试 DAQ 连接</Button>
+          </div>
+
+          {hwMsg && (
+            <div className="text-sm p-3 rounded bg-muted/50">{hwMsg}</div>
+          )}
+
+          <div className="flex gap-2">
+            <Button onClick={saveHardwareOnly} variant="outline"><Save className="w-4 h-4 mr-1" />仅保存</Button>
+            <Button onClick={saveAndApplyHardware} disabled={hwLoading}>
+              {hwLoading ? <RefreshCw className="w-4 h-4 mr-1 animate-spin" /> : <Zap className="w-4 h-4 mr-1" />}
+              保存并应用
+            </Button>
+          </div>
+
+          <div className="text-xs text-muted-foreground bg-muted/50 p-3 rounded">
+            <p>"仅保存"将配置写入文件，下次重启生效。</p>
+            <p>"保存并应用"将立即通知节点重连设备，无需重启系统。</p>
+            <p>串口建议优先选择 /dev/serial/by-id/... 路径，避免 USB 口漂移。</p>
+          </div>
+        </CardContent>
+      </Card>
     </div>
   )
 }
