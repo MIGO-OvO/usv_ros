@@ -1084,6 +1084,8 @@ class WebConfigServer(object):
 
             self._add_log("硬件配置已应用", "info")
             return jsonify({"success": True, "message": "硬件配置已应用", "data": hw, "results": results})
+
+    def _trigger_mission(self, action):
         """触发任务动作。"""
         if self.standalone:
             msg = "独立模式下无法触发任务 (需要 ROS 集成)"
@@ -1098,6 +1100,11 @@ class WebConfigServer(object):
         }
 
         service_name = service_map.get(action)
+        if not service_name:
+            msg = f"不支持的任务动作: {action}"
+            self._add_log(msg, "warning")
+            return jsonify({"success": False, "message": msg}), 400
+
         try:
             # 如果是启动，先发送最新配置
             if action == 'start':
