@@ -1,15 +1,22 @@
 #!/bin/bash
 # USV Wi-Fi Hotspot Setup Script
-# 在 Jetson Nano 上创建 Wi-Fi 热点（显式开放网络，无密码）
+# 在 Jetson Nano 上创建 Wi-Fi 热点。
 #
 # 使用方法:
-#   sudo ./setup_hotspot.sh [SSID]
+#   sudo ./setup_hotspot.sh [SSID] [PASSWORD]
 #
 # 默认:
 #   SSID: USV_Control
-#   安全模式: open
+#   PASSWORD: 12345678
+#
+# 说明:
+#   - 当前 Jetson / NetworkManager 环境下，开放热点配置存在兼容性问题。
+#   - 默认改为创建 WPA-PSK 热点，优先保证现场可用性。
+
+set -euo pipefail
 
 SSID="${1:-USV_Control}"
+PASSWORD="${2:-12345678}"
 INTERFACE="wlan0"
 CON_NAME="USV_AP"
 HOTSPOT_IP="10.42.0.1"
@@ -18,7 +25,8 @@ echo "=========================================="
 echo "USV Wi-Fi Hotspot Setup"
 echo "=========================================="
 echo "SSID: $SSID"
-echo "安全模式: open (无密码)"
+echo "Password: $PASSWORD"
+echo "Security: WPA-PSK"
 echo "Interface: $INTERFACE"
 echo ""
 
@@ -37,20 +45,27 @@ if ! ip link show "$INTERFACE" >/dev/null 2>&1; then
     exit 1
 fi
 
+if [ "${#PASSWORD}" -lt 8 ]; then
+    echo "错误: WPA-PSK 密码长度必须 >= 8"
+    exit 1
+fi
+
 echo "清理旧连接..."
 nmcli con delete "$CON_NAME" >/dev/null 2>&1 || true
 
 echo "断开 $INTERFACE 当前连接..."
 nmcli dev disconnect "$INTERFACE" >/dev/null 2>&1 || true
 
-echo "创建开放热点连接..."
-nmcli connection add type wifi ifname "$INTERFACE" con-name "$CON_NAME" autoconnect yes ssid "$SSID" >/dev/null
+echo "创建热点连接..."
+nmcli connection add type wifi ifname "$INTERFACE" con-name "$CON_NAME" ssid "$SSID" >/dev/null
 nmcli connection modify "$CON_NAME" \
     802-11-wireless.mode ap \
     802-11-wireless.band bg \
     ipv4.method shared \
     ipv6.method ignore \
-    wifi-sec.key-mgmt "" >/dev/null
+    wifi-sec.key-mgmt wpa-psk \
+    wifi-sec.psk "$PASSWORD" \
+    connection.autoconnect yes >/dev/null
 
 echo "启动热点连接..."
 if nmcli connection up "$CON_NAME" >/dev/null 2>&1; then
@@ -59,7 +74,8 @@ if nmcli connection up "$CON_NAME" >/dev/null 2>&1; then
     echo "热点创建成功!"
     echo "=========================================="
     echo "SSID: $SSID"
-    echo "安全模式: open (无密码)"
+    echo "Password: $PASSWORD"
+    echo "Security: WPA-PSK"
     echo "热点 IP: $HOTSPOT_IP"
     echo ""
     echo "当前 $INTERFACE 状态:"
@@ -77,7 +93,7 @@ else
     echo "可能原因:"
     echo "1. $INTERFACE 已被其他连接占用"
     echo "2. 网络接口不支持 AP 模式"
-    echo "3. NetworkManager 不允许当前无线芯片创建开放热点"
+    echo "3. NetworkManager 不允许当前无线芯片创建热点"
     echo ""
     echo "建议排查:"
     echo "  nmcli dev status"

@@ -1032,7 +1032,13 @@ class WebConfigServer(object):
 
         # 启动 SocketIO 服务器
         try:
-            self.socketio.run(self.app, host=self.host, port=self.port, use_reloader=False)
+            self.socketio.run(
+                self.app,
+                host=self.host,
+                port=self.port,
+                use_reloader=False,
+                allow_unsafe_werkzeug=True
+            )
         except Exception as e:
             rospy.logerr(f"Server error: {e}")
         except KeyboardInterrupt:
