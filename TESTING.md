@@ -1,5 +1,5 @@
 # USV ROS 系统功能测试手册
-Updated: 2026-03-15T01:20:00Z
+Updated: 2026-03-15T02:00:00Z
 
 ## 1. 目标
 用于验证 `src/usv_ros/` 当前主链路是否可用，包括：
@@ -40,6 +40,7 @@ chmod +x src/usv_ros/scripts/stop_usv_all.sh
 chmod +x src/usv_ros/scripts/status_usv_all.sh
 chmod +x src/usv_ros/scripts/restart_usv_all.sh
 chmod +x src/usv_ros/scripts/setup_hotspot.sh
+chmod +x src/usv_ros/scripts/stop_hotspot.sh
 ```
 
 ## 3. 启动与状态测试
@@ -176,10 +177,16 @@ rostopic echo /mavros/mavlink/to
 ### 9.1 代码核查结论
 - `web_config_server.py` **没有**实装“创建热点”的逻辑。
 - Web 节点只负责监听 `0.0.0.0:5000` 并提供页面/API。
-- 热点创建由独立脚本 `src/usv_ros/scripts/setup_hotspot.sh` 负责，底层依赖 `nmcli`。
+- 热点创建由独立脚本 `src/usv_ros/scripts/setup_hotspot.sh` 负责，关闭由 `src/usv_ros/scripts/stop_hotspot.sh` 负责，底层依赖 `nmcli`。
 - 因此：**可以通过热点访问 Web 页，但热点功能不在 Web 节点内部实现。**
 
-### 9.2 热点创建与访问测试
+### 9.2 为什么可能会看到“热点要求输入密码”
+- 旧脚本使用 `nmcli dev wifi hotspot ...`。
+- 在很多 NetworkManager 版本中，这条命令会默认创建带 WPA/WPA2 安全配置的热点，而不是严格意义上的开放热点。
+- 现已改为显式创建 `802-11-wireless.mode=ap` 且 `wifi-sec.key-mgmt=''` 的开放热点连接。
+- 若设备端仍显示需要密码，先执行关闭脚本，再重新创建热点，避免沿用旧连接配置。
+
+### 9.3 热点创建与访问测试
 ```bash
 cd ~/usv_ws/src/usv_ros/scripts
 sudo ./setup_hotspot.sh USV_Control
@@ -187,10 +194,28 @@ sudo ./setup_hotspot.sh USV_Control
 客户端连接热点后访问：
 - `http://10.42.0.1:5000`
 
+建议附加检查：
+```bash
+nmcli -f GENERAL.NAME,802-11-wireless.ssid,802-11-wireless.mode,802-11-wireless-security.key-mgmt con show USV_AP
+./status_usv_all.sh
+curl http://10.42.0.1:5000/api/ui/debug
+```
+
 通过判据：
 - 手机/电脑能连接 `USV_Control`
+- `nmcli ... con show USV_AP` 中 `key-mgmt` 为空
+- `status_usv_all.sh` 显示 `conn=active ip=assigned web_port=listening`
 - `curl http://10.42.0.1:5000/api/ui/debug` 返回 JSON
 - 浏览器能打开 Web 配置页
+
+### 9.4 一键关闭热点
+```bash
+cd ~/usv_ws/src/usv_ros/scripts
+sudo ./stop_hotspot.sh
+```
+通过判据：
+- `nmcli con show --active` 中不再出现 `USV_AP`
+- `status_usv_all.sh` 不再显示 `conn=active`
 
 ## 10. 停止与重启测试
 ```bash
@@ -207,5 +232,6 @@ sudo ./setup_hotspot.sh USV_Control
 - Web 启动即退出：检查 `usv_system.log` 中 Werkzeug 报错
 - 5000 端口不通：检查 `ss -tuln | grep 5000`
 - 热点无法创建：检查 `nmcli`、`wlan0` 是否支持 AP 模式
+- 热点仍要求密码：先执行 `sudo ./stop_hotspot.sh`，再执行 `sudo ./setup_hotspot.sh USV_Control`，并检查 `nmcli con show USV_AP`
 - MAVROS 无数据：检查 `/mavros/state` 与飞控串口
 

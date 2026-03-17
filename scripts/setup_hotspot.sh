@@ -1,83 +1,90 @@
 #!/bin/bash
 # USV Wi-Fi Hotspot Setup Script
-# 在 Jetson Nano 上创建 Wi-Fi 热点 (无密码)
+# 在 Jetson Nano 上创建 Wi-Fi 热点（显式开放网络，无密码）
 #
 # 使用方法:
 #   sudo ./setup_hotspot.sh [SSID]
 #
 # 默认:
 #   SSID: USV_Control
-#   无密码 (开放网络)
+#   安全模式: open
 
 SSID="${1:-USV_Control}"
 INTERFACE="wlan0"
 CON_NAME="USV_AP"
+HOTSPOT_IP="10.42.0.1"
 
 echo "=========================================="
 echo "USV Wi-Fi Hotspot Setup"
 echo "=========================================="
 echo "SSID: $SSID"
-echo "密码: 无 (开放网络)"
+echo "安全模式: open (无密码)"
 echo "Interface: $INTERFACE"
 echo ""
 
-# 检查是否为 root
 if [ "$EUID" -ne 0 ]; then
     echo "请使用 sudo 运行此脚本"
     exit 1
 fi
 
-# 检查 NetworkManager
-if ! command -v nmcli &> /dev/null; then
+if ! command -v nmcli >/dev/null 2>&1; then
     echo "错误: nmcli 未安装"
     exit 1
 fi
 
-# 删除已存在的连接
+if ! ip link show "$INTERFACE" >/dev/null 2>&1; then
+    echo "错误: 接口 $INTERFACE 不存在"
+    exit 1
+fi
+
 echo "清理旧连接..."
-nmcli con delete "$CON_NAME" 2>/dev/null
+nmcli con delete "$CON_NAME" >/dev/null 2>&1 || true
 
-# 创建热点 (无密码)
-echo "创建开放热点..."
-nmcli dev wifi hotspot ifname "$INTERFACE" con-name "$CON_NAME" ssid "$SSID"
+echo "断开 $INTERFACE 当前连接..."
+nmcli dev disconnect "$INTERFACE" >/dev/null 2>&1 || true
 
-if [ $? -eq 0 ]; then
+echo "创建开放热点连接..."
+nmcli connection add type wifi ifname "$INTERFACE" con-name "$CON_NAME" autoconnect yes ssid "$SSID" >/dev/null
+nmcli connection modify "$CON_NAME" \
+    802-11-wireless.mode ap \
+    802-11-wireless.band bg \
+    ipv4.method shared \
+    ipv6.method ignore \
+    wifi-sec.key-mgmt "" >/dev/null
+
+echo "启动热点连接..."
+if nmcli connection up "$CON_NAME" >/dev/null 2>&1; then
     echo ""
     echo "=========================================="
     echo "热点创建成功!"
     echo "=========================================="
     echo "SSID: $SSID"
-    echo "密码: 无 (开放网络)"
-    echo "热点 IP: 10.42.0.1"
+    echo "安全模式: open (无密码)"
+    echo "热点 IP: $HOTSPOT_IP"
     echo ""
-    echo "注意: 如果 wlan0 已连接到其他网络，热点可能无法启动"
-    echo "当前 wlan0 状态:"
-    ip addr show wlan0 | grep "inet " || echo "  未分配 IP"
+    echo "当前 $INTERFACE 状态:"
+    ip -4 addr show "$INTERFACE" | grep "inet " || echo "  未分配 IP"
     echo ""
     echo "Web 配置界面:"
-    echo "  - 通过热点: http://10.42.0.1:5000"
-    echo "  - 通过 SSH: http://10.33.106.36:5000"
+    echo "  - 通过热点: http://$HOTSPOT_IP:5000"
     echo ""
-    echo "SSH 访问:"
-    echo "  ssh jetson@10.33.106.36"
-    echo ""
-    echo "设置开机自启:"
-    echo "  nmcli con mod '$CON_NAME' connection.autoconnect yes"
+    echo "连接详情:"
+    nmcli -f GENERAL.NAME,GENERAL.DEVICES,802-11-wireless.ssid,802-11-wireless.mode,802-11-wireless-security.key-mgmt con show "$CON_NAME"
     echo ""
 else
     echo "热点创建失败!"
     echo ""
     echo "可能原因:"
-    echo "1. wlan0 已连接到其他网络 (需要断开)"
+    echo "1. $INTERFACE 已被其他连接占用"
     echo "2. 网络接口不支持 AP 模式"
+    echo "3. NetworkManager 不允许当前无线芯片创建开放热点"
     echo ""
-    echo "解决方案:"
-    echo "  # 断开当前 Wi-Fi 连接"
-    echo "  nmcli dev disconnect wlan0"
-    echo "  # 然后重新运行此脚本"
+    echo "建议排查:"
+    echo "  nmcli dev status"
+    echo "  nmcli -p connection show '$CON_NAME'"
+    echo "  nmcli dev wifi list ifname $INTERFACE"
     exit 1
 fi
 
-# 显示连接状态
 echo "当前网络状态:"
 nmcli dev status
