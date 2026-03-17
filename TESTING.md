@@ -236,28 +236,39 @@ sudo ./stop_hotspot.sh
 
 ## 11. 硬件连接设置测试
 ### 11.1 Web 页面入口
-在浏览器打开 Settings 页面，应看到第三张卡片"硬件连接设置"。
+在浏览器打开 Settings 页面，应看到第三张卡片“硬件连接设置”。
+
+页面动作应包括：
+- `刷新设备`
+- `测试泵控连接`
+- `测试 DAQ 连接`
+- `仅保存`
+- `保存并应用`
 
 ### 11.2 设备枚举
-点击"刷新设备"按钮：
+点击“刷新设备”按钮：
 ```bash
 curl http://127.0.0.1:5000/api/hardware/serial-ports
 curl http://127.0.0.1:5000/api/hardware/daq-devices
 ```
 通过判据：
 - 串口列表返回 `success=true`，`ports` 数组包含当前已插入的 USB 串口
-- DAQ 列表返回 `success=true`，若无 NI-DAQ 驱动则 `simulation_mode=true`
+- 若存在 `/dev/serial/by-id`，返回项应优先给出 `by_id`
+- DAQ 列表返回 `success=true`
+- 若无 NI-DAQ 驱动或设备，返回 `simulation_mode=true`
 
 ### 11.3 硬件配置读写
 ```bash
 curl http://127.0.0.1:5000/api/hardware/config
 curl -X POST http://127.0.0.1:5000/api/hardware/config \
   -H "Content-Type: application/json" \
-  -d '{"pump_serial_port":"/dev/ttyUSB1","pump_baudrate":115200}'
+  -d '{"pump_serial_port":"/dev/ttyUSB1","pump_baudrate":115200,"daq_device_name":"Dev1","daq_channel":"ai0","daq_sample_rate":100}'
 ```
 通过判据：
 - GET 返回当前硬件配置 JSON
-- POST 返回 `success=true`，配置已保存
+- POST 返回 `success=true`
+- 再次 GET 可读到更新后的 `hardware` 配置段
+- `POST /api/hardware/config` 不应触发运行中节点重连
 
 ### 11.4 连接测试
 ```bash
@@ -271,24 +282,38 @@ curl -X POST http://127.0.0.1:5000/api/hardware/test-daq \
 通过判据：
 - 正确串口返回 `success=true`
 - 错误串口返回 `success=false` 并附错误信息
-- DAQ 测试同理
+- 正确 DAQ 通道返回 `success=true`
+- 错误 DAQ 通道返回 `success=false` 并附错误信息
 
 ### 11.5 保存并应用（运行时热切换）
 ```bash
 curl -X POST http://127.0.0.1:5000/api/hardware/apply \
   -H "Content-Type: application/json" \
   -d '{"pump_serial_port":"/dev/ttyUSB0","pump_baudrate":115200,"pump_timeout":1.0,"daq_device_name":"Dev1","daq_channel":"ai0","daq_sample_rate":100}'
+
+rosservice call /usv/pump_reconnect
+rosservice call /usv/spectrometer_reconfigure
 ```
 通过判据：
-- 返回 `success=true`
+- HTTP 返回 `success=true`
 - `results.pump.success=true` 表示泵控节点已重连
 - `results.daq.success=true` 表示 DAQ 节点已重建
+- `pump_control_node.py` 日志出现 `Reconnecting:` 或 `Reconnected to`
+- `spectrometer_node.py` 日志出现 `Reconfiguring DAQ:` 或 `Reconfigured to`
 - 错误时返回失败信息但 Web 仍可访问、节点进程不退出
+
+### 11.6 边界确认
+- `pump_serial_port`、`pump_baudrate`、`pump_timeout`：当前支持运行时热切换
+- `daq_device_name`、`daq_channel`、`daq_sample_rate`：当前支持运行时热切换
+- `daq_auto_start`：当前已在默认配置与前端数据模型中存在，但 `POST /api/hardware/apply` 未运行时下发该字段；若要验证其效果，应重启 `spectrometer_node` 或整套系统
 
 ## 12. 故障排查
 - `serial` 模块缺失：安装 `pyserial`
 - Web 启动即退出：检查 `usv_system.log` 中 Werkzeug 报错
 - 5000 端口不通：检查 `ss -tuln | grep 5000`
+- 串口测试失败：检查设备路径、用户组权限、串口占用
+- DAQ 测试失败：检查 NI-DAQmx 驱动、设备名、通道名
+- 保存并应用失败：检查 `/usv/pump_reconnect` 与 `/usv/spectrometer_reconfigure` 是否存在，检查 `results.*.message`
 - 热点无法创建：检查 `nmcli`、`wlan0` 是否支持 AP 模式
 - 热点仍要求密码：先执行 `sudo ./stop_hotspot.sh`，再执行 `sudo ./setup_hotspot.sh USV_Control`，并检查 `nmcli con show USV_AP`
 - MAVROS 无数据：检查 `/mavros/state` 与飞控串口
