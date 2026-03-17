@@ -191,6 +191,11 @@ rostopic echo /mavros/mavlink/to
 cd ~/usv_ws/src/usv_ros/scripts
 sudo ./setup_hotspot.sh USV_Control 12345678
 ```
+说明：
+- 脚本会在启动热点前记录 `wlan0` 当前活动 WiFi 连接名。
+- 记录文件路径：`~/usv_ws/.usv_run/previous_wifi_connection`
+- 关闭热点时，`stop_hotspot.sh` 会尝试自动回连该连接。
+
 客户端连接热点后访问：
 - `http://10.42.0.1:5000`
 
@@ -216,6 +221,7 @@ sudo ./stop_hotspot.sh
 ```
 通过判据：
 - `nmcli con show --active` 中不再出现 `USV_AP`
+- 若热点前存在活动 WiFi，则自动尝试回连该连接
 - `status_usv_all.sh` 不再显示 `conn=active`
 
 ## 10. 停止与重启测试

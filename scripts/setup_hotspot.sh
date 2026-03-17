@@ -20,6 +20,11 @@ PASSWORD="${2:-12345678}"
 INTERFACE="wlan0"
 CON_NAME="USV_AP"
 HOTSPOT_IP="10.42.0.1"
+WS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+RUN_DIR="$WS_DIR/.usv_run"
+PREV_WIFI_FILE="$RUN_DIR/previous_wifi_connection"
+
+mkdir -p "$RUN_DIR"
 
 echo "=========================================="
 echo "USV Wi-Fi Hotspot Setup"
@@ -48,6 +53,15 @@ fi
 if [ "${#PASSWORD}" -lt 8 ]; then
     echo "错误: WPA-PSK 密码长度必须 >= 8"
     exit 1
+fi
+
+PREVIOUS_WIFI="$(nmcli -t -f NAME,DEVICE,TYPE con show --active 2>/dev/null | awk -F: -v iface="$INTERFACE" '$2==iface && $3=="802-11-wireless" {print $1; exit}')"
+if [ -n "$PREVIOUS_WIFI" ] && [ "$PREVIOUS_WIFI" != "$CON_NAME" ]; then
+    echo "$PREVIOUS_WIFI" > "$PREV_WIFI_FILE"
+    echo "记录上一个 WiFi 连接: $PREVIOUS_WIFI"
+else
+    rm -f "$PREV_WIFI_FILE"
+    echo "未检测到可回连的上一个 WiFi 连接"
 fi
 
 echo "清理旧连接..."
