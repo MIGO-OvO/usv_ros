@@ -187,8 +187,6 @@ roslaunch usv_ros usv_bringup.launch
 
 ### 5.2 多终端顺序启动（调试/联调推荐）
 
-适用于你提到的“先起 ROS，再起服务”流程，便于分终端观察日志。
-
 **终端 A：启动 ROS Master**
 
 ```bash
@@ -280,10 +278,19 @@ tail -f ~/usv_ws/.usv_run/logs/usv_system.log
 
 - `pump_port`（默认 `/dev/ttyUSB0`）
 - `pump_baudrate`（默认 `115200`）
+- `pump_timeout`（默认 `1.0` 秒）
+- `pid_mode`（默认 `true`）
+- `pid_precision`（默认 `0.1`）
 - `daq_device`（默认 `Dev1`）
 - `daq_channel`（默认 `ai0`）
+- `daq_sample_rate`（默认 `100`）
+- `daq_auto_start`（默认 `false`）
 - `web_host`（默认 `0.0.0.0`）
 - `web_port`（默认 `5000`）
+- `web_ui`（默认 `auto`，可选 `legacy|react|auto`）
+- `mavros_timeout`（默认 `30.0`）
+- `auto_trigger_on_waypoint`（默认 `true`）
+- `trigger_waypoints`（默认 `[]`，示例：`[1,3,5]`）
 - `enable_pump|enable_spectrometer|enable_web|enable_mavlink_trigger|enable_mavlink_bridge`
 
 示例：仅启动泵控 + Web
@@ -293,6 +300,15 @@ roslaunch usv_ros usv_bringup.launch \
   enable_spectrometer:=false \
   enable_mavlink_trigger:=false \
   enable_mavlink_bridge:=false
+```
+
+示例：限制自动触发航点并切换 Web UI
+
+```bash
+roslaunch usv_ros usv_bringup.launch \
+  trigger_waypoints:="[2,4]" \
+  web_ui:=react \
+  pump_timeout:=2.0
 ```
 
 ### 5.5 访问 Web 控制台

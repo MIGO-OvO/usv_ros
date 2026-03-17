@@ -21,22 +21,25 @@
     <!-- 泵控制参数 -->
     <arg name="pump_port" default="/dev/ttyUSB0" />
     <arg name="pump_baudrate" default="115200" />
+    <arg name="pump_timeout" default="1.0" />
     <arg name="pid_mode" default="true" />
     <arg name="pid_precision" default="0.1" />
-    
+
     <!-- 分光检测器参数 -->
     <arg name="daq_device" default="Dev1" />
     <arg name="daq_channel" default="ai0" />
     <arg name="daq_sample_rate" default="100" />
     <arg name="daq_auto_start" default="false" />
-    
+
     <!-- Web 服务器参数 -->
     <arg name="web_host" default="0.0.0.0" />
     <arg name="web_port" default="5000" />
-    
+    <arg name="web_ui" default="auto" />
+
     <!-- MAVLink 触发参数 -->
     <arg name="mavros_timeout" default="30.0" />
     <arg name="auto_trigger_on_waypoint" default="true" />
+    <arg name="trigger_waypoints" default="[]" />
 
     <!-- 节点启用开关 -->
     <arg name="enable_pump" default="true" />
@@ -49,17 +52,17 @@
     <rosparam file="$(find usv_ros)/config/usv_params.yaml" command="load" />
 
     <!-- ==================== Pump Control Node ==================== -->
-    <node name="pump_control_node" pkg="usv_ros" type="pump_control_node.py" 
+    <node name="pump_control_node" pkg="usv_ros" type="pump_control_node.py"
           output="screen" if="$(arg enable_pump)">
         <param name="serial_port" value="$(arg pump_port)" />
         <param name="baudrate" value="$(arg pump_baudrate)" />
-        <param name="timeout" value="1.0" />
+        <param name="timeout" value="$(arg pump_timeout)" />
         <param name="pid_mode" value="$(arg pid_mode)" />
         <param name="pid_precision" value="$(arg pid_precision)" />
     </node>
 
     <!-- ==================== Spectrometer Node ==================== -->
-    <node name="spectrometer_node" pkg="usv_ros" type="spectrometer_node.py" 
+    <node name="spectrometer_node" pkg="usv_ros" type="spectrometer_node.py"
           output="screen" if="$(arg enable_spectrometer)">
         <param name="device_name" value="$(arg daq_device)" />
         <param name="channel" value="$(arg daq_channel)" />
@@ -68,50 +71,22 @@
     </node>
 
     <!-- ==================== Web Config Server ==================== -->
-    <!-- 
-    Web 配置服务器 - 提供 HTTP 接口配置采样参数
-    访问地址: http://<nano_ip>:5000
-    
-    API:
-      GET  /api/config - 获取配置
-      POST /api/config - 保存配置
-      POST /api/mission/start - 启动采样
-      POST /api/mission/stop - 停止采样
-    -->
-    <node name="web_config_server" pkg="usv_ros" type="web_config_server.py" 
+    <node name="web_config_server" pkg="usv_ros" type="web_config_server.py"
           output="screen" if="$(arg enable_web)">
         <param name="host" value="$(arg web_host)" />
         <param name="port" value="$(arg web_port)" />
+        <param name="web_ui" value="$(arg web_ui)" />
     </node>
 
     <!-- ==================== MAVLink Trigger Node ==================== -->
-    <!--
-    MAVLink 指令触发节点 - 唯一任务编排入口
-    监听 /mavros/mavlink/from 中的 COMMAND_LONG，解析 USV 自定义命令。
-
-    MAVLink 指令:
-      31010: 开始采样
-      31011: 停止采样
-      31012: 暂停
-      31013: 恢复
-      31014: 零点校准
-    -->
     <node name="mavlink_trigger_node" pkg="usv_ros" type="mavlink_trigger_node.py"
           output="screen" if="$(arg enable_mavlink_trigger)">
         <param name="mavros_timeout" value="$(arg mavros_timeout)" />
         <param name="auto_trigger_on_waypoint" value="$(arg auto_trigger_on_waypoint)" />
+        <rosparam param="trigger_waypoints" subst_value="true">$(arg trigger_waypoints)</rosparam>
     </node>
 
     <!-- ==================== MAVLink Telemetry Bridge ==================== -->
-    <!--
-    载荷遥测桥接节点 - 将 ROS 载荷数据转为 MAVLink NAMED_VALUE_FLOAT 回传 QGC
-
-    回传遥测:
-      USV_VOLT : 分光检测器电压
-      PUMP_X/Y/Z/A : 泵角度
-      USV_STAT : 载荷状态码
-    -->
     <node name="usv_mavlink_bridge" pkg="usv_ros" type="usv_mavlink_bridge.py"
           output="screen" if="$(arg enable_mavlink_bridge)" />
-
 </launch>

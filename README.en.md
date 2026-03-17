@@ -277,10 +277,19 @@ Common args in `launch/usv_bringup.launch`:
 
 - `pump_port` (default `/dev/ttyUSB0`)
 - `pump_baudrate` (default `115200`)
+- `pump_timeout` (default `1.0` seconds)
+- `pid_mode` (default `true`)
+- `pid_precision` (default `0.1`)
 - `daq_device` (default `Dev1`)
 - `daq_channel` (default `ai0`)
+- `daq_sample_rate` (default `100`)
+- `daq_auto_start` (default `false`)
 - `web_host` (default `0.0.0.0`)
 - `web_port` (default `5000`)
+- `web_ui` (default `auto`, options: `legacy|react|auto`)
+- `mavros_timeout` (default `30.0`)
+- `auto_trigger_on_waypoint` (default `true`)
+- `trigger_waypoints` (default `[]`, example: `[1,3,5]`)
 - `enable_pump|enable_spectrometer|enable_web|enable_mavlink_trigger|enable_mavlink_bridge`
 
 Example: pump + web only
@@ -290,6 +299,15 @@ roslaunch usv_ros usv_bringup.launch \
   enable_spectrometer:=false \
   enable_mavlink_trigger:=false \
   enable_mavlink_bridge:=false
+```
+
+Example: restrict auto-trigger waypoints and switch Web UI
+
+```bash
+roslaunch usv_ros usv_bringup.launch \
+  trigger_waypoints:="[2,4]" \
+  web_ui:=react \
+  pump_timeout:=2.0
 ```
 
 ### 5.5 Access Web Console
