@@ -26,12 +26,13 @@ Python: 3.8
 
 from __future__ import print_function
 
+import json
 import struct
 import threading
 import time
 
 import rospy
-from std_msgs.msg import String, Float64
+from std_msgs.msg import String
 from mavros_msgs.msg import Mavlink
 
 # MAVLink 常量
@@ -51,6 +52,7 @@ class USVMavlinkBridge(object):
         # 数据缓存 (线程安全)
         self._lock = threading.Lock()
         self._voltage = 0.0
+        self._absorbance = 0.0
         self._pump_angles = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
         self._status_code = 0  # 0=idle
 
@@ -63,7 +65,7 @@ class USVMavlinkBridge(object):
         )
 
         # Subscribers
-        rospy.Subscriber('/usv/spectrometer_voltage', Float64, self._voltage_cb)
+        rospy.Subscriber('/usv/spectrometer_voltage', String, self._voltage_cb)
         rospy.Subscriber('/usv/pump_angles', String, self._angles_cb)
         rospy.Subscriber('/usv/pump_status', String, self._pump_status_cb)
         rospy.Subscriber('/usv/trigger_status', String, self._trigger_status_cb)
@@ -74,8 +76,15 @@ class USVMavlinkBridge(object):
     # ==================== ROS 数据订阅 ====================
 
     def _voltage_cb(self, msg):
+        """解析分光 JSON 数据。"""
+        try:
+            data = json.loads(msg.data)
+        except Exception:
+            data = {"voltage": 0.0, "absorbance": 0.0, "raw": msg.data}
+
         with self._lock:
-            self._voltage = msg.data
+            self._voltage = float(data.get('voltage', data.get('sample_voltage', 0.0)) or 0.0)
+            self._absorbance = float(data.get('absorbance', 0.0) or 0.0)
 
     def _angles_cb(self, msg):
         """解析泵角度字符串: 'X:123.456,Y:78.901,Z:0.000,A:45.678'"""
@@ -173,11 +182,13 @@ class USVMavlinkBridge(object):
         while not rospy.is_shutdown():
             with self._lock:
                 voltage = self._voltage
+                absorbance = self._absorbance
                 angles = self._pump_angles.copy()
                 status = self._status_code
 
             # 发送所有遥测值
             self._send_named_value_float("USV_VOLT", voltage)
+            self._send_named_value_float("USV_ABS", absorbance)
             self._send_named_value_float("PUMP_X", angles["X"])
             self._send_named_value_float("PUMP_Y", angles["Y"])
             self._send_named_value_float("PUMP_Z", angles["Z"])

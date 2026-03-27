@@ -33,6 +33,7 @@ Services:
 from __future__ import print_function
 
 import json
+import math
 import os
 import struct
 import sys
@@ -57,10 +58,47 @@ HEADER1 = 0x55
 HEADER2_ANGLE = 0xCC
 HEADER2_PID = 0xAA
 HEADER2_TEST = 0xBB
+HEADER2_SPECTRO = 0xDD
 PACKET_SIZE_ANGLE = 20
 PACKET_SIZE_PID = 29
 PACKET_SIZE_TEST = 18
+PACKET_SIZE_SPECTRO = 18
 TAIL = 0x0A
+
+SPECTRO_STATUS_VALID = 0x01
+SPECTRO_STATUS_I2C_ERROR = 0x02
+SPECTRO_STATUS_NOT_CONFIG = 0x04
+SPECTRO_STATUS_SATURATED = 0x08
+
+DEFAULT_I2C_MAPPING = {
+    "angles": {"X": 0, "Y": 3, "Z": 4, "A": 7},
+    "spectro_channel": 2,
+}
+
+DEFAULT_SPECTRO_CONFIG = {
+    "enabled": True,
+    "auto_start": False,
+    "ads_address": "0x40",
+    "mux": "AIN0_AVSS",
+    "gain": 1,
+    "pga_bypass": True,
+    "turbo_mode": False,
+    "continuous_mode": True,
+    "vref_mode": "AVDD",
+    "adc_rate": 90,
+    "publish_rate": 20,
+    "reference_voltage": 2.5,
+    "baseline_voltage": 2.5,
+    "path_length_cm": 1.0,
+}
+
+DEFAULT_ANGLE_STREAM = {
+    "enabled": True,
+    "auto_start": True,
+}
+
+
+
 
 
 class PumpSerialReader(object):
@@ -83,13 +121,15 @@ class PumpSerialReader(object):
         self.on_angle_received = None   # func(dict) - 角度数据 [0xCC]
         self.on_pid_data_received = None  # func(dict) - PID 数据 [0xAA]
         self.on_test_result_received = None  # func(dict) - 测试结果 [0xBB]
+        self.on_spectro_received = None  # func(dict) - 分光数据 [0xDD]
         self.on_text_received = None    # func(str) - 文本响应
 
-    def start(self, on_angle=None, on_pid=None, on_test=None, on_text=None):
+    def start(self, on_angle=None, on_pid=None, on_test=None, on_spectro=None, on_text=None):
         """启动后台读取线程。"""
         self.on_angle_received = on_angle
         self.on_pid_data_received = on_pid
         self.on_test_result_received = on_test
+        self.on_spectro_received = on_spectro
         self.on_text_received = on_text
         self.running = True
         self.read_thread = threading.Thread(target=self._read_loop, daemon=True)
@@ -196,6 +236,8 @@ class PumpSerialReader(object):
                 self._parse_pid_packet(data)
             elif packet_type == HEADER2_TEST:
                 self._parse_test_packet(data)
+            elif packet_type == HEADER2_SPECTRO:
+                self._parse_spectro_packet(data)
         except Exception as e:
             rospy.logwarn("Packet parse error: %s", str(e))
 
@@ -248,6 +290,23 @@ class PumpSerialReader(object):
         if self.on_test_result_received:
             self.on_test_result_received(result)
 
+    def _parse_spectro_packet(self, data):
+        """解析分光数据包 [0x55][0xDD]。"""
+        status = data[7]
+        packet = {
+            "timestamp_ms": struct.unpack("<I", data[2:6])[0],
+            "tca_channel": data[6],
+            "status": status,
+            "raw_code": struct.unpack("<i", data[8:12])[0],
+            "voltage": struct.unpack("<f", data[12:16])[0],
+            "valid": bool(status & SPECTRO_STATUS_VALID),
+            "i2c_error": bool(status & SPECTRO_STATUS_I2C_ERROR),
+            "not_configured": bool(status & SPECTRO_STATUS_NOT_CONFIG),
+            "saturated": bool(status & SPECTRO_STATUS_SATURATED),
+        }
+        if self.on_spectro_received:
+            self.on_spectro_received(packet)
+
     def _process_text(self, data):
         """处理文本数据。"""
         try:
@@ -282,6 +341,9 @@ class PumpControlNode(object):
         self.timeout = rospy.get_param('~timeout', 1.0)
         self.pid_mode = rospy.get_param('~pid_mode', True)
         self.pid_precision = rospy.get_param('~pid_precision', 0.1)
+        self.i2c_mapping = rospy.get_param('~i2c_mapping', rospy.get_param('/i2c_mapping', DEFAULT_I2C_MAPPING))
+        self.spectro_config = rospy.get_param('~spectrometer', rospy.get_param('/spectrometer', DEFAULT_SPECTRO_CONFIG))
+        self.angle_stream = rospy.get_param('~angle_stream', rospy.get_param('/angle_stream', DEFAULT_ANGLE_STREAM))
 
         # 串口连接
         self.serial_conn = None
@@ -316,17 +378,28 @@ class PumpControlNode(object):
         self.inject_pump_last_response = ""
         self.inject_pump_last_error = ""
 
+        # 分光状态
+        self.latest_spectro = None
+        self.spectro_state = "idle"
+        self.spectro_reference_voltage = float(self.spectro_config.get('reference_voltage', 2.5))
+        self.spectro_baseline_voltage = float(self.spectro_config.get('baseline_voltage', 2.5))
+
         # Publishers
         self.angles_pub = rospy.Publisher('/usv/pump_angles', String, queue_size=10)
         self.status_pub = rospy.Publisher('/usv/pump_status', String, queue_size=10)
         self.pid_complete_pub = rospy.Publisher('/usv/pump_pid_complete', String, queue_size=10)
         self.pid_error_pub = rospy.Publisher('/usv/pump_pid_error', String, queue_size=50)
         self.injection_status_pub = rospy.Publisher('/usv/injection_pump_status', String, queue_size=10)
+        self.spectro_voltage_pub = rospy.Publisher('/usv/spectrometer_voltage', String, queue_size=20)
+        self.spectro_status_pub = rospy.Publisher('/usv/spectrometer_status', String, queue_size=20)
+        self.spectro_raw_pub = rospy.Publisher('/usv/spectrometer_raw', String, queue_size=20)
+        self.spectro_absorbance_pub = rospy.Publisher('/usv/spectrometer_absorbance', String, queue_size=20)
 
         # Subscribers
         self.cmd_sub = rospy.Subscriber('/usv/pump_command', String, self._cmd_callback)
         self.step_sub = rospy.Subscriber('/usv/pump_step', String, self._step_callback)
         self.steps_sub = rospy.Subscriber('/usv/automation_steps', String, self._steps_callback)
+        self.spectro_cmd_sub = rospy.Subscriber('/usv/spectrometer_command', String, self._spectro_cmd_callback)
 
         # Services
         self.stop_srv = rospy.Service('/usv/pump_stop', Trigger, self._stop_callback)
@@ -338,6 +411,9 @@ class PumpControlNode(object):
         self.injection_off_srv = rospy.Service('/usv/injection_pump_off', Trigger, self._injection_off_callback)
         self.injection_status_srv = rospy.Service('/usv/injection_pump_get_status', Trigger, self._injection_status_callback)
         self.reconnect_srv = rospy.Service('/usv/pump_reconnect', Trigger, self._reconnect_callback)
+        self.spectro_start_srv = rospy.Service('/usv/spectrometer_start', Trigger, self._spectro_start_callback)
+        self.spectro_stop_srv = rospy.Service('/usv/spectrometer_stop', Trigger, self._spectro_stop_callback)
+        self.i2c_map_apply_srv = rospy.Service('/usv/i2c_map_apply', Trigger, self._i2c_map_apply_callback)
 
         rospy.loginfo("Pump Control Node initialized")
         rospy.loginfo("  Serial: %s @ %d", self.serial_port, self.baudrate)
@@ -362,8 +438,11 @@ class PumpControlNode(object):
                 on_angle=self._on_angle_received,
                 on_pid=self._on_pid_data_received,
                 on_test=self._on_test_result_received,
+                on_spectro=self._on_spectro_received,
                 on_text=self._on_text_received
             )
+
+            self._apply_runtime_configuration()
 
             rospy.loginfo("Connected to pump controller: %s", self.serial_port)
             self._publish_status("connected")
@@ -449,6 +528,91 @@ class PumpControlNode(object):
         except (serial.SerialException, OSError) as e:
             rospy.logerr("Send failed: %s", str(e))
             return False
+
+    def _apply_runtime_configuration(self):
+        """连接后同步 I2C 映射和 ADS 采样配置。"""
+        self._query_i2c_mapping()
+        self._apply_i2c_mapping()
+        self._query_ads_status()
+        if self.angle_stream.get('enabled', True) and self.angle_stream.get('auto_start', True):
+            self._start_angle_stream()
+        if self.spectro_config.get('enabled', True):
+            self._apply_spectro_config()
+            if self.spectro_config.get('auto_start', False):
+                self._spectro_start()
+        else:
+            self._publish_spectro_status('disabled')
+
+    def _query_i2c_mapping(self):
+        return self.send_command('I2CMAP?')
+
+    def _query_ads_status(self):
+        return self.send_command('ADSSTATUS?')
+
+    def _start_angle_stream(self):
+        ok = self.send_command('ANGLESTREAM_START')
+        if ok:
+            rospy.loginfo('Angle stream started')
+        return ok
+
+    def _stop_angle_stream(self):
+        ok = self.send_command('ANGLESTREAM_STOP')
+        if ok:
+            rospy.loginfo('Angle stream stopped')
+        return ok
+
+    def _apply_i2c_mapping(self):
+        angles = self.i2c_mapping.get('angles', {})
+        cmd = "I2CMAP:X={x},Y={y},Z={z},A={a},SPEC={spec}".format(
+            x=angles.get('X', 0),
+            y=angles.get('Y', 3),
+            z=angles.get('Z', 4),
+            a=angles.get('A', 7),
+            spec=self.i2c_mapping.get('spectro_channel', 2)
+        )
+        ok = self.send_command(cmd)
+        if ok:
+            rospy.loginfo("Applied I2C mapping: %s", cmd)
+        return ok
+
+    def _apply_spectro_config(self):
+        cmd = self._build_ads_config_command()
+        ok = self.send_command(cmd)
+        if ok:
+            self.spectro_state = 'configured'
+            self._publish_spectro_status('configured')
+            self._publish_spectro_config_snapshot()
+        return ok
+
+    def _build_ads_config_command(self):
+        cfg = self.spectro_config
+        return (
+            "ADSCFG:ADDR={addr},CH={ch},MUX={mux},GAIN={gain},VREF={vref},RATE={rate},PUB={pub},MODE={mode}"
+            .format(
+                addr=cfg.get('ads_address', '0x40'),
+                ch=self.i2c_mapping.get('spectro_channel', 2),
+                mux=cfg.get('mux', 'AIN0_AVSS'),
+                gain=cfg.get('gain', 1),
+                vref=cfg.get('vref_mode', 'AVDD'),
+                rate=cfg.get('adc_rate', 90),
+                pub=cfg.get('publish_rate', 20),
+                mode='CONT' if cfg.get('continuous_mode', True) else 'SINGLE',
+            )
+        )
+
+    def _spectro_start(self):
+        ok = self.send_command('ADSSTART')
+        if ok:
+            self.spectro_state = 'acquiring'
+            self._publish_spectro_status('acquiring')
+        return ok
+
+    def _spectro_stop(self):
+        ok = self.send_command('ADSSTOP')
+        if ok:
+            self.spectro_state = 'stopped'
+            self._publish_spectro_status('stopped')
+        return ok
 
     def _is_injection_pump_command(self, command):
         """判断是否为进样泵直通指令。"""
@@ -630,11 +794,52 @@ class PumpControlNode(object):
         if self._parse_injection_pump_text(text):
             return
 
+        if text.startswith("I2CMAP_OK:"):
+            self._publish_status("i2c_map_synced")
+            return
+
+        if text.startswith("ADS_OK:START"):
+            self.spectro_state = 'acquiring'
+            self._publish_spectro_status('acquiring')
+            return
+
+        if text.startswith("ADS_OK:STOP"):
+            self.spectro_state = 'stopped'
+            self._publish_spectro_status('stopped')
+            return
+
+        if text.startswith("ADS_STATUS:"):
+            self._publish_spectro_status(text)
+            return
+
+        if text.startswith("ADS_ERR:"):
+            self.spectro_state = 'error'
+            self._publish_spectro_status(text)
+            return
+
+        if text == "ANGLESTREAM_OK":
+            self._publish_status("angle_stream_started")
+            return
+
+        if text == "ANGLESTREAM_STOPPED":
+            self._publish_status("angle_stream_stopped")
+            return
+
         # 检查 PID 完成消息
         if text.startswith("PID_DONE:"):
             motor = text.split(":")[1] if ":" in text else ""
             if motor in MOTOR_NAMES:
                 self._notify_pid_complete(motor)
+
+    def _publish_spectro_config_snapshot(self):
+        msg = String()
+        msg.data = json.dumps({
+            'i2c_mapping': self.i2c_mapping,
+            'spectrometer': self.spectro_config,
+            'angle_stream': self.angle_stream,
+            'ads_command': self._build_ads_config_command(),
+        })
+        self.spectro_raw_pub.publish(msg)
 
     def _check_pid_complete(self, angles):
         """检查 PID 是否完成 (基于角度误差)。"""
@@ -660,6 +865,55 @@ class PumpControlNode(object):
         msg.data = motor
         self.pid_complete_pub.publish(msg)
         rospy.loginfo("PID complete: %s", motor)
+
+
+    def _on_spectro_received(self, data):
+        """分光数据回调。"""
+        self.latest_spectro = data
+        if data.get('valid', False):
+            self.spectro_state = 'acquiring'
+        elif data.get('i2c_error', False):
+            self.spectro_state = 'i2c_error'
+        elif data.get('not_configured', False):
+            self.spectro_state = 'not_configured'
+        elif data.get('saturated', False):
+            self.spectro_state = 'saturated'
+
+        self._publish_spectro_status(self.spectro_state)
+
+        raw_msg = String()
+        raw_msg.data = json.dumps(data)
+        self.spectro_raw_pub.publish(raw_msg)
+
+        voltage_msg = String()
+        voltage_msg.data = json.dumps({
+            'voltage': data.get('voltage', 0.0),
+            'timestamp_ms': data.get('timestamp_ms', 0),
+            'tca_channel': data.get('tca_channel', -1),
+        })
+        self.spectro_voltage_pub.publish(voltage_msg)
+
+        absorbance = self._calculate_absorbance(data.get('voltage', 0.0))
+        absorbance_msg = String()
+        absorbance_msg.data = json.dumps({
+            'absorbance': absorbance,
+            'reference_voltage': self.spectro_reference_voltage,
+            'baseline_voltage': self.spectro_baseline_voltage,
+        })
+        self.spectro_absorbance_pub.publish(absorbance_msg)
+
+    def _calculate_absorbance(self, voltage):
+        ref = max(self.spectro_reference_voltage, 1e-6)
+        sample = max(voltage, 1e-6)
+        baseline = max(self.spectro_baseline_voltage, 1e-6)
+        corrected_sample = max(sample / baseline, 1e-6)
+        corrected_ref = max(ref / baseline, 1e-6)
+        return round(math.log10(corrected_ref / corrected_sample), 6)
+
+    def _publish_spectro_status(self, status):
+        msg = String()
+        msg.data = status
+        self.spectro_status_pub.publish(msg)
 
     def _cmd_callback(self, msg):
         """直接指令回调。"""
@@ -699,6 +953,54 @@ class PumpControlNode(object):
                 rospy.logerr("Manual step injection pump command failed")
         except json.JSONDecodeError as e:
             rospy.logerr("Invalid step JSON: %s", str(e))
+
+    def _spectro_cmd_callback(self, msg):
+        """分光控制指令回调，支持 JSON 指令。"""
+        try:
+            payload = json.loads(msg.data)
+        except json.JSONDecodeError:
+            rospy.logerr("Invalid spectrometer command JSON: %s", msg.data)
+            return
+
+        cmd = str(payload.get('cmd', '')).strip().lower()
+        if cmd == 'start':
+            self._spectro_start()
+        elif cmd == 'stop':
+            self._spectro_stop()
+        elif cmd == 'configure':
+            self.spectro_config.update(payload)
+            self._apply_spectro_config()
+        elif cmd == 'set_i2c_map':
+            mapping = payload.get('mapping', {})
+            if 'angles' in mapping:
+                self.i2c_mapping['angles'] = mapping['angles']
+            if 'spectro_channel' in mapping:
+                self.i2c_mapping['spectro_channel'] = mapping['spectro_channel']
+            self._apply_i2c_mapping()
+        elif cmd == 'query_status':
+            self._query_ads_status()
+            self._query_i2c_mapping()
+        elif cmd == 'angle_stream_start':
+            self._start_angle_stream()
+        elif cmd == 'angle_stream_stop':
+            self._stop_angle_stream()
+        elif cmd == 'set_baseline':
+            if 'voltage' in payload:
+                self.spectro_baseline_voltage = float(payload['voltage'])
+        else:
+            rospy.logwarn("Unknown spectrometer command: %s", cmd)
+
+    def _spectro_start_callback(self, req):
+        success = self._spectro_start()
+        return TriggerResponse(success=success, message='Spectrometer started' if success else 'Spectrometer start failed')
+
+    def _spectro_stop_callback(self, req):
+        success = self._spectro_stop()
+        return TriggerResponse(success=success, message='Spectrometer stopped' if success else 'Spectrometer stop failed')
+
+    def _i2c_map_apply_callback(self, req):
+        success = self._apply_i2c_mapping()
+        return TriggerResponse(success=success, message='I2C mapping applied' if success else 'I2C mapping apply failed')
 
     def _steps_callback(self, msg):
         """

@@ -13,30 +13,18 @@ interface SerialPort {
   by_id?: string
 }
 
-interface DaqDevice {
-  name: string
-  product_type: string
-  channels: string[]
-}
-
 interface HardwareConfig {
   pump_serial_port: string
   pump_baudrate: number
   pump_timeout: number
-  daq_device_name: string
-  daq_channel: string
-  daq_sample_rate: number
-  daq_auto_start: boolean
+  spectrometer_auto_start: boolean
 }
 
 const DEFAULT_HW: HardwareConfig = {
   pump_serial_port: '/dev/ttyUSB0',
   pump_baudrate: 115200,
   pump_timeout: 1.0,
-  daq_device_name: 'Dev1',
-  daq_channel: 'ai0',
-  daq_sample_rate: 100,
-  daq_auto_start: false,
+  spectrometer_auto_start: false,
 }
 
 export default function Settings() {
@@ -47,7 +35,6 @@ export default function Settings() {
 
   const [hw, setHw] = useState<HardwareConfig>({ ...DEFAULT_HW })
   const [serialPorts, setSerialPorts] = useState<SerialPort[]>([])
-  const [daqDevices, setDaqDevices] = useState<DaqDevice[]>([])
   const [hwLoading, setHwLoading] = useState(false)
   const [hwMsg, setHwMsg] = useState('')
 
@@ -66,12 +53,8 @@ export default function Settings() {
 
   const refreshDevices = async () => {
     try {
-      const [sp, dq] = await Promise.all([
-        fetch('/api/hardware/serial-ports').then(r => r.json()),
-        fetch('/api/hardware/daq-devices').then(r => r.json()),
-      ])
+      const sp = await fetch('/api/hardware/serial-ports').then(r => r.json())
       if (sp.success) setSerialPorts(sp.ports || [])
-      if (dq.success) setDaqDevices(dq.devices || [])
     } catch (e) { console.error(e) }
   }
 
@@ -87,17 +70,7 @@ export default function Settings() {
     } catch (e: any) { setHwMsg(e.message) }
   }
 
-  const testDaq = async () => {
-    setHwMsg('')
-    try {
-      const res = await fetch('/api/hardware/test-daq', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ device_name: hw.daq_device_name, channel: hw.daq_channel })
-      })
-      const data = await res.json()
-      setHwMsg(data.message)
-    } catch (e: any) { setHwMsg(e.message) }
-  }
+
 
   const saveAndApplyHardware = async () => {
     setHwLoading(true)
@@ -110,7 +83,6 @@ export default function Settings() {
       const data = await res.json()
       const msgs: string[] = [data.message || '']
       if (data.results?.pump) msgs.push('泵控: ' + data.results.pump.message)
-      if (data.results?.daq) msgs.push('DAQ: ' + data.results.daq.message)
       setHwMsg(msgs.join(' | '))
     } catch (e: any) { setHwMsg(e.message) }
     setHwLoading(false)
@@ -327,34 +299,7 @@ export default function Settings() {
             <Button variant="outline" size="sm" onClick={testPumpPort}><Activity className="w-4 h-4 mr-1" />测试泵控连接</Button>
           </div>
 
-          {/* DAQ 设备 */}
-          <div className="space-y-3">
-            <h4 className="font-medium text-sm">DAQ 数据采集卡</h4>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
-              <div className="space-y-2">
-                <Label>设备名</Label>
-                <select
-                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                  value={hw.daq_device_name}
-                  onChange={e => setHw(p => ({ ...p, daq_device_name: e.target.value }))}
-                >
-                  <option value={hw.daq_device_name}>{hw.daq_device_name}</option>
-                  {daqDevices.filter(d => d.name !== hw.daq_device_name).map(d => (
-                    <option key={d.name} value={d.name}>{d.name} ({d.product_type})</option>
-                  ))}
-                </select>
-              </div>
-              <div className="space-y-2">
-                <Label>通道</Label>
-                <Input value={hw.daq_channel} onChange={e => setHw(p => ({ ...p, daq_channel: e.target.value }))} />
-              </div>
-              <div className="space-y-2">
-                <Label>采样率 (Hz)</Label>
-                <Input type="number" value={hw.daq_sample_rate} onChange={e => setHw(p => ({ ...p, daq_sample_rate: parseInt(e.target.value) || 100 }))} />
-              </div>
-            </div>
-            <Button variant="outline" size="sm" onClick={testDaq}><Activity className="w-4 h-4 mr-1" />测试 DAQ 连接</Button>
-          </div>
+
 
           {hwMsg && (
             <div className="text-sm p-3 rounded bg-muted/50">{hwMsg}</div>

@@ -5,8 +5,7 @@
     水质监测无人船系统启动文件
 
     系统架构:
-      - pump_control_node: 蠕动泵控制 (串口 -> ESP32)
-      - spectrometer_node: 分光检测器采集 (NI DAQ)
+      - pump_control_node: 蠕动泵控制 + ADS 分光采集串口桥接 (串口 -> ESP32)
       - web_config_server: Web 配置界面 (HTTP)
       - mavlink_trigger_node: MAVLink 指令触发与任务编排
       - usv_mavlink_bridge: 载荷遥测回传 QGC
@@ -25,11 +24,7 @@
     <arg name="pid_mode" default="true" />
     <arg name="pid_precision" default="0.1" />
 
-    <!-- 分光检测器参数 -->
-    <arg name="daq_device" default="Dev1" />
-    <arg name="daq_channel" default="ai0" />
-    <arg name="daq_sample_rate" default="100" />
-    <arg name="daq_auto_start" default="false" />
+    <!-- 分光检测器参数已并入 pump_control_node，通过 usv_params.yaml 下发 -->
 
     <!-- Web 服务器参数 -->
     <arg name="web_host" default="0.0.0.0" />
@@ -43,7 +38,6 @@
 
     <!-- 节点启用开关 -->
     <arg name="enable_pump" default="true" />
-    <arg name="enable_spectrometer" default="true" />
     <arg name="enable_web" default="true" />
     <arg name="enable_mavlink_trigger" default="true" />
     <arg name="enable_mavlink_bridge" default="true" />
@@ -59,16 +53,15 @@
         <param name="timeout" value="$(arg pump_timeout)" />
         <param name="pid_mode" value="$(arg pid_mode)" />
         <param name="pid_precision" value="$(arg pid_precision)" />
+        <rosparam subst_value="true">
+          i2c_mapping: $(eval i2c_mapping)
+          spectrometer: $(eval spectrometer)
+          angle_stream: $(eval angle_stream)
+        </rosparam>
+
     </node>
 
-    <!-- ==================== Spectrometer Node ==================== -->
-    <node name="spectrometer_node" pkg="usv_ros" type="spectrometer_node.py"
-          output="screen" if="$(arg enable_spectrometer)">
-        <param name="device_name" value="$(arg daq_device)" />
-        <param name="channel" value="$(arg daq_channel)" />
-        <param name="sample_rate" value="$(arg daq_sample_rate)" />
-        <param name="auto_start" value="$(arg daq_auto_start)" />
-    </node>
+    <!-- 分光功能已并入 pump_control_node -->
 
     <!-- ==================== Web Config Server ==================== -->
     <node name="web_config_server" pkg="usv_ros" type="web_config_server.py"

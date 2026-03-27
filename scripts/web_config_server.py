@@ -43,7 +43,7 @@ except ImportError:
 # 尝试导入 ROS，如果失败则以独立模式运行
 try:
     import rospy
-    from std_msgs.msg import String, Float64
+    from std_msgs.msg import String
     from std_srvs.srv import Trigger
     ROS_AVAILABLE = True
 except ImportError:
@@ -289,10 +289,16 @@ DEFAULT_CONFIG = {
         "pump_serial_port": "/dev/ttyUSB0",
         "pump_baudrate": 115200,
         "pump_timeout": 1.0,
-        "daq_device_name": "Dev1",
-        "daq_channel": "ai0",
-        "daq_sample_rate": 100,
-        "daq_auto_start": False
+        "ads_address": "0x40",
+        "spectro_channel": 2,
+        "mux": "AIN0_AVSS",
+        "gain": 1,
+        "vref_mode": "AVDD",
+        "adc_rate": 90,
+        "publish_rate": 20,
+        "continuous_mode": True,
+        "auto_start": False,
+        "i2c_mapping": {"X": 0, "Y": 3, "Z": 4, "A": 7}
     }
 }
 
@@ -403,6 +409,9 @@ class WebConfigServer(object):
         self.automation_running = False
         self.current_angles = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
         self.current_voltage = 0.0
+        self.current_absorbance = 0.0
+        self.spectrometer_status = "idle"
+        self.latest_spectrometer_payload = {}
         self.mission_status = "IDLE"
         self.injection_pump_status = {
             "enabled": False,
@@ -410,14 +419,14 @@ class WebConfigServer(object):
             "last_response": "",
             "last_error": "",
         }
-        self.voltage_history = []  # List of {timestamp, value}
+        self.voltage_history = []  # List of {timestamp, voltage, absorbance, raw}
 
         # ROS 订阅 (仅在非独立模式)
         if not self.standalone:
             self.status_sub = rospy.Subscriber('/usv/pump_status', String, self._status_cb)
             self.angles_sub = rospy.Subscriber('/usv/pump_angles', String, self._angles_cb)
             self.injection_status_sub = rospy.Subscriber('/usv/injection_pump_status', String, self._injection_status_cb)
-            self.voltage_sub = rospy.Subscriber('/usv/spectrometer_voltage', Float64, self._voltage_cb)
+            self.voltage_sub = rospy.Subscriber('/usv/spectrometer_voltage', String, self._voltage_cb)
             self.mission_sub = rospy.Subscriber('/usv/mission_status', String, self._mission_status_cb)
             self.pid_error_sub = rospy.Subscriber('/usv/pump_pid_error', String, self._pid_error_cb)
             self.steps_pub = rospy.Publisher('/usv/automation_steps', String, queue_size=1)
@@ -507,14 +516,32 @@ class WebConfigServer(object):
             rospy.logerr(f"Error parsing angles: {e}")
 
     def _voltage_cb(self, msg):
-        """电压数据回调"""
-        self.current_voltage = msg.data
-        # 如果正在运行自动化任务，记录数据
+        """分光数据回调，兼容新的 JSON String 格式。"""
+        try:
+            data = json.loads(msg.data)
+        except Exception:
+            data = {"voltage": 0.0, "raw": msg.data}
+
+        self.current_voltage = float(data.get('voltage', data.get('sample_voltage', 0.0)) or 0.0)
+        self.current_absorbance = float(data.get('absorbance', 0.0) or 0.0)
+        self.spectrometer_status = str(data.get('status', self.spectrometer_status))
+        self.latest_spectrometer_payload = data
+
         if self.automation_running:
             self.data_manager.add_data_point(self.current_voltage)
             self.voltage_history.append({
                 "timestamp": datetime.now().isoformat(),
-                "voltage": self.current_voltage
+                "voltage": self.current_voltage,
+                "absorbance": self.current_absorbance,
+                "raw": data,
+            })
+
+        if self.socketio:
+            self.socketio.emit('voltage', {
+                "value": self.current_voltage,
+                "absorbance": self.current_absorbance,
+                "status": self.spectrometer_status,
+                "raw": data,
             })
 
     def _mission_status_cb(self, msg):
@@ -802,10 +829,16 @@ class WebConfigServer(object):
             emit('status', {
                 "pump_connected": self.pump_connected,
                 "automation_running": self.automation_running,
-                "mission_status": self.mission_status
+                "mission_status": self.mission_status,
+                "spectrometer_status": self.spectrometer_status,
             })
             emit('angles', self.current_angles)
-            emit('voltage', {"value": self.current_voltage})
+            emit('voltage', {
+                "value": self.current_voltage,
+                "absorbance": self.current_absorbance,
+                "status": self.spectrometer_status,
+                "raw": self.latest_spectrometer_payload,
+            })
             emit('injection_pump_status', self.injection_pump_status)
 
         # ================= 数据 API =================
@@ -991,24 +1024,7 @@ class WebConfigServer(object):
                 pass
             return jsonify({"success": True, "ports": ports})
 
-        @self.app.route('/api/hardware/daq-devices', methods=['GET'])
-        def list_daq_devices():
-            devices = []
-            simulation_mode = True
-            try:
-                import nidaqmx.system
-                system = nidaqmx.system.System.local()
-                for dev in system.devices:
-                    channels = [ch.name for ch in dev.ai_physical_chans]
-                    devices.append({
-                        "name": dev.name,
-                        "product_type": dev.product_type,
-                        "channels": channels
-                    })
-                simulation_mode = False
-            except Exception:
-                pass
-            return jsonify({"success": True, "devices": devices, "simulation_mode": simulation_mode})
+
 
         @self.app.route('/api/hardware/test-pump-port', methods=['POST'])
         def test_pump_port():
@@ -1024,19 +1040,7 @@ class WebConfigServer(object):
             except Exception as e:
                 return jsonify({"success": False, "message": str(e)})
 
-        @self.app.route('/api/hardware/test-daq', methods=['POST'])
-        def test_daq():
-            data = request.get_json() or {}
-            dev_name = data.get('device_name', 'Dev1')
-            channel = data.get('channel', 'ai0')
-            try:
-                import nidaqmx
-                task = nidaqmx.Task()
-                task.ai_channels.add_ai_voltage_chan(f"{dev_name}/{channel}")
-                task.close()
-                return jsonify({"success": True, "message": f"DAQ {dev_name}/{channel} 可访问"})
-            except Exception as e:
-                return jsonify({"success": False, "message": str(e)})
+
 
         @self.app.route('/api/hardware/apply', methods=['POST'])
         def apply_hardware_config():
@@ -1052,7 +1056,7 @@ class WebConfigServer(object):
             if not self.config_manager.update(current):
                 return jsonify({"success": False, "message": "保存失败"}), 500
 
-            results = {"pump": None, "daq": None}
+            results = {"pump": None}
 
             # 通知 pump 节点重连
             if not self.standalone:
@@ -1067,20 +1071,8 @@ class WebConfigServer(object):
                 except Exception as e:
                     results["pump"] = {"success": False, "message": str(e)}
 
-                # 通知 spectrometer 节点重建
-                try:
-                    rospy.set_param('/spectrometer_node/device_name', hw['daq_device_name'])
-                    rospy.set_param('/spectrometer_node/channel', hw['daq_channel'])
-                    rospy.set_param('/spectrometer_node/sample_rate', int(hw['daq_sample_rate']))
-                    svc = rospy.ServiceProxy('/usv/spectrometer_reconfigure', Trigger)
-                    svc.wait_for_service(timeout=3.0)
-                    resp = svc()
-                    results["daq"] = {"success": resp.success, "message": resp.message}
-                except Exception as e:
-                    results["daq"] = {"success": False, "message": str(e)}
             else:
                 results["pump"] = {"success": True, "message": "独立模式，跳过"}
-                results["daq"] = {"success": True, "message": "独立模式，跳过"}
 
             self._add_log("硬件配置已应用", "info")
             return jsonify({"success": True, "message": "硬件配置已应用", "data": hw, "results": results})

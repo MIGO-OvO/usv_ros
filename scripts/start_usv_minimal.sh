@@ -11,7 +11,6 @@ print_workspace_info
 
 log "启动最小化系统: pump + web"
 exec roslaunch usv_ros usv_bringup.launch \
-    enable_spectrometer:=false \
     enable_mavlink_trigger:=false \
     enable_mavlink_bridge:=false \
     "$@"

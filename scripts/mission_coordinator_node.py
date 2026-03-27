@@ -31,9 +31,11 @@ Services:
 
 from __future__ import print_function
 
+import json
+import math
 import threading
 import rospy
-from std_msgs.msg import String, Float64, UInt16
+from std_msgs.msg import String
 from mavros_msgs.msg import State, WaypointReached
 from mavros_msgs.srv import SetMode, SetModeRequest
 
@@ -72,7 +74,7 @@ class MissionCoordinatorNode(object):
         self.state_lock = threading.Lock()
 
         # 检测数据
-        self.voltage_samples = []
+        self.spectrometer_samples = []
         self.voltage_lock = threading.Lock()
 
         # Publishers
@@ -94,7 +96,7 @@ class MissionCoordinatorNode(object):
             '/mavros/mission/reached', WaypointReached, self._waypoint_reached_cb
         )
         self.voltage_sub = rospy.Subscriber(
-            '/usv/spectrometer_voltage', Float64, self._voltage_cb
+            '/usv/spectrometer_voltage', String, self._voltage_cb
         )
 
         # Service clients (延迟初始化)
@@ -118,12 +120,24 @@ class MissionCoordinatorNode(object):
             self._start_sampling_sequence()
 
     def _voltage_cb(self, msg):
-        """电压数据回调。"""
+        """分光 JSON 数据回调。"""
+        try:
+            data = json.loads(msg.data)
+        except Exception:
+            data = {"voltage": 0.0, "absorbance": 0.0, "raw": msg.data}
+
+        sample = {
+            "timestamp": rospy.Time.now().to_sec(),
+            "voltage": float(data.get('voltage', data.get('sample_voltage', 0.0)) or 0.0),
+            "absorbance": float(data.get('absorbance', 0.0) or 0.0),
+            "status": str(data.get('status', 'unknown')),
+            "raw": data,
+        }
+
         with self.voltage_lock:
-            self.voltage_samples.append(msg.data)
-            # 限制缓冲区大小
-            if len(self.voltage_samples) > 1000:
-                self.voltage_samples = self.voltage_samples[-500:]
+            self.spectrometer_samples.append(sample)
+            if len(self.spectrometer_samples) > 1000:
+                self.spectrometer_samples = self.spectrometer_samples[-500:]
 
     def _init_services(self):
         """初始化 MAVROS 服务客户端。"""
@@ -250,25 +264,30 @@ class MissionCoordinatorNode(object):
         rospy.loginfo("Pumps stopped")
 
     def _clear_voltage_samples(self):
-        """清空电压样本。"""
+        """清空分光样本。"""
         with self.voltage_lock:
-            self.voltage_samples = []
+            self.spectrometer_samples = []
 
     def _calculate_result(self):
         """计算检测结果。"""
         with self.voltage_lock:
-            samples = self.voltage_samples.copy()
+            samples = self.spectrometer_samples.copy()
 
         if not samples:
             return {"error": "No samples collected"}
 
-        # 简单统计
-        avg_voltage = sum(samples) / len(samples)
-        max_voltage = max(samples)
-        min_voltage = min(samples)
+        voltages = [float(s.get('voltage', 0.0) or 0.0) for s in samples]
+        absorbances = [float(s.get('absorbance', 0.0) or 0.0) for s in samples]
+        avg_voltage = sum(voltages) / len(voltages)
+        max_voltage = max(voltages)
+        min_voltage = min(voltages)
+        avg_absorbance = sum(absorbances) / len(absorbances)
+        max_absorbance = max(absorbances)
+        min_absorbance = min(absorbances)
 
-        # TODO: 实现实际的吸光度计算和浓度换算
-        # 基于朗伯-比尔定律: A = log10(I0/I) = εcl
+        if avg_absorbance <= 0.0 and avg_voltage > 0.0:
+            reference_voltage = rospy.get_param('~reference_voltage', 3.3)
+            avg_absorbance = max(0.0, math.log10(reference_voltage / max(avg_voltage, 1e-6)))
 
         result = {
             "waypoint": self.current_waypoint,
@@ -276,7 +295,10 @@ class MissionCoordinatorNode(object):
             "avg_voltage": round(avg_voltage, 4),
             "max_voltage": round(max_voltage, 4),
             "min_voltage": round(min_voltage, 4),
-            # "concentration": calculated_concentration
+            "avg_absorbance": round(avg_absorbance, 4),
+            "max_absorbance": round(max_absorbance, 4),
+            "min_absorbance": round(min_absorbance, 4),
+            "last_status": samples[-1].get('status', 'unknown'),
         }
 
         rospy.loginfo("Detection result: %s", result)
@@ -285,8 +307,7 @@ class MissionCoordinatorNode(object):
     def _publish_result(self, result):
         """发布检测结果。"""
         msg = String()
-        parts = ["{}:{}".format(k, v) for k, v in result.items()]
-        msg.data = ",".join(parts)
+        msg.data = json.dumps(result, ensure_ascii=False)
         self.detection_result_pub.publish(msg)
 
     def run(self):

@@ -29,7 +29,6 @@ catkin_package(
 ## Mark executable scripts (Python etc.) for installation
 catkin_install_python(PROGRAMS
   scripts/pump_control_node.py
-  scripts/spectrometer_node.py
   scripts/mission_coordinator_node.py
   scripts/web_config_server.py
   scripts/mavlink_trigger_node.py

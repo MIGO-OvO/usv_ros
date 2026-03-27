@@ -6,11 +6,11 @@ pump:
   serial_port: "/dev/ttyUSB0"    # ESP32 电机控制板串口
   baudrate: 115200               # 波特率 (与下位机一致)
   timeout: 1.0                   # 串口超时 (秒)
-  
+
   # PID 闭环控制
   pid_mode: true                 # 启用 PID 精确定位模式 (R 指令)
   pid_precision: 0.1             # PID 定位精度 (度)
-  
+
   # PID 参数 (发送到下位机)
   pid_params:
     kp: 0.14
@@ -18,7 +18,7 @@ pump:
     kd: 0.06
     out_min: 1.0
     out_max: 8.0
-  
+
   # 电机配置 (X/Y/Z/A 四轴蠕动泵)
   motors:
     X:
@@ -38,7 +38,7 @@ pump:
 automation:
   pid_wait_timeout: 60.0         # PID 完成等待超时 (秒)
   default_interval: 1000         # 默认步骤间隔 (毫秒)
-  
+
   # 示例采样序列
   sampling_sequence:
     loop_count: 1                # 循环次数 (0=无限)
@@ -49,14 +49,14 @@ automation:
         Z: {enable: "D"}
         A: {enable: "E", direction: "F", speed: "3", angle: "360", continuous: false}
         interval: 2000
-      
+
       # 步骤2: 启动水样泵和试剂泵
       - X: {enable: "E", direction: "F", speed: "5", angle: "180"}
         Y: {enable: "E", direction: "F", speed: "5", angle: "90"}
         Z: {enable: "D"}
         A: {enable: "E", direction: "F", speed: "3", angle: "180"}
         interval: 5000
-      
+
       # 步骤3: 停止所有泵
       - X: {enable: "D"}
         Y: {enable: "D"}
@@ -65,15 +65,34 @@ automation:
         interval: 1000
 
 # ==================== 分光检测器参数 ====================
+i2c_mapping:
+  angles:
+    X: 0
+    Y: 3
+    Z: 4
+    A: 7
+  spectro_channel: 2
+
 spectrometer:
-  device_name: "Dev1"            # NI DAQ 设备名
-  channel: "ai0"                 # 模拟输入通道
-  sample_rate: 100               # 采样率 (Hz)
-  auto_start: false              # 是否自动开始采集
-  
-  # 光学参数
-  baseline_voltage: 2.5          # 基线电压 (V)
-  path_length_cm: 1.0            # 光程长度 (cm)
+  enabled: true
+  auto_start: false
+  ads_address: "0x40"
+  mux: "AIN0_AVSS"
+  gain: 1
+  pga_bypass: true
+  turbo_mode: false
+  continuous_mode: true
+  vref_mode: "AVDD"
+  adc_rate: 90
+  publish_rate: 20
+  reference_voltage: 2.5
+  baseline_voltage: 2.5
+  path_length_cm: 1.0
+
+angle_stream:
+  enabled: true
+  auto_start: true
+
 
 # ==================== 任务协调参数 ====================
 mission:
@@ -89,7 +108,7 @@ mavros:
   target_component_id: 1
 
 # ==================== 通信协议参考 ====================
-# 
+#
 # === 泵控制指令格式 (发送到 ESP32) ===
 #
 # 1. 传统开环模式 (J 指令):
@@ -115,6 +134,15 @@ mavros:
 # 6. PID 停止:
 #    "PIDSTOP\r\n"
 #
+# === 新增下位机配置命令参考 ===
+# 1. I2C 通道映射:
+#    "I2CMAP:X=0,Y=3,Z=4,A=7,SPEC=2\r\n"
+# 2. ADS 配置:
+#    "ADSCFG:ADDR=0x40,CH=2,MUX=AIN0_AVSS,GAIN=1,VREF=AVDD,RATE=90,PUB=20,MODE=CONT\r\n"
+# 3. ADS 启停:
+#    "ADSSTART\r\n"
+#    "ADSSTOP\r\n"
+#
 # === 下位机数据包格式 (从 ESP32 接收) ===
 #
 # 1. 角度数据包 [0x55][0xCC]:
@@ -126,3 +154,7 @@ mavros:
 #
 # 3. PID 测试结果包 [0x55][0xBB]:
 #    [0x55][0xBB][motor_id:1B][run_idx:1B][total:1B][conv_time:2B][overshoot:2B][error:2B][osc:1B][smooth:1B][jerk:2B][score:1B][checksum][0x0A]
+#
+# 4. 分光数据包 [0x55][0xDD]:
+#    [0x55][0xDD][timestamp_ms:4B][tca_channel:1B][status:1B][raw_code:4B][voltage:4B][checksum][0x0A]
+#    - status 位: bit0=valid, bit1=i2c_error, bit2=not_configured, bit3=saturated

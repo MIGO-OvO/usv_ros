@@ -1,6 +1,6 @@
 # USV ROS Package
 
-> ROS Noetic payload stack for USV water-quality monitoring (Jetson Nano + Pixhawk + ESP32 + NI DAQ).
+> ROS Noetic payload stack for USV water-quality monitoring (Jetson Nano + Pixhawk + ESP32).
 
 Chinese version: `README.md`  
 English version: `README.en.md`
@@ -24,15 +24,14 @@ English version: `README.en.md`
 `usv_ros` is the ROS package for the USV payload subsystem, deployed on Jetson Nano. It provides:
 
 - UART control for ESP32 motor board (4 stepper pumps + injection pump)
-- NI DAQ voltage acquisition and ROS publication
+- ADS spectrometer data acquisition via ESP32 serial bridge
 - Web control interface (Flask + Socket.IO + React)
 - MAVROS / MAVLink integration for mission trigger and telemetry uplink
 
 Core entry points:
 
 - `launch/usv_bringup.launch`: all-in-one startup entry
-- `scripts/pump_control_node.py`: pump control (including injection pump)
-- `scripts/spectrometer_node.py`: spectrometer acquisition
+- `scripts/pump_control_node.py`: pump control (including injection pump) and spectrometer data acquisition
 - `scripts/web_config_server.py`: Web gateway
 - `scripts/mavlink_trigger_node.py`: MAVLink trigger node
 - `scripts/usv_mavlink_bridge.py`: telemetry bridge
@@ -57,15 +56,14 @@ Jetson Nano / ROS Noetic
   ├─ mission_coordinator_node.py  (mission state orchestration)
   ├─ usv_mavlink_bridge.py        (telemetry bridge)
   ├─ web_config_server.py         (HTTP/WebSocket gateway)
-  ├─ pump_control_node.py         (pump control + automation + injection pump protocol)
-  └─ spectrometer_node.py         (voltage sampling)
+  ├─ pump_control_node.py         (pump control + automation + injection pump protocol + spectrometer reading)
             ▲
             │
 Hardware
   ├─ ESP32 motor board (UART)
   │   ├─ X/Y/Z/A stepper pumps
   │   └─ Injection pump (DC PWM)
-  └─ NI DAQ + spectrometer (USB)
+  └─ ADS Spectrometer (USB)
 ```
 
 ### 2.2 Key Data Flow
@@ -73,7 +71,7 @@ Hardware
 1. Web UI calls REST APIs of `web_config_server.py`, and receives real-time states via Socket.IO.
 2. `web_config_server.py` forwards control requests to ROS topics/services.
 3. `pump_control_node.py` encodes/decodes serial protocol and drives ESP32.
-4. `spectrometer_node.py` publishes `/usv/spectrometer_voltage`.
+4. `pump_control_node.py` manages pumps and reads ADS spectrometer data, publishing `/usv/spectrometer_voltage` as JSON.
 5. `mavlink_trigger_node.py` listens on `/mavros/mavlink/from` and converts triggers to ROS actions.
 6. `usv_mavlink_bridge.py` maps payload states to `/mavros/mavlink/to` telemetry.
 
@@ -82,7 +80,7 @@ Hardware
 By default (switchable with `enable_*` args):
 
 - `pump_control_node`
-- `spectrometer_node`
+- `pump_control_node`
 - `web_config_server`
 - `mavlink_trigger_node`
 - `usv_mavlink_bridge`
@@ -99,7 +97,7 @@ src/usv_ros/
 │  └─ usv_bringup.launch
 ├─ scripts/
 │  ├─ pump_control_node.py
-│  ├─ spectrometer_node.py
+
 │  ├─ web_config_server.py
 │  ├─ mavlink_trigger_node.py
 │  ├─ mission_coordinator_node.py
@@ -143,8 +141,7 @@ echo "source ~/usv_ws/devel/setup.bash" >> ~/.bashrc
 
 ```bash
 pip3 install pyserial flask flask-cors flask-socketio eventlet
-# Optional for real DAQ hardware
-pip3 install nidaqmx
+
 ```
 
 ### 4.4 Frontend and Static Assets
@@ -166,7 +163,7 @@ npm run build
 ### 4.5 Hardware and Link Checks (Before Launch)
 
 1. UART device is present for ESP32 (e.g. `/dev/ttyUSB0`).
-2. NI DAQ is detected (e.g. `Dev1/ai0`).
+2. ESP32 serial bridge is accessible.
 3. MAVROS state topic is updating (`/mavros/state`).
 4. `config/usv_params.yaml` matches on-site hardware settings.
 
@@ -280,23 +277,20 @@ Common args in `launch/usv_bringup.launch`:
 - `pump_timeout` (default `1.0` seconds)
 - `pid_mode` (default `true`)
 - `pid_precision` (default `0.1`)
-- `daq_device` (default `Dev1`)
-- `daq_channel` (default `ai0`)
-- `daq_sample_rate` (default `100`)
-- `daq_auto_start` (default `false`)
+
 - `web_host` (default `0.0.0.0`)
 - `web_port` (default `5000`)
 - `web_ui` (default `auto`, options: `legacy|react|auto`)
 - `mavros_timeout` (default `30.0`)
 - `auto_trigger_on_waypoint` (default `true`)
 - `trigger_waypoints` (default `[]`, example: `[1,3,5]`)
-- `enable_pump|enable_spectrometer|enable_web|enable_mavlink_trigger|enable_mavlink_bridge`
+- `enable_pump|enable_web|enable_mavlink_trigger|enable_mavlink_bridge`
 
 Example: pump + web only
 
 ```bash
 roslaunch usv_ros usv_bringup.launch \
-  enable_spectrometer:=false \
+  
   enable_mavlink_trigger:=false \
   enable_mavlink_bridge:=false
 ```
@@ -363,8 +357,7 @@ curl -X POST http://127.0.0.1:5000/api/injection-pump/off
 
 ### 7.2 Spectrometer Mode
 
-- `nidaqmx` available: real DAQ acquisition
-- `nidaqmx` unavailable: automatic simulation mode
+
 
 ---
 
@@ -377,7 +370,7 @@ curl -X POST http://127.0.0.1:5000/api/injection-pump/off
    Check serial port path, permissions, ESP32 power, and cabling.
 
 3. **No spectrometer data**  
-   Verify `daq_device/daq_channel`, NI driver, and `nidaqmx` installation.
+   Verify pump hardware connections.
 
 4. **MAVLink trigger not effective**  
    Verify `/mavros/mavlink/from` and `/mavros/mission/reached` traffic.
