@@ -170,8 +170,9 @@ rostopic echo /mavros/mavlink/to
 ```
 通过判据：
 - 存在 `msgid=251` (`NAMED_VALUE_FLOAT`) 输出
-- 当前应有：`USV_VOLT`、`PUMP_X/Y/Z/A`、`USV_STAT`
-- 当前未实现：`USV_ABS`
+- 当前应有：`USV_VOLT`、`USV_ABS`、`PUMP_X/Y/Z/A`、`USV_STAT`
+- 当 `/usv/spectrometer_voltage` 有 JSON 数据时，`USV_VOLT` 应同步变化
+- 当分光数据变化时，`USV_ABS` 应同步变化
 
 ## 9. 热点访问测试
 ### 9.1 代码核查结论
@@ -234,8 +235,83 @@ sudo ./stop_hotspot.sh
 - 停止后显示 `STOPPED`
 - 重启后重新显示 `RUNNING`
 
-## 11. 硬件连接设置测试
-### 11.1 Web 页面入口
+## 11. 新采集架构验证
+本章用于验证当前已部署到船载电脑上的新架构是否按设计工作：
+- `pump_control_node.py` 同时负责泵控与 ADS 分光串口桥接
+- `/usv/spectrometer_voltage` 为 `std_msgs/String`
+- 载荷格式为 JSON，而不是旧的 `Float64`
+- `web_config_server.py` 与 `usv_mavlink_bridge.py` 均消费新的 JSON 数据
+
+推荐按“先本地 ROS 话题，再 Web，再 MAVLink”的顺序验证。
+
+### 11.1 节点与话题基线检查
+```bash
+rosnode list
+rostopic list | grep spectrometer
+rosservice list | grep /usv/
+```
+通过判据：
+- 存在 `/pump_control_node`、`/web_config_server`、`/usv_mavlink_bridge`
+- 存在话题：`/usv/spectrometer_voltage`、`/usv/spectrometer_status`、`/usv/spectrometer_raw`、`/usv/spectrometer_absorbance`
+- 存在服务：`/usv/spectrometer_start`、`/usv/spectrometer_stop`、`/usv/pump_reconnect`
+- 不应再依赖独立分光节点
+
+### 11.2 分光话题格式验证
+先观察状态与数据：
+```bash
+rostopic echo /usv/spectrometer_status
+rostopic echo /usv/spectrometer_voltage
+rostopic echo /usv/spectrometer_raw
+rostopic echo /usv/spectrometer_absorbance
+```
+通过判据：
+- `/usv/spectrometer_status` 可见 `idle`、`acquiring`、`i2c_error`、`not_configured`、`saturated` 等状态
+- `/usv/spectrometer_voltage` 的 `data` 字段是 JSON 字符串，至少包含 `voltage`、`timestamp_ms`、`tca_channel`
+- `/usv/spectrometer_raw` 的 `data` 字段是 JSON 字符串，包含原始采样内容
+- `/usv/spectrometer_absorbance` 的 `data` 字段是 JSON 字符串，至少包含 `absorbance`
+- 不应出现旧 `Float64` 电压载荷验证步骤
+
+### 11.3 启停验证
+```bash
+rosservice call /usv/spectrometer_start
+sleep 3
+rosservice call /usv/spectrometer_stop
+sleep 2
+rosservice call /usv/spectrometer_start
+```
+通过判据：
+- 服务调用返回成功
+- 启动后 `/usv/spectrometer_status` 进入 `acquiring` 或持续输出有效状态
+- 停止后状态回到 `idle` 或停止采样更新
+- 重新启动后可再次恢复数据发布
+
+### 11.4 Web 侧联调验证
+浏览器打开 `http://<Jetson-IP>:5000`，进入 Monitor 与 Settings 页面。
+
+在终端可同时观察：
+```bash
+curl http://127.0.0.1:5000/api/data/voltage
+curl http://127.0.0.1:5000/api/hardware/config
+curl http://127.0.0.1:5000/api/hardware/serial-ports
+```
+通过判据：
+- Monitor 页面有电压/吸光度更新，不是固定 0 或空白
+- `/api/data/voltage` 返回 `value`、`absorbance`、`status`、`raw`
+- Settings 页面能看到“硬件连接设置”卡片，且仅包含当前实现的串口配置项
+- “刷新设备”“测试泵控连接”“仅保存”“保存并应用”均可点击
+
+### 11.5 MAVLink 桥接联动验证
+```bash
+rostopic echo /usv/spectrometer_voltage
+rostopic echo /mavros/mavlink/to
+```
+通过判据：
+- 当 `/usv/spectrometer_voltage` 中 JSON 的 `voltage` 变化时，MAVLink 上行中的 `USV_VOLT` 应同步变化
+- 当分光数据计算出吸光度变化时，`USV_ABS` 应同步变化
+- `usv_mavlink_bridge.py` 不应因 JSON 解析失败而频繁报错
+
+### 11.6 硬件连接设置测试
+#### 11.6.1 Web 页面入口
 在浏览器打开 Settings 页面，应看到第三张卡片“硬件连接设置”。
 
 页面动作应包括：
@@ -244,7 +320,7 @@ sudo ./stop_hotspot.sh
 - `仅保存`
 - `保存并应用`
 
-### 11.2 设备枚举
+#### 11.6.2 设备枚举
 点击“刷新设备”按钮：
 ```bash
 curl http://127.0.0.1:5000/api/hardware/serial-ports
@@ -253,12 +329,12 @@ curl http://127.0.0.1:5000/api/hardware/serial-ports
 - 串口列表返回 `success=true`，`ports` 数组包含当前已插入的 USB 串口
 - 若存在 `/dev/serial/by-id`，返回项应优先给出 `by_id`
 
-### 11.3 硬件配置读写
+#### 11.6.3 硬件配置读写
 ```bash
 curl http://127.0.0.1:5000/api/hardware/config
 curl -X POST http://127.0.0.1:5000/api/hardware/config \
   -H "Content-Type: application/json" \
-  -d '{"pump_serial_port":"/dev/ttyUSB1","pump_baudrate":115200}'
+  -d '{"pump_serial_port":"/dev/ttyUSB1","pump_baudrate":115200,"pump_timeout":1.0,"spectrometer_auto_start":false}'
 ```
 通过判据：
 - GET 返回当前硬件配置 JSON
@@ -266,7 +342,7 @@ curl -X POST http://127.0.0.1:5000/api/hardware/config \
 - 再次 GET 可读到更新后的 `hardware` 配置段
 - `POST /api/hardware/config` 不应触发运行中节点重连
 
-### 11.4 连接测试
+#### 11.6.4 连接测试
 ```bash
 curl -X POST http://127.0.0.1:5000/api/hardware/test-pump-port \
   -H "Content-Type: application/json" \
@@ -276,13 +352,11 @@ curl -X POST http://127.0.0.1:5000/api/hardware/test-pump-port \
 - 正确串口返回 `success=true`
 - 错误串口返回 `success=false` 并附错误信息
 
-### 11.5 保存并应用（运行时热切换）
+#### 11.6.5 保存并应用（运行时热切换）
 ```bash
 curl -X POST http://127.0.0.1:5000/api/hardware/apply \
   -H "Content-Type: application/json" \
   -d '{"pump_serial_port":"/dev/ttyUSB0","pump_baudrate":115200,"pump_timeout":1.0}'
-
-rosservice call /usv/pump_reconnect
 ```
 通过判据：
 - HTTP 返回 `success=true`
@@ -290,17 +364,20 @@ rosservice call /usv/pump_reconnect
 - `pump_control_node.py` 日志出现 `Reconnecting:` 或 `Reconnected to`
 - 错误时返回失败信息但 Web 仍可访问、节点进程不退出
 
-### 11.6 边界确认
+#### 11.6.6 边界确认
 - `pump_serial_port`、`pump_baudrate`、`pump_timeout`：当前支持运行时热切换
-- `spectrometer_auto_start`：当前已在默认配置与前端数据模型中存在，但 `POST /api/hardware/apply` 未运行时下发该字段；若要验证其效果，应重启 `pump_control_node` 或整套系统
+- `spectrometer_auto_start`：当前已在默认配置与前端数据模型中存在，但 `POST /api/hardware/apply` 不会运行时下发；若要验证其效果，应重启 `pump_control_node` 或整套系统
 
 ## 12. 故障排查
 - `serial` 模块缺失：安装 `pyserial`
 - Web 启动即退出：检查 `usv_system.log` 中 Werkzeug 报错
 - 5000 端口不通：检查 `ss -tuln | grep 5000`
+- 分光话题无数据：检查 ESP32 串口桥接是否在线，检查 `/usv/spectrometer_status` 与 `usv_system.log`
+- `/usv/spectrometer_voltage` 不是 JSON：确认船载电脑已拉取到当前版本，而不是旧版 `Float64` 架构
 - 串口测试失败：检查设备路径、用户组权限、串口占用
 - 保存并应用失败：检查 `/usv/pump_reconnect` 是否存在，检查 `results.*.message`
 - 热点无法创建：检查 `nmcli`、`wlan0` 是否支持 AP 模式
 - 热点仍要求密码：先执行 `sudo ./stop_hotspot.sh`，再执行 `sudo ./setup_hotspot.sh USV_Control`，并检查 `nmcli con show USV_AP`
 - MAVROS 无数据：检查 `/mavros/state` 与飞控串口
+
 
