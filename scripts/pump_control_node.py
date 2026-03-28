@@ -386,12 +386,12 @@ class PumpControlNode(object):
 
         # Publishers
         self.angles_pub = rospy.Publisher('/usv/pump_angles', String, queue_size=10)
-        self.status_pub = rospy.Publisher('/usv/pump_status', String, queue_size=10)
+        self.status_pub = rospy.Publisher('/usv/pump_status', String, queue_size=10, latch=True)
         self.pid_complete_pub = rospy.Publisher('/usv/pump_pid_complete', String, queue_size=10)
         self.pid_error_pub = rospy.Publisher('/usv/pump_pid_error', String, queue_size=50)
-        self.injection_status_pub = rospy.Publisher('/usv/injection_pump_status', String, queue_size=10)
+        self.injection_status_pub = rospy.Publisher('/usv/injection_pump_status', String, queue_size=10, latch=True)
         self.spectro_voltage_pub = rospy.Publisher('/usv/spectrometer_voltage', String, queue_size=20)
-        self.spectro_status_pub = rospy.Publisher('/usv/spectrometer_status', String, queue_size=20)
+        self.spectro_status_pub = rospy.Publisher('/usv/spectrometer_status', String, queue_size=20, latch=True)
         self.spectro_raw_pub = rospy.Publisher('/usv/spectrometer_raw', String, queue_size=20)
         self.spectro_absorbance_pub = rospy.Publisher('/usv/spectrometer_absorbance', String, queue_size=20)
 

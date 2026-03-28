@@ -75,7 +75,7 @@ i2c_mapping:
 
 spectrometer:
   enabled: true
-  auto_start: false
+  auto_start: true
   ads_address: "0x40"
   mux: "AIN0_AVSS"
   gain: 1
