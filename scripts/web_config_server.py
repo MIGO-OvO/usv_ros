@@ -421,6 +421,16 @@ class WebConfigServer(object):
         }
         self.voltage_history = []  # List of {timestamp, voltage, absorbance, raw}
 
+        # Flask & SocketIO
+        self.app = None
+        self.socketio = None
+        self.server_thread = None
+
+        if FLASK_AVAILABLE:
+            self._setup_flask()
+        else:
+            rospy.logerr("Flask/SocketIO not available!")
+
         # ROS 订阅 (仅在非独立模式)
         if not self.standalone:
             self.status_sub = rospy.Subscriber('/usv/pump_status', String, self._status_cb)
@@ -440,16 +450,6 @@ class WebConfigServer(object):
             self.pid_error_sub = None
             self.steps_pub = None
             self.command_pub = None
-
-        # Flask & SocketIO
-        self.app = None
-        self.socketio = None
-        self.server_thread = None
-
-        if FLASK_AVAILABLE:
-            self._setup_flask()
-        else:
-            rospy.logerr("Flask/SocketIO not available!")
 
         mode_str = "独立模式 (无 ROS)" if self.standalone else "ROS 模式"
         rospy.loginfo("Web Config Server initialized (%s)", mode_str)

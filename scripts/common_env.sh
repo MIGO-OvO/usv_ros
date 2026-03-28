@@ -88,6 +88,26 @@ stop_pid_file() {
     rm -f "$pid_file"
 }
 
+cleanup_port_process() {
+    local port="$1"
+
+    if command -v lsof >/dev/null 2>&1; then
+        local pids
+        pids="$(lsof -ti tcp:"$port" 2>/dev/null || true)"
+        if [[ -n "$pids" ]]; then
+            log "清理占用端口 $port 的旧进程: $pids"
+            kill $pids >/dev/null 2>&1 || true
+            sleep 1
+            for pid in $pids; do
+                if is_pid_running "$pid"; then
+                    log "端口 $port 进程未退出，强制停止 pid=$pid"
+                    kill -9 "$pid" >/dev/null 2>&1 || true
+                fi
+            done
+        fi
+    fi
+}
+
 start_background_process() {
     local pid_file="$1"
     local log_file="$2"

@@ -13,6 +13,7 @@ MASTER_PID_FILE="$RUN_DIR/roscore.pid"
 MASTER_LOG_FILE="$LOG_DIR/roscore.log"
 LAUNCH_PID_FILE="$RUN_DIR/usv_system.pid"
 LAUNCH_LOG_FILE="$LOG_DIR/usv_system.log"
+WEB_PORT="${WEB_PORT:-5000}"
 
 if [[ -f "$LAUNCH_PID_FILE" ]]; then
     launch_pid="$(cat "$LAUNCH_PID_FILE")"
@@ -35,6 +36,8 @@ if ! rostopic list >/dev/null 2>&1; then
     start_background_process "$MASTER_PID_FILE" "$MASTER_LOG_FILE" roscore
     sleep 3
 fi
+
+cleanup_port_process "$WEB_PORT"
 
 require_roscore
 log "ROS Master 已就绪，开始后台启动 usv_ros 系统"
