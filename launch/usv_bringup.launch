@@ -46,20 +46,7 @@
     <rosparam file="$(find usv_ros)/config/usv_params.yaml" command="load" />
 
     <!-- ==================== Pump Control Node ==================== -->
-    <node name="pump_control_node" pkg="usv_ros" type="pump_control_node.py"
-          output="screen" if="$(arg enable_pump)">
-        <param name="serial_port" value="$(arg pump_port)" />
-        <param name="baudrate" value="$(arg pump_baudrate)" />
-        <param name="timeout" value="$(arg pump_timeout)" />
-        <param name="pid_mode" value="$(arg pid_mode)" />
-        <param name="pid_precision" value="$(arg pid_precision)" />
-        <rosparam subst_value="true">
-          i2c_mapping: $(eval i2c_mapping)
-          spectrometer: $(eval spectrometer)
-          angle_stream: $(eval angle_stream)
-        </rosparam>
 
-    </node>
 
     <!-- 分光功能已并入 pump_control_node -->
 
