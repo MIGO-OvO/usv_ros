@@ -421,16 +421,6 @@ class WebConfigServer(object):
         }
         self.voltage_history = []  # List of {timestamp, voltage, absorbance, raw}
 
-        # Flask & SocketIO
-        self.app = None
-        self.socketio = None
-        self.server_thread = None
-
-        if FLASK_AVAILABLE:
-            self._setup_flask()
-        else:
-            rospy.logerr("Flask/SocketIO not available!")
-
         # ROS 订阅 (仅在非独立模式)
         if not self.standalone:
             self.status_sub = rospy.Subscriber('/usv/pump_status', String, self._status_cb)
@@ -450,6 +440,16 @@ class WebConfigServer(object):
             self.pid_error_sub = None
             self.steps_pub = None
             self.command_pub = None
+
+        # Flask & SocketIO
+        self.app = None
+        self.socketio = None
+        self.server_thread = None
+
+        if FLASK_AVAILABLE:
+            self._setup_flask()
+        else:
+            rospy.logerr("Flask/SocketIO not available!")
 
         mode_str = "独立模式 (无 ROS)" if self.standalone else "ROS 模式"
         rospy.loginfo("Web Config Server initialized (%s)", mode_str)
@@ -1140,16 +1140,22 @@ class WebConfigServer(object):
 
     def _data_push_loop(self):
         """后台线程：定时推送实时数据"""
-        rate = 20 # Hz
+        rate = 20  # Hz
         while not rospy.is_shutdown():
             if self.socketio:
                 self.socketio.emit('status', {
                     "pump_connected": self.pump_connected,
                     "automation_running": self.automation_running,
-                    "mission_status": self.mission_status
+                    "mission_status": self.mission_status,
                 })
                 self.socketio.emit('angles', self.current_angles)
-                self.socketio.emit('voltage', {"value": self.current_voltage})
+                self.socketio.emit('voltage', {
+                    "value": self.current_voltage,
+                    "voltage": self.current_voltage,
+                    "absorbance": self.current_absorbance,
+                    "status": self.spectrometer_status,
+                    "raw": self.latest_spectrometer_payload,
+                })
 
             if self.standalone:
                 # 独立模式模拟数据变化 (测试用)

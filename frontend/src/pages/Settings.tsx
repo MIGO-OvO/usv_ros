@@ -17,14 +17,36 @@ interface HardwareConfig {
   pump_serial_port: string
   pump_baudrate: number
   pump_timeout: number
-  spectrometer_auto_start: boolean
+  ads_address: string
+  spectro_channel: number
+  mux: string
+  gain: number
+  vref_mode: string
+  adc_rate: number
+  publish_rate: number
+  continuous_mode: boolean
+  auto_start: boolean
+  reference_voltage: number
+  baseline_voltage: number
+  i2c_mapping: Record<'X' | 'Y' | 'Z' | 'A', number>
 }
 
 const DEFAULT_HW: HardwareConfig = {
   pump_serial_port: '/dev/ttyUSB0',
   pump_baudrate: 115200,
   pump_timeout: 1.0,
-  spectrometer_auto_start: false,
+  ads_address: '0x40',
+  spectro_channel: 2,
+  mux: 'AIN0',
+  gain: 1,
+  vref_mode: 'AVDD',
+  adc_rate: 90,
+  publish_rate: 20,
+  continuous_mode: true,
+  auto_start: false,
+  reference_voltage: 2.5,
+  baseline_voltage: 0.0,
+  i2c_mapping: { X: 0, Y: 3, Z: 4, A: 7 },
 }
 
 export default function Settings() {
@@ -47,8 +69,15 @@ export default function Settings() {
     try {
       const res = await fetch('/api/hardware/config')
       const data = await res.json()
-      if (data.success) setHw({ ...DEFAULT_HW, ...data.data })
+      if (data.success) setHw({ ...DEFAULT_HW, ...data.data, i2c_mapping: { ...DEFAULT_HW.i2c_mapping, ...(data.data?.i2c_mapping || {}) } })
     } catch (e) { console.error(e) }
+  }
+
+  const setMapChannel = (axis: 'X' | 'Y' | 'Z' | 'A', value: string) => {
+    setHw(prev => ({
+      ...prev,
+      i2c_mapping: { ...prev.i2c_mapping, [axis]: parseInt(value) || 0 },
+    }))
   }
 
   const refreshDevices = async () => {
@@ -70,8 +99,6 @@ export default function Settings() {
     } catch (e: any) { setHwMsg(e.message) }
   }
 
-
-
   const saveAndApplyHardware = async () => {
     setHwLoading(true)
     setHwMsg('')
@@ -83,7 +110,10 @@ export default function Settings() {
       const data = await res.json()
       const msgs: string[] = [data.message || '']
       if (data.results?.pump) msgs.push('泵控: ' + data.results.pump.message)
-      setHwMsg(msgs.join(' | '))
+      if (data.results?.spectrometer) msgs.push('分光: ' + data.results.spectrometer.message)
+      if (data.results?.i2c_mapping) msgs.push('映射: ' + data.results.i2c_mapping.message)
+      setHwMsg(msgs.filter(Boolean).join(' | '))
+      if (data.data) setHw({ ...DEFAULT_HW, ...data.data, i2c_mapping: { ...DEFAULT_HW.i2c_mapping, ...(data.data.i2c_mapping || {}) } })
     } catch (e: any) { setHwMsg(e.message) }
     setHwLoading(false)
   }
@@ -97,6 +127,7 @@ export default function Settings() {
       })
       const data = await res.json()
       setHwMsg(data.message || '已保存')
+      if (data.data) setHw({ ...DEFAULT_HW, ...data.data, i2c_mapping: { ...DEFAULT_HW.i2c_mapping, ...(data.data.i2c_mapping || {}) } })
     } catch (e: any) { setHwMsg(e.message) }
   }
 
@@ -274,16 +305,10 @@ export default function Settings() {
             <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
               <div className="space-y-2">
                 <Label>串口路径</Label>
-                <select
-                  className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm"
-                  value={hw.pump_serial_port}
-                  onChange={e => setHw(p => ({ ...p, pump_serial_port: e.target.value }))}
-                >
+                <select className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" value={hw.pump_serial_port} onChange={e => setHw(p => ({ ...p, pump_serial_port: e.target.value }))}>
                   <option value={hw.pump_serial_port}>{hw.pump_serial_port}</option>
                   {serialPorts.filter(p => p.path !== hw.pump_serial_port).map(p => (
-                    <option key={p.by_id || p.path} value={p.by_id || p.path}>
-                      {p.by_id || p.path}{p.description ? ` (${p.description})` : ''}
-                    </option>
+                    <option key={p.by_id || p.path} value={p.by_id || p.path}>{p.by_id || p.path}{p.description ? ` (${p.description})` : ''}</option>
                   ))}
                 </select>
               </div>
@@ -299,7 +324,40 @@ export default function Settings() {
             <Button variant="outline" size="sm" onClick={testPumpPort}><Activity className="w-4 h-4 mr-1" />测试泵控连接</Button>
           </div>
 
+          <div className="space-y-3">
+            <h4 className="font-medium text-sm">ADS122C04 分光参数</h4>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="space-y-2"><Label>ADS 地址</Label><Input value={hw.ads_address} onChange={e => setHw(p => ({ ...p, ads_address: e.target.value }))} /></div>
+              <div className="space-y-2"><Label>TCA 分光通道</Label><Input type="number" min="0" max="7" value={hw.spectro_channel} onChange={e => setHw(p => ({ ...p, spectro_channel: parseInt(e.target.value) || 0 }))} /></div>
+              <div className="space-y-2"><Label>AIN 通道</Label><select className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" value={hw.mux} onChange={e => setHw(p => ({ ...p, mux: e.target.value }))}><option value="AIN0">AIN0</option><option value="AIN1">AIN1</option><option value="AIN2">AIN2</option><option value="AIN3">AIN3</option></select></div>
+              <div className="space-y-2"><Label>增益</Label><select className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" value={hw.gain} onChange={e => setHw(p => ({ ...p, gain: parseInt(e.target.value) || 1 }))}><option value="1">1</option><option value="2">2</option><option value="4">4</option><option value="8">8</option><option value="16">16</option><option value="32">32</option><option value="64">64</option><option value="128">128</option></select></div>
+              <div className="space-y-2"><Label>参考电压</Label><select className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" value={hw.vref_mode} onChange={e => setHw(p => ({ ...p, vref_mode: e.target.value }))}><option value="AVDD">AVDD</option><option value="INTERNAL">INTERNAL</option><option value="EXTERNAL">EXTERNAL</option></select></div>
+              <div className="space-y-2"><Label>ADC 速率</Label><Input type="number" value={hw.adc_rate} onChange={e => setHw(p => ({ ...p, adc_rate: parseInt(e.target.value) || 90 }))} /></div>
+              <div className="space-y-2"><Label>发布频率</Label><Input type="number" value={hw.publish_rate} onChange={e => setHw(p => ({ ...p, publish_rate: parseInt(e.target.value) || 20 }))} /></div>
+              <div className="space-y-2"><Label>参考电压值</Label><Input type="number" step="0.001" value={hw.reference_voltage} onChange={e => setHw(p => ({ ...p, reference_voltage: parseFloat(e.target.value) || 0 }))} /></div>
+              <div className="space-y-2"><Label>基线电压</Label><Input type="number" step="0.001" value={hw.baseline_voltage} onChange={e => setHw(p => ({ ...p, baseline_voltage: parseFloat(e.target.value) || 0 }))} /></div>
+            </div>
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={hw.continuous_mode} onChange={e => setHw(p => ({ ...p, continuous_mode: e.target.checked }))} />连续采样模式</label>
+              <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={hw.auto_start} onChange={e => setHw(p => ({ ...p, auto_start: e.target.checked }))} />启动后自动开启分光</label>
+            </div>
+          </div>
 
+          <div className="space-y-3">
+            <h4 className="font-medium text-sm">角度 / 分光 TCA 通道映射</h4>
+            <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+              {(['X', 'Y', 'Z', 'A'] as const).map(axis => (
+                <div key={axis} className="space-y-2">
+                  <Label>{axis} 轴通道</Label>
+                  <Input type="number" min="0" max="7" value={hw.i2c_mapping[axis]} onChange={e => setMapChannel(axis, e.target.value)} />
+                </div>
+              ))}
+              <div className="space-y-2">
+                <Label>分光通道</Label>
+                <Input type="number" min="0" max="7" value={hw.spectro_channel} onChange={e => setHw(p => ({ ...p, spectro_channel: parseInt(e.target.value) || 0 }))} />
+              </div>
+            </div>
+          </div>
 
           {hwMsg && (
             <div className="text-sm p-3 rounded bg-muted/50">{hwMsg}</div>
@@ -314,8 +372,8 @@ export default function Settings() {
           </div>
 
           <div className="text-xs text-muted-foreground bg-muted/50 p-3 rounded">
-            <p>"仅保存"将配置写入文件，下次重启生效。</p>
-            <p>"保存并应用"将立即通知节点重连设备，无需重启系统。</p>
+            <p>支持在 Web 端直接修改 ADS 参数、分光通道以及四个角度采样通道映射。</p>
+            <p>“仅保存”写入配置文件；“保存并应用”会同时重连泵控并下发分光/I2C 映射。</p>
             <p>串口建议优先选择 /dev/serial/by-id/... 路径，避免 USB 口漂移。</p>
           </div>
         </CardContent>

@@ -79,7 +79,7 @@ DEFAULT_SPECTRO_CONFIG = {
     "enabled": True,
     "auto_start": False,
     "ads_address": "0x40",
-    "mux": "AIN0_AVSS",
+    "mux": "AIN0",
     "gain": 1,
     "pga_bypass": True,
     "turbo_mode": False,
@@ -88,9 +88,10 @@ DEFAULT_SPECTRO_CONFIG = {
     "adc_rate": 90,
     "publish_rate": 20,
     "reference_voltage": 2.5,
-    "baseline_voltage": 2.5,
+    "baseline_voltage": 0.0,
     "path_length_cm": 1.0,
 }
+
 
 DEFAULT_ANGLE_STREAM = {
     "enabled": True,
@@ -189,14 +190,17 @@ class PumpSerialReader(object):
     def _find_header(self):
         """查找二进制帧头。"""
         for i in range(len(self.binary_buffer) - 1):
-            if self.binary_buffer[i] == HEADER1:
-                h2 = self.binary_buffer[i + 1]
-                if h2 == HEADER2_ANGLE:
-                    return (i, HEADER2_ANGLE, PACKET_SIZE_ANGLE)
-                elif h2 == HEADER2_PID:
-                    return (i, HEADER2_PID, PACKET_SIZE_PID)
-                elif h2 == HEADER2_TEST:
-                    return (i, HEADER2_TEST, PACKET_SIZE_TEST)
+            if self.binary_buffer[i] != HEADER1:
+                continue
+            h2 = self.binary_buffer[i + 1]
+            if h2 == HEADER2_ANGLE:
+                return (i, HEADER2_ANGLE, PACKET_SIZE_ANGLE)
+            elif h2 == HEADER2_PID:
+                return (i, HEADER2_PID, PACKET_SIZE_PID)
+            elif h2 == HEADER2_TEST:
+                return (i, HEADER2_TEST, PACKET_SIZE_TEST)
+            elif h2 == HEADER2_SPECTRO:
+                return (i, HEADER2_SPECTRO, PACKET_SIZE_SPECTRO)
         return None
 
     def _validate_packet(self, data, packet_type, packet_size):
@@ -208,7 +212,6 @@ class PumpSerialReader(object):
         if data[packet_size - 1] != TAIL:
             return False
 
-        # 计算校验和
         if packet_type == HEADER2_ANGLE:
             checksum = 0
             for i in range(1, 18):
@@ -222,6 +225,11 @@ class PumpSerialReader(object):
         elif packet_type == HEADER2_TEST:
             checksum = 0
             for i in range(2, 16):
+                checksum ^= data[i]
+            return checksum == data[16]
+        elif packet_type == HEADER2_SPECTRO:
+            checksum = 0
+            for i in range(1, 16):
                 checksum ^= data[i]
             return checksum == data[16]
 
@@ -382,7 +390,9 @@ class PumpControlNode(object):
         self.latest_spectro = None
         self.spectro_state = "idle"
         self.spectro_reference_voltage = float(self.spectro_config.get('reference_voltage', 2.5))
-        self.spectro_baseline_voltage = float(self.spectro_config.get('baseline_voltage', 2.5))
+        self.spectro_baseline_voltage = float(self.spectro_config.get('baseline_voltage', 0.0))
+        self.spectro_command_event = threading.Event()
+        self.spectro_command_result = None
 
         # Publishers
         self.angles_pub = rospy.Publisher('/usv/pump_angles', String, queue_size=10)
@@ -586,33 +596,45 @@ class PumpControlNode(object):
 
     def _build_ads_config_command(self):
         cfg = self.spectro_config
+        mux = str(cfg.get('mux', 'AIN0')).strip().upper()
+        ain = mux.split('_', 1)[0] if mux.startswith('AIN') else 'AIN0'
+        vref_mode = str(cfg.get('vref_mode', 'AVDD')).strip().upper()
+        adc_rate = int(cfg.get('adc_rate', 90) or 90)
+        publish_rate = max(1, int(cfg.get('publish_rate', 20) or 20))
         return (
-            "ADSCFG:ADDR={addr},CH={ch},MUX={mux},GAIN={gain},VREF={vref},RATE={rate},PUB={pub},MODE={mode}"
+            "ADSCFG:CH={ch},ADDR={addr},AIN={ain},REF={vref},GAIN={gain},DR={rate},MODE={mode},PR={pub}"
             .format(
-                addr=cfg.get('ads_address', '0x40'),
-                ch=self.i2c_mapping.get('spectro_channel', 2),
-                mux=cfg.get('mux', 'AIN0_AVSS'),
-                gain=cfg.get('gain', 1),
-                vref=cfg.get('vref_mode', 'AVDD'),
-                rate=cfg.get('adc_rate', 90),
-                pub=cfg.get('publish_rate', 20),
+                ch=int(self.i2c_mapping.get('spectro_channel', 2)),
+                addr=str(cfg.get('ads_address', '0x40')).strip(),
+                ain=ain,
+                vref=vref_mode,
+                gain=int(cfg.get('gain', 1) or 1),
+                rate=adc_rate,
+                pub=publish_rate,
                 mode='CONT' if cfg.get('continuous_mode', True) else 'SINGLE',
             )
         )
 
+    def _wait_for_spectro_command_result(self, timeout=2.0):
+        self.spectro_command_event.clear()
+        self.spectro_command_result = None
+        if self.spectro_command_event.wait(timeout):
+            return self.spectro_command_result
+        return False, 'timeout'
+
     def _spectro_start(self):
         ok = self.send_command('ADSSTART')
-        if ok:
-            self.spectro_state = 'acquiring'
-            self._publish_spectro_status('acquiring')
-        return ok
+        if not ok:
+            return False, 'Spectrometer start command send failed'
+        success, message = self._wait_for_spectro_command_result(timeout=2.0)
+        return success, message if message != 'timeout' else 'Spectrometer start timeout'
 
     def _spectro_stop(self):
         ok = self.send_command('ADSSTOP')
-        if ok:
-            self.spectro_state = 'stopped'
-            self._publish_spectro_status('stopped')
-        return ok
+        if not ok:
+            return False, 'Spectrometer stop command send failed'
+        success, message = self._wait_for_spectro_command_result(timeout=2.0)
+        return success, message if message != 'timeout' else 'Spectrometer stop timeout'
 
     def _is_injection_pump_command(self, command):
         """判断是否为进样泵直通指令。"""
@@ -800,11 +822,15 @@ class PumpControlNode(object):
 
         if text.startswith("ADS_OK:START"):
             self.spectro_state = 'acquiring'
+            self.spectro_command_result = (True, text)
+            self.spectro_command_event.set()
             self._publish_spectro_status('acquiring')
             return
 
         if text.startswith("ADS_OK:STOP"):
             self.spectro_state = 'stopped'
+            self.spectro_command_result = (True, text)
+            self.spectro_command_event.set()
             self._publish_spectro_status('stopped')
             return
 
@@ -814,6 +840,8 @@ class PumpControlNode(object):
 
         if text.startswith("ADS_ERR:"):
             self.spectro_state = 'error'
+            self.spectro_command_result = (False, text)
+            self.spectro_command_event.set()
             self._publish_spectro_status(text)
             return
 
@@ -879,6 +907,22 @@ class PumpControlNode(object):
         elif data.get('saturated', False):
             self.spectro_state = 'saturated'
 
+        absorbance = self._calculate_absorbance(data.get('voltage', 0.0))
+        payload = {
+            'voltage': data.get('voltage', 0.0),
+            'sample_voltage': data.get('voltage', 0.0),
+            'absorbance': absorbance,
+            'status': self.spectro_state,
+            'timestamp_ms': data.get('timestamp_ms', 0),
+            'tca_channel': data.get('tca_channel', -1),
+            'raw_code': data.get('raw_code', 0),
+            'valid': data.get('valid', False),
+            'i2c_error': data.get('i2c_error', False),
+            'not_configured': data.get('not_configured', False),
+            'saturated': data.get('saturated', False),
+            'reference_voltage': self.spectro_reference_voltage,
+            'baseline_voltage': self.spectro_baseline_voltage,
+        }
         self._publish_spectro_status(self.spectro_state)
 
         raw_msg = String()
@@ -886,29 +930,22 @@ class PumpControlNode(object):
         self.spectro_raw_pub.publish(raw_msg)
 
         voltage_msg = String()
-        voltage_msg.data = json.dumps({
-            'voltage': data.get('voltage', 0.0),
-            'timestamp_ms': data.get('timestamp_ms', 0),
-            'tca_channel': data.get('tca_channel', -1),
-        })
+        voltage_msg.data = json.dumps(payload)
         self.spectro_voltage_pub.publish(voltage_msg)
 
-        absorbance = self._calculate_absorbance(data.get('voltage', 0.0))
         absorbance_msg = String()
         absorbance_msg.data = json.dumps({
             'absorbance': absorbance,
             'reference_voltage': self.spectro_reference_voltage,
             'baseline_voltage': self.spectro_baseline_voltage,
+            'sample_voltage': data.get('voltage', 0.0),
         })
         self.spectro_absorbance_pub.publish(absorbance_msg)
 
     def _calculate_absorbance(self, voltage):
-        ref = max(self.spectro_reference_voltage, 1e-6)
-        sample = max(voltage, 1e-6)
-        baseline = max(self.spectro_baseline_voltage, 1e-6)
-        corrected_sample = max(sample / baseline, 1e-6)
-        corrected_ref = max(ref / baseline, 1e-6)
-        return round(math.log10(corrected_ref / corrected_sample), 6)
+        ref = max(self.spectro_reference_voltage - self.spectro_baseline_voltage, 1e-6)
+        sample = max(voltage - self.spectro_baseline_voltage, 1e-6)
+        return round(math.log10(ref / sample), 6)
 
     def _publish_spectro_status(self, status):
         msg = String()
@@ -968,7 +1005,11 @@ class PumpControlNode(object):
         elif cmd == 'stop':
             self._spectro_stop()
         elif cmd == 'configure':
-            self.spectro_config.update(payload)
+            updated = dict(payload)
+            updated.pop('cmd', None)
+            self.spectro_config.update(updated)
+            self.spectro_reference_voltage = float(self.spectro_config.get('reference_voltage', self.spectro_reference_voltage))
+            self.spectro_baseline_voltage = float(self.spectro_config.get('baseline_voltage', self.spectro_baseline_voltage))
             self._apply_spectro_config()
         elif cmd == 'set_i2c_map':
             mapping = payload.get('mapping', {})
@@ -984,6 +1025,9 @@ class PumpControlNode(object):
             self._start_angle_stream()
         elif cmd == 'angle_stream_stop':
             self._stop_angle_stream()
+        elif cmd == 'set_reference':
+            if 'voltage' in payload:
+                self.spectro_reference_voltage = float(payload['voltage'])
         elif cmd == 'set_baseline':
             if 'voltage' in payload:
                 self.spectro_baseline_voltage = float(payload['voltage'])
@@ -991,12 +1035,12 @@ class PumpControlNode(object):
             rospy.logwarn("Unknown spectrometer command: %s", cmd)
 
     def _spectro_start_callback(self, req):
-        success = self._spectro_start()
-        return TriggerResponse(success=success, message='Spectrometer started' if success else 'Spectrometer start failed')
+        success, message = self._spectro_start()
+        return TriggerResponse(success=success, message=message)
 
     def _spectro_stop_callback(self, req):
-        success = self._spectro_stop()
-        return TriggerResponse(success=success, message='Spectrometer stopped' if success else 'Spectrometer stop failed')
+        success, message = self._spectro_stop()
+        return TriggerResponse(success=success, message=message)
 
     def _i2c_map_apply_callback(self, req):
         success = self._apply_i2c_mapping()

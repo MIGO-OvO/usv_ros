@@ -75,9 +75,9 @@ i2c_mapping:
 
 spectrometer:
   enabled: true
-  auto_start: true
+  auto_start: false
   ads_address: "0x40"
-  mux: "AIN0_AVSS"
+  mux: "AIN0"
   gain: 1
   pga_bypass: true
   turbo_mode: false
@@ -86,7 +86,7 @@ spectrometer:
   adc_rate: 90
   publish_rate: 20
   reference_voltage: 2.5
-  baseline_voltage: 2.5
+  baseline_voltage: 0.0
   path_length_cm: 1.0
 
 angle_stream:
