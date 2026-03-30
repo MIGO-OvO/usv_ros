@@ -38,6 +38,7 @@ import os
 import struct
 import sys
 import threading
+import time
 
 import serial
 import rospy
@@ -349,6 +350,8 @@ class PumpControlNode(object):
         self.timeout = rospy.get_param('~timeout', 1.0)
         self.pid_mode = rospy.get_param('~pid_mode', True)
         self.pid_precision = rospy.get_param('~pid_precision', 0.1)
+        self.auto_injection_command_delay = float(rospy.get_param('~auto_injection_command_delay', 0.15))
+        self.auto_injection_retry_delay = float(rospy.get_param('~auto_injection_retry_delay', 0.2))
         self.i2c_mapping = rospy.get_param('~i2c_mapping', rospy.get_param('/i2c_mapping', DEFAULT_I2C_MAPPING))
         self.spectro_config = rospy.get_param('~spectrometer', rospy.get_param('/spectrometer', DEFAULT_SPECTRO_CONFIG))
         self.angle_stream = rospy.get_param('~angle_stream', rospy.get_param('/angle_stream', DEFAULT_ANGLE_STREAM))
@@ -737,10 +740,12 @@ class PumpControlNode(object):
             motor_cfg = step.get(motor, {}) or {}
             if str(motor_cfg.get("enable", "D")).upper() == "E":
                 enabled_motors.append(motor)
+        pump_cfg = step.get("pump", {}) or {}
+        pump_enabled = bool(pump_cfg.get("enable", False))
         rospy.loginfo("[Automation] 开始执行步骤: %s, 电机=%s, 进样泵=%s",
                       step_name,
                       ",".join(enabled_motors) if enabled_motors else "无",
-                      "启用" if step.get("pump", {}).get("enable", False) else "关闭")
+                      "启用" if pump_enabled else "关闭")
 
         command = self.command_generator.generate_command(step, mode="auto")
         if command and not self.send_command(command):
@@ -748,10 +753,17 @@ class PumpControlNode(object):
             return False
         if command:
             rospy.loginfo("[Automation] 指令已发送: %s", command.strip())
-        elif not step.get("pump", {}).get("enable", False):
+        elif not pump_enabled:
             rospy.logwarn("[Automation] 步骤 %s 未生成电机指令，且未启用进样泵", step_name)
 
+        if command and pump_cfg:
+            time.sleep(self.auto_injection_command_delay)
+
         inject_ok = self._handle_injection_pump_step(step, mode="auto")
+        if not inject_ok and command and pump_enabled:
+            rospy.logwarn("[Automation] 进样泵首发失败，准备重试: %s", step_name)
+            time.sleep(self.auto_injection_retry_delay)
+            inject_ok = self._handle_injection_pump_step(step, mode="auto")
         if not inject_ok:
             rospy.logerr("[Automation] 进样泵步骤执行失败: %s", step_name)
         return inject_ok
