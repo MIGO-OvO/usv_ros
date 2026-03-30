@@ -3,6 +3,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Switch } from "@/components/ui/switch"
 import { Save, RefreshCw, Zap, Target, RotateCcw, Usb, Activity } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAppStore } from '@/store'
@@ -336,8 +337,8 @@ export default function Settings() {
               <div className="space-y-2"><Label>基线电压</Label><Input type="number" step="0.001" value={hw.baseline_voltage} onChange={e => setHw(p => ({ ...p, baseline_voltage: parseFloat(e.target.value) || 0 }))} /></div>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={hw.continuous_mode} onChange={e => setHw(p => ({ ...p, continuous_mode: e.target.checked }))} />连续采样模式</label>
-              <label className="flex items-center gap-2 text-sm"><input type="checkbox" checked={hw.auto_start} onChange={e => setHw(p => ({ ...p, auto_start: e.target.checked }))} />启动后自动开启分光</label>
+              <label className="flex items-center justify-between gap-2 text-sm"><span>连续采样模式</span><Switch checked={hw.continuous_mode} onCheckedChange={v => setHw(p => ({ ...p, continuous_mode: v }))} /></label>
+              <label className="flex items-center justify-between gap-2 text-sm"><span>启动后自动开启分光</span><Switch checked={hw.auto_start} onCheckedChange={v => setHw(p => ({ ...p, auto_start: v }))} /></label>
             </div>
           </div>
 

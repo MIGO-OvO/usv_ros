@@ -3,6 +3,8 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Switch } from "@/components/ui/switch"
+import { NumericInput } from "@/components/ui/numeric-input"
 import { Play, Square, Pause, Save, FolderOpen, Plus, Trash2, ArrowUp, ArrowDown } from 'lucide-react'
 import { useAppStore } from '@/store'
 import { InjectionPumpCard } from '@/components/injection-pump-card'
@@ -221,7 +223,7 @@ export default function Automation() {
             <CardContent className="space-y-4">
                 <div className="space-y-2">
                     <Label>循环次数 (0 = 无限循环)</Label>
-                    <Input type="number" value={loopCount} onChange={(e) => setLoopCount(parseInt(e.target.value))} />
+                    <NumericInput value={loopCount} onValueChange={setLoopCount} integer className="h-9" />
                 </div>
                 <div className="space-y-2">
                     <Label>预设名称</Label>
@@ -256,8 +258,9 @@ export default function Automation() {
                             <Input value={step.name} onChange={(e) => updateStep(index, 'name', e.target.value)} className="w-40" />
                             <div className="flex-1" />
                             <div className="flex items-center gap-2">
-                                <Label>步骤完成后等待 (ms)</Label>
-                                <Input type="number" value={step.interval} onChange={(e) => updateStep(index, 'interval', parseInt(e.target.value || '0'))} className="w-32" />
+                                <Label className="whitespace-nowrap text-xs text-muted-foreground">完成后等待</Label>
+                                <NumericInput value={step.interval} onValueChange={(v) => updateStep(index, 'interval', v)} integer className="w-24 h-7 text-xs px-2" />
+                                <span className="text-xs text-muted-foreground">ms</span>
                             </div>
                             <div className="flex gap-1">
                                 <Button size="icon" variant="ghost" onClick={() => moveStep(index, -1)}><ArrowUp className="w-4 h-4" /></Button>
@@ -266,65 +269,66 @@ export default function Automation() {
                             </div>
                         </div>
 
-                        <div className="grid grid-cols-1 xl:grid-cols-5 gap-4 pt-2">
-                            {['X', 'Y', 'Z', 'A'].map((axis) => (
+                        <div className="grid grid-cols-2 xl:grid-cols-5 gap-3 pt-2">
+                            {(['X', 'Y', 'Z', 'A'] as const).map((axis) => (
                                 <div key={axis} className="space-y-2 p-3 rounded-lg border border-border/60 bg-muted/20">
-                                    <div className="font-bold text-center text-xs mb-2">{axis} 轴</div>
                                     <div className="flex items-center justify-between">
-                                        <Label className="text-xs">启用</Label>
-                                        <input type="checkbox"
+                                        <span className="font-bold text-xs">{axis} 轴</span>
+                                        <Switch
                                             checked={(step as any)[axis].enable === 'E'}
-                                            onChange={(e) => updateStep(index, `${axis}.enable`, e.target.checked ? 'E' : 'D')}
+                                            onCheckedChange={(checked) => updateStep(index, `${axis}.enable`, checked ? 'E' : 'D')}
                                         />
                                     </div>
                                     {(step as any)[axis].enable === 'E' && (
                                         <>
-                                            <div className="grid grid-cols-2 gap-1">
-                                                <Label className="text-xs">角度</Label>
-                                                <Input className="h-7 text-xs px-1" value={(step as any)[axis].angle} onChange={(e) => updateStep(index, `${axis}.angle`, e.target.value)} />
+                                            <div className="space-y-1">
+                                                <Label className="text-xs text-muted-foreground">角度</Label>
+                                                <NumericInput className="h-7 text-xs px-2" value={(step as any)[axis].angle} onValueChange={(v) => updateStep(index, `${axis}.angle`, String(v))} />
                                             </div>
-                                            <div className="grid grid-cols-2 gap-1">
-                                                <Label className="text-xs">速度</Label>
-                                                <Input className="h-7 text-xs px-1" value={(step as any)[axis].speed} onChange={(e) => updateStep(index, `${axis}.speed`, e.target.value)} />
+                                            <div className="space-y-1">
+                                                <Label className="text-xs text-muted-foreground">速度</Label>
+                                                <NumericInput className="h-7 text-xs px-2" value={(step as any)[axis].speed} onValueChange={(v) => updateStep(index, `${axis}.speed`, String(v))} integer />
                                             </div>
                                         </>
                                     )}
                                 </div>
                             ))}
 
-                            <div className="space-y-3 p-3 rounded-lg border border-cyan-500/20 bg-cyan-500/5">
-                                <div className="font-bold text-center text-xs text-cyan-600 dark:text-cyan-400">进样泵</div>
+                            <div className="space-y-2 p-3 rounded-lg border border-cyan-500/20 bg-cyan-500/5">
                                 <div className="flex items-center justify-between">
-                                    <Label className="text-xs">启用</Label>
-                                    <input
-                                      type="checkbox"
+                                    <span className="font-bold text-xs text-cyan-600 dark:text-cyan-400">进样泵</span>
+                                    <Switch
                                       checked={!!step.pump?.enable}
-                                      onChange={(e) => updateStep(index, 'pump.enable', e.target.checked)}
+                                      onCheckedChange={(checked) => updateStep(index, 'pump.enable', checked)}
                                     />
                                 </div>
-                                <div className="grid grid-cols-2 gap-1">
-                                    <Label className="text-xs">转速%</Label>
-                                    <Input
-                                      className="h-7 text-xs px-1"
-                                      type="number"
-                                      min={0}
-                                      max={100}
-                                      value={step.pump?.speed ?? 0}
-                                      onChange={(e) => updateStep(index, 'pump.speed', parseInt(e.target.value || '0'))}
-                                    />
-                                </div>
-                                <div className="grid grid-cols-2 gap-1">
-                                    <Label className="text-xs">时长ms</Label>
-                                    <Input
-                                      className="h-7 text-xs px-1"
-                                      type="number"
-                                      min={0}
-                                      value={step.pump?.duration_ms ?? 0}
-                                      onChange={(e) => updateStep(index, 'pump.duration_ms', parseInt(e.target.value || '0'))}
-                                    />
-                                </div>
+                                {step.pump?.enable && (
+                                    <>
+                                        <div className="space-y-1">
+                                            <Label className="text-xs text-muted-foreground">转速%</Label>
+                                            <NumericInput
+                                              className="h-7 text-xs px-2"
+                                              integer
+                                              min={0}
+                                              max={100}
+                                              value={step.pump?.speed ?? 0}
+                                              onValueChange={(v) => updateStep(index, 'pump.speed', v)}
+                                            />
+                                        </div>
+                                        <div className="space-y-1">
+                                            <Label className="text-xs text-muted-foreground">时长ms</Label>
+                                            <NumericInput
+                                              className="h-7 text-xs px-2"
+                                              integer
+                                              min={0}
+                                              value={step.pump?.duration_ms ?? 0}
+                                              onValueChange={(v) => updateStep(index, 'pump.duration_ms', v)}
+                                            />
+                                        </div>
+                                    </>
+                                )}
                                 <p className="text-xs leading-4 text-muted-foreground">
-                                  进样泵将在本步骤启动后按设定时长运行，完成后自动关闭；步骤间隔从本步骤完成后才开始计时。
+                                  进样泵按设定时长运行后自动关闭。
                                 </p>
                             </div>
                         </div>

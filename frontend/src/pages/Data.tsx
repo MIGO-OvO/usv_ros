@@ -1,9 +1,9 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useState, useMemo } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { ScrollArea } from "@/components/ui/scroll-area"
 import { Download, Trash2, RefreshCw, FileText, Calendar } from 'lucide-react'
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
+import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts'
 import { cn } from "@/lib/utils"
 import { useConfirm } from '@/hooks/use-confirm'
 
@@ -82,6 +82,40 @@ export default function Data() {
           console.error(e)
       }
   }
+
+  // 数据统计 — 计算电压范围用于图表自适应
+  const chartStats = useMemo(() => {
+    if (chartData.length === 0) return null
+    const voltages = chartData.map((d: any) => d.voltage).filter((v: number) => v != null && isFinite(v))
+    if (voltages.length === 0) return null
+    const min = Math.min(...voltages)
+    const max = Math.max(...voltages)
+    const range = max - min
+    // 给 Y 轴上下各留 10% margin，避免数据贴边
+    const margin = range > 0 ? range * 0.1 : 0.001
+    return {
+      count: chartData.length,
+      vMin: min,
+      vMax: max,
+      yMin: min - margin,
+      yMax: max + margin,
+    }
+  }, [chartData])
+
+  // 是否有吸光度数据
+  const hasAbsorbance = useMemo(
+    () => chartData.some((d: any) => d.absorbance != null),
+    [chartData]
+  )
+
+  const tooltipStyle = {
+    backgroundColor: 'hsl(var(--card))',
+    borderColor: 'hsl(var(--border))',
+    borderRadius: '8px',
+  }
+
+  const formatVoltage = (v: number | undefined) =>
+    typeof v === 'number' ? v.toPrecision(6) : String(v ?? '')
 
   const exportMission = (e: React.MouseEvent, id: string) => {
       e.stopPropagation()
@@ -185,9 +219,10 @@ export default function Data() {
                     <CardTitle>
                         {selectedId ? (missions.find(m => m.id === selectedId)?.name || "任务详情") : "请选择任务"}
                     </CardTitle>
-                    {selectedId && (
-                        <div className="text-xs text-muted-foreground font-mono">
-                            ID: {selectedId}
+                    {selectedId && chartStats && (
+                        <div className="flex items-center gap-4 text-xs text-muted-foreground font-mono">
+                            <span>{chartStats.count} 点</span>
+                            <span>V: {chartStats.vMin.toPrecision(4)} ~ {chartStats.vMax.toPrecision(4)}</span>
                         </div>
                     )}
                   </div>
@@ -196,34 +231,76 @@ export default function Data() {
                  {selectedId ? (
                      loading ? (
                          <div className="h-full flex items-center justify-center text-muted-foreground">加载中...</div>
+                     ) : chartData.length === 0 ? (
+                         <div className="h-full flex items-center justify-center text-muted-foreground flex-col gap-2">
+                             <FileText className="w-8 h-8 opacity-20" />
+                             <p>该任务暂无数据点</p>
+                         </div>
                      ) : (
                         <ResponsiveContainer width="100%" height="100%">
                             <LineChart data={chartData}>
                                 <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
-                                <XAxis 
-                                    dataKey="timestamp" 
-                                    tickFormatter={(t) => new Date(t).toLocaleTimeString()} 
+                                <XAxis
+                                    dataKey="timestamp"
+                                    tickFormatter={(t) => new Date(t).toLocaleTimeString()}
                                     stroke="hsl(var(--muted-foreground))"
-                                    fontSize={12}
+                                    fontSize={11}
+                                    tickLine={false}
+                                    axisLine={false}
                                 />
-                                <YAxis 
-                                    domain={[0, 5]} 
-                                    stroke="hsl(var(--muted-foreground))"
-                                    fontSize={12}
-                                    label={{ value: '电压 (V)', angle: -90, position: 'insideLeft', style: { fill: 'hsl(var(--muted-foreground))' } }}
+                                <YAxis
+                                    yAxisId="voltage"
+                                    domain={chartStats ? [chartStats.yMin, chartStats.yMax] : ['auto', 'auto']}
+                                    stroke="hsl(var(--chart-1))"
+                                    fontSize={11}
+                                    tickLine={false}
+                                    axisLine={false}
+                                    tickFormatter={(v: number) => v.toPrecision(3)}
+                                    label={{ value: '电压 (V)', angle: -90, position: 'insideLeft', style: { fill: 'hsl(var(--chart-1))', fontSize: 11 } }}
                                 />
-                                <Tooltip 
-                                    contentStyle={{ backgroundColor: 'hsl(var(--card))', borderColor: 'hsl(var(--border))', borderRadius: '8px' }}
-                                    labelFormatter={(t) => new Date(t).toLocaleString()} 
+                                {hasAbsorbance && (
+                                    <YAxis
+                                        yAxisId="absorbance"
+                                        orientation="right"
+                                        domain={['auto', 'auto']}
+                                        stroke="hsl(var(--chart-2))"
+                                        fontSize={11}
+                                        tickLine={false}
+                                        axisLine={false}
+                                        tickFormatter={(v: number) => v.toPrecision(3)}
+                                        label={{ value: '吸光度', angle: 90, position: 'insideRight', style: { fill: 'hsl(var(--chart-2))', fontSize: 11 } }}
+                                    />
+                                )}
+                                <Tooltip
+                                    contentStyle={tooltipStyle}
+                                    labelFormatter={(t) => new Date(t).toLocaleString()}
+                                    formatter={formatVoltage}
                                 />
-                                <Line 
-                                    type="monotone" 
-                                    dataKey="voltage" 
-                                    stroke="hsl(var(--primary))" 
-                                    dot={false} 
-                                    strokeWidth={2} 
+                                <Legend />
+                                <Line
+                                    yAxisId="voltage"
+                                    type="monotone"
+                                    dataKey="voltage"
+                                    name="电压"
+                                    stroke="hsl(var(--chart-1))"
+                                    dot={false}
+                                    strokeWidth={2}
                                     activeDot={{ r: 4 }}
+                                    isAnimationActive={false}
                                 />
+                                {hasAbsorbance && (
+                                    <Line
+                                        yAxisId="absorbance"
+                                        type="monotone"
+                                        dataKey="absorbance"
+                                        name="吸光度"
+                                        stroke="hsl(var(--chart-2))"
+                                        dot={false}
+                                        strokeWidth={2}
+                                        activeDot={{ r: 4 }}
+                                        isAnimationActive={false}
+                                    />
+                                )}
                             </LineChart>
                         </ResponsiveContainer>
                      )

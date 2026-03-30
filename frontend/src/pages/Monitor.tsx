@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { useAppStore } from '@/store'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
@@ -28,15 +28,23 @@ export default function Monitor() {
     refreshInjectionPumpStatus,
   } = useAppStore()
 
-  const pidErrors = useRef<Record<string, number>>({ X: 0, Y: 0, Z: 0, A: 0 })
+  const pidErrorsRef = useRef<Record<string, number>>({ X: 0, Y: 0, Z: 0, A: 0 })
+  const [pidErrors, setPidErrors] = useState<Record<string, number>>({ X: 0, Y: 0, Z: 0, A: 0 })
 
   useEffect(() => {
     if (!socket) return
     const handlePidError = (data: { motor: string; error: number }) => {
-      pidErrors.current[data.motor] = data.error ?? 0
+      pidErrorsRef.current[data.motor] = data.error ?? 0
     }
     socket.on('pid_error', handlePidError)
-    return () => { socket.off('pid_error', handlePidError) }
+    // 每 500ms 将 ref 同步到 state 触发渲染
+    const timer = setInterval(() => {
+      setPidErrors({ ...pidErrorsRef.current })
+    }, 500)
+    return () => {
+      socket.off('pid_error', handlePidError)
+      clearInterval(timer)
+    }
   }, [socket])
 
   useEffect(() => {
@@ -166,7 +174,7 @@ export default function Monitor() {
              <CardContent>
                 <div className="grid grid-cols-4 gap-4">
                   {(['X', 'Y', 'Z', 'A'] as const).map((axis) => {
-                    const err = pidErrors.current[axis] ?? 0
+                    const err = pidErrors[axis] ?? 0
                     const absErr = Math.abs(err)
                     return (
                       <div key={axis} className="text-center p-3 rounded-lg border border-border/60 bg-muted/20">
