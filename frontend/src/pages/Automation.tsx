@@ -94,7 +94,16 @@ export default function Automation() {
       })
     }
 
-    await fetch(`/api/mission/${action}`, options)
+    try {
+      const response = await fetch(`/api/mission/${action}`, options)
+      const result = await response.json()
+      if (!response.ok || !result.success) {
+        alert(result.message || `任务${action}失败`)
+      }
+    } catch (error) {
+      console.error(error)
+      alert(`任务${action}请求失败`)
+    }
   }
 
   // Preset Logic

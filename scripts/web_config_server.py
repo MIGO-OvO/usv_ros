@@ -457,11 +457,15 @@ class WebConfigServer(object):
 
     def _status_cb(self, msg):
         """泵状态回调。"""
-        status = msg.data.lower()
-        self.pump_connected = 'connected' in status
-        self.automation_running = 'automation' in status and 'running' not in status.replace('running', '')
-        if 'automation' in status:
-            self.automation_running = 'running' in status or '运行' in status
+        status_raw = msg.data or ""
+        status = status_raw.lower()
+        self.pump_connected = 'connected' in status and 'disconnected' not in status
+
+        if 'automation:' in status:
+            automation_status = status.split('automation:', 1)[1].strip()
+            self.automation_running = ('运行' in automation_status) or ('running' in automation_status)
+        elif 'stopped' in status or '已停止' in status:
+            self.automation_running = False
 
         # 只记录关键状态变化，避免刷屏
         # self._add_log("[状态] " + msg.data)

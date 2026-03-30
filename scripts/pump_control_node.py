@@ -673,6 +673,7 @@ class PumpControlNode(object):
     def _send_injection_pump_command(self, enabled=None, speed=None):
         """发送进样泵控制指令。"""
         command = self._build_injection_pump_command(enabled=enabled, speed=speed)
+        rospy.loginfo("[InjectionPump] 发送指令: %s", command)
         success = self.send_command(command)
         if success:
             if speed is not None:
@@ -685,9 +686,12 @@ class PumpControlNode(object):
             elif enabled is not None:
                 self._update_injection_pump_state(
                     enabled=enabled,
+                    speed=0 if not enabled else self.inject_pump_speed,
                     response=command,
                     error=""
                 )
+        else:
+            self._update_injection_pump_state(error="send failed: {}".format(command))
         return success
 
     def _handle_injection_pump_step(self, step, mode):
@@ -696,7 +700,11 @@ class PumpControlNode(object):
         if not isinstance(pump_cfg, dict) or "enable" not in pump_cfg:
             return True
 
-        pump_enabled = bool(pump_cfg.get("enable", False))
+        pump_enabled_raw = pump_cfg.get("enable", False)
+        if isinstance(pump_enabled_raw, str):
+            pump_enabled = pump_enabled_raw.strip().lower() in ("1", "true", "yes", "on", "e", "enable", "enabled")
+        else:
+            pump_enabled = bool(pump_enabled_raw)
         pump_speed = pump_cfg.get("speed", 0)
 
         try:
@@ -705,6 +713,8 @@ class PumpControlNode(object):
             rospy.logerr("Invalid injection pump speed: %s", str(pump_speed))
             return False
 
+        rospy.loginfo("[Automation] 进样泵步骤参数: mode=%s, enable=%s, speed=%s", mode, pump_enabled, pump_speed)
+
         if pump_enabled and pump_speed > 0:
             success = self._send_injection_pump_command(speed=pump_speed)
             if success and mode == "auto":
@@ -712,7 +722,10 @@ class PumpControlNode(object):
             return success
 
         if not pump_enabled and mode == "auto":
-            return self._send_injection_pump_command(enabled=False)
+            success = self._send_injection_pump_command(enabled=False)
+            if success:
+                rospy.loginfo("[Automation] 进样泵已关闭")
+            return success
 
         return True
 
@@ -1138,8 +1151,11 @@ class PumpControlNode(object):
     def _auto_stop_callback(self, req):
         """停止自动化服务回调。"""
         rospy.loginfo("Automation stop requested")
-        self.automation_engine.stop()
-        return TriggerResponse(success=True, message="Automation stopped")
+        if self.automation_engine.is_running() or self.automation_engine.is_paused():
+            self.automation_engine.stop()
+        success = self.stop_all_pumps()
+        message = "Automation stopped and pumps halted" if success else "Automation stopped but pump halt failed"
+        return TriggerResponse(success=success, message=message)
 
     def _auto_pause_callback(self, req):
         """暂停自动化服务回调。"""
