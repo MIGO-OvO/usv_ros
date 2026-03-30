@@ -41,6 +41,22 @@ const DEFAULT_STEP: Step = {
   pump: { ...DEFAULT_INJECTION_PUMP },
 }
 
+const normalizeStep = (step?: Partial<Step>): Step => ({
+  name: step?.name || '新步骤',
+  interval: Number(step?.interval ?? 1000) || 1000,
+  X: { ...DEFAULT_PUMP, ...(step?.X || {}) },
+  Y: { ...DEFAULT_PUMP, ...(step?.Y || {}) },
+  Z: { ...DEFAULT_PUMP, ...(step?.Z || {}) },
+  A: { ...DEFAULT_PUMP, ...(step?.A || {}) },
+  pump: {
+    enable: !!step?.pump?.enable,
+    speed: Math.max(0, Math.min(100, Number(step?.pump?.speed ?? 0) || 0)),
+  },
+})
+
+const normalizeSteps = (rawSteps?: Partial<Step>[]): Step[] =>
+  Array.isArray(rawSteps) ? rawSteps.map((step) => normalizeStep(step)) : []
+
 export default function Automation() {
   const { automationRunning } = useAppStore()
   const [steps, setSteps] = useState<Step[]>([])
@@ -56,7 +72,7 @@ export default function Automation() {
         const res = await fetch('/api/config')
         const data = await res.json()
         if (data.sampling_sequence) {
-            setSteps(data.sampling_sequence.steps || [])
+            setSteps(normalizeSteps(data.sampling_sequence.steps))
             setLoopCount(data.sampling_sequence.loop_count || 1)
         }
     } catch (e) {
@@ -124,7 +140,7 @@ export default function Automation() {
         if (res.ok) {
             const data = await res.json()
             if (data.success) {
-                setSteps(data.data.steps)
+                setSteps(normalizeSteps(data.data.steps))
                 setLoopCount(data.data.loop_count)
             }
         } else {

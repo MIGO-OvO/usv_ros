@@ -261,6 +261,7 @@ DEFAULT_CONFIG = {
                 "Y": {"enable": "D"},
                 "Z": {"enable": "D"},
                 "A": {"enable": "E", "direction": "F", "speed": "3", "angle": "360"},
+                "pump": {"enable": False, "speed": 0},
                 "interval": 2000
             },
             {
@@ -269,6 +270,7 @@ DEFAULT_CONFIG = {
                 "Y": {"enable": "E", "direction": "F", "speed": "5", "angle": "90"},
                 "Z": {"enable": "D"},
                 "A": {"enable": "E", "direction": "F", "speed": "3", "angle": "180"},
+                "pump": {"enable": True, "speed": 60},
                 "interval": 5000
             },
             {
@@ -277,6 +279,7 @@ DEFAULT_CONFIG = {
                 "Y": {"enable": "D"},
                 "Z": {"enable": "D"},
                 "A": {"enable": "D"},
+                "pump": {"enable": False, "speed": 0},
                 "interval": 1000
             }
         ]
@@ -302,8 +305,37 @@ DEFAULT_CONFIG = {
     }
 }
 
+
 class ConfigManager(object):
     """配置文件管理器。"""
+
+    @staticmethod
+    def _normalize_sampling_sequence(sequence):
+        """标准化自动化步骤，补齐旧配置缺失的进样泵字段。"""
+        sequence = sequence or {}
+        raw_steps = sequence.get('steps', [])
+        normalized_steps = []
+        for raw_step in raw_steps if isinstance(raw_steps, list) else []:
+            step = dict(raw_step or {})
+            pump = step.get('pump') or {}
+            try:
+                pump_speed = int(float(pump.get('speed', 0) or 0))
+            except (TypeError, ValueError):
+                pump_speed = 0
+            pump_speed = max(0, min(100, pump_speed))
+            step['pump'] = {
+                'enable': bool(pump.get('enable', False)),
+                'speed': pump_speed,
+            }
+            normalized_steps.append(step)
+
+        normalized = dict(sequence)
+        normalized['steps'] = normalized_steps
+        try:
+            normalized['loop_count'] = int(sequence.get('loop_count', 1) or 1)
+        except (TypeError, ValueError):
+            normalized['loop_count'] = 1
+        return normalized
 
     def __init__(self, config_file=CONFIG_FILE):
         self.config_file = config_file
@@ -331,6 +363,9 @@ class ConfigManager(object):
     def save(self):
         """保存配置文件。"""
         try:
+            self.config['sampling_sequence'] = self._normalize_sampling_sequence(
+                self.config.get('sampling_sequence', {})
+            )
             self.config['updated_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
@@ -348,6 +383,9 @@ class ConfigManager(object):
                 else:
                     base[key] = value
         merge(self.config, loaded)
+        self.config['sampling_sequence'] = self._normalize_sampling_sequence(
+            self.config.get('sampling_sequence', {})
+        )
 
     def update(self, data):
         """更新配置。"""
@@ -357,11 +395,18 @@ class ConfigManager(object):
     def reset(self):
         """重置为默认配置。"""
         self.config = DEFAULT_CONFIG.copy()
+        self.config['sampling_sequence'] = self._normalize_sampling_sequence(
+            self.config.get('sampling_sequence', {})
+        )
         return self.save()
 
     def get(self):
         """获取当前配置。"""
-        return self.config.copy()
+        config = self.config.copy()
+        config['sampling_sequence'] = self._normalize_sampling_sequence(
+            config.get('sampling_sequence', {})
+        )
+        return config
 
 
 class WebConfigServer(object):
@@ -695,13 +740,23 @@ class WebConfigServer(object):
         def load_auto_preset(name):
             data = self.preset_manager.load_auto_preset(name)
             if data:
+                normalized = ConfigManager._normalize_sampling_sequence({
+                    'steps': data.get('steps', []),
+                    'loop_count': data.get('loop_count', 1),
+                })
+                data['steps'] = normalized['steps']
+                data['loop_count'] = normalized['loop_count']
                 return jsonify({"success": True, "data": data})
             return jsonify({"success": False, "message": "预设不存在"}), 404
 
         @self.app.route('/api/preset/auto/<name>', methods=['POST'])
         def save_auto_preset(name):
             data = request.get_json()
-            if self.preset_manager.save_auto_preset(name, data['steps'], data['loop_count']):
+            normalized = ConfigManager._normalize_sampling_sequence({
+                'steps': data.get('steps', []),
+                'loop_count': data.get('loop_count', 1),
+            })
+            if self.preset_manager.save_auto_preset(name, normalized['steps'], normalized['loop_count']):
                 self._add_log(f"预设 '{name}' 已保存", "success")
                 return jsonify({"success": True, "message": "预设已保存"})
             return jsonify({"success": False, "message": "保存失败"}), 500
@@ -1108,12 +1163,11 @@ class WebConfigServer(object):
             if action == 'start':
                 sampling_sequence = request_data.get('sampling_sequence')
                 if isinstance(sampling_sequence, dict):
+                    normalized_sequence = ConfigManager._normalize_sampling_sequence(sampling_sequence)
                     config = self.config_manager.get()
                     updated_sequence = dict(config.get('sampling_sequence', {}))
-                    if 'steps' in sampling_sequence:
-                        updated_sequence['steps'] = sampling_sequence.get('steps', [])
-                    if 'loop_count' in sampling_sequence:
-                        updated_sequence['loop_count'] = sampling_sequence.get('loop_count', 1)
+                    updated_sequence['steps'] = normalized_sequence.get('steps', [])
+                    updated_sequence['loop_count'] = normalized_sequence.get('loop_count', 1)
                     self.config_manager.update({'sampling_sequence': updated_sequence})
                 self._publish_steps()
                 # 开始记录数据
