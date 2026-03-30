@@ -754,6 +754,14 @@ class PumpControlNode(object):
             return False
         if command:
             rospy.loginfo("[Automation] 指令已发送: %s", command.strip())
+            # 设置 PID 目标角度，使 PID 完成检测能正常工作
+            if self.pid_mode:
+                targets = self.command_generator.get_pending_targets()
+                for motor, target in targets.items():
+                    if target is not None:
+                        self.pid_target_angles[motor] = target
+                if any(t is not None for t in targets.values()):
+                    rospy.loginfo("[Automation] PID 目标已设置: %s", {m: t for m, t in targets.items() if t is not None})
         elif not pump_enabled:
             rospy.logwarn("[Automation] 步骤 %s 未生成电机指令，且未启用进样泵", step_name)
 
