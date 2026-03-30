@@ -510,16 +510,30 @@ class WebConfigServer(object):
         """泵状态回调。"""
         status_raw = msg.data or ""
         status = status_raw.lower()
-        self.pump_connected = 'connected' in status and 'disconnected' not in status
 
+        # pump_connected 只在明确收到 connected/disconnected/error 时变更
+        if 'connected' in status and 'disconnected' not in status:
+            self.pump_connected = True
+        elif 'disconnected' in status or status.startswith('error:'):
+            self.pump_connected = False
+
+        # automation_running 从 automation: 前缀中提取
         if 'automation:' in status:
             automation_status = status.split('automation:', 1)[1].strip()
-            self.automation_running = ('运行' in automation_status) or ('running' in automation_status)
-        elif 'stopped' in status or '已停止' in status:
+            if '运行' in automation_status or 'running' in automation_status:
+                self.automation_running = True
+                self.mission_status = "RUNNING"
+            elif '已完成' in automation_status or 'finished' in automation_status or '完成' in automation_status:
+                self.automation_running = False
+                self.mission_status = "IDLE"
+            elif '已停止' in automation_status or 'stopped' in automation_status:
+                self.automation_running = False
+                self.mission_status = "IDLE"
+            elif '暂停' in automation_status or 'paused' in automation_status:
+                self.mission_status = "PAUSED"
+        elif status == 'stopped':
             self.automation_running = False
-
-        # 只记录关键状态变化，避免刷屏
-        # self._add_log("[状态] " + msg.data)
+            self.mission_status = "IDLE"
 
     def _injection_status_cb(self, msg):
         """进样泵状态回调。"""

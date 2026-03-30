@@ -446,6 +446,8 @@ class AutomationEngine(object):
         except Exception:
             pass
 
+        self._update_status("已完成")
+
     def _update_status(self, status):
         """更新状态。"""
         if self.on_status_update:

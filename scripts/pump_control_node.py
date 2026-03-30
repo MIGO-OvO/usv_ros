@@ -756,12 +756,22 @@ class PumpControlNode(object):
             rospy.loginfo("[Automation] 指令已发送: %s", command.strip())
             # 设置 PID 目标角度，使 PID 完成检测能正常工作
             if self.pid_mode:
-                targets = self.command_generator.get_pending_targets()
-                for motor, target in targets.items():
+                # 自动模式下 pending_targets 为 None，需用 expected_angles
+                expected = self.command_generator.get_expected_angles()
+                pending = self.command_generator.get_pending_targets()
+                set_count = 0
+                for motor in MOTOR_NAMES:
+                    target = pending.get(motor)
+                    if target is None:
+                        target = expected.get(motor)
                     if target is not None:
-                        self.pid_target_angles[motor] = target
-                if any(t is not None for t in targets.values()):
-                    rospy.loginfo("[Automation] PID 目标已设置: %s", {m: t for m, t in targets.items() if t is not None})
+                        motor_cfg = step.get(motor, {}) or {}
+                        if str(motor_cfg.get("enable", "D")).upper() == "E" and not motor_cfg.get("continuous", False):
+                            self.pid_target_angles[motor] = target
+                            set_count += 1
+                if set_count > 0:
+                    rospy.loginfo("[Automation] PID 目标已设置: %s",
+                                 {m: t for m, t in self.pid_target_angles.items()})
         elif not pump_enabled:
             rospy.logwarn("[Automation] 步骤 %s 未生成电机指令，且未启用进样泵", step_name)
 
