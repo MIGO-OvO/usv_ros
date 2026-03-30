@@ -115,6 +115,40 @@ rosservice call /usv/pump_stop
 - 返回 `success: True`
 - 状态进入 stop/stopped
 
+### 5.3 自动化任务启动链路测试
+1. 先确认 Web 中 `Automation` 页面已配置有效步骤，至少包含 1 个启用电机或进样泵的步骤。
+2. 分别在终端观察：
+```bash
+rostopic echo /usv/pump_status
+rostopic echo /usv/pump_pid_error
+rosservice call /usv/automation_stop
+```
+3. 在 ROS 日志终端中重点观察以下关键字：
+- `Automation steps loaded:`
+- `Automation start requested:`
+- `[Automation] 开始执行步骤:`
+- `[Automation] 指令已发送:`
+4. 在 Web 点击“启动任务”，或直接调用：
+```bash
+curl -X POST http://127.0.0.1:5000/api/mission/start
+```
+5. 若需手工验证步骤下发，可执行：
+```bash
+rostopic pub /usv/automation_steps std_msgs/String "data: '{\"steps\": [{\"name\": \"测试步1\", \"X\": {\"enable\": \"E\", \"direction\": \"F\", \"angle\": \"90\"}}], \"loop_count\": 1, \"pid_mode\": true, \"pid_precision\": 0.1}'" -1
+rosservice call /usv/automation_start
+```
+通过判据：
+- Web 返回 `success: true`
+- `pump_control_node` 日志出现 `Automation steps loaded` 与 `Automation start requested`
+- 随后出现 `[Automation] 开始执行步骤:` 和 `[Automation] 指令已发送:`
+- 泵组有实际动作，或至少 `/usv/pump_status` 显示进入 automation/running
+
+若失败，优先检查：
+- Web 返回是否是 `No automation steps loaded`
+- `Automation steps payload received but step list is empty`
+- `/usv/automation_steps` 发布前后控制节点是否在线
+- `pid_mode/pid_precision` 是否被错误配置
+
 ## 6. 进样泵测试
 ```bash
 rostopic echo /usv/injection_pump_status

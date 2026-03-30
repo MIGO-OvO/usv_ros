@@ -291,51 +291,23 @@ DEFAULT_CONFIG = {
         "pump_timeout": 1.0,
         "ads_address": "0x40",
         "spectro_channel": 2,
-        "mux": "AIN0",
+        "mux": "AIN0_AVSS",
         "gain": 1,
         "vref_mode": "AVDD",
         "adc_rate": 90,
         "publish_rate": 20,
         "continuous_mode": True,
         "auto_start": False,
-        "reference_voltage": 2.5,
-        "baseline_voltage": 0.0,
         "i2c_mapping": {"X": 0, "Y": 3, "Z": 4, "A": 7}
     }
 }
-
-
-def normalize_hardware_config(data):
-    hw = json.loads(json.dumps(DEFAULT_CONFIG['hardware']))
-    if isinstance(data, dict):
-        for key, value in data.items():
-            if key == 'i2c_mapping' and isinstance(value, dict):
-                for axis in ['X', 'Y', 'Z', 'A']:
-                    if axis in value:
-                        hw['i2c_mapping'][axis] = int(value[axis])
-            elif key in hw:
-                hw[key] = value
-    hw['pump_baudrate'] = int(hw.get('pump_baudrate', 115200) or 115200)
-    hw['pump_timeout'] = float(hw.get('pump_timeout', 1.0) or 1.0)
-    hw['spectro_channel'] = int(hw.get('spectro_channel', 2) or 2)
-    hw['gain'] = int(hw.get('gain', 1) or 1)
-    hw['adc_rate'] = int(hw.get('adc_rate', 90) or 90)
-    hw['publish_rate'] = int(hw.get('publish_rate', 20) or 20)
-    hw['reference_voltage'] = float(hw.get('reference_voltage', 2.5) or 2.5)
-    hw['baseline_voltage'] = float(hw.get('baseline_voltage', 0.0) or 0.0)
-    hw['continuous_mode'] = bool(hw.get('continuous_mode', True))
-    hw['auto_start'] = bool(hw.get('auto_start', False))
-    hw['mux'] = str(hw.get('mux', 'AIN0')).strip().upper() or 'AIN0'
-    hw['vref_mode'] = str(hw.get('vref_mode', 'AVDD')).strip().upper() or 'AVDD'
-    hw['ads_address'] = str(hw.get('ads_address', '0x40')).strip() or '0x40'
-    return hw
 
 class ConfigManager(object):
     """配置文件管理器。"""
 
     def __init__(self, config_file=CONFIG_FILE):
         self.config_file = config_file
-        self.config = json.loads(json.dumps(DEFAULT_CONFIG))
+        self.config = DEFAULT_CONFIG.copy()
         self._ensure_dir()
 
     def _ensure_dir(self):
@@ -384,12 +356,12 @@ class ConfigManager(object):
 
     def reset(self):
         """重置为默认配置。"""
-        self.config = json.loads(json.dumps(DEFAULT_CONFIG))
+        self.config = DEFAULT_CONFIG.copy()
         return self.save()
 
     def get(self):
         """获取当前配置。"""
-        return json.loads(json.dumps(self.config))
+        return self.config.copy()
 
 
 class WebConfigServer(object):
@@ -457,9 +429,8 @@ class WebConfigServer(object):
             self.voltage_sub = rospy.Subscriber('/usv/spectrometer_voltage', String, self._voltage_cb)
             self.mission_sub = rospy.Subscriber('/usv/mission_status', String, self._mission_status_cb)
             self.pid_error_sub = rospy.Subscriber('/usv/pump_pid_error', String, self._pid_error_cb)
-            self.steps_pub = rospy.Publisher('/usv/automation_steps', String, queue_size=1)
+            self.steps_pub = rospy.Publisher('/usv/automation_steps', String, queue_size=1, latch=True)
             self.command_pub = rospy.Publisher('/usv/pump_command', String, queue_size=10)
-            self.spectro_cmd_pub = rospy.Publisher('/usv/spectrometer_command', String, queue_size=10)
         else:
             self.status_sub = None
             self.angles_sub = None
@@ -469,7 +440,6 @@ class WebConfigServer(object):
             self.pid_error_sub = None
             self.steps_pub = None
             self.command_pub = None
-            self.spectro_cmd_pub = None
 
         # Flask & SocketIO
         self.app = None
@@ -488,11 +458,10 @@ class WebConfigServer(object):
     def _status_cb(self, msg):
         """泵状态回调。"""
         status = msg.data.lower()
-        if 'connected' in status or 'angle_stream' in status or 'i2c_map_synced' in status:
-            self.pump_connected = True
-        elif 'disconnected' in status or status.startswith('error'):
-            self.pump_connected = False
-        self.automation_running = 'automation' in status and ('running' in status or '运行' in status)
+        self.pump_connected = 'connected' in status
+        self.automation_running = 'automation' in status and 'running' not in status.replace('running', '')
+        if 'automation' in status:
+            self.automation_running = 'running' in status or '运行' in status
 
         # 只记录关键状态变化，避免刷屏
         # self._add_log("[状态] " + msg.data)
@@ -623,65 +592,6 @@ class WebConfigServer(object):
             if os.path.isdir(folder):
                 return folder
         return candidates[-1]
-
-    def _publish_spectro_command(self, payload):
-        if self.standalone or not self.spectro_cmd_pub:
-            return {"success": False, "message": "ROS Spectrometer Publisher 未初始化"}
-        msg = String()
-        msg.data = json.dumps(payload)
-        self.spectro_cmd_pub.publish(msg)
-        return {"success": True, "message": "分光配置已下发"}
-
-    def _apply_runtime_hardware_config(self, hw):
-        results = {"pump": None, "spectrometer": None, "i2c_mapping": None}
-        if self.standalone:
-            for key in results:
-                results[key] = {"success": True, "message": "独立模式，跳过"}
-            return results
-
-        try:
-            rospy.set_param('/pump_control_node/serial_port', hw['pump_serial_port'])
-            rospy.set_param('/pump_control_node/baudrate', int(hw['pump_baudrate']))
-            rospy.set_param('/pump_control_node/timeout', float(hw['pump_timeout']))
-            rospy.set_param('/spectrometer', {
-                'enabled': True,
-                'auto_start': hw['auto_start'],
-                'ads_address': hw['ads_address'],
-                'mux': hw['mux'],
-                'gain': hw['gain'],
-                'vref_mode': hw['vref_mode'],
-                'adc_rate': hw['adc_rate'],
-                'publish_rate': hw['publish_rate'],
-                'continuous_mode': hw['continuous_mode'],
-                'reference_voltage': hw['reference_voltage'],
-                'baseline_voltage': hw['baseline_voltage'],
-            })
-            rospy.set_param('/i2c_mapping', {'angles': hw['i2c_mapping'], 'spectro_channel': hw['spectro_channel']})
-            svc = rospy.ServiceProxy('/usv/pump_reconnect', Trigger)
-            svc.wait_for_service(timeout=3.0)
-            resp = svc()
-            results['pump'] = {"success": resp.success, "message": resp.message}
-        except Exception as e:
-            results['pump'] = {"success": False, "message": str(e)}
-
-        results['spectrometer'] = self._publish_spectro_command({
-            'cmd': 'configure',
-            'ads_address': hw['ads_address'],
-            'mux': hw['mux'],
-            'gain': hw['gain'],
-            'vref_mode': hw['vref_mode'],
-            'adc_rate': hw['adc_rate'],
-            'publish_rate': hw['publish_rate'],
-            'continuous_mode': hw['continuous_mode'],
-            'auto_start': hw['auto_start'],
-            'reference_voltage': hw['reference_voltage'],
-            'baseline_voltage': hw['baseline_voltage'],
-        })
-        results['i2c_mapping'] = self._publish_spectro_command({
-            'cmd': 'set_i2c_map',
-            'mapping': {'angles': hw['i2c_mapping'], 'spectro_channel': hw['spectro_channel']},
-        })
-        return results
 
     def _setup_flask(self):
         """设置 Flask 和 SocketIO 应用。"""
@@ -1064,14 +974,19 @@ class WebConfigServer(object):
         # ================= 硬件配置 API =================
         @self.app.route('/api/hardware/config', methods=['GET'])
         def get_hardware_config():
-            hw = normalize_hardware_config(self.config_manager.get().get('hardware', {}))
+            hw = self.config_manager.get().get('hardware', DEFAULT_CONFIG['hardware'])
             return jsonify({"success": True, "data": hw})
 
         @self.app.route('/api/hardware/config', methods=['POST'])
         def save_hardware_config():
-            data = request.get_json() or {}
+            data = request.get_json()
+            if not data:
+                return jsonify({"success": False, "message": "请求体为空"}), 400
             current = self.config_manager.get()
-            hw = normalize_hardware_config(data)
+            hw = current.get('hardware', dict(DEFAULT_CONFIG['hardware']))
+            for key in DEFAULT_CONFIG['hardware']:
+                if key in data:
+                    hw[key] = data[key]
             current['hardware'] = hw
             if self.config_manager.update(current):
                 self._add_log("硬件配置已保存", "success")
@@ -1129,15 +1044,36 @@ class WebConfigServer(object):
 
         @self.app.route('/api/hardware/apply', methods=['POST'])
         def apply_hardware_config():
-            """保存硬件配置并通知节点运行时应用。"""
+            """保存硬件配置并通知节点运行时重连。"""
             data = request.get_json() or {}
+            # 先保存
             current = self.config_manager.get()
-            hw = normalize_hardware_config(data)
+            hw = current.get('hardware', dict(DEFAULT_CONFIG['hardware']))
+            for key in DEFAULT_CONFIG['hardware']:
+                if key in data:
+                    hw[key] = data[key]
             current['hardware'] = hw
             if not self.config_manager.update(current):
                 return jsonify({"success": False, "message": "保存失败"}), 500
 
-            results = self._apply_runtime_hardware_config(hw)
+            results = {"pump": None}
+
+            # 通知 pump 节点重连
+            if not self.standalone:
+                try:
+                    rospy.set_param('/pump_control_node/serial_port', hw['pump_serial_port'])
+                    rospy.set_param('/pump_control_node/baudrate', int(hw['pump_baudrate']))
+                    rospy.set_param('/pump_control_node/timeout', float(hw['pump_timeout']))
+                    svc = rospy.ServiceProxy('/usv/pump_reconnect', Trigger)
+                    svc.wait_for_service(timeout=3.0)
+                    resp = svc()
+                    results["pump"] = {"success": resp.success, "message": resp.message}
+                except Exception as e:
+                    results["pump"] = {"success": False, "message": str(e)}
+
+            else:
+                results["pump"] = {"success": True, "message": "独立模式，跳过"}
+
             self._add_log("硬件配置已应用", "info")
             return jsonify({"success": True, "message": "硬件配置已应用", "data": hw, "results": results})
 
@@ -1162,20 +1098,22 @@ class WebConfigServer(object):
             return jsonify({"success": False, "message": msg}), 400
 
         try:
-            # 如果是启动，先发送最新配置
             if action == 'start':
-                self._publish_steps()
-                # 开始记录数据
-                self.data_manager.start_mission(self.config_manager.get().get('mission', {}).get('name', ''))
+                publish_ok, publish_msg = self._publish_steps()
+                if not publish_ok:
+                    self._add_log(publish_msg, "error")
+                    return jsonify({"success": False, "message": publish_msg}), 500
 
-            # 如果是停止，停止记录
             if action == 'stop':
                 self.data_manager.stop_mission()
 
-            # 调用服务
             rospy.wait_for_service(service_name, timeout=2.0)
             service = rospy.ServiceProxy(service_name, Trigger)
             resp = service()
+
+            if action == 'start' and resp.success:
+                mission_name = self.config_manager.get().get('mission', {}).get('name', '')
+                self.data_manager.start_mission(mission_name)
 
             self._add_log(f"任务 {action}: {resp.message}", "success" if resp.success else "error")
             return jsonify({"success": resp.success, "message": resp.message})
@@ -1188,51 +1126,71 @@ class WebConfigServer(object):
     def _publish_steps(self):
         """发布采样步骤到 ROS。"""
         if self.standalone or not self.steps_pub:
-            return
+            return False, "ROS Publisher 未初始化"
 
         config = self.config_manager.get()
+        sampling_sequence = config.get('sampling_sequence', {}) or {}
+        steps = sampling_sequence.get('steps', []) or []
+        if not isinstance(steps, list) or not steps:
+            return False, "采样任务未配置有效步骤"
+
         steps_data = {
-            "steps": config.get('sampling_sequence', {}).get('steps', []),
-            "loop_count": config.get('sampling_sequence', {}).get('loop_count', 1),
+            "steps": steps,
+            "loop_count": sampling_sequence.get('loop_count', 1),
             "pid_mode": config.get('pump_settings', {}).get('pid_mode', True),
             "pid_precision": config.get('pump_settings', {}).get('pid_precision', 0.1)
         }
-        msg = String()
-        msg.data = json.dumps(steps_data)
-        self.steps_pub.publish(msg)
-        self._add_log("配置已发送到控制节点")
+
+        try:
+            deadline = time.time() + 2.0
+            while self.steps_pub.get_num_connections() == 0 and time.time() < deadline and not rospy.is_shutdown():
+                time.sleep(0.05)
+
+            msg = String()
+            msg.data = json.dumps(steps_data)
+            self.steps_pub.publish(msg)
+            time.sleep(0.1)
+
+            connection_count = self.steps_pub.get_num_connections()
+            if connection_count == 0:
+                warn_msg = "采样步骤已发布，但控制节点尚未建立 automation_steps 订阅连接"
+                self._add_log(warn_msg, "warning")
+                return True, warn_msg
+
+            ok_msg = f"配置已发送到控制节点（订阅数: {connection_count}）"
+            self._add_log(ok_msg, "info")
+            return True, ok_msg
+        except Exception as e:
+            return False, f"发布采样步骤失败: {str(e)}"
 
     def _data_push_loop(self):
         """后台线程：定时推送实时数据"""
-        rate = 20  # Hz
+        rate = 20 # Hz
         while not rospy.is_shutdown():
             if self.socketio:
                 self.socketio.emit('status', {
                     "pump_connected": self.pump_connected,
                     "automation_running": self.automation_running,
-                    "mission_status": self.mission_status,
+                    "mission_status": self.mission_status
                 })
                 self.socketio.emit('angles', self.current_angles)
-                self.socketio.emit('voltage', {
-                    "value": self.current_voltage,
-                    "voltage": self.current_voltage,
-                    "absorbance": self.current_absorbance,
-                    "status": self.spectrometer_status,
-                    "raw": self.latest_spectrometer_payload,
-                })
+                self.socketio.emit('voltage', {"value": self.current_voltage})
 
             if self.standalone:
+                # 独立模式模拟数据变化 (测试用)
                 if self.automation_running:
                     for k in self.current_angles:
                         self.current_angles[k] = (self.current_angles[k] + 1) % 360
+                    # 模拟电压变化
                     self.current_voltage = (self.current_voltage + 0.1) % 5.0
-                    self.voltage_history.append({
-                        "timestamp": datetime.now().isoformat(),
-                        "voltage": self.current_voltage,
-                    })
-                time.sleep(1.0 / rate)
+                    if self.automation_running:
+                         self.voltage_history.append({
+                            "timestamp": datetime.now().isoformat(),
+                            "voltage": self.current_voltage
+                        })
+                time.sleep(1.0/rate)
             else:
-                threading.Event().wait(1.0 / rate)
+                threading.Event().wait(1.0/rate)
 
     def run(self):
         """运行服务器。"""

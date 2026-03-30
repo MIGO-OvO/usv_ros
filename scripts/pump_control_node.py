@@ -718,12 +718,30 @@ class PumpControlNode(object):
 
     def _send_automation_step(self, step):
         """自动化引擎步骤发送钩子。"""
+        step_name = step.get("name", "未命名步骤")
+        enabled_motors = []
+        for motor in MOTOR_NAMES:
+            motor_cfg = step.get(motor, {}) or {}
+            if str(motor_cfg.get("enable", "D")).upper() == "E":
+                enabled_motors.append(motor)
+        rospy.loginfo("[Automation] 开始执行步骤: %s, 电机=%s, 进样泵=%s",
+                      step_name,
+                      ",".join(enabled_motors) if enabled_motors else "无",
+                      "启用" if step.get("pump", {}).get("enable", False) else "关闭")
+
         command = self.command_generator.generate_command(step, mode="auto")
         if command and not self.send_command(command):
+            rospy.logerr("[Automation] 步骤发送失败: %s", step_name)
             return False
         if command:
             rospy.loginfo("[Automation] 指令已发送: %s", command.strip())
-        return self._handle_injection_pump_step(step, mode="auto")
+        elif not step.get("pump", {}).get("enable", False):
+            rospy.logwarn("[Automation] 步骤 %s 未生成电机指令，且未启用进样泵", step_name)
+
+        inject_ok = self._handle_injection_pump_step(step, mode="auto")
+        if not inject_ok:
+            rospy.logerr("[Automation] 进样泵步骤执行失败: %s", step_name)
+        return inject_ok
 
     def _parse_injection_pump_text(self, text):
         """解析进样泵文本响应。"""
@@ -1055,14 +1073,29 @@ class PumpControlNode(object):
             data = json.loads(msg.data)
             steps = data.get("steps", [])
             loop_count = data.get("loop_count", 1)
+            pid_mode = bool(data.get("pid_mode", self.pid_mode))
+            pid_precision = float(data.get("pid_precision", self.pid_precision))
 
+            self.pid_mode = pid_mode
+            self.pid_precision = pid_precision
+            self.pid_precision_threshold = pid_precision
+            self.command_generator.set_pid_mode(pid_mode, pid_precision)
             self.automation_engine.set_steps(steps)
             self.automation_engine.set_loop_count(loop_count)
-            self.automation_engine.set_pid_mode(self.pid_mode)
+            self.automation_engine.set_pid_mode(pid_mode)
 
-            rospy.loginfo("Automation steps loaded: %d steps, %s loops",
-                          len(steps), "∞" if loop_count == 0 else str(loop_count))
+            step_names = [step.get("name", "未命名步骤") for step in steps[:5] if isinstance(step, dict)]
+            rospy.loginfo("Automation steps loaded: %d steps, %s loops, pid_mode=%s, pid_precision=%.3f, preview=%s",
+                          len(steps),
+                          "∞" if loop_count == 0 else str(loop_count),
+                          pid_mode,
+                          pid_precision,
+                          step_names)
+            if not steps:
+                rospy.logwarn("Automation steps payload received but step list is empty")
 
+        except (TypeError, ValueError) as e:
+            rospy.logerr("Invalid automation step config: %s", str(e))
         except json.JSONDecodeError as e:
             rospy.logerr("Invalid steps JSON: %s", str(e))
 
@@ -1080,14 +1113,31 @@ class PumpControlNode(object):
 
     def _auto_start_callback(self, req):
         """启动自动化服务回调。"""
+        step_count = len(self.automation_engine.steps)
+        if self.automation_engine.is_running():
+            rospy.logwarn("Automation start rejected: already running")
+            return TriggerResponse(success=False, message="Automation already running")
+
+        if step_count == 0:
+            rospy.logwarn("Automation start rejected: no steps loaded")
+            return TriggerResponse(success=False, message="No automation steps loaded")
+
+        rospy.loginfo("Automation start requested: %d steps, loop_count=%s, pid_mode=%s, pid_precision=%.3f",
+                      step_count,
+                      "∞" if self.automation_engine.loop_count == 0 else str(self.automation_engine.loop_count),
+                      self.pid_mode,
+                      self.pid_precision)
         success = self.automation_engine.start()
-        return TriggerResponse(
-            success=success,
-            message="Automation started" if success else "Start failed"
-        )
+        message = "Automation started" if success else "Automation start failed"
+        if success:
+            rospy.loginfo("Automation engine thread started successfully")
+        else:
+            rospy.logerr("Automation engine failed to start despite pre-check passing")
+        return TriggerResponse(success=success, message=message)
 
     def _auto_stop_callback(self, req):
         """停止自动化服务回调。"""
+        rospy.loginfo("Automation stop requested")
         self.automation_engine.stop()
         return TriggerResponse(success=True, message="Automation stopped")
 
@@ -1124,11 +1174,12 @@ class PumpControlNode(object):
 
     def _on_automation_status(self, status):
         """自动化状态更新回调。"""
+        rospy.loginfo("[Automation] 状态更新: %s", status)
         self._publish_status("automation: " + status)
 
     def _on_automation_error(self, error):
         """自动化错误回调。"""
-        rospy.logerr("Automation error: %s", error)
+        rospy.logerr("[Automation] 错误: %s", error)
         self._publish_status("error: " + error)
 
     def _publish_status(self, status):
