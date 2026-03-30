@@ -82,7 +82,19 @@ export default function Automation() {
   }
 
   const handleAction = async (action: string) => {
-    await fetch(`/api/mission/${action}`, { method: 'POST' })
+    const options: RequestInit = { method: 'POST' }
+
+    if (action === 'start') {
+      options.headers = { 'Content-Type': 'application/json' }
+      options.body = JSON.stringify({
+        sampling_sequence: {
+          steps,
+          loop_count: loopCount,
+        },
+      })
+    }
+
+    await fetch(`/api/mission/${action}`, options)
   }
 
   // Preset Logic

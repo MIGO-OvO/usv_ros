@@ -429,7 +429,7 @@ class WebConfigServer(object):
             self.voltage_sub = rospy.Subscriber('/usv/spectrometer_voltage', String, self._voltage_cb)
             self.mission_sub = rospy.Subscriber('/usv/mission_status', String, self._mission_status_cb)
             self.pid_error_sub = rospy.Subscriber('/usv/pump_pid_error', String, self._pid_error_cb)
-            self.steps_pub = rospy.Publisher('/usv/automation_steps', String, queue_size=1, latch=True)
+            self.steps_pub = rospy.Publisher('/usv/automation_steps', String, queue_size=1)
             self.command_pub = rospy.Publisher('/usv/pump_command', String, queue_size=10)
         else:
             self.status_sub = None
@@ -1098,22 +1098,31 @@ class WebConfigServer(object):
             return jsonify({"success": False, "message": msg}), 400
 
         try:
-            if action == 'start':
-                publish_ok, publish_msg = self._publish_steps()
-                if not publish_ok:
-                    self._add_log(publish_msg, "error")
-                    return jsonify({"success": False, "message": publish_msg}), 500
+            request_data = request.get_json(silent=True) or {}
 
+            # 如果是启动，优先使用请求中携带的最新配置
+            if action == 'start':
+                sampling_sequence = request_data.get('sampling_sequence')
+                if isinstance(sampling_sequence, dict):
+                    config = self.config_manager.get()
+                    updated_sequence = dict(config.get('sampling_sequence', {}))
+                    if 'steps' in sampling_sequence:
+                        updated_sequence['steps'] = sampling_sequence.get('steps', [])
+                    if 'loop_count' in sampling_sequence:
+                        updated_sequence['loop_count'] = sampling_sequence.get('loop_count', 1)
+                    self.config_manager.update({'sampling_sequence': updated_sequence})
+                self._publish_steps()
+                # 开始记录数据
+                self.data_manager.start_mission(self.config_manager.get().get('mission', {}).get('name', ''))
+
+            # 如果是停止，停止记录
             if action == 'stop':
                 self.data_manager.stop_mission()
 
+            # 调用服务
             rospy.wait_for_service(service_name, timeout=2.0)
             service = rospy.ServiceProxy(service_name, Trigger)
             resp = service()
-
-            if action == 'start' and resp.success:
-                mission_name = self.config_manager.get().get('mission', {}).get('name', '')
-                self.data_manager.start_mission(mission_name)
 
             self._add_log(f"任务 {action}: {resp.message}", "success" if resp.success else "error")
             return jsonify({"success": resp.success, "message": resp.message})
@@ -1126,42 +1135,19 @@ class WebConfigServer(object):
     def _publish_steps(self):
         """发布采样步骤到 ROS。"""
         if self.standalone or not self.steps_pub:
-            return False, "ROS Publisher 未初始化"
+            return
 
         config = self.config_manager.get()
-        sampling_sequence = config.get('sampling_sequence', {}) or {}
-        steps = sampling_sequence.get('steps', []) or []
-        if not isinstance(steps, list) or not steps:
-            return False, "采样任务未配置有效步骤"
-
         steps_data = {
-            "steps": steps,
-            "loop_count": sampling_sequence.get('loop_count', 1),
+            "steps": config.get('sampling_sequence', {}).get('steps', []),
+            "loop_count": config.get('sampling_sequence', {}).get('loop_count', 1),
             "pid_mode": config.get('pump_settings', {}).get('pid_mode', True),
             "pid_precision": config.get('pump_settings', {}).get('pid_precision', 0.1)
         }
-
-        try:
-            deadline = time.time() + 2.0
-            while self.steps_pub.get_num_connections() == 0 and time.time() < deadline and not rospy.is_shutdown():
-                time.sleep(0.05)
-
-            msg = String()
-            msg.data = json.dumps(steps_data)
-            self.steps_pub.publish(msg)
-            time.sleep(0.1)
-
-            connection_count = self.steps_pub.get_num_connections()
-            if connection_count == 0:
-                warn_msg = "采样步骤已发布，但控制节点尚未建立 automation_steps 订阅连接"
-                self._add_log(warn_msg, "warning")
-                return True, warn_msg
-
-            ok_msg = f"配置已发送到控制节点（订阅数: {connection_count}）"
-            self._add_log(ok_msg, "info")
-            return True, ok_msg
-        except Exception as e:
-            return False, f"发布采样步骤失败: {str(e)}"
+        msg = String()
+        msg.data = json.dumps(steps_data)
+        self.steps_pub.publish(msg)
+        self._add_log("配置已发送到控制节点")
 
     def _data_push_loop(self):
         """后台线程：定时推送实时数据"""
