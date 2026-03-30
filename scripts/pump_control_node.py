@@ -374,6 +374,7 @@ class PumpControlNode(object):
         self.automation_engine.on_status_update = self._on_automation_status
         self.automation_engine.on_error = self._on_automation_error
         self.automation_engine.on_step_command = self._send_automation_step
+        self.automation_engine.on_step_wait = self._wait_for_automation_step
 
         # 当前角度状态
         self.current_angles = {m: 0.0 for m in MOTOR_NAMES}
@@ -767,6 +768,70 @@ class PumpControlNode(object):
         if not inject_ok:
             rospy.logerr("[Automation] 进样泵步骤执行失败: %s", step_name)
         return inject_ok
+
+    def _estimate_motor_step_duration(self, step):
+        """估算非 PID 模式下本步骤电机运行时间（秒）。"""
+        max_duration = 0.0
+        for motor in MOTOR_NAMES:
+            cfg = step.get(motor, {}) or {}
+            if str(cfg.get("enable", "D")).upper() != "E":
+                continue
+            if cfg.get("continuous", False):
+                continue
+            try:
+                speed = float(cfg.get("speed", 0) or 0)
+                angle = abs(float(cfg.get("angle", 0) or 0))
+            except (TypeError, ValueError):
+                continue
+            if speed <= 0 or angle <= 0:
+                continue
+            duration = (angle / 360.0) * (60.0 / speed)
+            if duration > max_duration:
+                max_duration = duration
+        return max_duration
+
+    def _wait_seconds_with_pause(self, seconds):
+        """支持暂停/停止的秒级等待。"""
+        if seconds <= 0:
+            return self.automation_engine.is_running()
+        end_time = time.time() + seconds
+        while self.automation_engine.is_running() and time.time() < end_time:
+            while self.automation_engine.is_paused() and self.automation_engine.is_running():
+                time.sleep(0.1)
+                end_time += 0.1
+            time.sleep(min(0.05, max(0.0, end_time - time.time())))
+        return self.automation_engine.is_running()
+
+    def _wait_for_automation_step(self, step):
+        """等待自动化步骤实际完成。"""
+        if not self.automation_engine.is_running():
+            return False
+
+        if not self.pid_mode:
+            motor_wait_seconds = self._estimate_motor_step_duration(step)
+            if motor_wait_seconds > 0:
+                rospy.loginfo("[Automation] 等待电机步骤完成: %.2fs", motor_wait_seconds)
+                if not self._wait_seconds_with_pause(motor_wait_seconds):
+                    return False
+
+        pump_cfg = step.get("pump", {}) or {}
+        pump_enabled = bool(pump_cfg.get("enable", False))
+        try:
+            pump_duration_ms = int(float(pump_cfg.get("duration_ms", 0) or 0))
+        except (TypeError, ValueError):
+            pump_duration_ms = 0
+        pump_duration_ms = max(0, pump_duration_ms)
+
+        if pump_enabled and pump_duration_ms > 0:
+            rospy.loginfo("[Automation] 进样泵运行时长: %d ms", pump_duration_ms)
+            if not self._wait_seconds_with_pause(pump_duration_ms / 1000.0):
+                return False
+            if not self._send_injection_pump_command(enabled=False):
+                rospy.logerr("[Automation] 进样泵定时关闭失败")
+                return False
+            rospy.loginfo("[Automation] 进样泵定时运行完成，已关闭")
+
+        return self.automation_engine.is_running()
 
     def _parse_injection_pump_text(self, text):
         """解析进样泵文本响应。"""

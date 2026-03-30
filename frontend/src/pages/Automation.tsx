@@ -17,6 +17,7 @@ interface PumpConfig {
 interface InjectionPumpConfig {
   enable: boolean
   speed: number
+  duration_ms: number
 }
 
 interface Step {
@@ -30,7 +31,7 @@ interface Step {
 }
 
 const DEFAULT_PUMP: PumpConfig = { enable: 'D', direction: 'F', speed: '5', angle: '0' }
-const DEFAULT_INJECTION_PUMP: InjectionPumpConfig = { enable: false, speed: 0 }
+const DEFAULT_INJECTION_PUMP: InjectionPumpConfig = { enable: false, speed: 0, duration_ms: 0 }
 const DEFAULT_STEP: Step = {
   name: '新步骤',
   interval: 1000,
@@ -51,6 +52,7 @@ const normalizeStep = (step?: Partial<Step>): Step => ({
   pump: {
     enable: !!step?.pump?.enable,
     speed: Math.max(0, Math.min(100, Number(step?.pump?.speed ?? 0) || 0)),
+    duration_ms: Math.max(0, Number(step?.pump?.duration_ms ?? 0) || 0),
   },
 })
 
@@ -253,8 +255,8 @@ export default function Automation() {
                             <Input value={step.name} onChange={(e) => updateStep(index, 'name', e.target.value)} className="w-40" />
                             <div className="flex-1" />
                             <div className="flex items-center gap-2">
-                                <Label>间隔 (ms)</Label>
-                                <Input type="number" value={step.interval} onChange={(e) => updateStep(index, 'interval', parseInt(e.target.value))} className="w-24" />
+                                <Label>步骤完成后等待 (ms)</Label>
+                                <Input type="number" value={step.interval} onChange={(e) => updateStep(index, 'interval', parseInt(e.target.value || '0'))} className="w-32" />
                             </div>
                             <div className="flex gap-1">
                                 <Button size="icon" variant="ghost" onClick={() => moveStep(index, -1)}><ArrowUp className="w-4 h-4" /></Button>
@@ -310,8 +312,18 @@ export default function Automation() {
                                       onChange={(e) => updateStep(index, 'pump.speed', parseInt(e.target.value || '0'))}
                                     />
                                 </div>
+                                <div className="grid grid-cols-2 gap-1">
+                                    <Label className="text-[10px]">运行时长ms</Label>
+                                    <Input
+                                      className="h-6 text-[10px] px-1"
+                                      type="number"
+                                      min={0}
+                                      value={step.pump?.duration_ms ?? 0}
+                                      onChange={(e) => updateStep(index, 'pump.duration_ms', parseInt(e.target.value || '0'))}
+                                    />
+                                </div>
                                 <p className="text-[10px] leading-4 text-muted-foreground">
-                                  步骤执行时将发送独立 `PUMP:SET` 或 `PUMP:OFF` 指令。
+                                  进样泵将在本步骤启动后按设定时长运行，完成后自动关闭；步骤间隔从本步骤完成后才开始计时。
                                 </p>
                             </div>
                         </div>

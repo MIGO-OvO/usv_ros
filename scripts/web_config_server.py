@@ -261,7 +261,7 @@ DEFAULT_CONFIG = {
                 "Y": {"enable": "D"},
                 "Z": {"enable": "D"},
                 "A": {"enable": "E", "direction": "F", "speed": "3", "angle": "360"},
-                "pump": {"enable": False, "speed": 0},
+                "pump": {"enable": False, "speed": 0, "duration_ms": 0},
                 "interval": 2000
             },
             {
@@ -270,7 +270,7 @@ DEFAULT_CONFIG = {
                 "Y": {"enable": "E", "direction": "F", "speed": "5", "angle": "90"},
                 "Z": {"enable": "D"},
                 "A": {"enable": "E", "direction": "F", "speed": "3", "angle": "180"},
-                "pump": {"enable": True, "speed": 60},
+                "pump": {"enable": True, "speed": 60, "duration_ms": 3000},
                 "interval": 5000
             },
             {
@@ -279,7 +279,7 @@ DEFAULT_CONFIG = {
                 "Y": {"enable": "D"},
                 "Z": {"enable": "D"},
                 "A": {"enable": "D"},
-                "pump": {"enable": False, "speed": 0},
+                "pump": {"enable": False, "speed": 0, "duration_ms": 0},
                 "interval": 1000
             }
         ]
@@ -322,10 +322,16 @@ class ConfigManager(object):
                 pump_speed = int(float(pump.get('speed', 0) or 0))
             except (TypeError, ValueError):
                 pump_speed = 0
+            try:
+                pump_duration_ms = int(float(pump.get('duration_ms', 0) or 0))
+            except (TypeError, ValueError):
+                pump_duration_ms = 0
             pump_speed = max(0, min(100, pump_speed))
+            pump_duration_ms = max(0, pump_duration_ms)
             step['pump'] = {
                 'enable': bool(pump.get('enable', False)),
                 'speed': pump_speed,
+                'duration_ms': pump_duration_ms,
             }
             normalized_steps.append(step)
 

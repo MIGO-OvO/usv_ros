@@ -52,6 +52,7 @@ class AutomationEngine(object):
         self.send_command = send_command_func
         self.log = log_func or self._default_log
         self.on_step_command = None  # func(step) -> bool，可选的步骤级发送钩子
+        self.on_step_wait = None     # func(step) -> bool，可选的步骤完成等待钩子
 
         # 步骤和循环配置
         self.steps = []
@@ -267,23 +268,15 @@ class AutomationEngine(object):
             if not self._send_step_command(step):
                 break
 
-            # PID 模式下等待完成
-            if self._pid_mode_enabled:
-                pid_motors = self._get_step_active_motors(step)
-                if pid_motors:
-                    self._pending_pid_motors = pid_motors.copy()
-                    self._pid_complete_event.clear()
-
-                    if not self._wait_for_pid_complete():
-                        if self._running.is_set():
-                            self._update_status("步骤 {} PID 等待超时".format(step_idx + 1))
-                        break
+            # 步骤执行完成等待
+            if not self._wait_for_step_execution(step):
+                break
 
             # 步骤完成回调
             if self.on_step_complete:
                 self.on_step_complete(step_idx, step)
 
-            # 等待间隔
+            # 等待间隔（在步骤完成后开始计时）
             interval_ms = step.get("interval", 0)
             self._wait_interval(interval_ms)
 
@@ -378,6 +371,28 @@ class AutomationEngine(object):
             self._pid_complete_event.clear()
 
         return self._running.is_set()
+
+    def _wait_for_step_execution(self, step):
+        """等待步骤执行完成，再进入 interval 计时。"""
+        if self._pid_mode_enabled:
+            pid_motors = self._get_step_active_motors(step)
+            if pid_motors:
+                self._pending_pid_motors = pid_motors.copy()
+                self._pid_complete_event.clear()
+                if not self._wait_for_pid_complete():
+                    if self._running.is_set():
+                        self._update_status("PID 步骤等待超时")
+                    return False
+
+        if self.on_step_wait:
+            try:
+                return self.on_step_wait(step)
+            except Exception as e:
+                self._handle_error("步骤完成等待异常: {}".format(str(e)))
+                return False
+
+        return self._running.is_set()
+
 
     def _wait_interval(self, interval_ms):
         """

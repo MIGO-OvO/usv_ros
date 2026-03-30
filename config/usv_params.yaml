@@ -48,6 +48,7 @@ automation:
         Y: {enable: "D"}
         Z: {enable: "D"}
         A: {enable: "E", direction: "F", speed: "3", angle: "360", continuous: false}
+        pump: {enable: false, speed: 0, duration_ms: 0}
         interval: 2000
 
       # 步骤2: 启动水样泵和试剂泵
@@ -55,6 +56,7 @@ automation:
         Y: {enable: "E", direction: "F", speed: "5", angle: "90"}
         Z: {enable: "D"}
         A: {enable: "E", direction: "F", speed: "3", angle: "180"}
+        pump: {enable: true, speed: 60, duration_ms: 3000}
         interval: 5000
 
       # 步骤3: 停止所有泵
@@ -62,6 +64,7 @@ automation:
         Y: {enable: "D"}
         Z: {enable: "D"}
         A: {enable: "D"}
+        pump: {enable: false, speed: 0, duration_ms: 0}
         interval: 1000
 
 # ==================== 分光检测器参数 ====================
@@ -77,7 +80,7 @@ spectrometer:
   enabled: true
   auto_start: false
   ads_address: "0x40"
-  mux: "AIN0"
+  mux: "AIN0_AVSS"
   gain: 1
   pga_bypass: true
   turbo_mode: false
@@ -86,7 +89,7 @@ spectrometer:
   adc_rate: 90
   publish_rate: 20
   reference_voltage: 2.5
-  baseline_voltage: 0.0
+  baseline_voltage: 2.5
   path_length_cm: 1.0
 
 angle_stream:
