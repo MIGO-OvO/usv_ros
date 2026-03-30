@@ -6,6 +6,7 @@ import { Label } from "@/components/ui/label"
 import { Play, Square, Pause, Save, FolderOpen, Plus, Trash2, ArrowUp, ArrowDown } from 'lucide-react'
 import { useAppStore } from '@/store'
 import { InjectionPumpCard } from '@/components/injection-pump-card'
+import { toast } from '@/hooks/use-toast'
 
 interface PumpConfig {
   enable: string
@@ -116,11 +117,11 @@ export default function Automation() {
       const response = await fetch(`/api/mission/${action}`, options)
       const result = await response.json()
       if (!response.ok || !result.success) {
-        alert(result.message || `任务${action}失败`)
+        toast({ title: '操作失败', description: result.message || `任务${action}失败`, variant: 'destructive' })
       }
     } catch (error) {
       console.error(error)
-      alert(`任务${action}请求失败`)
+      toast({ title: '请求失败', description: `任务${action}请求异常`, variant: 'destructive' })
     }
   }
 
@@ -132,7 +133,7 @@ export default function Automation() {
         headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ steps, loop_count: loopCount })
     })
-    alert('预设已保存')
+    toast({ title: '预设已保存', variant: 'success' })
   }
 
   const loadPreset = async () => {
@@ -146,7 +147,7 @@ export default function Automation() {
                 setLoopCount(data.data.loop_count)
             }
         } else {
-            alert('预设不存在')
+            toast({ title: '预设不存在', variant: 'destructive' })
         }
     } catch (e) {
         console.error(e)
@@ -270,7 +271,7 @@ export default function Automation() {
                                 <div key={axis} className="space-y-2 p-3 rounded-lg border border-border/60 bg-muted/20">
                                     <div className="font-bold text-center text-xs mb-2">{axis} 轴</div>
                                     <div className="flex items-center justify-between">
-                                        <Label className="text-[10px]">启用</Label>
+                                        <Label className="text-xs">启用</Label>
                                         <input type="checkbox"
                                             checked={(step as any)[axis].enable === 'E'}
                                             onChange={(e) => updateStep(index, `${axis}.enable`, e.target.checked ? 'E' : 'D')}
@@ -279,12 +280,12 @@ export default function Automation() {
                                     {(step as any)[axis].enable === 'E' && (
                                         <>
                                             <div className="grid grid-cols-2 gap-1">
-                                                <Label className="text-[10px]">角度</Label>
-                                                <Input className="h-6 text-[10px] px-1" value={(step as any)[axis].angle} onChange={(e) => updateStep(index, `${axis}.angle`, e.target.value)} />
+                                                <Label className="text-xs">角度</Label>
+                                                <Input className="h-7 text-xs px-1" value={(step as any)[axis].angle} onChange={(e) => updateStep(index, `${axis}.angle`, e.target.value)} />
                                             </div>
                                             <div className="grid grid-cols-2 gap-1">
-                                                <Label className="text-[10px]">速度</Label>
-                                                <Input className="h-6 text-[10px] px-1" value={(step as any)[axis].speed} onChange={(e) => updateStep(index, `${axis}.speed`, e.target.value)} />
+                                                <Label className="text-xs">速度</Label>
+                                                <Input className="h-7 text-xs px-1" value={(step as any)[axis].speed} onChange={(e) => updateStep(index, `${axis}.speed`, e.target.value)} />
                                             </div>
                                         </>
                                     )}
@@ -294,7 +295,7 @@ export default function Automation() {
                             <div className="space-y-3 p-3 rounded-lg border border-cyan-500/20 bg-cyan-500/5">
                                 <div className="font-bold text-center text-xs text-cyan-600 dark:text-cyan-400">进样泵</div>
                                 <div className="flex items-center justify-between">
-                                    <Label className="text-[10px]">启用</Label>
+                                    <Label className="text-xs">启用</Label>
                                     <input
                                       type="checkbox"
                                       checked={!!step.pump?.enable}
@@ -302,9 +303,9 @@ export default function Automation() {
                                     />
                                 </div>
                                 <div className="grid grid-cols-2 gap-1">
-                                    <Label className="text-[10px]">转速%</Label>
+                                    <Label className="text-xs">转速%</Label>
                                     <Input
-                                      className="h-6 text-[10px] px-1"
+                                      className="h-7 text-xs px-1"
                                       type="number"
                                       min={0}
                                       max={100}
@@ -313,16 +314,16 @@ export default function Automation() {
                                     />
                                 </div>
                                 <div className="grid grid-cols-2 gap-1">
-                                    <Label className="text-[10px]">运行时长ms</Label>
+                                    <Label className="text-xs">时长ms</Label>
                                     <Input
-                                      className="h-6 text-[10px] px-1"
+                                      className="h-7 text-xs px-1"
                                       type="number"
                                       min={0}
                                       value={step.pump?.duration_ms ?? 0}
                                       onChange={(e) => updateStep(index, 'pump.duration_ms', parseInt(e.target.value || '0'))}
                                     />
                                 </div>
-                                <p className="text-[10px] leading-4 text-muted-foreground">
+                                <p className="text-xs leading-4 text-muted-foreground">
                                   进样泵将在本步骤启动后按设定时长运行，完成后自动关闭；步骤间隔从本步骤完成后才开始计时。
                                 </p>
                             </div>

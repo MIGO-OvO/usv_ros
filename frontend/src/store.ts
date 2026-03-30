@@ -21,6 +21,21 @@ interface LogEntry {
   level: string
 }
 
+interface VoltagePoint {
+  time: string
+  voltage: number
+  absorbance: number
+}
+
+interface PidErrorState {
+  X: number
+  Y: number
+  Z: number
+  A: number
+}
+
+const MAX_HISTORY_POINTS = 150
+
 interface AppState {
   socket: Socket | null
   connected: boolean
@@ -30,6 +45,9 @@ interface AppState {
   pumpAngles: PumpAngles
   rawAngles: PumpAngles
   currentVoltage: number
+  currentAbsorbance: number
+  voltageHistory: VoltagePoint[]
+  pidErrors: PidErrorState
   injectionPump: InjectionPumpStatus
   logs: LogEntry[]
 
@@ -57,6 +75,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   pumpAngles: { X: 0, Y: 0, Z: 0, A: 0 },
   rawAngles: { X: 0, Y: 0, Z: 0, A: 0 },
   currentVoltage: 0,
+  currentAbsorbance: 0,
+  voltageHistory: [],
+  pidErrors: { X: 0, Y: 0, Z: 0, A: 0 },
   injectionPump: DEFAULT_INJECTION_PUMP_STATUS,
   logs: [],
 
@@ -98,8 +119,18 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ rawAngles: data })
     })
 
-    socket.on('voltage', (data: { value: number }) => {
-      set({ currentVoltage: data.value })
+    socket.on('voltage', (data: { value: number; absorbance?: number }) => {
+      const voltage = data.value ?? 0
+      const absorbance = data.absorbance ?? 0
+      const time = new Date().toLocaleTimeString()
+      set((state) => ({
+        currentVoltage: voltage,
+        currentAbsorbance: absorbance,
+        voltageHistory: [
+          ...state.voltageHistory.slice(-(MAX_HISTORY_POINTS - 1)),
+          { time, voltage, absorbance },
+        ],
+      }))
     })
 
     socket.on('injection_pump_status', (data: InjectionPumpStatus) => {

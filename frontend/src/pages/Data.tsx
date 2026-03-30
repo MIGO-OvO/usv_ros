@@ -5,6 +5,7 @@ import { ScrollArea } from "@/components/ui/scroll-area"
 import { Download, Trash2, RefreshCw, FileText, Calendar } from 'lucide-react'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
 import { cn } from "@/lib/utils"
+import { useConfirm } from '@/hooks/use-confirm'
 
 interface MissionMeta {
     id: string
@@ -15,6 +16,7 @@ interface MissionMeta {
 }
 
 export default function Data() {
+  const confirm = useConfirm()
   const [missions, setMissions] = useState<MissionMeta[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [chartData, setChartData] = useState<any[]>([])
@@ -64,7 +66,8 @@ export default function Data() {
 
   const deleteMission = async (e: React.MouseEvent, id: string) => {
       e.stopPropagation()
-      if (!confirm("确定要删除此任务记录吗？")) return
+      const ok = await confirm({ title: '删除任务', description: '确定要删除此任务记录吗？此操作不可撤销。' })
+      if (!ok) return
       
       try {
           const res = await fetch(`/api/data/mission/${id}`, { method: 'DELETE' })

@@ -4,7 +4,10 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Save, RefreshCw, Zap, Target, RotateCcw, Usb, Activity } from 'lucide-react'
+import { cn } from '@/lib/utils'
 import { useAppStore } from '@/store'
+import { toast } from '@/hooks/use-toast'
+import { useConfirm } from '@/hooks/use-confirm'
 
 interface SerialPort {
   path: string
@@ -51,6 +54,7 @@ const DEFAULT_HW: HardwareConfig = {
 
 export default function Settings() {
   const { pumpAngles, rawAngles } = useAppStore()
+  const confirm = useConfirm()
   const [config, setConfig] = useState({
       Kp: 0, Ki: 0, Kd: 0, output_min: -255, output_max: 255
   })
@@ -143,17 +147,6 @@ export default function Settings() {
     }
   }
 
-/*
-  const fetchOffsets = async () => {
-      try {
-          const res = await fetch('/api/calibration/offsets')
-          const data = await res.json()
-          if (data.success) setOffsets(data.data)
-      } catch (e) {
-          console.error(e)
-      }
-  }
-*/
   const saveConfig = async () => {
       try {
           await fetch('/api/pid/config', {
@@ -161,30 +154,37 @@ export default function Settings() {
               headers: {'Content-Type': 'application/json'},
               body: JSON.stringify(config)
           })
-          alert("PID 参数已更新")
+          toast({ title: 'PID 参数已更新', variant: 'success' })
       } catch (e) {
           console.error(e)
+          toast({ title: 'PID 参数更新失败', variant: 'destructive' })
       }
   }
 
   const setZero = async (axis?: string) => {
-      if (!confirm(axis ? `确定要将 ${axis} 轴当前位置设为零点吗？` : "确定要将所有轴设为零点吗？")) return
+      const ok = await confirm({
+        title: '设置零点',
+        description: axis ? `确定要将 ${axis} 轴当前位置设为零点吗？` : '确定要将所有轴设为零点吗？',
+      })
+      if (!ok) return
       await fetch('/api/calibration/zero', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ axis })
       })
-      // fetchOffsets()
   }
 
   const resetZero = async (axis?: string) => {
-      if (!confirm("确定要重置零点偏移吗？")) return
+      const ok = await confirm({
+        title: '重置零点',
+        description: axis ? `确定要重置 ${axis} 轴零点偏移吗？` : '确定要重置所有轴零点偏移吗？',
+      })
+      if (!ok) return
       await fetch('/api/calibration/reset', {
           method: 'POST',
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ axis })
       })
-      // fetchOffsets()
   }
 
   const handleChange = (key: string, value: string) => {
@@ -255,12 +255,10 @@ export default function Settings() {
                     <div>操作</div>
                 </div>
                 
-                {['X', 'Y', 'Z', 'A'].map((axis) => (
+                {(['X', 'Y', 'Z', 'A'] as const).map((axis) => (
                     <div key={axis} className="grid grid-cols-4 gap-4 items-center text-sm">
                         <div className="font-bold text-center bg-muted/30 py-2 rounded">{axis}</div>
-                        {/* @ts-ignore */}
                         <div className="text-center font-mono text-muted-foreground">{rawAngles[axis]?.toFixed(2)}°</div>
-                        {/* @ts-ignore */}
                         <div className="text-center font-mono font-bold text-primary">{pumpAngles[axis]?.toFixed(2)}°</div>
                         <div className="flex gap-1 justify-center">
                             <Button size="icon" variant="outline" className="h-8 w-8" onClick={() => setZero(axis)} title="设为零点">
@@ -360,7 +358,12 @@ export default function Settings() {
           </div>
 
           {hwMsg && (
-            <div className="text-sm p-3 rounded bg-muted/50">{hwMsg}</div>
+            <div className={cn(
+              "text-sm p-3 rounded",
+              hwMsg.includes('失败') || hwMsg.includes('error') || hwMsg.includes('Error')
+                ? "bg-red-500/10 text-red-700 dark:text-red-400"
+                : "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
+            )}>{hwMsg}</div>
           )}
 
           <div className="flex gap-2">

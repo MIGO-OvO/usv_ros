@@ -4,7 +4,7 @@ import { cn } from "@/lib/utils"
 
 const navItems = [
   { name: "监控", href: "/", icon: LayoutDashboard },
-  { name: "自动", href: "/automation", icon: PlayCircle },
+  { name: "自动化", href: "/automation", icon: PlayCircle },
   { name: "数据", href: "/data", icon: Database },
   { name: "设置", href: "/settings", icon: Settings },
 ]
@@ -18,20 +18,20 @@ export function MobileNav() {
         {navItems.map((item) => {
           const Icon = item.icon
           const isActive = location.pathname === item.href
-          
+
           return (
             <Link
               key={item.name}
               to={item.href}
               className={cn(
-                "flex flex-col items-center justify-center gap-1 w-full h-full text-[10px] font-medium transition-colors",
-                isActive 
-                  ? "text-primary" 
+                "flex flex-col items-center justify-center gap-1 w-full h-full text-xs font-medium transition-colors",
+                isActive
+                  ? "text-primary"
                   : "text-muted-foreground hover:text-foreground"
               )}
             >
               <div className={cn(
-                  "p-1.5 rounded-full transition-all",
+                  "p-1.5 rounded-full transition-colors",
                   isActive && "bg-primary/10"
               )}>
                 <Icon className="h-5 w-5" />
