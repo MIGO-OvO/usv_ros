@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# pyright: reportMissingImports=false
 """
 USV MAVLink Telemetry Bridge (载荷遥测桥接节点)
 =================================================
@@ -33,7 +34,7 @@ import time
 
 import rospy
 from std_msgs.msg import String
-from mavros_msgs.msg import Mavlink
+from mavros_msgs.msg import Mavlink, State
 
 # MAVLink 常量
 MAVLINK_MSG_ID_NAMED_VALUE_FLOAT = 251
@@ -55,6 +56,8 @@ class USVMavlinkBridge(object):
         self._absorbance = 0.0
         self._pump_angles = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
         self._status_code = 0  # 0=idle
+        self._mavros_connected = False
+        self._pkt_count = 0
 
         # 启动时间基准 (用于 time_boot_ms)
         self._boot_time = time.time()
@@ -69,6 +72,7 @@ class USVMavlinkBridge(object):
         rospy.Subscriber('/usv/pump_angles', String, self._angles_cb)
         rospy.Subscriber('/usv/pump_status', String, self._pump_status_cb)
         rospy.Subscriber('/usv/trigger_status', String, self._trigger_status_cb)
+        rospy.Subscriber('/mavros/state', State, self._mavros_state_cb)
 
         rospy.loginfo("USV MAVLink Bridge initialized")
         rospy.loginfo("  Telemetry rate: %d Hz", TELEMETRY_RATE_HZ)
@@ -121,6 +125,15 @@ class USVMavlinkBridge(object):
                 self._status_code = 1  # 暂停仍算 sampling 状态
             elif "calibrate" in data:
                 self._status_code = 4
+
+    def _mavros_state_cb(self, msg):
+        with self._lock:
+            prev = self._mavros_connected
+            self._mavros_connected = msg.connected
+        if prev and not msg.connected:
+            rospy.logwarn("MAVROS disconnected, pausing telemetry")
+        elif not prev and msg.connected:
+            rospy.loginfo("MAVROS reconnected, resuming telemetry")
 
     # ==================== MAVLink 打包与发送 ====================
 
@@ -181,6 +194,13 @@ class USVMavlinkBridge(object):
 
         while not rospy.is_shutdown():
             with self._lock:
+                connected = self._mavros_connected
+            if not connected:
+                rospy.logwarn_throttle(10, "MAVROS not connected, skipping telemetry")
+                rate.sleep()
+                continue
+
+            with self._lock:
                 voltage = self._voltage
                 absorbance = self._absorbance
                 angles = self._pump_angles.copy()
@@ -194,6 +214,8 @@ class USVMavlinkBridge(object):
             self._send_named_value_float("PUMP_Z", angles["Z"])
             self._send_named_value_float("PUMP_A", angles["A"])
             self._send_named_value_float("USV_STAT", float(status))
+            self._pkt_count = (self._pkt_count + 1) % 65536
+            self._send_named_value_float("USV_PKT", float(self._pkt_count))
 
             rate.sleep()
 
@@ -210,4 +232,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

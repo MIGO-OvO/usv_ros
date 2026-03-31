@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+# pyright: reportMissingImports=false
 """
 MAVLink Trigger Node (MAVLink 指令触发节点)
 ============================================
@@ -47,6 +48,12 @@ CMD_CALIBRATE = 31014
 
 # MAVLink 协议常量
 MAVLINK_MSG_ID_COMMAND_LONG = 76
+MAVLINK_MSG_ID_COMMAND_ACK = 77
+
+# MAV_RESULT enum
+MAV_RESULT_ACCEPTED = 0
+MAV_RESULT_TEMPORARILY_REJECTED = 1
+MAV_RESULT_FAILED = 5
 
 # 配置文件路径
 CONFIG_FILE = os.path.expanduser("~/usv_ws/config/sampling_config.json")
@@ -79,6 +86,11 @@ class MAVLinkTriggerNode(object):
         # Publishers
         self.status_pub = rospy.Publisher('/usv/trigger_status', String, queue_size=10)
         self.steps_pub = rospy.Publisher('/usv/automation_steps', String, queue_size=1)
+        self.pump_command_pub = rospy.Publisher('/usv/pump_command', String, queue_size=10)
+        # MAVLink ACK 发送通道
+        self.mavlink_to_pub = rospy.Publisher(
+            '/mavros/mavlink/to', Mavlink, queue_size=10
+        )
 
         # Subscribers
         self.state_sub = rospy.Subscriber('/mavros/state', State, self._state_cb)
@@ -86,6 +98,10 @@ class MAVLinkTriggerNode(object):
 
         # 监听 MAVROS 原始 MAVLink 入站消息 (从飞控/GCS 收到的所有 MAVLink 帧)
         # mavros_msgs/Mavlink 包含 msgid、payload64 等字段
+        # TODO: QGC sends COMMAND_LONG with compId=1 (autopilot). The autopilot
+        # NAKs unknown cmds 31010-31014, but MAVROS forwards all /from messages
+        # so we still receive them. Ideally use compId=191 (ONBOARD_COMPUTER),
+        # but this requires MAVROS routing verification.
         self.mavlink_sub = rospy.Subscriber(
             '/mavros/mavlink/from', Mavlink, self._mavlink_from_cb, queue_size=20
         )
@@ -170,7 +186,17 @@ class MAVLinkTriggerNode(object):
                 msg.sysid, msg.compid, command, param1, param2
             )
 
-            self.handle_mavlink_command(command, param1, param2)
+            success = self.handle_mavlink_command(command, param1, param2)
+
+            # 根据命令执行结果决定 ACK 类型
+            if success:
+                ack_result = MAV_RESULT_ACCEPTED
+            elif command == CMD_START_SAMPLING and self.is_sampling:
+                ack_result = MAV_RESULT_TEMPORARILY_REJECTED
+            else:
+                ack_result = MAV_RESULT_FAILED
+
+            self._send_command_ack(command, ack_result, msg.sysid, msg.compid)
 
         except Exception as e:
             rospy.logerr("Error parsing COMMAND_LONG payload: %s", str(e))
@@ -333,6 +359,51 @@ class MAVLinkTriggerNode(object):
         msg.data = status
         self.status_pub.publish(msg)
 
+    def _payload_to_uint64_list(self, payload):
+        """将字节载荷转为 uint64 列表 (8 字节对齐)。"""
+        remainder = len(payload) % 8
+        if remainder:
+            payload += b'\x00' * (8 - remainder)
+        result = []
+        for i in range(0, len(payload), 8):
+            val = struct.unpack_from('<Q', payload, i)[0]
+            result.append(val)
+        return result
+
+    def _send_command_ack(self, command, result, target_system, target_component):
+        """
+        发送 COMMAND_ACK (msgid=77) 回传给命令发送方。
+
+        COMMAND_ACK 载荷格式 (10 bytes, little-endian):
+          offset 0: command          uint16 (被确认的命令 ID)
+          offset 2: result           uint8  (MAV_RESULT)
+          offset 3: progress         uint8  (0xFF = 不支持进度)
+          offset 4: result_param2    int32  (附加结果参数, 0)
+          offset 8: target_system    uint8
+          offset 9: target_component uint8
+        """
+        payload = struct.pack('<HBBiBB',
+                              command,
+                              result,
+                              0xFF,  # progress: not supported
+                              0,     # result_param2
+                              target_system,
+                              target_component)
+
+        mavlink_msg = Mavlink()
+        mavlink_msg.header.stamp = rospy.Time.now()
+        mavlink_msg.framing_status = 1  # MAVLINK_FRAMING_OK
+        mavlink_msg.magic = 253  # MAVLink v2
+        mavlink_msg.len = len(payload)
+        mavlink_msg.sysid = 1
+        mavlink_msg.compid = 191  # MAV_COMP_ID_ONBOARD_COMPUTER
+        mavlink_msg.msgid = MAVLINK_MSG_ID_COMMAND_ACK
+        mavlink_msg.payload64 = self._payload_to_uint64_list(payload)
+
+        self.mavlink_to_pub.publish(mavlink_msg)
+        rospy.loginfo("Sent COMMAND_ACK: cmd=%d result=%d target=%d/%d",
+                      command, result, target_system, target_component)
+
     def handle_mavlink_command(self, cmd_id, param1=0, param2=0):
         """
         处理 MAVLink 自定义指令。
@@ -365,8 +436,14 @@ class MAVLinkTriggerNode(object):
             self._resume_sampling()
             return True
         elif cmd_id == CMD_CALIBRATE:
-            rospy.logwarn("Calibration command (31014) received - not yet fully implemented")
-            self._publish_status("calibrate_requested")
+            if self.is_sampling:
+                rospy.logwarn("Cannot calibrate while sampling is active")
+                return False
+            rospy.loginfo("Calibration command received, sending CALXYZA to pump")
+            self._publish_status("calibrate_started")
+            cmd_msg = String()
+            cmd_msg.data = "CALXYZA\r\n"
+            self.pump_command_pub.publish(cmd_msg)
             return True
         else:
             rospy.logwarn("Unknown command: %d", cmd_id)
@@ -400,14 +477,24 @@ class MAVLinkTriggerNode(object):
         )
 
         rate = rospy.Rate(1)
+        prev_connected = False
         while not rospy.is_shutdown():
             # 状态监控
             with self.state_lock:
+                connected = self.mavros_connected
                 mode = self.mavros_state.mode
                 armed = self.mavros_state.armed
 
-            rospy.logdebug_throttle(10, "Mode: %s, Armed: %s, Sampling: %s",
-                                    mode, armed, self.is_sampling)
+            if prev_connected and not connected:
+                rospy.logwarn("MAVROS connection lost")
+                self._publish_status("mavros_disconnected")
+            elif not prev_connected and connected:
+                rospy.loginfo("MAVROS connection restored")
+                self._publish_status("mavros_connected")
+            prev_connected = connected
+
+            rospy.logdebug_throttle(10, "Mode: %s, Armed: %s, Sampling: %s, Connected: %s",
+                                    mode, armed, self.is_sampling, connected)
 
             rate.sleep()
 
