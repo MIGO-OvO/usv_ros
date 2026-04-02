@@ -37,8 +37,14 @@ from std_msgs.msg import String
 from mavros_msgs.msg import Mavlink, State
 
 # MAVLink 常量
+MAVLINK_MSG_ID_HEARTBEAT = 0
 MAVLINK_MSG_ID_NAMED_VALUE_FLOAT = 251
 # NAMED_VALUE_FLOAT 载荷: time_boot_ms(uint32) + value(float32) + name(char[10]) = 18 bytes
+
+MAV_TYPE_ONBOARD_CONTROLLER = 18
+MAV_AUTOPILOT_INVALID = 8
+MAV_STATE_ACTIVE = 4
+HEARTBEAT_RATE_HZ = 1
 
 # 遥测发送频率 (Hz)
 TELEMETRY_RATE_HZ = 2
@@ -50,6 +56,9 @@ class USVMavlinkBridge(object):
     def __init__(self):
         rospy.init_node('usv_mavlink_bridge', anonymous=False)
 
+        self._source_system_id = int(rospy.get_param('~source_system_id', rospy.get_param('/mavros/target_system_id', 1)))
+        self._source_component_id = int(rospy.get_param('~source_component_id', 191))
+
         # 数据缓存 (线程安全)
         self._lock = threading.Lock()
         self._voltage = 0.0
@@ -58,6 +67,7 @@ class USVMavlinkBridge(object):
         self._status_code = 0  # 0=idle
         self._mavros_connected = False
         self._pkt_count = 0
+        self._last_heartbeat_sent_at = 0.0
 
         # 启动时间基准 (用于 time_boot_ms)
         self._boot_time = time.time()
@@ -76,6 +86,7 @@ class USVMavlinkBridge(object):
 
         rospy.loginfo("USV MAVLink Bridge initialized")
         rospy.loginfo("  Telemetry rate: %d Hz", TELEMETRY_RATE_HZ)
+        rospy.loginfo("  MAVLink source IDs: sysid=%d compid=%d", self._source_system_id, self._source_component_id)
 
     # ==================== ROS 数据订阅 ====================
 
@@ -156,6 +167,21 @@ class USVMavlinkBridge(object):
         payload = struct.pack('<If', time_ms, value) + name_bytes
         return payload
 
+    def _build_heartbeat(self):
+        custom_mode = 0
+        base_mode = 0
+        system_status = MAV_STATE_ACTIVE
+        mavlink_version = 3
+        return struct.pack(
+            '<IBBBBB',
+            custom_mode,
+            MAV_TYPE_ONBOARD_CONTROLLER,
+            MAV_AUTOPILOT_INVALID,
+            base_mode,
+            system_status,
+            mavlink_version,
+        )
+
     def _payload_to_uint64_list(self, payload):
         """将字节载荷转为 uint64 列表 (8 字节对齐)。"""
         # 补齐到 8 的倍数
@@ -177,9 +203,24 @@ class USVMavlinkBridge(object):
         mavlink_msg.framing_status = 1  # MAVLINK_FRAMING_OK
         mavlink_msg.magic = 253  # MAVLink v2
         mavlink_msg.len = len(payload)
-        mavlink_msg.sysid = 1
-        mavlink_msg.compid = 191  # MAV_COMP_ID_ONBOARD_COMPUTER
+        mavlink_msg.sysid = self._source_system_id
+        mavlink_msg.compid = self._source_component_id
         mavlink_msg.msgid = MAVLINK_MSG_ID_NAMED_VALUE_FLOAT
+        mavlink_msg.payload64 = self._payload_to_uint64_list(payload)
+
+        self._mavlink_pub.publish(mavlink_msg)
+
+    def _send_heartbeat(self):
+        payload = self._build_heartbeat()
+
+        mavlink_msg = Mavlink()
+        mavlink_msg.header.stamp = rospy.Time.now()
+        mavlink_msg.framing_status = 1
+        mavlink_msg.magic = 253
+        mavlink_msg.len = len(payload)
+        mavlink_msg.sysid = self._source_system_id
+        mavlink_msg.compid = self._source_component_id
+        mavlink_msg.msgid = MAVLINK_MSG_ID_HEARTBEAT
         mavlink_msg.payload64 = self._payload_to_uint64_list(payload)
 
         self._mavlink_pub.publish(mavlink_msg)
@@ -205,6 +246,11 @@ class USVMavlinkBridge(object):
                 absorbance = self._absorbance
                 angles = self._pump_angles.copy()
                 status = self._status_code
+
+            now = time.time()
+            if now - self._last_heartbeat_sent_at >= (1.0 / HEARTBEAT_RATE_HZ):
+                self._send_heartbeat()
+                self._last_heartbeat_sent_at = now
 
             # 发送所有遥测值
             self._send_named_value_float("USV_VOLT", voltage)

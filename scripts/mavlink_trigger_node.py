@@ -68,6 +68,9 @@ class MAVLinkTriggerNode(object):
     def __init__(self):
         rospy.init_node('mavlink_trigger_node', anonymous=False)
 
+        self._source_system_id = int(rospy.get_param('~source_system_id', rospy.get_param('/mavros/target_system_id', 1)))
+        self._source_component_id = int(rospy.get_param('~source_component_id', 191))
+
         # 参数
         self.mavros_timeout = rospy.get_param('~mavros_timeout', 30.0)
         self.auto_trigger_on_waypoint = rospy.get_param('~auto_trigger_on_waypoint', True)
@@ -109,6 +112,7 @@ class MAVLinkTriggerNode(object):
         rospy.loginfo("MAVLink Trigger Node initialized")
         rospy.loginfo("  Auto trigger on waypoint: %s", self.auto_trigger_on_waypoint)
         rospy.loginfo("  Listening for COMMAND_LONG on /mavros/mavlink/from")
+        rospy.loginfo("  MAVLink source IDs: sysid=%d compid=%d", self._source_system_id, self._source_component_id)
 
     def _state_cb(self, msg):
         """MAVROS 状态回调。"""
@@ -395,8 +399,8 @@ class MAVLinkTriggerNode(object):
         mavlink_msg.framing_status = 1  # MAVLINK_FRAMING_OK
         mavlink_msg.magic = 253  # MAVLink v2
         mavlink_msg.len = len(payload)
-        mavlink_msg.sysid = 1
-        mavlink_msg.compid = 191  # MAV_COMP_ID_ONBOARD_COMPUTER
+        mavlink_msg.sysid = self._source_system_id
+        mavlink_msg.compid = self._source_component_id
         mavlink_msg.msgid = MAVLINK_MSG_ID_COMMAND_ACK
         mavlink_msg.payload64 = self._payload_to_uint64_list(payload)
 

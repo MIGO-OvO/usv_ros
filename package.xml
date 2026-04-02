@@ -19,6 +19,7 @@
   <depend>std_msgs</depend>
   <depend>std_srvs</depend>
   <depend>geometry_msgs</depend>
+  <exec_depend>mavros</exec_depend>
   <depend>mavros_msgs</depend>
 
   <!-- Python dependencies -->

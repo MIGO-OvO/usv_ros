@@ -35,6 +35,13 @@
     <arg name="mavros_timeout" default="30.0" />
     <arg name="auto_trigger_on_waypoint" default="true" />
     <arg name="trigger_waypoints" default="[]" />
+    <arg name="enable_mavros" default="true" />
+    <arg name="mavros_fcu_url" default="/dev/ttyTHS1:57600" />
+    <arg name="mavros_gcs_url" default="" />
+    <arg name="mavros_tgt_system" default="1" />
+    <arg name="mavros_tgt_component" default="1" />
+    <arg name="mavros_fcu_protocol" default="v2.0" />
+    <arg name="mavros_respawn" default="false" />
 
     <!-- 节点启用开关 -->
     <arg name="enable_pump" default="true" />
@@ -44,6 +51,16 @@
 
     <!-- ==================== Load Parameters ==================== -->
     <rosparam file="$(find usv_ros)/config/usv_params.yaml" command="load" />
+
+    <!-- ==================== MAVROS Bridge ==================== -->
+    <include file="$(find mavros)/launch/apm.launch" if="$(arg enable_mavros)">
+        <arg name="fcu_url" value="$(arg mavros_fcu_url)" />
+        <arg name="gcs_url" value="$(arg mavros_gcs_url)" />
+        <arg name="tgt_system" value="$(arg mavros_tgt_system)" />
+        <arg name="tgt_component" value="$(arg mavros_tgt_component)" />
+        <arg name="fcu_protocol" value="$(arg mavros_fcu_protocol)" />
+        <arg name="respawn_mavros" value="$(arg mavros_respawn)" />
+    </include>
 
     <!-- ==================== Pump Control Node ==================== -->
     <node name="pump_control_node" pkg="usv_ros" type="pump_control_node.py"
