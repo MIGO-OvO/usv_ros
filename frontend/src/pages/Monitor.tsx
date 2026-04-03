@@ -5,6 +5,7 @@ import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContai
 import { Activity, Zap, Play, Square } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { InjectionPumpCard } from '@/components/injection-pump-card'
+import { LinkDiagnosticsCard } from '@/components/link-diagnostics-card'
 
 const MISSION_STATUS_MAP: Record<string, string> = {
   IDLE: '空闲',
@@ -201,6 +202,10 @@ export default function Monitor() {
 
         <div className="xl:col-span-1">
           <InjectionPumpCard />
+        </div>
+
+        <div className="xl:col-span-1">
+          <LinkDiagnosticsCard />
         </div>
       </div>
     </div>

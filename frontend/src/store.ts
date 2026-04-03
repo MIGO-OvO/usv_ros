@@ -34,6 +34,25 @@ interface PidErrorState {
   A: number
 }
 
+interface MavrosState {
+  connected: boolean
+  armed: boolean
+  mode: string
+}
+
+interface BridgeDiag {
+  sysid: number
+  compid: number
+  mavros_connected: boolean
+  tx_total: number
+  tx_named_value: number
+  tx_heartbeat: number
+  pub_errors: number
+  mavros_drops: number
+  uptime_s: number
+  rate_hz: number
+}
+
 const MAX_HISTORY_POINTS = 150
 
 interface AppState {
@@ -50,6 +69,8 @@ interface AppState {
   pidErrors: PidErrorState
   injectionPump: InjectionPumpStatus
   logs: LogEntry[]
+  mavrosState: MavrosState
+  bridgeDiag: BridgeDiag | null
 
   connect: () => void
   disconnect: () => void
@@ -80,6 +101,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   pidErrors: { X: 0, Y: 0, Z: 0, A: 0 },
   injectionPump: DEFAULT_INJECTION_PUMP_STATUS,
   logs: [],
+  mavrosState: { connected: false, armed: false, mode: '' },
+  bridgeDiag: null,
 
   connect: () => {
     if (get().socket) return
@@ -139,6 +162,14 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     socket.on('log', (data: LogEntry) => {
       set((state) => ({ logs: [...state.logs.slice(-99), data] }))
+    })
+
+    socket.on('mavros_state', (data: MavrosState) => {
+      set({ mavrosState: data })
+    })
+
+    socket.on('bridge_diagnostics', (data: BridgeDiag) => {
+      set({ bridgeDiag: data })
     })
 
     set({ socket })
