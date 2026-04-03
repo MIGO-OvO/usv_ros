@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>USV 通信诊断</title>
+<script src="https://cdn.socket.io/4.7.4/socket.io.min.js"></script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:system-ui,sans-serif;background:#0d1117;color:#c9d1d9;padding:16px}
+h1{font-size:1.3em;color:#58a6ff;margin-bottom:12px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+.card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px}
+.card h2{font-size:.9em;color:#8b949e;margin-bottom:8px;border-bottom:1px solid #21262d;padding-bottom:4px}
+.kv{display:flex;justify-content:space-between;padding:2px 0;font-size:.85em}
+.kv .k{color:#8b949e}.kv .v{font-weight:600;font-variant-numeric:tabular-nums}
+.ok{color:#3fb950}.warn{color:#d29922}.err{color:#f85149}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:4px}
+.dot.on{background:#3fb950}.dot.off{background:#f85149}
+#events{max-height:220px;overflow-y:auto;font-size:.78em;font-family:monospace}
+#events div{padding:2px 4px;border-bottom:1px solid #21262d}
+.actions{margin:12px 0;display:flex;gap:8px}
+.btn{background:#21262d;border:1px solid #30363d;color:#c9d1d9;padding:6px 14px;border-radius:6px;cursor:pointer;font-size:.85em}
+.btn:hover{background:#30363d}
+.btn.primary{background:#1f6feb;border-color:#1f6feb;color:#fff}
+.full{grid-column:1/-1}
+.nodes{display:flex;gap:8px;flex-wrap:wrap}
+.node{padding:3px 8px;border-radius:4px;font-size:.78em;border:1px solid #30363d}
+.node.alive{border-color:#3fb950;color:#3fb950}.node.dead{border-color:#f85149;color:#f85149}
+</style>
+</head>
+<body>
+<h1>🚢 USV 通信链路诊断</h1>
+<div class="actions">
+  <button class="btn primary" onclick="refresh()">🔄 刷新</button>
+  <button class="btn" onclick="exportDiag()">📥 导出报告</button>
+  <span id="lastUpdate" style="color:#8b949e;font-size:.8em;line-height:2.2"></span>
+</div>
+<div class="grid">
+  <div class="card" id="mavros"><h2>MAVROS 状态</h2><div id="mavrosBody">加载中...</div></div>
+  <div class="card" id="bridge"><h2>MAVLink 桥接</h2><div id="bridgeBody">加载中...</div></div>
+  <div class="card full" id="nodesCard"><h2>ROS 节点</h2><div id="nodesBody" class="nodes">加载中...</div></div>
+  <div class="card full"><h2>链路事件日志</h2><div id="events">等待数据...</div></div>
+</div>
+<script>
+const API = location.origin;
+function kv(k,v,cls){return `<div class="kv"><span class="k">${k}</span><span class="v ${cls||''}">${v}</span></div>`}
+function dot(on){return `<span class="dot ${on?'on':'off'}"></span>`}
+
+function renderMavros(d){
+  const b=document.getElementById('mavrosBody');
+  if(!d||!Object.keys(d).length){b.innerHTML='<span class="err">无数据</span>';return}
+  b.innerHTML=kv('连接',dot(d.connected)+(d.connected?'已连接':'断开'),d.connected?'ok':'err')
+    +kv('模式',d.mode||'--')+kv('解锁',d.armed?'是':'否',d.armed?'warn':'');
+}
+function renderBridge(d){
+  const b=document.getElementById('bridgeBody');
+  if(!d||!Object.keys(d).length){b.innerHTML='<span class="err">无数据 (桥接节点未运行?)</span>';return}
+  b.innerHTML=kv('SysID',d.sysid)+kv('CompID',d.compid)
+    +kv('MAVROS连接',d.mavros_connected?'是':'否',d.mavros_connected?'ok':'err')
+    +kv('TX总计',d.tx_total)+kv('TX Named',d.tx_named_value)+kv('TX 心跳',d.tx_heartbeat)
+    +kv('发布错误',d.pub_errors,d.pub_errors>0?'err':'')+kv('MAVROS掉线',d.mavros_drops,d.mavros_drops>0?'warn':'')
+    +kv('运行时间',d.uptime_s+'s')+kv('速率',d.rate_hz+'Hz');
+}
+function renderNodes(nodes){
+  const b=document.getElementById('nodesBody');
+  if(!nodes||!nodes.length){b.innerHTML='<span style="color:#8b949e">无法获取</span>';return}
+  b.innerHTML=nodes.map(n=>`<span class="node ${n.alive?'alive':'dead'}">${n.alive?'●':'✕'} ${n.name}</span>`).join('');
+}
+function renderEvents(evts){
+  const el=document.getElementById('events');
+  if(!evts||!evts.length){el.innerHTML='<div>暂无事件</div>';return}
+  el.innerHTML=evts.slice(-50).reverse().map(e=>`<div><span style="color:#8b949e">${e.ts}</span> [${e.type}] ${e.detail}</div>`).join('');
+}
+function refresh(){
+  fetch(API+'/api/diagnostics/link').then(r=>r.json()).then(r=>{
+    if(!r.success)return;const d=r.data;
+    renderMavros(d.mavros);renderBridge(d.bridge);renderNodes(d.nodes);renderEvents(d.link_events_recent);
+    document.getElementById('lastUpdate').textContent='更新: '+new Date().toLocaleTimeString();
+  }).catch(e=>console.error(e));
+}
+function exportDiag(){window.open(API+'/api/diagnostics/export','_blank')}
+// SocketIO 实时
+try{
+  const sock=io(API,{transports:['websocket','polling']});
+  sock.on('mavros_state',d=>renderMavros(d));
+  sock.on('bridge_diagnostics',d=>renderBridge(d));
+}catch(e){console.warn('SocketIO not available',e)}
+refresh();setInterval(refresh,5000);
+</script>
+</body>
+</html>

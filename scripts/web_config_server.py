@@ -497,6 +497,29 @@ class WebConfigServer(object):
         self.socketio = None
         self.server_thread = None
 
+        # ========== 通信诊断状态 ==========
+        self._mavros_state = {"connected": False, "armed": False, "mode": ""}
+        self._bridge_diag = {}           # 最新的桥接诊断数据
+        self._diag_history = []          # 诊断历史 (最近 200 条)
+        self._diag_history_max = 200
+        self._link_events = []           # 链路事件日志 (最近 500 条)
+        self._link_events_max = 500
+
+        # 通信诊断 ROS 订阅
+        if not self.standalone:
+            try:
+                from mavros_msgs.msg import State as MavrosState
+                self._mavros_state_sub = rospy.Subscriber(
+                    '/mavros/state', MavrosState, self._web_mavros_state_cb)
+            except ImportError:
+                self._mavros_state_sub = None
+                rospy.logwarn("mavros_msgs not available, MAVROS state monitoring disabled")
+            self._bridge_diag_sub = rospy.Subscriber(
+                '/usv/bridge_diagnostics', String, self._bridge_diag_cb)
+        else:
+            self._mavros_state_sub = None
+            self._bridge_diag_sub = None
+
         if FLASK_AVAILABLE:
             self._setup_flask()
         else:
@@ -644,6 +667,47 @@ class WebConfigServer(object):
                 'level': level,
                 'timestamp': timestamp
             })
+
+    # ========== 通信诊断回调 ==========
+
+    def _web_mavros_state_cb(self, msg):
+        """MAVROS State 回调 - 用于通信诊断"""
+        prev_connected = self._mavros_state.get("connected", False)
+        self._mavros_state = {
+            "connected": msg.connected,
+            "armed": msg.armed,
+            "mode": msg.mode,
+        }
+        if prev_connected and not msg.connected:
+            self._add_link_event("mavros_disconnect", "MAVROS 与飞控断开连接")
+        elif not prev_connected and msg.connected:
+            self._add_link_event("mavros_connect", "MAVROS 已连接飞控 mode=%s" % msg.mode)
+        if self.socketio:
+            self.socketio.emit('mavros_state', self._mavros_state)
+
+    def _bridge_diag_cb(self, msg):
+        """桥接节点诊断数据回调"""
+        try:
+            data = json.loads(msg.data)
+            self._bridge_diag = data
+            self._diag_history.append(data)
+            if len(self._diag_history) > self._diag_history_max:
+                self._diag_history = self._diag_history[-self._diag_history_max:]
+            if self.socketio:
+                self.socketio.emit('bridge_diagnostics', data)
+        except Exception:
+            pass
+
+    def _add_link_event(self, event_type, detail):
+        """记录链路事件"""
+        entry = {
+            "ts": datetime.now().isoformat(),
+            "type": event_type,
+            "detail": detail,
+        }
+        self._link_events.append(entry)
+        if len(self._link_events) > self._link_events_max:
+            self._link_events = self._link_events[-self._link_events_max:]
 
     def _resolve_static_folder(self):
         candidates = []
@@ -1155,6 +1219,63 @@ class WebConfigServer(object):
 
             self._add_log("硬件配置已应用", "info")
             return jsonify({"success": True, "message": "硬件配置已应用", "data": hw, "results": results})
+
+        # ================= 通信诊断 API =================
+        @self.app.route('/api/diagnostics/link', methods=['GET'])
+        def get_link_diagnostics():
+            """获取完整通信链路诊断报告"""
+            # 检查 ROS 节点状态
+            nodes = []
+            if ROS_AVAILABLE and not self.standalone:
+                try:
+                    import rosnode
+                    node_list = rosnode.get_node_names()
+                    for n in ['/mavros', '/usv_mavlink_bridge', '/mavlink_trigger_node',
+                              '/pump_control_node', '/web_config_server']:
+                        nodes.append({"name": n, "alive": n in node_list})
+                except Exception:
+                    nodes = [{"name": "unknown", "alive": False, "error": "rosnode API unavailable"}]
+            return jsonify({
+                "success": True,
+                "data": {
+                    "mavros": self._mavros_state,
+                    "bridge": self._bridge_diag,
+                    "nodes": nodes,
+                    "link_events_recent": self._link_events[-20:],
+                }
+            })
+
+        @self.app.route('/api/diagnostics/history', methods=['GET'])
+        def get_diag_history():
+            """获取桥接节点诊断历史 (用于趋势分析)"""
+            return jsonify({"success": True, "data": self._diag_history})
+
+        @self.app.route('/api/diagnostics/events', methods=['GET'])
+        def get_link_events():
+            """获取链路事件日志"""
+            return jsonify({"success": True, "data": self._link_events})
+
+        @self.app.route('/api/diagnostics/export', methods=['GET'])
+        def export_diagnostics():
+            """导出结构化诊断报告 (JSON)"""
+            report = {
+                "exported_at": datetime.now().isoformat(),
+                "mavros_state": self._mavros_state,
+                "bridge_latest": self._bridge_diag,
+                "bridge_history": self._diag_history,
+                "link_events": self._link_events,
+                "config": {
+                    "fcu_url": rospy.get_param('/mavros/fcu_url', 'unknown') if ROS_AVAILABLE and not self.standalone else 'standalone',
+                    "gcs_url": rospy.get_param('/mavros/gcs_url', '') if ROS_AVAILABLE and not self.standalone else '',
+                },
+            }
+            from flask import Response
+            return Response(
+                json.dumps(report, indent=2, ensure_ascii=False),
+                mimetype='application/json',
+                headers={"Content-Disposition": "attachment; filename=usv_diagnostics_%s.json" %
+                         datetime.now().strftime("%Y%m%d_%H%M%S")}
+            )
 
     def _trigger_mission(self, action):
         """触发任务动作。"""

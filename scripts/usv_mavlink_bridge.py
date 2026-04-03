@@ -6,8 +6,12 @@ USV MAVLink Telemetry Bridge
 ============================
 ROS topics -> MAVLink NAMED_VALUE_FLOAT -> 飞控串口 -> 数传 -> QGC
 
-使用 mavros 的 /mavlink/to 话题发送，但使用 mavros_msgs.mavlink.convert
-进行正确的消息格式转换，确保 MAVROS 能正确序列化并写入串口。
+关键:
+  sysid 必须使用与飞控不同的值 (默认 2)。ArduPilot 按 sysid 做路由,
+  如果伴随计算机 sysid == SYSID_THISMAV, 飞控不会将消息转发到其他串口。
+
+使用 mavros 的 /mavlink/to 话题发送原始 MAVLink 帧，MAVROS 负责
+序列化并写入 FCU 串口。
 """
 
 from __future__ import print_function
@@ -23,6 +27,7 @@ from mavros_msgs.msg import Mavlink, State
 
 TELEMETRY_RATE_HZ = 2
 HEARTBEAT_RATE_HZ = 1
+DIAG_REPORT_INTERVAL = 10   # 每 N 秒输出一次链路诊断
 
 MAVLINK_MSG_ID_HEARTBEAT = 0
 MAVLINK_MSG_ID_NAMED_VALUE_FLOAT = 251
@@ -31,7 +36,9 @@ MAV_TYPE_ONBOARD_CONTROLLER = 18
 MAV_AUTOPILOT_INVALID = 8
 MAV_STATE_ACTIVE = 4
 
-SYS_ID = 1
+# 关键修复: sysid=2 避免与飞控 SYSID_THISMAV=1 冲突
+# ArduPilot 路由规则: 只转发 sysid != 自身 的消息到其他端口
+SYS_ID = 2
 COMP_ID = 191
 
 
@@ -40,9 +47,19 @@ class USVMavlinkBridge(object):
     def __init__(self):
         rospy.init_node('usv_mavlink_bridge', anonymous=False)
 
-        self._sys_id = int(rospy.get_param('~source_system_id',
-                                           rospy.get_param('/mavros/target_system_id', SYS_ID)))
+        # sysid: 默认 2; 如果用户显式设置了 ~source_system_id 则用用户值
+        self._sys_id = int(rospy.get_param('~source_system_id', SYS_ID))
         self._comp_id = int(rospy.get_param('~source_component_id', COMP_ID))
+
+        # 运行时参数验证
+        fcu_sysid = int(rospy.get_param('/mavros/target_system_id', 1))
+        if self._sys_id == fcu_sysid:
+            rospy.logwarn("="*60)
+            rospy.logwarn("WARNING: source_system_id (%d) == FCU sysid (%d)",
+                          self._sys_id, fcu_sysid)
+            rospy.logwarn("ArduPilot will NOT forward these messages to GCS!")
+            rospy.logwarn("Set ~source_system_id to a different value (e.g. 2)")
+            rospy.logwarn("="*60)
 
         self._lock = threading.Lock()
         self._voltage = 0.0
@@ -55,7 +72,18 @@ class USVMavlinkBridge(object):
         self._boot_time = time.time()
         self._last_heartbeat = 0.0
 
+        # 诊断计数器
+        self._diag_lock = threading.Lock()
+        self._diag_tx_total = 0        # 总发送包数
+        self._diag_tx_heartbeat = 0    # 心跳包数
+        self._diag_tx_named = 0        # NAMED_VALUE_FLOAT 包数
+        self._diag_pub_errors = 0      # 发布错误数
+        self._diag_mavros_drops = 0    # MAVROS 断连计数
+        self._diag_last_report = time.time()
+
         self._mavlink_pub = rospy.Publisher('/mavros/mavlink/to', Mavlink, queue_size=30)
+        # 诊断状态话题 - 供 Web 面板和其他节点消费
+        self._diag_pub = rospy.Publisher('/usv/bridge_diagnostics', String, queue_size=5)
 
         rospy.Subscriber('/usv/spectrometer_voltage', String, self._voltage_cb)
         rospy.Subscriber('/usv/pump_angles', String, self._angles_cb)
@@ -63,8 +91,8 @@ class USVMavlinkBridge(object):
         rospy.Subscriber('/usv/trigger_status', String, self._trigger_status_cb)
         rospy.Subscriber('/mavros/state', State, self._mavros_state_cb)
 
-        rospy.loginfo("USV MAVLink Bridge initialized  sysid=%d compid=%d rate=%dHz",
-                      self._sys_id, self._comp_id, TELEMETRY_RATE_HZ)
+        rospy.loginfo("USV MAVLink Bridge initialized  sysid=%d compid=%d rate=%dHz fcu_sysid=%d",
+                      self._sys_id, self._comp_id, TELEMETRY_RATE_HZ, fcu_sysid)
 
     def _voltage_cb(self, msg):
         try:
@@ -114,6 +142,8 @@ class USVMavlinkBridge(object):
             self._mavros_connected = msg.connected
         if prev and not msg.connected:
             rospy.logwarn("MAVROS disconnected")
+            with self._diag_lock:
+                self._diag_mavros_drops += 1
         elif not prev and msg.connected:
             rospy.loginfo("MAVROS connected")
 
@@ -135,20 +165,31 @@ class USVMavlinkBridge(object):
         return out
 
     def _publish_raw(self, msgid, payload):
-        m = Mavlink()
-        m.header.stamp = rospy.Time.now()
-        m.framing_status = 1  # MAVLINK_FRAMING_OK
-        m.magic = 253         # MAVLink v2
-        m.len = len(payload)
-        m.incompat_flags = 0
-        m.compat_flags = 0
-        m.seq = self._next_seq()
-        m.sysid = self._sys_id
-        m.compid = self._comp_id
-        m.msgid = msgid
-        m.checksum = 0
-        m.payload64 = self._payload_to_uint64(payload)
-        self._mavlink_pub.publish(m)
+        try:
+            m = Mavlink()
+            m.header.stamp = rospy.Time.now()
+            m.framing_status = 1  # MAVLINK_FRAMING_OK
+            m.magic = 253         # MAVLink v2
+            m.len = len(payload)
+            m.incompat_flags = 0
+            m.compat_flags = 0
+            m.seq = self._next_seq()
+            m.sysid = self._sys_id
+            m.compid = self._comp_id
+            m.msgid = msgid
+            m.checksum = 0
+            m.payload64 = self._payload_to_uint64(payload)
+            self._mavlink_pub.publish(m)
+            with self._diag_lock:
+                self._diag_tx_total += 1
+                if msgid == MAVLINK_MSG_ID_HEARTBEAT:
+                    self._diag_tx_heartbeat += 1
+                elif msgid == MAVLINK_MSG_ID_NAMED_VALUE_FLOAT:
+                    self._diag_tx_named += 1
+        except Exception as e:
+            with self._diag_lock:
+                self._diag_pub_errors += 1
+            rospy.logerr_throttle(10, "publish_raw error: %s", str(e))
 
     def _send_named_value_float(self, name, value):
         name_bytes = name.encode('ascii')[:10].ljust(10, b'\x00')
@@ -167,6 +208,32 @@ class USVMavlinkBridge(object):
         )
         self._publish_raw(MAVLINK_MSG_ID_HEARTBEAT, payload)
 
+    def _publish_diagnostics(self):
+        """发布结构化诊断信息到 /usv/bridge_diagnostics"""
+        now = time.time()
+        with self._diag_lock:
+            uptime = now - self._boot_time
+            diag = {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)),
+                "uptime_s": int(uptime),
+                "sysid": self._sys_id,
+                "compid": self._comp_id,
+                "mavros_connected": self._mavros_connected,
+                "tx_total": self._diag_tx_total,
+                "tx_heartbeat": self._diag_tx_heartbeat,
+                "tx_named_value": self._diag_tx_named,
+                "pub_errors": self._diag_pub_errors,
+                "mavros_drops": self._diag_mavros_drops,
+                "pkt_count": self._pkt_count,
+                "rate_hz": TELEMETRY_RATE_HZ,
+            }
+        try:
+            msg = String()
+            msg.data = json.dumps(diag)
+            self._diag_pub.publish(msg)
+        except Exception:
+            pass
+
     def run(self):
         rate = rospy.Rate(TELEMETRY_RATE_HZ)
         rospy.loginfo("USV MAVLink Bridge: telemetry loop started")
@@ -176,6 +243,11 @@ class USVMavlinkBridge(object):
                 connected = self._mavros_connected
             if not connected:
                 rospy.logwarn_throttle(10, "MAVROS not connected, waiting...")
+                # 即使断连也定期发送诊断
+                now = time.time()
+                if now - self._diag_last_report >= DIAG_REPORT_INTERVAL:
+                    self._publish_diagnostics()
+                    self._diag_last_report = now
                 rate.sleep()
                 continue
 
@@ -199,6 +271,11 @@ class USVMavlinkBridge(object):
             self._send_named_value_float("USV_STAT", float(status))
             self._pkt_count = (self._pkt_count + 1) % 65536
             self._send_named_value_float("USV_PKT", float(self._pkt_count))
+
+            # 定期诊断报告
+            if now - self._diag_last_report >= DIAG_REPORT_INTERVAL:
+                self._publish_diagnostics()
+                self._diag_last_report = now
 
             rate.sleep()
 
