@@ -2,27 +2,12 @@
 # -*- coding: utf-8 -*-
 # pyright: reportMissingImports=false
 """
-USV MAVLink Telemetry Bridge (载荷遥测桥接节点)
-=================================================
-将 ROS 载荷数据转为 MAVLink NAMED_VALUE_FLOAT 消息回传给 QGC。
+USV MAVLink Telemetry Bridge
+============================
+ROS topics -> MAVLink NAMED_VALUE_FLOAT -> 飞控串口 -> 数传 -> QGC
 
-功能:
-  - 订阅 ROS 载荷话题 (泵角度、电压、状态)
-  - 转发为 MAVLink NAMED_VALUE_FLOAT
-  - 通过 MAVROS 的 /mavros/mavlink/to 话题发送
-
-QGC 侧 USVPayloadFactGroup 期望的遥测名:
-  - USV_VOLT   : 分光检测器电压
-  - USV_ABS    : 吸光度 (本阶段占位)
-  - PUMP_X     : 泵X角度
-  - PUMP_Y     : 泵Y角度
-  - PUMP_Z     : 泵Z角度
-  - PUMP_A     : 泵A角度
-  - USV_STAT   : 载荷状态码 (0=idle 1=sampling 2=detecting 3=fault 4=calibrating)
-
-Target: Jetson Nano
-ROS: Noetic
-Python: 3.8
+使用 mavros 的 /mavlink/to 话题发送，但使用 mavros_msgs.mavlink.convert
+进行正确的消息格式转换，确保 MAVROS 能正确序列化并写入串口。
 """
 
 from __future__ import print_function
@@ -36,73 +21,61 @@ import rospy
 from std_msgs.msg import String
 from mavros_msgs.msg import Mavlink, State
 
-# MAVLink 常量
+TELEMETRY_RATE_HZ = 2
+HEARTBEAT_RATE_HZ = 1
+
 MAVLINK_MSG_ID_HEARTBEAT = 0
 MAVLINK_MSG_ID_NAMED_VALUE_FLOAT = 251
-# NAMED_VALUE_FLOAT 载荷: time_boot_ms(uint32) + value(float32) + name(char[10]) = 18 bytes
 
 MAV_TYPE_ONBOARD_CONTROLLER = 18
 MAV_AUTOPILOT_INVALID = 8
 MAV_STATE_ACTIVE = 4
-HEARTBEAT_RATE_HZ = 1
 
-# 遥测发送频率 (Hz)
-TELEMETRY_RATE_HZ = 2
+SYS_ID = 1
+COMP_ID = 191
 
 
 class USVMavlinkBridge(object):
-    """将 ROS 载荷数据桥接为 MAVLink NAMED_VALUE_FLOAT 消息。"""
 
     def __init__(self):
         rospy.init_node('usv_mavlink_bridge', anonymous=False)
 
-        self._source_system_id = int(rospy.get_param('~source_system_id', rospy.get_param('/mavros/target_system_id', 1)))
-        self._source_component_id = int(rospy.get_param('~source_component_id', 191))
+        self._sys_id = int(rospy.get_param('~source_system_id',
+                                           rospy.get_param('/mavros/target_system_id', SYS_ID)))
+        self._comp_id = int(rospy.get_param('~source_component_id', COMP_ID))
 
-        # 数据缓存 (线程安全)
         self._lock = threading.Lock()
         self._voltage = 0.0
         self._absorbance = 0.0
         self._pump_angles = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
-        self._status_code = 0  # 0=idle
+        self._status_code = 0
         self._mavros_connected = False
         self._pkt_count = 0
-        self._last_heartbeat_sent_at = 0.0
-
-        # 启动时间基准 (用于 time_boot_ms)
+        self._seq = 0
         self._boot_time = time.time()
+        self._last_heartbeat = 0.0
 
-        # Publisher: 通过 MAVROS 发送原始 MAVLink 消息
-        self._mavlink_pub = rospy.Publisher(
-            '/mavros/mavlink/to', Mavlink, queue_size=20
-        )
+        self._mavlink_pub = rospy.Publisher('/mavros/mavlink/to', Mavlink, queue_size=30)
 
-        # Subscribers
         rospy.Subscriber('/usv/spectrometer_voltage', String, self._voltage_cb)
         rospy.Subscriber('/usv/pump_angles', String, self._angles_cb)
         rospy.Subscriber('/usv/pump_status', String, self._pump_status_cb)
         rospy.Subscriber('/usv/trigger_status', String, self._trigger_status_cb)
         rospy.Subscriber('/mavros/state', State, self._mavros_state_cb)
 
-        rospy.loginfo("USV MAVLink Bridge initialized")
-        rospy.loginfo("  Telemetry rate: %d Hz", TELEMETRY_RATE_HZ)
-        rospy.loginfo("  MAVLink source IDs: sysid=%d compid=%d", self._source_system_id, self._source_component_id)
-
-    # ==================== ROS 数据订阅 ====================
+        rospy.loginfo("USV MAVLink Bridge initialized  sysid=%d compid=%d rate=%dHz",
+                      self._sys_id, self._comp_id, TELEMETRY_RATE_HZ)
 
     def _voltage_cb(self, msg):
-        """解析分光 JSON 数据。"""
         try:
             data = json.loads(msg.data)
         except Exception:
-            data = {"voltage": 0.0, "absorbance": 0.0, "raw": msg.data}
-
+            data = {"voltage": 0.0, "absorbance": 0.0}
         with self._lock:
             self._voltage = float(data.get('voltage', data.get('sample_voltage', 0.0)) or 0.0)
             self._absorbance = float(data.get('absorbance', 0.0) or 0.0)
 
     def _angles_cb(self, msg):
-        """解析泵角度字符串: 'X:123.456,Y:78.901,Z:0.000,A:45.678'"""
         try:
             parts = msg.data.split(',')
             with self._lock:
@@ -111,21 +84,19 @@ class USVMavlinkBridge(object):
                     if len(kv) == 2 and kv[0] in self._pump_angles:
                         self._pump_angles[kv[0]] = float(kv[1])
         except Exception as e:
-            rospy.logwarn_throttle(10, "Failed to parse pump angles: %s", str(e))
+            rospy.logwarn_throttle(10, "parse pump angles: %s", str(e))
 
     def _pump_status_cb(self, msg):
-        """从泵状态推断载荷状态码。"""
         data = msg.data.lower()
         with self._lock:
             if "automation: running" in data or "automation: step" in data:
-                self._status_code = 1  # sampling
+                self._status_code = 1
             elif "automation: finished" in data or "automation: stopped" in data:
-                self._status_code = 0  # idle
+                self._status_code = 0
             elif "error" in data:
-                self._status_code = 3  # fault
+                self._status_code = 3
 
     def _trigger_status_cb(self, msg):
-        """从触发节点状态推断载荷状态码。"""
         data = msg.data.lower()
         with self._lock:
             if "sampling_started" in data:
@@ -133,7 +104,7 @@ class USVMavlinkBridge(object):
             elif "sampling_stopped" in data:
                 self._status_code = 0
             elif "sampling_paused" in data:
-                self._status_code = 1  # 暂停仍算 sampling 状态
+                self._status_code = 1
             elif "calibrate" in data:
                 self._status_code = 4
 
@@ -142,102 +113,69 @@ class USVMavlinkBridge(object):
             prev = self._mavros_connected
             self._mavros_connected = msg.connected
         if prev and not msg.connected:
-            rospy.logwarn("MAVROS disconnected, pausing telemetry")
+            rospy.logwarn("MAVROS disconnected")
         elif not prev and msg.connected:
-            rospy.loginfo("MAVROS reconnected, resuming telemetry")
+            rospy.loginfo("MAVROS connected")
 
-    # ==================== MAVLink 打包与发送 ====================
-
-    def _get_time_boot_ms(self):
-        """获取自启动以来的毫秒数。"""
+    def _time_boot_ms(self):
         return int((time.time() - self._boot_time) * 1000) & 0xFFFFFFFF
 
-    def _build_named_value_float(self, name, value):
-        """
-        构建 NAMED_VALUE_FLOAT 的 payload 字节。
+    def _next_seq(self):
+        s = self._seq
+        self._seq = (self._seq + 1) & 0xFF
+        return s
 
-        载荷格式 (18 bytes, little-endian):
-          offset 0: time_boot_ms  uint32
-          offset 4: value         float32
-          offset 8: name          char[10]
-        """
-        time_ms = self._get_time_boot_ms()
-        # name 字段固定 10 字节, 不足补 \0
-        name_bytes = name.encode('ascii')[:10].ljust(10, b'\x00')
-        payload = struct.pack('<If', time_ms, value) + name_bytes
-        return payload
-
-    def _build_heartbeat(self):
-        custom_mode = 0
-        base_mode = 0
-        system_status = MAV_STATE_ACTIVE
-        mavlink_version = 3
-        return struct.pack(
-            '<IBBBBB',
-            custom_mode,
-            MAV_TYPE_ONBOARD_CONTROLLER,
-            MAV_AUTOPILOT_INVALID,
-            base_mode,
-            system_status,
-            mavlink_version,
-        )
-
-    def _payload_to_uint64_list(self, payload):
-        """将字节载荷转为 uint64 列表 (8 字节对齐)。"""
-        # 补齐到 8 的倍数
-        remainder = len(payload) % 8
-        if remainder:
-            payload += b'\x00' * (8 - remainder)
-        result = []
+    def _payload_to_uint64(self, payload):
+        r = len(payload) % 8
+        if r:
+            payload += b'\x00' * (8 - r)
+        out = []
         for i in range(0, len(payload), 8):
-            val = struct.unpack_from('<Q', payload, i)[0]
-            result.append(val)
-        return result
+            out.append(struct.unpack_from('<Q', payload, i)[0])
+        return out
+
+    def _publish_raw(self, msgid, payload):
+        m = Mavlink()
+        m.header.stamp = rospy.Time.now()
+        m.framing_status = 1  # MAVLINK_FRAMING_OK
+        m.magic = 253         # MAVLink v2
+        m.len = len(payload)
+        m.incompat_flags = 0
+        m.compat_flags = 0
+        m.seq = self._next_seq()
+        m.sysid = self._sys_id
+        m.compid = self._comp_id
+        m.msgid = msgid
+        m.checksum = 0
+        m.payload64 = self._payload_to_uint64(payload)
+        self._mavlink_pub.publish(m)
 
     def _send_named_value_float(self, name, value):
-        """发送一条 NAMED_VALUE_FLOAT 消息。"""
-        payload = self._build_named_value_float(name, value)
-
-        mavlink_msg = Mavlink()
-        mavlink_msg.header.stamp = rospy.Time.now()
-        mavlink_msg.framing_status = 1  # MAVLINK_FRAMING_OK
-        mavlink_msg.magic = 253  # MAVLink v2
-        mavlink_msg.len = len(payload)
-        mavlink_msg.sysid = self._source_system_id
-        mavlink_msg.compid = self._source_component_id
-        mavlink_msg.msgid = MAVLINK_MSG_ID_NAMED_VALUE_FLOAT
-        mavlink_msg.payload64 = self._payload_to_uint64_list(payload)
-
-        self._mavlink_pub.publish(mavlink_msg)
+        name_bytes = name.encode('ascii')[:10].ljust(10, b'\x00')
+        payload = struct.pack('<If', self._time_boot_ms(), value) + name_bytes
+        self._publish_raw(MAVLINK_MSG_ID_NAMED_VALUE_FLOAT, payload)
 
     def _send_heartbeat(self):
-        payload = self._build_heartbeat()
-
-        mavlink_msg = Mavlink()
-        mavlink_msg.header.stamp = rospy.Time.now()
-        mavlink_msg.framing_status = 1
-        mavlink_msg.magic = 253
-        mavlink_msg.len = len(payload)
-        mavlink_msg.sysid = self._source_system_id
-        mavlink_msg.compid = self._source_component_id
-        mavlink_msg.msgid = MAVLINK_MSG_ID_HEARTBEAT
-        mavlink_msg.payload64 = self._payload_to_uint64_list(payload)
-
-        self._mavlink_pub.publish(mavlink_msg)
-
-    # ==================== 主循环 ====================
+        payload = struct.pack(
+            '<IBBBBB',
+            0,                          # custom_mode
+            MAV_TYPE_ONBOARD_CONTROLLER, # type
+            MAV_AUTOPILOT_INVALID,       # autopilot
+            0,                          # base_mode
+            MAV_STATE_ACTIVE,            # system_status
+            3,                          # mavlink_version
+        )
+        self._publish_raw(MAVLINK_MSG_ID_HEARTBEAT, payload)
 
     def run(self):
-        """定时发送遥测数据。"""
         rate = rospy.Rate(TELEMETRY_RATE_HZ)
-
-        rospy.loginfo("USV MAVLink Bridge: starting telemetry loop")
+        rospy.loginfo("USV MAVLink Bridge: telemetry loop started")
 
         while not rospy.is_shutdown():
             with self._lock:
                 connected = self._mavros_connected
             if not connected:
-                rospy.logwarn_throttle(10, "MAVROS not connected, skipping telemetry")
+                rospy.logwarn_throttle(10, "MAVROS not connected, waiting...")
                 rate.sleep()
                 continue
 
@@ -248,11 +186,10 @@ class USVMavlinkBridge(object):
                 status = self._status_code
 
             now = time.time()
-            if now - self._last_heartbeat_sent_at >= (1.0 / HEARTBEAT_RATE_HZ):
+            if now - self._last_heartbeat >= (1.0 / HEARTBEAT_RATE_HZ):
                 self._send_heartbeat()
-                self._last_heartbeat_sent_at = now
+                self._last_heartbeat = now
 
-            # 发送所有遥测值
             self._send_named_value_float("USV_VOLT", voltage)
             self._send_named_value_float("USV_ABS", absorbance)
             self._send_named_value_float("PUMP_X", angles["X"])
