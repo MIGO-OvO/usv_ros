@@ -5,26 +5,28 @@
 NAMED_VALUE_FLOAT probe for real-hardware debugging.
 
 Purpose:
-  Distinguish whether short-name NAMED_VALUE_FLOAT frames are being dropped
-  because of the current bridge-style encoding.
+  Distinguish whether the current /mavros/mavlink/to publication path is
+  failing because messages are not MAVLink-finalized before transmission.
 
 What it does:
-  - Publishes raw MAVLink to /mavros/mavlink/to
+  - Publishes MAVLink to /mavros/mavlink/to
   - Sends companion HEARTBEAT with sysid=2 compid=191
-  - Runs a few phases with different NAMED_VALUE_FLOAT encodings
+  - Compares today's raw publication path against a finalized pymavlink path
 
 Recommended true-hardware usage:
   1. Start MAVROS and connect the Jetson to the FCU as usual
   2. Open QGC Analyze > MAVLink Inspector
   3. Run:
        rosrun usv_ros named_value_float_probe.py
-  4. Watch whether msgid=251 appears during each phase
+  4. Watch whether source 2/191 and msgid=251 appear during each phase
 
 Interpretation:
+  - bridge_short missing + finalized_short visible
+      => root cause strongly points to missing MAVLink finalization/checksum
   - bridge_short missing + bridge_10char visible + trimmed_short visible
       => root cause strongly points to short-name bridge encoding
   - all phases visible
-      => root cause is likely further downstream than encoding
+      => root cause is likely further downstream than encoding/finalization
   - no phases visible
       => root cause is likely before QGC consumption, e.g. MAVROS/FCU/routing
 """
@@ -37,6 +39,11 @@ import time
 
 import rospy
 from mavros_msgs.msg import Mavlink, State
+
+try:
+    from pymavlink.dialects.v20 import common as mavlink2
+except ImportError:
+    mavlink2 = None
 
 TELEMETRY_RATE_HZ = 2.0
 HEARTBEAT_RATE_HZ = 1.0
@@ -59,12 +66,16 @@ class NamedValueFloatProbe(object):
         self._rate_hz = float(args.rate_hz)
         self._phase_seconds = float(args.phase_seconds)
         self._wait_timeout = float(args.wait_timeout)
-        self._phases = self._build_phases(args.phases)
 
         self._seq = 0
         self._boot_time = time.time()
         self._last_heartbeat = 0.0
         self._mavros_connected = False
+        self._pymav = None
+        if mavlink2 is not None:
+            self._pymav = mavlink2.MAVLink(None, srcSystem=self._sys_id, srcComponent=self._comp_id)
+
+        self._phases = self._build_phases(args.phases)
 
         self._pub = rospy.Publisher("/mavros/mavlink/to", Mavlink, queue_size=20)
         self._state_sub = rospy.Subscriber("/mavros/state", State, self._state_cb, queue_size=5)
@@ -79,32 +90,41 @@ class NamedValueFloatProbe(object):
 
     def _build_phases(self, requested):
         phase_map = {
-            # Mirrors current bridge behavior for an actual panel field name.
             "bridge_short": {
                 "id": "bridge_short",
                 "label": "bridge-style short name",
+                "tx_mode": "raw",
                 "encoding": "bridge",
                 "name": "USV_VOLT",
                 "value": 11.11,
                 "notes": "Current bridge-style zero-padded short name; expected payload len 18",
             },
-            # Control case: exactly 10 chars, same bridge encoding path.
             "bridge_10char": {
                 "id": "bridge_10char",
                 "label": "bridge-style 10-char name",
+                "tx_mode": "raw",
                 "encoding": "bridge",
                 "name": "ABCDEFGHIJ",
                 "value": 22.22,
                 "notes": "Control case; expected payload len 18",
             },
-            # Same panel field, but with trailing zeros trimmed from the payload.
             "trimmed_short": {
                 "id": "trimmed_short",
                 "label": "trimmed short name",
+                "tx_mode": "raw",
                 "encoding": "trimmed",
                 "name": "USV_VOLT",
                 "value": 33.33,
                 "notes": "Short name without trailing NUL padding; expected payload len 16",
+            },
+            "finalized_short": {
+                "id": "finalized_short",
+                "label": "pymavlink finalized short name",
+                "tx_mode": "finalized",
+                "encoding": "pymavlink",
+                "name": "USV_VOLT",
+                "value": 44.44,
+                "notes": "Valid MAVLink2 packet with computed checksum; expected packet len 28",
             },
         }
 
@@ -112,6 +132,8 @@ class NamedValueFloatProbe(object):
         for phase_id in requested:
             if phase_id not in phase_map:
                 raise ValueError("unknown phase: %s" % phase_id)
+            if phase_map[phase_id]["tx_mode"] == "finalized" and self._pymav is None:
+                raise RuntimeError("phase %s requires pymavlink on the target ROS system" % phase_id)
             selected.append(phase_map[phase_id])
         return selected
 
@@ -135,8 +157,8 @@ class NamedValueFloatProbe(object):
     def _publish_raw(self, msgid, payload):
         msg = Mavlink()
         msg.header.stamp = rospy.Time.now()
-        msg.framing_status = 1  # MAVLINK_FRAMING_OK
-        msg.magic = 253         # MAVLink v2
+        msg.framing_status = 1
+        msg.magic = 253
         msg.len = len(payload)
         msg.incompat_flags = 0
         msg.compat_flags = 0
@@ -148,17 +170,53 @@ class NamedValueFloatProbe(object):
         msg.payload64 = self._payload_to_uint64(payload)
         self._pub.publish(msg)
 
+    def _publish_packet(self, packet):
+        if len(packet) < 12:
+            raise ValueError("finalized packet too short")
+
+        payload_len = packet[1]
+        payload_start = 10
+        payload_end = payload_start + payload_len
+
+        msg = Mavlink()
+        msg.header.stamp = rospy.Time.now()
+        msg.framing_status = 1
+        msg.magic = packet[0]
+        msg.len = payload_len
+        msg.incompat_flags = packet[2]
+        msg.compat_flags = packet[3]
+        msg.seq = packet[4]
+        msg.sysid = packet[5]
+        msg.compid = packet[6]
+        msg.msgid = packet[7] | (packet[8] << 8) | (packet[9] << 16)
+        msg.checksum = struct.unpack_from("<H", packet, payload_end)[0]
+        msg.payload64 = self._payload_to_uint64(packet[payload_start:payload_end])
+        self._pub.publish(msg)
+
     def _send_heartbeat(self):
         payload = struct.pack(
             "<IBBBBB",
-            0,                           # custom_mode
+            0,
             MAV_TYPE_ONBOARD_CONTROLLER,
             MAV_AUTOPILOT_INVALID,
-            0,                           # base_mode
+            0,
             MAV_STATE_ACTIVE,
-            3,                           # mavlink_version
+            3,
         )
         self._publish_raw(MAVLINK_MSG_ID_HEARTBEAT, payload)
+        return len(payload), payload.hex()
+
+    def _send_finalized_heartbeat(self):
+        msg = self._pymav.heartbeat_encode(
+            MAV_TYPE_ONBOARD_CONTROLLER,
+            MAV_AUTOPILOT_INVALID,
+            0,
+            0,
+            MAV_STATE_ACTIVE,
+        )
+        packet = msg.pack(self._pymav)
+        self._publish_packet(packet)
+        return len(packet), packet.hex()
 
     def _build_named_value_payload(self, name, value, encoding):
         base = struct.pack("<If", self._time_boot_ms(), float(value))
@@ -174,6 +232,16 @@ class NamedValueFloatProbe(object):
         payload = self._build_named_value_payload(name, value, encoding)
         self._publish_raw(MAVLINK_MSG_ID_NAMED_VALUE_FLOAT, payload)
         return len(payload), payload.hex()
+
+    def _send_finalized_named_value_float(self, name, value):
+        msg = self._pymav.named_value_float_encode(
+            self._time_boot_ms(),
+            name.encode("ascii")[:10],
+            float(value),
+        )
+        packet = msg.pack(self._pymav)
+        self._publish_packet(packet)
+        return len(packet), packet.hex()
 
     def _wait_for_mavros(self):
         if self._mavros_connected:
@@ -200,30 +268,45 @@ class NamedValueFloatProbe(object):
             rospy.loginfo("Phase %d/%d: %s", index, len(self._phases), phase["id"])
             rospy.loginfo("  label: %s", phase["label"])
             rospy.loginfo("  notes: %s", phase["notes"])
-            rospy.loginfo("  name=%s value=%.2f encoding=%s",
-                          phase["name"], phase["value"], phase["encoding"])
-            rospy.loginfo("  QGC expectation: watch MAVLink Inspector for msgid=251 during this phase")
+            rospy.loginfo(
+                "  name=%s value=%.2f encoding=%s tx_mode=%s",
+                phase["name"], phase["value"], phase["encoding"], phase["tx_mode"]
+            )
+            rospy.loginfo(
+                "  QGC expectation: watch MAVLink Inspector for source %d/%d and msgid=251",
+                self._sys_id, self._comp_id
+            )
             rospy.loginfo("=" * 72)
 
             end_time = time.time() + self._phase_seconds
             while not rospy.is_shutdown() and time.time() < end_time:
                 now = time.time()
                 if now - self._last_heartbeat >= (1.0 / HEARTBEAT_RATE_HZ):
-                    self._send_heartbeat()
+                    if phase["tx_mode"] == "finalized":
+                        self._send_finalized_heartbeat()
+                    else:
+                        self._send_heartbeat()
                     self._last_heartbeat = now
 
-                payload_len, payload_hex = self._send_named_value_float(
-                    phase["name"], phase["value"], phase["encoding"]
-                )
+                if phase["tx_mode"] == "finalized":
+                    frame_len, frame_hex = self._send_finalized_named_value_float(
+                        phase["name"], phase["value"]
+                    )
+                else:
+                    frame_len, frame_hex = self._send_named_value_float(
+                        phase["name"], phase["value"], phase["encoding"]
+                    )
+
                 rospy.loginfo_throttle(
                     2.0,
-                    "phase=%s payload_len=%d payload_hex=%s",
-                    phase["id"], payload_len, payload_hex
+                    "phase=%s tx_mode=%s frame_len=%d frame_hex=%s",
+                    phase["id"], phase["tx_mode"], frame_len, frame_hex
                 )
                 rate.sleep()
 
         rospy.loginfo("Probe finished")
-        rospy.loginfo("Please report which phases produced msgid=251 in QGC Inspector:")
+        rospy.loginfo("Please report which phases produced source %d/%d and msgid=251 in QGC Inspector:",
+                      self._sys_id, self._comp_id)
         for phase in self._phases:
             rospy.loginfo("  - %s", phase["id"])
 
@@ -234,8 +317,8 @@ def _parse_args():
     )
     parser.add_argument(
         "--phases",
-        default="bridge_short,bridge_10char,trimmed_short",
-        help="Comma-separated phase ids. Default: bridge_short,bridge_10char,trimmed_short",
+        default="bridge_short,finalized_short",
+        help="Comma-separated phase ids. Default: bridge_short,finalized_short",
     )
     parser.add_argument("--phase-seconds", type=float, default=10.0, help="Seconds per phase")
     parser.add_argument("--rate-hz", type=float, default=TELEMETRY_RATE_HZ, help="NAMED_VALUE_FLOAT send rate")
