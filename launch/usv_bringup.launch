@@ -36,12 +36,14 @@
     <arg name="auto_trigger_on_waypoint" default="true" />
     <arg name="trigger_waypoints" default="[]" />
     <arg name="enable_mavros" default="true" />
-    <arg name="mavros_fcu_url" default="/dev/ttyTHS1:57600" />
+    <arg name="mavros_fcu_url" default="/dev/ttyTHS1:921600" />
     <arg name="mavros_gcs_url" default="" />
     <arg name="mavros_tgt_system" default="1" />
     <arg name="mavros_tgt_component" default="1" />
     <arg name="mavros_fcu_protocol" default="v2.0" />
     <arg name="mavros_respawn" default="false" />
+    <arg name="mavlink_source_system" default="1" />
+    <arg name="mavlink_source_component" default="240" />
 
     <!-- 节点启用开关 -->
     <arg name="enable_pump" default="true" />
@@ -87,10 +89,15 @@
           output="screen" if="$(arg enable_mavlink_trigger)">
         <param name="mavros_timeout" value="$(arg mavros_timeout)" />
         <param name="auto_trigger_on_waypoint" value="$(arg auto_trigger_on_waypoint)" />
+        <param name="source_system_id" value="$(arg mavlink_source_system)" />
+        <param name="source_component_id" value="$(arg mavlink_source_component)" />
         <rosparam param="trigger_waypoints" subst_value="true">$(arg trigger_waypoints)</rosparam>
     </node>
 
     <!-- ==================== MAVLink Telemetry Bridge ==================== -->
     <node name="usv_mavlink_bridge" pkg="usv_ros" type="usv_mavlink_bridge.py"
-          output="screen" if="$(arg enable_mavlink_bridge)" />
+          output="screen" if="$(arg enable_mavlink_bridge)">
+        <param name="source_system_id" value="$(arg mavlink_source_system)" />
+        <param name="source_component_id" value="$(arg mavlink_source_component)" />
+    </node>
 </launch>

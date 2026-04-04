@@ -7,8 +7,8 @@ USV MAVLink Telemetry Bridge
 ROS topics -> MAVLink NAMED_VALUE_FLOAT -> 飞控串口 -> 数传 -> QGC
 
 关键:
-  sysid 必须使用与飞控不同的值 (默认 2)。ArduPilot 按 sysid 做路由,
-  如果伴随计算机 sysid == SYSID_THISMAV, 飞控不会将消息转发到其他串口。
+  nano 连接飞控后的上发消息默认使用 sysid=1、compid=240，
+  与当前飞控 / QGC 联调观测结果保持一致。
 
 使用 mavros 的 /mavlink/to 话题发送原始 MAVLink 帧，MAVROS 负责
 序列化并写入 FCU 串口。
@@ -36,10 +36,9 @@ MAV_TYPE_ONBOARD_CONTROLLER = 18
 MAV_AUTOPILOT_INVALID = 8
 MAV_STATE_ACTIVE = 4
 
-# 关键修复: sysid=2 避免与飞控 SYSID_THISMAV=1 冲突
-# ArduPilot 路由规则: 只转发 sysid != 自身 的消息到其他端口
-SYS_ID = 2
-COMP_ID = 191
+# 默认采用现场验证通过的 nano -> 飞控 MAVLink 源 ID
+SYS_ID = 1
+COMP_ID = 240
 
 
 class USVMavlinkBridge(object):
@@ -47,19 +46,15 @@ class USVMavlinkBridge(object):
     def __init__(self):
         rospy.init_node('usv_mavlink_bridge', anonymous=False)
 
-        # sysid: 默认 2; 如果用户显式设置了 ~source_system_id 则用用户值
+        # sysid/compid 默认与现场验证通过的 nano -> 飞控配置一致
         self._sys_id = int(rospy.get_param('~source_system_id', SYS_ID))
         self._comp_id = int(rospy.get_param('~source_component_id', COMP_ID))
 
-        # 运行时参数验证
+        # 运行时参数记录
         fcu_sysid = int(rospy.get_param('/mavros/target_system_id', 1))
         if self._sys_id == fcu_sysid:
-            rospy.logwarn("="*60)
-            rospy.logwarn("WARNING: source_system_id (%d) == FCU sysid (%d)",
+            rospy.loginfo("source_system_id (%d) matches FCU sysid (%d) by current deployment design",
                           self._sys_id, fcu_sysid)
-            rospy.logwarn("ArduPilot will NOT forward these messages to GCS!")
-            rospy.logwarn("Set ~source_system_id to a different value (e.g. 2)")
-            rospy.logwarn("="*60)
 
         self._lock = threading.Lock()
         self._voltage = 0.0

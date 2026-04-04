@@ -284,6 +284,9 @@ Common args in `launch/usv_bringup.launch`:
 - `mavros_timeout` (default `30.0`)
 - `auto_trigger_on_waypoint` (default `true`)
 - `trigger_waypoints` (default `[]`, example: `[1,3,5]`)
+- `mavros_fcu_url` (default `/dev/ttyTHS1:921600`)
+- `mavlink_source_system` (default `1`)
+- `mavlink_source_component` (default `240`)
 - `enable_pump|enable_web|enable_mavlink_trigger|enable_mavlink_bridge`
 
 Example: pump + web only

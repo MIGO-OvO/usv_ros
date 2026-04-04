@@ -69,7 +69,7 @@ class MAVLinkTriggerNode(object):
         rospy.init_node('mavlink_trigger_node', anonymous=False)
 
         self._source_system_id = int(rospy.get_param('~source_system_id', rospy.get_param('/mavros/target_system_id', 1)))
-        self._source_component_id = int(rospy.get_param('~source_component_id', 191))
+        self._source_component_id = int(rospy.get_param('~source_component_id', 240))
 
         # 参数
         self.mavros_timeout = rospy.get_param('~mavros_timeout', 30.0)
@@ -100,11 +100,8 @@ class MAVLinkTriggerNode(object):
         self.waypoint_sub = rospy.Subscriber('/mavros/mission/reached', WaypointReached, self._waypoint_cb)
 
         # 监听 MAVROS 原始 MAVLink 入站消息 (从飞控/GCS 收到的所有 MAVLink 帧)
-        # mavros_msgs/Mavlink 包含 msgid、payload64 等字段
-        # TODO: QGC sends COMMAND_LONG with compId=1 (autopilot). The autopilot
-        # NAKs unknown cmds 31010-31014, but MAVROS forwards all /from messages
-        # so we still receive them. Ideally use compId=191 (ONBOARD_COMPUTER),
-        # but this requires MAVROS routing verification.
+        # mavros_msgs/Mavlink 包含 msgid、payload64 等字段。
+        # 当前现场配置下，QGC 可见 nano 侧使用 source 1/240 发送 HEARTBEAT、SYSTEM_TIME 等消息。
         self.mavlink_sub = rospy.Subscriber(
             '/mavros/mavlink/from', Mavlink, self._mavlink_from_cb, queue_size=20
         )

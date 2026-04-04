@@ -410,7 +410,7 @@ curl -X POST http://127.0.0.1:5000/api/hardware/apply \
 ### 12.1 飞控参数与物理连接确认
 在 QGC 中确认以下参数：
 - `SERIAL2_PROTOCOL = 2`（MAVLink2；若现场使用 MAVLink1，则至少必须是 MAVLink 协议，而不是 GPS/RCIN 等）
-- `SERIAL2_BAUD = 57`
+- `SERIAL2_BAUD = 921`（921600 bps）
 - `SYSID_THISMAV = 1`
 
 现场硬件应满足：
@@ -497,7 +497,7 @@ rostopic echo /mavros/mavlink/from
 通过判据：
 - `/mavros/mavlink/from` 能看到 `msgid: 76`（`COMMAND_LONG`）
 - `/usv/trigger_status` 出现 `sampling_started`、`sampling_paused`、`sampling_resumed`、`sampling_stopped`
-- 若点击 QGC 后 `/mavros/mavlink/from` 无变化，优先检查飞控 `SERIAL2_PROTOCOL`、QGC 是否已连上飞控、以及 Jetson 侧 MAVROS 是否真的连到 `/dev/ttyTHS1:57600`
+- 若点击 QGC 后 `/mavros/mavlink/from` 无变化，优先检查飞控 `SERIAL2_PROTOCOL`、QGC 是否已连上飞控、以及 Jetson 侧 MAVROS 是否真的连到 `/dev/ttyTHS1:921600`
 
 ### 12.5 MAVLink 上行链路检查（Jetson -> 飞控 -> QGC）
 在 Jetson 终端执行：
@@ -513,7 +513,7 @@ rostopic echo /mavros/mavlink/to
 - `msgid: 251`（`NAMED_VALUE_FLOAT`）
 
 通过判据：
-- 可见来自 `compid=191` 的 `HEARTBEAT`
+- 可见来自 `sysid=1 compid=240` 的 `HEARTBEAT`
 - 点击 QGC 按钮后可见 `COMMAND_ACK`
 - 持续可见 `NAMED_VALUE_FLOAT`，且包含 `USV_VOLT` `USV_ABS` `PUMP_X/Y/Z/A` `USV_STAT` `USV_PKT`
 

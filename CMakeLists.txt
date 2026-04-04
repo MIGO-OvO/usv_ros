@@ -34,6 +34,7 @@ catkin_install_python(PROGRAMS
   scripts/mavlink_trigger_node.py
   scripts/usv_mavlink_bridge.py
   scripts/named_value_float_probe.py
+  scripts/mavlink_topic_tap.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 
