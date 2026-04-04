@@ -4,14 +4,15 @@
 """
 USV MAVLink Telemetry Bridge
 ============================
-ROS topics -> MAVLink NAMED_VALUE_FLOAT -> 飞控串口 -> 数传 -> QGC
+ROS topics -> 多通道 MAVLink -> 飞控串口 -> 数传 -> QGC
 
-关键:
-  nano 连接飞控后的上发消息默认使用 sysid=1、compid=240，
-  与当前飞控 / QGC 联调观测结果保持一致。
+消息通道策略 (ArduPilot 白名单转发):
+  NAMED_VALUE_FLOAT (251) - 电压/吸光度 (保留，QGC MAVLink Inspector 可直读)
+  STATUSTEXT        (253) - 状态码文本   (白名单，QGC 主 HUD 直接显示)
+  DEBUG_VECT        (254) - 泵角度 xyz   (白名单，单帧携带 3 个 float)
+  DEBUG             (255) - 包计数/泵A   (白名单，ind + value)
 
-使用 mavros 的 /mavlink/to 话题发送原始 MAVLink 帧，MAVROS 负责
-序列化并写入 FCU 串口。
+sysid=1 compid=240，与飞控 / QGC 联调观测结果保持一致。
 """
 
 from __future__ import print_function
@@ -25,16 +26,32 @@ import rospy
 from std_msgs.msg import String
 from mavros_msgs.msg import Mavlink, State
 
-TELEMETRY_RATE_HZ = 2
+TELEMETRY_RATE_HZ = 5
 HEARTBEAT_RATE_HZ = 1
 DIAG_REPORT_INTERVAL = 10   # 每 N 秒输出一次链路诊断
 
+# MAVLink 消息 ID
 MAVLINK_MSG_ID_HEARTBEAT = 0
 MAVLINK_MSG_ID_NAMED_VALUE_FLOAT = 251
+MAVLINK_MSG_ID_STATUSTEXT = 253
+MAVLINK_MSG_ID_DEBUG_VECT = 254
+MAVLINK_MSG_ID_DEBUG = 255
 
 MAV_TYPE_ONBOARD_CONTROLLER = 18
 MAV_AUTOPILOT_INVALID = 8
 MAV_STATE_ACTIVE = 4
+
+# STATUSTEXT severity
+MAV_SEVERITY_NOTICE = 6
+
+# 状态码 -> 可读文本映射
+STATUS_TEXT_MAP = {
+    0: "IDLE",
+    1: "SAMPLING",
+    2: "DETECTING",
+    3: "FAULT",
+    4: "CALIBRATING",
+}
 
 # 默认采用现场验证通过的 nano -> 飞控 MAVLink 源 ID
 SYS_ID = 1
@@ -203,6 +220,30 @@ class USVMavlinkBridge(object):
         )
         self._publish_raw(MAVLINK_MSG_ID_HEARTBEAT, payload)
 
+    def _send_statustext(self, text, severity=MAV_SEVERITY_NOTICE):
+        """STATUSTEXT (253) - 白名单消息，QGC HUD 直接显示。
+        载荷: severity(u8) + text(50 bytes, NUL padded) + id(u16) + chunk_seq(u8)
+        """
+        text_bytes = text.encode('ascii')[:50].ljust(50, b'\x00')
+        payload = struct.pack('<B', severity) + text_bytes + struct.pack('<HB', 0, 0)
+        self._publish_raw(MAVLINK_MSG_ID_STATUSTEXT, payload)
+
+    def _send_debug_vect(self, name, x, y, z):
+        """DEBUG_VECT (254) - 白名单消息，用于泵角度 (3 float / 帧)。
+        载荷: time_usec(u64) + x(f32) + y(f32) + z(f32) + name(10 bytes)
+        """
+        name_bytes = name.encode('ascii')[:10].ljust(10, b'\x00')
+        time_us = int((time.time() - self._boot_time) * 1e6) & 0xFFFFFFFFFFFFFFFF
+        payload = struct.pack('<Qfff', time_us, x, y, z) + name_bytes
+        self._publish_raw(MAVLINK_MSG_ID_DEBUG_VECT, payload)
+
+    def _send_debug(self, ind, value):
+        """DEBUG (255) - 白名单消息，用于包计数等单值调试。
+        载荷: time_boot_ms(u32) + value(f32) + ind(u8)
+        """
+        payload = struct.pack('<IfB', self._time_boot_ms(), value, ind)
+        self._publish_raw(MAVLINK_MSG_ID_DEBUG, payload)
+
     def _publish_diagnostics(self):
         """发布结构化诊断信息到 /usv/bridge_diagnostics"""
         now = time.time()
@@ -231,14 +272,14 @@ class USVMavlinkBridge(object):
 
     def run(self):
         rate = rospy.Rate(TELEMETRY_RATE_HZ)
-        rospy.loginfo("USV MAVLink Bridge: telemetry loop started")
+        rospy.loginfo("USV MAVLink Bridge: telemetry loop started at %dHz", TELEMETRY_RATE_HZ)
+        last_status_text = ""
 
         while not rospy.is_shutdown():
             with self._lock:
                 connected = self._mavros_connected
             if not connected:
                 rospy.logwarn_throttle(10, "MAVROS not connected, waiting...")
-                # 即使断连也定期发送诊断
                 now = time.time()
                 if now - self._diag_last_report >= DIAG_REPORT_INTERVAL:
                     self._publish_diagnostics()
@@ -257,15 +298,28 @@ class USVMavlinkBridge(object):
                 self._send_heartbeat()
                 self._last_heartbeat = now
 
+            # --- 通道 1: NAMED_VALUE_FLOAT (251) - 电压/吸光度 ---
             self._send_named_value_float("USV_VOLT", voltage)
             self._send_named_value_float("USV_ABS", absorbance)
-            self._send_named_value_float("PUMP_X", angles["X"])
-            self._send_named_value_float("PUMP_Y", angles["Y"])
-            self._send_named_value_float("PUMP_Z", angles["Z"])
-            self._send_named_value_float("PUMP_A", angles["A"])
-            self._send_named_value_float("USV_STAT", float(status))
+
+            # --- 通道 2: DEBUG_VECT (254) - 泵角度 XYZ + A ---
+            # 第一帧: PUMP_XYZ -> x=X, y=Y, z=Z
+            self._send_debug_vect("PUMP_XYZ", angles["X"], angles["Y"], angles["Z"])
+            # 第二帧: PUMP_A__ -> x=A, y=status, z=pkt_count
             self._pkt_count = (self._pkt_count + 1) % 65536
-            self._send_named_value_float("USV_PKT", float(self._pkt_count))
+            self._send_debug_vect("PUMP_A__",
+                                  angles["A"],
+                                  float(status),
+                                  float(self._pkt_count))
+
+            # --- 通道 3: DEBUG (255) - 包计数 ---
+            self._send_debug(0, float(self._pkt_count))
+
+            # --- 通道 4: STATUSTEXT (253) - 状态变更通知 ---
+            status_text = "USV:" + STATUS_TEXT_MAP.get(status, "UNK%d" % status)
+            if status_text != last_status_text:
+                self._send_statustext(status_text)
+                last_status_text = status_text
 
             # 定期诊断报告
             if now - self._diag_last_report >= DIAG_REPORT_INTERVAL:
