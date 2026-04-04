@@ -286,8 +286,8 @@ tail -f ~/usv_ws/.usv_run/logs/usv_system.log
 - `auto_trigger_on_waypoint`（默认 `true`）
 - `trigger_waypoints`（默认 `[]`，示例：`[1,3,5]`）
 - `mavros_fcu_url`（默认 `/dev/ttyTHS1:921600`）
-- `mavlink_source_system`（默认 `1`）
-- `mavlink_source_component`（默认 `240`）
+- `mavlink_source_system`（默认 `2`，必须与飞控 SYSID_THISMAV 不同）
+- `mavlink_source_component`（默认 `191`，MAV_COMP_ID_ONBOARD_COMPUTER）
 - `enable_pump|enable_web|enable_mavlink_trigger|enable_mavlink_bridge`
 
 示例：仅启动泵控 + Web

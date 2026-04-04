@@ -12,7 +12,9 @@ ROS topics -> 多通道 MAVLink -> 飞控串口 -> 数传 -> QGC
   DEBUG_VECT        (254) - 泵角度 xyz   (白名单，单帧携带 3 个 float)
   DEBUG             (255) - 包计数/泵A   (白名单，ind + value)
 
-sysid=1 compid=240，与飞控 / QGC 联调观测结果保持一致。
+sysid=2 compid=191 (MAV_COMP_ID_ONBOARD_COMPUTER)。
+  sysid 必须与飞控 SYSID_THISMAV(=1) 不同，否则 ArduPilot 不转发;
+  compid 必须与 MAVROS 默认 compid(=240) 不同，否则 MAVROS 丢弃。
 """
 
 from __future__ import print_function
@@ -53,9 +55,10 @@ STATUS_TEXT_MAP = {
     4: "CALIBRATING",
 }
 
-# 默认采用现场验证通过的 nano -> 飞控 MAVLink 源 ID
-SYS_ID = 1
-COMP_ID = 240
+# sysid=2: 必须与飞控 SYSID_THISMAV(=1) 不同，ArduPilot 才会转发到 GCS
+# compid=191: MAV_COMP_ID_ONBOARD_COMPUTER，与 MAVROS 默认 compid(=240) 不同
+SYS_ID = 2
+COMP_ID = 191
 
 
 class USVMavlinkBridge(object):
@@ -63,14 +66,16 @@ class USVMavlinkBridge(object):
     def __init__(self):
         rospy.init_node('usv_mavlink_bridge', anonymous=False)
 
-        # sysid/compid 默认与现场验证通过的 nano -> 飞控配置一致
+        # sysid 必须与飞控不同，否则 ArduPilot 不转发
+        # compid 必须与 MAVROS 不同，否则 MAVROS 丢弃
         self._sys_id = int(rospy.get_param('~source_system_id', SYS_ID))
         self._comp_id = int(rospy.get_param('~source_component_id', COMP_ID))
 
-        # 运行时参数记录
+        # 运行时参数验证
         fcu_sysid = int(rospy.get_param('/mavros/target_system_id', 1))
         if self._sys_id == fcu_sysid:
-            rospy.loginfo("source_system_id (%d) matches FCU sysid (%d) by current deployment design",
+            rospy.logwarn("source_system_id (%d) == FCU sysid (%d), "
+                          "ArduPilot will NOT forward telemetry to GCS!",
                           self._sys_id, fcu_sysid)
 
         self._lock = threading.Lock()

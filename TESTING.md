@@ -513,7 +513,7 @@ rostopic echo /mavros/mavlink/to
 - `msgid: 251`（`NAMED_VALUE_FLOAT`）
 
 通过判据：
-- 可见来自 `sysid=1 compid=240` 的 `HEARTBEAT`
+- 可见来自 `sysid=2 compid=191` 的 `HEARTBEAT`
 - 点击 QGC 按钮后可见 `COMMAND_ACK`
 - 持续可见 `NAMED_VALUE_FLOAT`，且包含 `USV_VOLT` `USV_ABS` `PUMP_X/Y/Z/A` `USV_STAT` `USV_PKT`
 

@@ -6,7 +6,7 @@ Observe /mavros/mavlink/to and /mavros/mavlink/from to confirm whether a
 companion source appears on the local ROS graph.
 
 Usage:
-  rosrun usv_ros mavlink_topic_tap.py --sysid 1 --compid 240
+  rosrun usv_ros mavlink_topic_tap.py --sysid 2 --compid 191
 """
 
 from __future__ import print_function
@@ -109,8 +109,8 @@ class MavlinkTopicTap(object):
 
 def _parse_args():
     parser = argparse.ArgumentParser(description="Observe MAVROS raw MAVLink topics for a target source id.")
-    parser.add_argument("--sysid", type=int, default=1, help="Watched system id")
-    parser.add_argument("--compid", type=int, default=240, help="Watched component id")
+    parser.add_argument("--sysid", type=int, default=2, help="Watched system id")
+    parser.add_argument("--compid", type=int, default=191, help="Watched component id")
     parser.add_argument("--duration", type=float, default=30.0, help="Observe duration in seconds")
     return parser.parse_args(rospy.myargv()[1:])
 
