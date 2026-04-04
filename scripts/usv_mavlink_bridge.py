@@ -267,7 +267,6 @@ class USVMavlinkBridge(object):
     def run(self):
         rate = rospy.Rate(TELEMETRY_RATE_HZ)
         rospy.loginfo("USV MAVLink Bridge: telemetry loop started at %dHz", TELEMETRY_RATE_HZ)
-        last_status_text = ""
 
         while not rospy.is_shutdown():
             with self._lock:
@@ -292,28 +291,18 @@ class USVMavlinkBridge(object):
                 self._send_heartbeat()
                 self._last_heartbeat = now
 
-            # --- 通道 1: NAMED_VALUE_FLOAT (251) - 电压/吸光度 ---
+            # 全部通过 NAMED_VALUE_FLOAT (251) 发送
+            # 与 SITL 测试脚本 test_sitl_usv.py 保持一致
+            # 飞控固件 handle_message 只拦截 NAMED_VALUE_FLOAT
             self._send_named_value_float("USV_VOLT", voltage)
             self._send_named_value_float("USV_ABS", absorbance)
-
-            # --- 通道 2: DEBUG_VECT (254) - 泵角度 XYZ + A ---
-            # 第一帧: PUMP_XYZ -> x=X, y=Y, z=Z
-            self._send_debug_vect("PUMP_XYZ", angles["X"], angles["Y"], angles["Z"])
-            # 第二帧: PUMP_A__ -> x=A, y=status, z=pkt_count
+            self._send_named_value_float("PUMP_X", angles["X"])
+            self._send_named_value_float("PUMP_Y", angles["Y"])
+            self._send_named_value_float("PUMP_Z", angles["Z"])
+            self._send_named_value_float("PUMP_A", angles["A"])
+            self._send_named_value_float("USV_STAT", float(status))
             self._pkt_count = (self._pkt_count + 1) % 65536
-            self._send_debug_vect("PUMP_A__",
-                                  angles["A"],
-                                  float(status),
-                                  float(self._pkt_count))
-
-            # --- 通道 3: DEBUG (255) - 包计数 ---
-            self._send_debug(0, float(self._pkt_count))
-
-            # --- 通道 4: STATUSTEXT (253) - 状态变更通知 ---
-            status_text = "USV:" + STATUS_TEXT_MAP.get(status, "UNK%d" % status)
-            if status_text != last_status_text:
-                self._send_statustext(status_text)
-                last_status_text = status_text
+            self._send_named_value_float("USV_PKT", float(self._pkt_count))
 
             # 定期诊断报告
             if now - self._diag_last_report >= DIAG_REPORT_INTERVAL:
