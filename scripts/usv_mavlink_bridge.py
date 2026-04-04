@@ -12,9 +12,7 @@ ROS topics -> 多通道 MAVLink -> 飞控串口 -> 数传 -> QGC
   DEBUG_VECT        (254) - 泵角度 xyz   (白名单，单帧携带 3 个 float)
   DEBUG             (255) - 包计数/泵A   (白名单，ind + value)
 
-sysid=2 compid=191 (MAV_COMP_ID_ONBOARD_COMPUTER)。
-  sysid 必须与飞控 SYSID_THISMAV(=1) 不同，否则 ArduPilot 不转发;
-  compid 必须与 MAVROS 默认 compid(=240) 不同，否则 MAVROS 丢弃。
+sysid=1 compid=240，与 MAVROS 默认配置一致。
 """
 
 from __future__ import print_function
@@ -55,10 +53,8 @@ STATUS_TEXT_MAP = {
     4: "CALIBRATING",
 }
 
-# sysid=2: 必须与飞控 SYSID_THISMAV(=1) 不同，ArduPilot 才会转发到 GCS
-# compid=191: MAV_COMP_ID_ONBOARD_COMPUTER，与 MAVROS 默认 compid(=240) 不同
-SYS_ID = 2
-COMP_ID = 191
+SYS_ID = 1
+COMP_ID = 240
 
 
 class USVMavlinkBridge(object):
@@ -66,17 +62,10 @@ class USVMavlinkBridge(object):
     def __init__(self):
         rospy.init_node('usv_mavlink_bridge', anonymous=False)
 
-        # sysid 必须与飞控不同，否则 ArduPilot 不转发
-        # compid 必须与 MAVROS 不同，否则 MAVROS 丢弃
         self._sys_id = int(rospy.get_param('~source_system_id', SYS_ID))
         self._comp_id = int(rospy.get_param('~source_component_id', COMP_ID))
 
-        # 运行时参数验证
-        fcu_sysid = int(rospy.get_param('/mavros/target_system_id', 1))
-        if self._sys_id == fcu_sysid:
-            rospy.logwarn("source_system_id (%d) == FCU sysid (%d), "
-                          "ArduPilot will NOT forward telemetry to GCS!",
-                          self._sys_id, fcu_sysid)
+        rospy.loginfo("USV MAVLink Bridge: sysid=%d compid=%d", self._sys_id, self._comp_id)
 
         self._lock = threading.Lock()
         self._voltage = 0.0
@@ -108,8 +97,8 @@ class USVMavlinkBridge(object):
         rospy.Subscriber('/usv/trigger_status', String, self._trigger_status_cb)
         rospy.Subscriber('/mavros/state', State, self._mavros_state_cb)
 
-        rospy.loginfo("USV MAVLink Bridge initialized  sysid=%d compid=%d rate=%dHz fcu_sysid=%d",
-                      self._sys_id, self._comp_id, TELEMETRY_RATE_HZ, fcu_sysid)
+        rospy.loginfo("USV MAVLink Bridge initialized  sysid=%d compid=%d rate=%dHz",
+                      self._sys_id, self._comp_id, TELEMETRY_RATE_HZ)
 
     def _voltage_cb(self, msg):
         try:

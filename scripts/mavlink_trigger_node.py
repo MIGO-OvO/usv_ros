@@ -69,7 +69,7 @@ class MAVLinkTriggerNode(object):
         rospy.init_node('mavlink_trigger_node', anonymous=False)
 
         self._source_system_id = int(rospy.get_param('~source_system_id', rospy.get_param('/mavros/target_system_id', 1)))
-        self._source_component_id = int(rospy.get_param('~source_component_id', 191))
+        self._source_component_id = int(rospy.get_param('~source_component_id', 240))
 
         # 参数
         self.mavros_timeout = rospy.get_param('~mavros_timeout', 30.0)

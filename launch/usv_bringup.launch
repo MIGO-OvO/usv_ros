@@ -42,8 +42,8 @@
     <arg name="mavros_tgt_component" default="1" />
     <arg name="mavros_fcu_protocol" default="v2.0" />
     <arg name="mavros_respawn" default="false" />
-    <arg name="mavlink_source_system" default="2" />
-    <arg name="mavlink_source_component" default="191" />
+    <arg name="mavlink_source_system" default="1" />
+    <arg name="mavlink_source_component" default="240" />
 
     <!-- 节点启用开关 -->
     <arg name="enable_pump" default="true" />

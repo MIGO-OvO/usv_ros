@@ -10,7 +10,7 @@ Purpose:
 
 What it does:
   - Publishes MAVLink to /mavros/mavlink/to
-  - Sends companion HEARTBEAT with sysid=2 compid=191
+  - Sends companion HEARTBEAT with sysid=1 compid=240
   - Compares today's raw publication path against a finalized pymavlink path
 
 Recommended true-hardware usage:
@@ -18,7 +18,7 @@ Recommended true-hardware usage:
   2. Open QGC Analyze > MAVLink Inspector
   3. Run:
        rosrun usv_ros named_value_float_probe.py
-  4. Watch whether source 2/191 and msgid=251 appear during each phase
+  4. Watch whether source 1/240 and msgid=251 appear during each phase
 
 Interpretation:
   - bridge_short missing + finalized_short visible
@@ -323,8 +323,8 @@ def _parse_args():
     parser.add_argument("--phase-seconds", type=float, default=10.0, help="Seconds per phase")
     parser.add_argument("--rate-hz", type=float, default=TELEMETRY_RATE_HZ, help="NAMED_VALUE_FLOAT send rate")
     parser.add_argument("--wait-timeout", type=float, default=15.0, help="Wait timeout for /mavros/state")
-    parser.add_argument("--sysid", type=int, default=2, help="Companion source sysid")
-    parser.add_argument("--compid", type=int, default=191, help="Companion source compid")
+    parser.add_argument("--sysid", type=int, default=1, help="Companion source sysid")
+    parser.add_argument("--compid", type=int, default=240, help="Companion source compid")
 
     args = parser.parse_args(rospy.myargv()[1:])
     args.phases = [item.strip() for item in args.phases.split(",") if item.strip()]
