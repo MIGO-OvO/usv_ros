@@ -34,8 +34,19 @@ DIAG_REPORT_INTERVAL = 10   # 每 N 秒输出一次链路诊断
 MAVLINK_MSG_ID_HEARTBEAT = 0
 MAVLINK_MSG_ID_NAMED_VALUE_FLOAT = 251
 MAVLINK_MSG_ID_STATUSTEXT = 253
-MAVLINK_MSG_ID_DEBUG_VECT = 254
-MAVLINK_MSG_ID_DEBUG = 255
+MAVLINK_MSG_ID_DEBUG_VECT = 250
+MAVLINK_MSG_ID_DEBUG = 254
+
+# MAVLink CRC_EXTRA seed bytes (per-message type, from MAVLink XML definitions)
+# MAVROS send_message(mavlink_message_t*) does NOT recalculate CRC,
+# so we must provide the correct checksum ourselves.
+MAVLINK_CRC_EXTRA = {
+    0: 50,      # HEARTBEAT
+    250: 49,    # DEBUG_VECT
+    251: 170,   # NAMED_VALUE_FLOAT
+    253: 83,    # STATUSTEXT
+    254: 46,    # DEBUG
+}
 
 MAV_TYPE_ONBOARD_CONTROLLER = 18
 MAV_AUTOPILOT_INVALID = 8
@@ -170,8 +181,39 @@ class USVMavlinkBridge(object):
             out.append(struct.unpack_from('<Q', payload, i)[0])
         return out
 
+    @staticmethod
+    def _mavlink_crc16(buf):
+        """MAVLink X.25 CRC-16/MCRF4XX checksum."""
+        crc = 0xFFFF
+        for b in buf:
+            tmp = b ^ (crc & 0xFF)
+            tmp = (tmp ^ (tmp << 4)) & 0xFF
+            crc = (crc >> 8) ^ (tmp << 8) ^ (tmp << 3) ^ (tmp >> 4)
+            crc &= 0xFFFF
+        return crc
+
+    def _compute_checksum(self, msgid, seq, payload):
+        """Compute MAVLink v2 checksum over header+payload+CRC_EXTRA."""
+        crc_extra = MAVLINK_CRC_EXTRA.get(msgid, 0)
+        # MAVLink v2 CRC covers: len, incompat, compat, seq, sysid, compid,
+        # msgid (3 bytes LE), payload, then CRC_EXTRA seed
+        header = struct.pack(
+            '<BBBBBBBBB',
+            len(payload),       # payload length
+            0,                  # incompat_flags
+            0,                  # compat_flags
+            seq,
+            self._sys_id,
+            self._comp_id,
+            msgid & 0xFF,
+            (msgid >> 8) & 0xFF,
+            (msgid >> 16) & 0xFF,
+        )
+        return self._mavlink_crc16(header + payload + struct.pack('B', crc_extra))
+
     def _publish_raw(self, msgid, payload):
         try:
+            seq = self._next_seq()
             m = Mavlink()
             m.header.stamp = rospy.Time.now()
             m.framing_status = 1  # MAVLINK_FRAMING_OK
@@ -179,11 +221,11 @@ class USVMavlinkBridge(object):
             m.len = len(payload)
             m.incompat_flags = 0
             m.compat_flags = 0
-            m.seq = self._next_seq()
+            m.seq = seq
             m.sysid = self._sys_id
             m.compid = self._comp_id
             m.msgid = msgid
-            m.checksum = 0
+            m.checksum = self._compute_checksum(msgid, seq, payload)
             m.payload64 = self._payload_to_uint64(payload)
             self._mavlink_pub.publish(m)
             with self._diag_lock:
