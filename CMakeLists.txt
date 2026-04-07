@@ -33,8 +33,10 @@ catkin_install_python(PROGRAMS
   scripts/web_config_server.py
   scripts/mavlink_trigger_node.py
   scripts/usv_mavlink_bridge.py
+  scripts/usv_mavlink_router_bridge.py
   scripts/named_value_float_probe.py
   scripts/mavlink_topic_tap.py
+  scripts/test_real_usv_serial.py
   DESTINATION ${CATKIN_PACKAGE_BIN_DESTINATION}
 )
 

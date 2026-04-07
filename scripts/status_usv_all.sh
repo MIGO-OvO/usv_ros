@@ -9,8 +9,10 @@ ensure_run_dirs
 
 MASTER_PID_FILE="$RUN_DIR/roscore.pid"
 LAUNCH_PID_FILE="$RUN_DIR/usv_system.pid"
+ROUTER_PID_FILE="$RUN_DIR/mavlink_router.pid"
 MASTER_LOG_FILE="$LOG_DIR/roscore.log"
 LAUNCH_LOG_FILE="$LOG_DIR/usv_system.log"
+ROUTER_LOG_FILE="$LOG_DIR/mavlink_router.log"
 HOTSPOT_IFACE="${HOTSPOT_IFACE:-wlan0}"
 HOTSPOT_CONN_NAME="${HOTSPOT_CONN_NAME:-USV_AP}"
 HOTSPOT_IP="${HOTSPOT_IP:-10.42.0.1}"
@@ -85,6 +87,7 @@ print_hotspot_status() {
 echo "USV Runtime Status"
 echo "run_dir=$RUN_DIR"
 print_status "roscore" "$MASTER_PID_FILE" "$MASTER_LOG_FILE"
+print_status "mavlink_router" "$ROUTER_PID_FILE" "$ROUTER_LOG_FILE"
 print_status "usv_system" "$LAUNCH_PID_FILE" "$LAUNCH_LOG_FILE"
 print_hotspot_status
 

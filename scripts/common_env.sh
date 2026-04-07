@@ -8,6 +8,35 @@ ROS_SETUP="/opt/ros/noetic/setup.bash"
 WORKSPACE_SETUP="$WS_DIR/devel/setup.bash"
 RUN_DIR="$WS_DIR/.usv_run"
 LOG_DIR="$RUN_DIR/logs"
+ROUTER_PID_FILE="$RUN_DIR/mavlink_router.pid"
+ROUTER_LOG_FILE="$LOG_DIR/mavlink_router.log"
+MAVLINK_ROUTERD_BIN="${MAVLINK_ROUTERD_BIN:-mavlink-routerd}"
+FCU_UART_DEVICE="${FCU_UART_DEVICE:-/dev/ttyTHS1}"
+FCU_UART_BAUD="${FCU_UART_BAUD:-921600}"
+ROUTER_MAVROS_UDP="${ROUTER_MAVROS_UDP:-127.0.0.1:14550}"
+ROUTER_BRIDGE_UDP="${ROUTER_BRIDGE_UDP:-127.0.0.1:14551}"
+ROUTER_TCP_PORT="${ROUTER_TCP_PORT:-5760}"
+
+start_mavlink_router() {
+    ensure_run_dirs
+    if [[ -f "$ROUTER_PID_FILE" ]]; then
+        local old_pid
+        old_pid="$(cat "$ROUTER_PID_FILE")"
+        if is_pid_running "$old_pid"; then
+            log "mavlink-router 已在运行 (pid=$old_pid)"
+            return 0
+        fi
+        rm -f "$ROUTER_PID_FILE"
+    fi
+    if ! command -v "$MAVLINK_ROUTERD_BIN" >/dev/null 2>&1; then
+        log "缺少 mavlink-routerd，请先安装或设置 MAVLINK_ROUTERD_BIN"
+        exit 1
+    fi
+    cleanup_port_process "$ROUTER_TCP_PORT"
+    log "启动 mavlink-router: uart=$FCU_UART_DEVICE:$FCU_UART_BAUD tcp=$ROUTER_TCP_PORT udp=$ROUTER_MAVROS_UDP,$ROUTER_BRIDGE_UDP"
+    start_background_process "$ROUTER_PID_FILE" "$ROUTER_LOG_FILE" "$MAVLINK_ROUTERD_BIN" -e "$ROUTER_MAVROS_UDP" -e "$ROUTER_BRIDGE_UDP" "$FCU_UART_DEVICE:$FCU_UART_BAUD"
+}
+
 
 log() {
     echo "[usv-startup] $*"

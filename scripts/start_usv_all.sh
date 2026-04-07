@@ -38,11 +38,13 @@ if ! rostopic list >/dev/null 2>&1; then
 fi
 
 cleanup_port_process "$WEB_PORT"
+start_mavlink_router
 
 require_roscore
-log "ROS Master 已就绪，开始后台启动 usv_ros 系统"
+log "ROS Master 与 mavlink-router 已就绪，开始后台启动 usv_ros 系统"
 start_background_process "$LAUNCH_PID_FILE" "$LAUNCH_LOG_FILE" roslaunch usv_ros usv_bringup.launch "$@"
 sleep 5
 log "一键启动完成"
 log "查看 ROS Master 日志: tail -f $MASTER_LOG_FILE"
+log "查看路由日志: tail -f $ROUTER_LOG_FILE"
 log "查看系统日志: tail -f $LAUNCH_LOG_FILE"
