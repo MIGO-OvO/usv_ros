@@ -22,6 +22,10 @@ COMP_ID = 191   # MAV_COMP_ID_ONBOARD_COMPUTER, matches QGC USVPayloadPanel targ
 ROUTER_URL = "tcp:127.0.0.1:5760"
 WAIT_HEARTBEAT_TIMEOUT = 10.0
 
+# USV 自定义命令范围
+CMD_START_SAMPLING = 31010
+CMD_CALIBRATE = 31014
+
 
 class USVMavlinkRouterBridge(object):
 
@@ -121,11 +125,52 @@ class USVMavlinkRouterBridge(object):
             rospy.logwarn("Failed to send COMMAND_ACK: %s", str(exc))
 
     def _receive_mavlink_messages(self):
-        """非阻塞 drain：消费 pymavlink 接收缓冲，保持协议状态机推进。"""
+        """接收 QGC 发来的 COMMAND_LONG，并转发给内部触发节点处理。"""
         while True:
             msg = self._conn.recv_match(blocking=False)
             if not msg:
                 break
+
+            msg_type = msg.get_type()
+            if msg_type == "BAD_DATA":
+                continue
+
+            if msg_type != "COMMAND_LONG":
+                continue
+
+            try:
+                command = int(msg.command)
+                if command < CMD_START_SAMPLING or command > CMD_CALIBRATE:
+                    continue
+
+                target_system = int(getattr(msg, "target_system", 0) or 0)
+                target_component = int(getattr(msg, "target_component", 0) or 0)
+
+                ack_target_system = int(getattr(msg, "get_srcSystem", lambda: 0)())
+                ack_target_component = int(getattr(msg, "get_srcComponent", lambda: 0)())
+
+                rx_msg = Float32MultiArray()
+                rx_msg.data = [
+                    float(command),
+                    float(getattr(msg, "param1", 0.0) or 0.0),
+                    float(getattr(msg, "param2", 0.0) or 0.0),
+                    float(target_system),
+                    float(target_component),
+                    float(ack_target_system),
+                    float(ack_target_component),
+                ]
+                self._cmd_rx_pub.publish(rx_msg)
+
+                rospy.loginfo(
+                    "Forward COMMAND_LONG cmd=%d target=%d/%d from=%d/%d",
+                    command,
+                    target_system,
+                    target_component,
+                    ack_target_system,
+                    ack_target_component,
+                )
+            except Exception as exc:
+                rospy.logwarn("Failed to forward COMMAND_LONG: %s", str(exc))
 
     def _publish_diagnostics(self):
         msg = String()
