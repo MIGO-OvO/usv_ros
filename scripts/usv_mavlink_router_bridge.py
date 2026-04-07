@@ -10,7 +10,7 @@ import threading
 import time
 
 import rospy
-from std_msgs.msg import String
+from std_msgs.msg import String, Float32MultiArray
 from mavros_msgs.msg import State
 from pymavlink import mavutil
 
@@ -42,6 +42,8 @@ class USVMavlinkRouterBridge(object):
         self._last_heartbeat = 0.0
         self._diag_last_report = time.time()
         self._diag_pub = rospy.Publisher("/usv/bridge_diagnostics", String, queue_size=5)
+        self._cmd_rx_pub = rospy.Publisher("/usv/mavlink_cmd_rx", Float32MultiArray, queue_size=5)
+        rospy.Subscriber("/usv/mavlink_cmd_ack", Float32MultiArray, self._cmd_ack_cb)
         rospy.Subscriber("/usv/spectrometer_voltage", String, self._voltage_cb)
         rospy.Subscriber("/usv/pump_angles", String, self._angles_cb)
         rospy.Subscriber("/usv/pump_status", String, self._pump_status_cb)
@@ -104,6 +106,32 @@ class USVMavlinkRouterBridge(object):
     def _mavros_state_cb(self, msg):
         self._mavros_connected = bool(msg.connected)
 
+    def _cmd_ack_cb(self, msg):
+        try:
+            command, result, target_sys, target_comp = msg.data
+            self._conn.mav.command_ack_send(
+                int(command),
+                int(result),
+                0xFF,  # progress not supported
+                0,     # result_param2
+                int(target_sys),
+                int(target_comp)
+            )
+        except Exception as exc:
+            rospy.logwarn("Failed to send COMMAND_ACK: %s", str(exc))
+
+    def _receive_mavlink_messages(self):
+        while True:
+            msg = self._conn.recv_match(type='COMMAND_LONG', blocking=False)
+            if not msg:
+                break
+            
+            if msg.target_component in (0, self._comp_id) and msg.target_system in (0, self._sys_id):
+                if 31010 <= msg.command <= 31014:
+                    rx_msg = Float32MultiArray()
+                    rx_msg.data = [msg.command, msg.param1, msg.param2, msg.sysid, msg.compid]
+                    self._cmd_rx_pub.publish(rx_msg)
+
     def _publish_diagnostics(self):
         msg = String()
         msg.data = json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()), "router_url": self._router_url, "sysid": self._sys_id, "compid": self._comp_id, "pkt_count": self._pkt_count, "mavros_connected": self._mavros_connected, "rate_hz": TELEMETRY_RATE_HZ})
@@ -127,23 +155,24 @@ class USVMavlinkRouterBridge(object):
     def run(self):
         rate = rospy.Rate(TELEMETRY_RATE_HZ)
         while not rospy.is_shutdown():
-            if not self._mavros_connected:
-                rospy.logwarn_throttle(10, "MAVROS not connected to router/FCU, waiting...")
-                if time.time() - self._diag_last_report >= DIAG_REPORT_INTERVAL:
-                    self._publish_diagnostics()
-                    self._diag_last_report = time.time()
-                rate.sleep()
-                continue
-            with self._lock:
-                voltage = self._voltage
-                absorbance = self._absorbance
-                angles = self._pump_angles.copy()
-                status = self._status_code
+            # 命令接收始终运行，不依赖 MAVROS 连接状态
+            self._receive_mavlink_messages()
+
             now = time.time()
             if now - self._last_heartbeat >= (1.0 / HEARTBEAT_RATE_HZ):
                 self._send_heartbeat()
                 self._last_heartbeat = now
-            self._send_payload(voltage, absorbance, angles, status)
+
+            if self._mavros_connected:
+                with self._lock:
+                    voltage = self._voltage
+                    absorbance = self._absorbance
+                    angles = self._pump_angles.copy()
+                    status = self._status_code
+                self._send_payload(voltage, absorbance, angles, status)
+            else:
+                rospy.logwarn_throttle(10, "MAVROS not connected, telemetry paused (cmd rx active)")
+
             if now - self._diag_last_report >= DIAG_REPORT_INTERVAL:
                 self._publish_diagnostics()
                 self._diag_last_report = now
