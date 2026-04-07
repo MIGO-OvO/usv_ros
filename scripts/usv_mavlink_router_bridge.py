@@ -121,16 +121,20 @@ class USVMavlinkRouterBridge(object):
             rospy.logwarn("Failed to send COMMAND_ACK: %s", str(exc))
 
     def _receive_mavlink_messages(self):
+        """非阻塞接收所有 MAVLink 消息，提取 USV 自定义 COMMAND_LONG。"""
         while True:
-            msg = self._conn.recv_match(type='COMMAND_LONG', blocking=False)
+            msg = self._conn.recv_match(blocking=False)
             if not msg:
                 break
-            
-            if msg.target_component in (0, self._comp_id) and msg.target_system in (0, self._sys_id):
+            msg_type = msg.get_type()
+            if msg_type == 'COMMAND_LONG':
                 if 31010 <= msg.command <= 31014:
                     rx_msg = Float32MultiArray()
                     rx_msg.data = [msg.command, msg.param1, msg.param2, msg.sysid, msg.compid]
                     self._cmd_rx_pub.publish(rx_msg)
+                    rospy.loginfo("CMD intercepted: cmd=%d from=%d/%d target=%d/%d",
+                                 msg.command, msg.sysid, msg.compid,
+                                 msg.target_system, msg.target_component)
 
     def _publish_diagnostics(self):
         msg = String()
