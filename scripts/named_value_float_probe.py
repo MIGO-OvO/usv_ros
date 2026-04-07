@@ -65,6 +65,7 @@ class NamedValueFloatProbe(object):
         self._comp_id = int(args.compid)
         self._rate_hz = float(args.rate_hz)
         self._phase_seconds = float(args.phase_seconds)
+        self._run_forever = bool(args.run_forever)
         self._wait_timeout = float(args.wait_timeout)
 
         self._seq = 0
@@ -82,7 +83,10 @@ class NamedValueFloatProbe(object):
 
         rospy.loginfo("NAMED_VALUE_FLOAT probe initialized")
         rospy.loginfo("  source ids: sysid=%d compid=%d", self._sys_id, self._comp_id)
-        rospy.loginfo("  rate: %.2f Hz, phase_seconds: %.1f", self._rate_hz, self._phase_seconds)
+        if self._run_forever:
+            rospy.loginfo("  rate: %.2f Hz, phase_seconds: infinite(loop)", self._rate_hz)
+        else:
+            rospy.loginfo("  rate: %.2f Hz, phase_seconds: %.1f", self._rate_hz, self._phase_seconds)
         rospy.loginfo("  phases: %s", ", ".join([phase["id"] for phase in self._phases]))
 
     def _state_cb(self, msg):
@@ -263,46 +267,59 @@ class NamedValueFloatProbe(object):
         self._wait_for_mavros()
 
         rate = rospy.Rate(self._rate_hz)
-        for index, phase in enumerate(self._phases, 1):
-            rospy.loginfo("=" * 72)
-            rospy.loginfo("Phase %d/%d: %s", index, len(self._phases), phase["id"])
-            rospy.loginfo("  label: %s", phase["label"])
-            rospy.loginfo("  notes: %s", phase["notes"])
-            rospy.loginfo(
-                "  name=%s value=%.2f encoding=%s tx_mode=%s",
-                phase["name"], phase["value"], phase["encoding"], phase["tx_mode"]
-            )
-            rospy.loginfo(
-                "  QGC expectation: watch MAVLink Inspector for source %d/%d and msgid=251",
-                self._sys_id, self._comp_id
-            )
-            rospy.loginfo("=" * 72)
-
-            end_time = time.time() + self._phase_seconds
-            while not rospy.is_shutdown() and time.time() < end_time:
-                now = time.time()
-                if now - self._last_heartbeat >= (1.0 / HEARTBEAT_RATE_HZ):
-                    if phase["tx_mode"] == "finalized":
-                        self._send_finalized_heartbeat()
-                    else:
-                        self._send_heartbeat()
-                    self._last_heartbeat = now
-
-                if phase["tx_mode"] == "finalized":
-                    frame_len, frame_hex = self._send_finalized_named_value_float(
-                        phase["name"], phase["value"]
-                    )
+        cycle = 0
+        while not rospy.is_shutdown():
+            cycle += 1
+            for index, phase in enumerate(self._phases, 1):
+                rospy.loginfo("=" * 72)
+                if self._run_forever:
+                    rospy.loginfo("Cycle %d Phase %d/%d: %s", cycle, index, len(self._phases), phase["id"])
                 else:
-                    frame_len, frame_hex = self._send_named_value_float(
-                        phase["name"], phase["value"], phase["encoding"]
-                    )
-
-                rospy.loginfo_throttle(
-                    2.0,
-                    "phase=%s tx_mode=%s frame_len=%d frame_hex=%s",
-                    phase["id"], phase["tx_mode"], frame_len, frame_hex
+                    rospy.loginfo("Phase %d/%d: %s", index, len(self._phases), phase["id"])
+                rospy.loginfo("  label: %s", phase["label"])
+                rospy.loginfo("  notes: %s", phase["notes"])
+                rospy.loginfo(
+                    "  name=%s value=%.2f encoding=%s tx_mode=%s",
+                    phase["name"], phase["value"], phase["encoding"], phase["tx_mode"]
                 )
-                rate.sleep()
+                rospy.loginfo(
+                    "  QGC expectation: watch MAVLink Inspector for source %d/%d and msgid=251",
+                    self._sys_id, self._comp_id
+                )
+                rospy.loginfo("=" * 72)
+
+                if self._run_forever:
+                    end_time = None
+                else:
+                    end_time = time.time() + self._phase_seconds
+
+                while not rospy.is_shutdown() and (end_time is None or time.time() < end_time):
+                    now = time.time()
+                    if now - self._last_heartbeat >= (1.0 / HEARTBEAT_RATE_HZ):
+                        if phase["tx_mode"] == "finalized":
+                            self._send_finalized_heartbeat()
+                        else:
+                            self._send_heartbeat()
+                        self._last_heartbeat = now
+
+                    if phase["tx_mode"] == "finalized":
+                        frame_len, frame_hex = self._send_finalized_named_value_float(
+                            phase["name"], phase["value"]
+                        )
+                    else:
+                        frame_len, frame_hex = self._send_named_value_float(
+                            phase["name"], phase["value"], phase["encoding"]
+                        )
+
+                    rospy.loginfo_throttle(
+                        2.0,
+                        "phase=%s tx_mode=%s frame_len=%d frame_hex=%s",
+                        phase["id"], phase["tx_mode"], frame_len, frame_hex
+                    )
+                    rate.sleep()
+
+            if not self._run_forever:
+                break
 
         rospy.loginfo("Probe finished")
         rospy.loginfo("Please report which phases produced source %d/%d and msgid=251 in QGC Inspector:",
@@ -317,10 +334,27 @@ def _parse_args():
     )
     parser.add_argument(
         "--phases",
-        default="bridge_short,finalized_short",
-        help="Comma-separated phase ids. Default: bridge_short,finalized_short",
+        default="finalized_short",
+        help="Comma-separated phase ids. Default: finalized_short",
     )
-    parser.add_argument("--phase-seconds", type=float, default=10.0, help="Seconds per phase")
+    parser.add_argument(
+        "--phase-seconds",
+        type=float,
+        default=10.0,
+        help="Seconds per phase when --run-forever is not set"
+    )
+    parser.add_argument(
+        "--run-forever",
+        action="store_true",
+        default=True,
+        help="Loop through phases continuously until Ctrl+C (default: enabled)"
+    )
+    parser.add_argument(
+        "--run-once",
+        dest="run_forever",
+        action="store_false",
+        help="Run configured phases once, honoring --phase-seconds"
+    )
     parser.add_argument("--rate-hz", type=float, default=TELEMETRY_RATE_HZ, help="NAMED_VALUE_FLOAT send rate")
     parser.add_argument("--wait-timeout", type=float, default=15.0, help="Wait timeout for /mavros/state")
     parser.add_argument("--sysid", type=int, default=1, help="Companion source sysid")
