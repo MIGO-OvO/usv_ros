@@ -26,7 +26,7 @@ import rospy
 from std_msgs.msg import String
 from mavros_msgs.msg import Mavlink, State
 
-TELEMETRY_RATE_HZ = 5
+TELEMETRY_RATE_HZ = 2
 HEARTBEAT_RATE_HZ = 1
 DIAG_REPORT_INTERVAL = 10   # 每 N 秒输出一次链路诊断
 
