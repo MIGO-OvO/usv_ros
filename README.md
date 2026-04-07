@@ -34,7 +34,7 @@ English version: `README.en.md`
 - `scripts/pump_control_node.py`：泵控制节点（含进样泵）及分光采集
 - `scripts/web_config_server.py`：Web 网关节点
 - `scripts/mavlink_trigger_node.py`：MAVLink 触发节点
-- `scripts/usv_mavlink_bridge.py`：遥测桥接节点
+- `scripts/usv_mavlink_router_bridge.py`：通过 `mavlink-routerd` 发送载荷遥测的桥接节点
 
 ---
 
@@ -48,13 +48,13 @@ Ground Station (QGC)
   └─ MAVLink telemetry (NAMED_VALUE_FLOAT)
             ▲
             │
-Pixhawk + MAVROS
+Pixhawk + mavlink-routerd + MAVROS
             ▲
             │
 Jetson Nano / ROS Noetic
   ├─ mavlink_trigger_node.py      (任务触发)
   ├─ mission_coordinator_node.py  (任务状态协调)
-  ├─ usv_mavlink_bridge.py        (遥测桥接)
+  ├─ usv_mavlink_router_bridge.py (载荷遥测桥接)
   ├─ web_config_server.py         (HTTP/WebSocket 网关)
   ├─ pump_control_node.py         (泵控制 + 自动化执行 + 进样泵协议 + 分光读取)
             ▲
@@ -73,17 +73,16 @@ Hardware
 3. `pump_control_node.py` 对串口协议进行编解码，驱动 ESP32 并发布泵状态。
 4. `pump_control_node.py` 管理泵设备并通过 ESP32 串口采集分光数据，发布 `/usv/spectrometer_voltage` JSON 数据。
 5. `mavlink_trigger_node.py` 监听 `/mavros/mavlink/from`，将采样触发转换为 ROS 动作。
-6. `usv_mavlink_bridge.py` 将载荷状态映射回 `/mavros/mavlink/to` 遥测。
+6. `usv_mavlink_router_bridge.py` 通过 `mavlink-routerd` 向飞控发送载荷遥测。
 
 ### 2.3 当前 ROS 节点（`usv_bringup.launch`）
 
 默认可启动以下节点（可通过 `enable_*` 参数单独开关）：
 
 - `pump_control_node`
-- `pump_control_node`
 - `web_config_server`
 - `mavlink_trigger_node`
-- `usv_mavlink_bridge`
+- `usv_mavlink_bridge`（节点名），对应脚本 `usv_mavlink_router_bridge.py`
 
 ---
 
@@ -102,6 +101,7 @@ src/usv_ros/
 │  ├─ mavlink_trigger_node.py
 │  ├─ mission_coordinator_node.py
 │  ├─ usv_mavlink_bridge.py
+│  ├─ usv_mavlink_router_bridge.py
 │  └─ lib/
 ├─ frontend/
 │  ├─ src/
