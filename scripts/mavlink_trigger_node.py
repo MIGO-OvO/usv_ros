@@ -34,7 +34,7 @@ import struct
 import threading
 
 import rospy
-from std_msgs.msg import String
+from std_msgs.msg import String, Float32MultiArray
 from std_srvs.srv import Trigger, TriggerResponse
 from mavros_msgs.msg import State, WaypointReached, Mavlink
 from mavros_msgs.srv import SetMode, SetModeRequest
@@ -99,6 +99,9 @@ class MAVLinkTriggerNode(object):
         self.state_sub = rospy.Subscriber('/mavros/state', State, self._state_cb)
         self.waypoint_sub = rospy.Subscriber('/mavros/mission/reached', WaypointReached, self._waypoint_cb)
         self.pump_status_sub = rospy.Subscriber('/usv/pump_status', String, self._pump_status_cb)
+        self.mavlink_cmd_sub = rospy.Subscriber(
+            '/usv/mavlink_cmd_rx', Float32MultiArray, self._mavlink_cmd_rx_cb, queue_size=20
+        )
 
         # 监听 MAVROS 原始 MAVLink 入站消息 (从飞控/GCS 收到的所有 MAVLink 帧)
         # mavros_msgs/Mavlink 包含 msgid、payload64 等字段。
@@ -161,6 +164,57 @@ class MAVLinkTriggerNode(object):
 
         self._handle_command_long_payload(msg)
 
+    def _mavlink_cmd_rx_cb(self, msg):
+        """兼容旧内部总线 /usv/mavlink_cmd_rx。"""
+        try:
+            if len(msg.data) < 7:
+                return
+
+            command = int(msg.data[0])
+            param1 = float(msg.data[1])
+            param2 = float(msg.data[2])
+            target_system = int(msg.data[3])
+            target_component = int(msg.data[4])
+            sender_system = int(msg.data[5])
+            sender_component = int(msg.data[6])
+
+            if target_system != 0 and target_system != self._source_system_id:
+                return
+            if target_component != 0 and target_component != self._source_component_id:
+                return
+
+            self._dispatch_command_long(
+                command,
+                param1,
+                param2,
+                sender_system,
+                sender_component,
+                log_prefix="Received forwarded COMMAND_LONG",
+            )
+        except Exception as e:
+            rospy.logerr("Error handling forwarded COMMAND_LONG payload: %s", str(e))
+
+    def _dispatch_command_long(self, command, param1, param2, sender_system, sender_component, log_prefix):
+        """处理并确认自定义 COMMAND_LONG。"""
+        if command < CMD_START_SAMPLING or command > CMD_CALIBRATE:
+            return
+
+        rospy.loginfo(
+            "%s from sysid=%d compid=%d: cmd=%d param1=%.1f param2=%.1f",
+            log_prefix, sender_system, sender_component, command, param1, param2
+        )
+
+        success = self.handle_mavlink_command(command, param1, param2)
+
+        if success:
+            ack_result = MAV_RESULT_ACCEPTED
+        elif command == CMD_START_SAMPLING and self.is_sampling:
+            ack_result = MAV_RESULT_TEMPORARILY_REJECTED
+        else:
+            ack_result = MAV_RESULT_FAILED
+
+        self._send_command_ack(command, ack_result, sender_system, sender_component)
+
     def _handle_command_long_payload(self, msg):
         """
         解析 COMMAND_LONG 的 payload64 并分发命令。
@@ -193,26 +247,14 @@ class MAVLinkTriggerNode(object):
             param2 = struct.unpack_from('<f', payload_bytes, 4)[0]
             command = struct.unpack_from('<H', payload_bytes, 28)[0]
 
-            # 仅处理 USV 自定义命令范围 (31010~31014)
-            if command < CMD_START_SAMPLING or command > CMD_CALIBRATE:
-                return
-
-            rospy.loginfo(
-                "Received COMMAND_LONG from sysid=%d compid=%d: cmd=%d param1=%.1f param2=%.1f",
-                msg.sysid, msg.compid, command, param1, param2
+            self._dispatch_command_long(
+                command,
+                param1,
+                param2,
+                msg.sysid,
+                msg.compid,
+                log_prefix="Received COMMAND_LONG",
             )
-
-            success = self.handle_mavlink_command(command, param1, param2)
-
-            # 根据命令执行结果决定 ACK 类型
-            if success:
-                ack_result = MAV_RESULT_ACCEPTED
-            elif command == CMD_START_SAMPLING and self.is_sampling:
-                ack_result = MAV_RESULT_TEMPORARILY_REJECTED
-            else:
-                ack_result = MAV_RESULT_FAILED
-
-            self._send_command_ack(command, ack_result, msg.sysid, msg.compid)
 
         except Exception as e:
             rospy.logerr("Error parsing COMMAND_LONG payload: %s", str(e))
