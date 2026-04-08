@@ -30,12 +30,13 @@ from __future__ import print_function
 
 import json
 import os
+import struct
 import threading
 
 import rospy
-from std_msgs.msg import String, Float32MultiArray
+from std_msgs.msg import String
 from std_srvs.srv import Trigger, TriggerResponse
-from mavros_msgs.msg import State, WaypointReached
+from mavros_msgs.msg import State, WaypointReached, Mavlink
 from mavros_msgs.srv import SetMode, SetModeRequest
 
 # 自定义 MAVLink 指令 ID
@@ -44,6 +45,10 @@ CMD_STOP_SAMPLING = 31011
 CMD_PAUSE_SAMPLING = 31012
 CMD_RESUME_SAMPLING = 31013
 CMD_CALIBRATE = 31014
+
+# MAVLink 协议常量
+MAVLINK_MSG_ID_COMMAND_LONG = 76
+MAVLINK_MSG_ID_COMMAND_ACK = 77
 
 # MAV_RESULT enum
 MAV_RESULT_ACCEPTED = 0
@@ -85,17 +90,26 @@ class MAVLinkTriggerNode(object):
         self.status_pub = rospy.Publisher('/usv/trigger_status', String, queue_size=10)
         self.steps_pub = rospy.Publisher('/usv/automation_steps', String, queue_size=1)
         self.pump_command_pub = rospy.Publisher('/usv/pump_command', String, queue_size=10)
-        self._ack_pub = rospy.Publisher('/usv/mavlink_cmd_ack', Float32MultiArray, queue_size=5)
+        # MAVLink ACK 发送通道
+        self.mavlink_to_pub = rospy.Publisher(
+            '/mavros/mavlink/to', Mavlink, queue_size=10
+        )
 
         # Subscribers
         self.state_sub = rospy.Subscriber('/mavros/state', State, self._state_cb)
         self.waypoint_sub = rospy.Subscriber('/mavros/mission/reached', WaypointReached, self._waypoint_cb)
+        self.pump_status_sub = rospy.Subscriber('/usv/pump_status', String, self._pump_status_cb)
 
-        self.mavlink_cmd_sub = rospy.Subscriber('/usv/mavlink_cmd_rx', Float32MultiArray, self._mavlink_cmd_rx_cb, queue_size=20)
+        # 监听 MAVROS 原始 MAVLink 入站消息 (从飞控/GCS 收到的所有 MAVLink 帧)
+        # mavros_msgs/Mavlink 包含 msgid、payload64 等字段。
+        # 当前现场配置下，QGC 可见 nano 侧使用 source 1/240 发送 HEARTBEAT、SYSTEM_TIME 等消息。
+        self.mavlink_sub = rospy.Subscriber(
+            '/mavros/mavlink/from', Mavlink, self._mavlink_from_cb, queue_size=20
+        )
 
         rospy.loginfo("MAVLink Trigger Node initialized")
         rospy.loginfo("  Auto trigger on waypoint: %s", self.auto_trigger_on_waypoint)
-        rospy.loginfo("  Listening for COMMAND_LONG on /usv/mavlink_cmd_rx")
+        rospy.loginfo("  Listening for COMMAND_LONG on /mavros/mavlink/from")
         rospy.loginfo("  MAVLink source IDs: sysid=%d compid=%d", self._source_system_id, self._source_component_id)
 
     def _state_cb(self, msg):
@@ -117,32 +131,75 @@ class MAVLinkTriggerNode(object):
                 rospy.loginfo("Auto-triggering sampling at waypoint %d", msg.wp_seq)
                 self._start_sampling_sequence()
 
-    def _mavlink_cmd_rx_cb(self, msg):
-        """处理经网桥转发的 COMMAND_LONG 关键信息。"""
+    def _handle_completion(self):
+        rospy.loginfo("Handling sampling completion...")
+        self.is_sampling = False
+        self._publish_status("sampling_stopped")
+        rospy.sleep(1.0)
+        self.set_mode("AUTO")
+
+    def _pump_status_cb(self, msg):
+        data = msg.data.lower()
+        if "automation: finished" in data:
+            with self.state_lock:
+                if self.is_sampling:
+                    threading.Thread(target=self._handle_completion).start()
+
+    def _mavlink_from_cb(self, msg):
+        """
+        MAVROS 原始 MAVLink 入站消息回调。
+
+        mavros_msgs/Mavlink 消息结构:
+          - msgid: uint32     MAVLink 消息 ID
+          - payload64: uint64[]  载荷数据 (8 字节对齐的 little-endian 块)
+          - sysid: uint8      发送方系统 ID
+          - compid: uint8     发送方组件 ID
+        """
+        # 只处理 COMMAND_LONG (msgid=76)
+        if msg.msgid != MAVLINK_MSG_ID_COMMAND_LONG:
+            return
+
+        self._handle_command_long_payload(msg)
+
+    def _handle_command_long_payload(self, msg):
+        """
+        解析 COMMAND_LONG 的 payload64 并分发命令。
+
+        COMMAND_LONG 载荷格式 (33 bytes, little-endian):
+          offset 0:  param1  float32
+          offset 4:  param2  float32
+          offset 8:  param3  float32
+          offset 12: param4  float32
+          offset 16: param5  float32
+          offset 20: param6  float32
+          offset 24: param7  float32
+          offset 28: command uint16
+          offset 30: target_system    uint8
+          offset 31: target_component uint8
+          offset 32: confirmation     uint8
+        """
         try:
-            if len(msg.data) < 7:
+            # 将 payload64 (uint64 数组) 还原为连续字节流
+            payload_bytes = b''
+            for val in msg.payload64:
+                payload_bytes += struct.pack('<Q', val)
+
+            # COMMAND_LONG 载荷至少 33 字节
+            if len(payload_bytes) < 33:
                 return
 
-            command = int(msg.data[0])
-            param1 = float(msg.data[1])
-            param2 = float(msg.data[2])
-            target_system = int(msg.data[3])
-            target_component = int(msg.data[4])
-            sender_system = int(msg.data[5])
-            sender_component = int(msg.data[6])
-
-            if target_system != 0 and target_system != self._source_system_id:
-                return
-            if target_component != 0 and target_component != self._source_component_id:
-                return
+            # 解析关键字段
+            param1 = struct.unpack_from('<f', payload_bytes, 0)[0]
+            param2 = struct.unpack_from('<f', payload_bytes, 4)[0]
+            command = struct.unpack_from('<H', payload_bytes, 28)[0]
 
             # 仅处理 USV 自定义命令范围 (31010~31014)
             if command < CMD_START_SAMPLING or command > CMD_CALIBRATE:
                 return
 
             rospy.loginfo(
-                "Received forwarded COMMAND_LONG from sysid=%d compid=%d: cmd=%d param1=%.1f param2=%.1f",
-                sender_system, sender_component, command, param1, param2
+                "Received COMMAND_LONG from sysid=%d compid=%d: cmd=%d param1=%.1f param2=%.1f",
+                msg.sysid, msg.compid, command, param1, param2
             )
 
             success = self.handle_mavlink_command(command, param1, param2)
@@ -155,10 +212,10 @@ class MAVLinkTriggerNode(object):
             else:
                 ack_result = MAV_RESULT_FAILED
 
-            self._send_command_ack(command, ack_result, sender_system, sender_component)
+            self._send_command_ack(command, ack_result, msg.sysid, msg.compid)
 
         except Exception as e:
-            rospy.logerr("Error handling forwarded COMMAND_LONG payload: %s", str(e))
+            rospy.logerr("Error parsing COMMAND_LONG payload: %s", str(e))
 
     def _init_services(self):
         """初始化 MAVROS 服务。"""
@@ -318,12 +375,49 @@ class MAVLinkTriggerNode(object):
         msg.data = status
         self.status_pub.publish(msg)
 
+    def _payload_to_uint64_list(self, payload):
+        """将字节载荷转为 uint64 列表 (8 字节对齐)。"""
+        remainder = len(payload) % 8
+        if remainder:
+            payload += b'\x00' * (8 - remainder)
+        result = []
+        for i in range(0, len(payload), 8):
+            val = struct.unpack_from('<Q', payload, i)[0]
+            result.append(val)
+        return result
+
     def _send_command_ack(self, command, result, target_system, target_component):
-        """通过内部总线 /usv/mavlink_cmd_ack 将 ACK 交由网桥回发。"""
-        ack_msg = Float32MultiArray()
-        ack_msg.data = [float(command), float(result), float(target_system), float(target_component)]
-        self._ack_pub.publish(ack_msg)
-        rospy.loginfo("ACK via bridge: cmd=%d result=%d target=%d/%d",
+        """
+        发送 COMMAND_ACK (msgid=77) 回传给命令发送方。
+
+        COMMAND_ACK 载荷格式 (10 bytes, little-endian):
+          offset 0: command          uint16 (被确认的命令 ID)
+          offset 2: result           uint8  (MAV_RESULT)
+          offset 3: progress         uint8  (0xFF = 不支持进度)
+          offset 4: result_param2    int32  (附加结果参数, 0)
+          offset 8: target_system    uint8
+          offset 9: target_component uint8
+        """
+        payload = struct.pack('<HBBiBB',
+                              command,
+                              result,
+                              0xFF,  # progress: not supported
+                              0,     # result_param2
+                              target_system,
+                              target_component)
+
+        mavlink_msg = Mavlink()
+        mavlink_msg.header.stamp = rospy.Time.now()
+        mavlink_msg.framing_status = 1  # MAVLINK_FRAMING_OK
+        mavlink_msg.magic = 253  # MAVLink v2
+        mavlink_msg.len = len(payload)
+        mavlink_msg.sysid = self._source_system_id
+        mavlink_msg.compid = self._source_component_id
+        mavlink_msg.msgid = MAVLINK_MSG_ID_COMMAND_ACK
+        mavlink_msg.payload64 = self._payload_to_uint64_list(payload)
+
+        self.mavlink_to_pub.publish(mavlink_msg)
+        rospy.loginfo("Sent COMMAND_ACK: cmd=%d result=%d target=%d/%d",
                       command, result, target_system, target_component)
 
     def handle_mavlink_command(self, cmd_id, param1=0, param2=0):

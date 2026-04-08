@@ -181,13 +181,13 @@ class AutomationEngine(object):
         """暂停执行。"""
         self._paused.set()
         self.log("自动化流程已暂停")
-        self._update_status("已暂停")
+        self._update_status("paused")
 
     def resume(self):
         """恢复执行。"""
         self._paused.clear()
         self.log("自动化流程已恢复")
-        self._update_status("运行中")
+        self._update_status("running")
 
     def is_running(self):
         """检查是否正在运行。"""
@@ -250,7 +250,7 @@ class AutomationEngine(object):
     def _execute_loop(self):
         """执行单个循环。"""
         loop_info = "∞" if self.loop_count == 0 else str(self.loop_count)
-        self._update_status("运行中 (循环 {}/{})".format(self._current_loop, loop_info))
+        self._update_status("running (loop {}/{})".format(self._current_loop, loop_info))
         self._update_progress(0)
 
         for step_idx, step in enumerate(self.steps):
@@ -381,7 +381,7 @@ class AutomationEngine(object):
                 self._pid_complete_event.clear()
                 if not self._wait_for_pid_complete():
                     if self._running.is_set():
-                        self._update_status("PID 步骤等待超时")
+                        self._update_status("PID wait timeout")
                     return False
 
         if self.on_step_wait:
@@ -446,7 +446,7 @@ class AutomationEngine(object):
         except Exception:
             pass
 
-        self._update_status("已完成")
+        self._update_status("finished")
 
     def _update_status(self, status):
         """更新状态。"""
