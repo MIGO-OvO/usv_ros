@@ -1,18 +1,29 @@
 # USV ROS 系统功能测试手册
-Updated: 2026-04-02T00:00:00Z
+Updated: 2026-04-08T03:30:00Z
 
 ## 0. 脚本命令速查
 
 | 功能 | 脚本命令 | 备注 |
 |---|---|---|
-| **一键启动** | `./src/usv_ros/scripts/start_usv_all.sh` | 启动 `roscore` 及系统节点 |
-| **一键停止** | `./src/usv_ros/scripts/stop_usv_all.sh` | 停止所有相关进程 |
+| **一键启动** | `./src/usv_ros/scripts/start_usv_all.sh` | 启动 `roscore`、`mavlink-routerd` 与 `roslaunch usv_ros usv_bringup.launch` |
+| **一键停止** | `./src/usv_ros/scripts/stop_usv_all.sh` | 停止 `usv_system`、`mavlink-routerd`、`roscore` |
 | **重启系统** | `./src/usv_ros/scripts/restart_usv_all.sh` | 停止后重新启动 |
-| **查看状态** | `./src/usv_ros/scripts/status_usv_all.sh` | 检查节点、进程与网络 |
+| **查看脚本状态** | `./src/usv_ros/scripts/status_usv_all.sh` | 仅检查 `roscore` / `mavlink_router` / `usv_system` 进程与热点状态 |
+| **查看 ROS 节点列表** | `source /opt/ros/noetic/setup.bash && source devel/setup.bash && rosnode list` | 判断节点是否真的完成注册 |
+| **检查单节点存活** | `rosnode ping /pump_control_node -c 1` | 可替换为 `/web_config_server` `/mavlink_trigger_node` `/usv_mavlink_bridge` `/mavros` |
+| **查看节点详情** | `rosnode info /usv_mavlink_bridge` | 检查订阅/发布的话题是否完整 |
+| **查看 MAVROS 状态** | `rostopic echo -n 1 /mavros/state` | 核心字段：`connected: True` |
+| **查看桥接诊断** | `rostopic echo /usv/bridge_diagnostics` | 检查 `tx_total` `tx_named_value` `mavros_connected` `pkt_count` |
+| **查看命令下行** | `rostopic echo /usv/mavlink_cmd_rx` | 检查 QGC 指令是否到达 Jetson |
+| **查看执行状态** | `rostopic echo /usv/trigger_status` | 检查 `sampling_started` / `mavros_disconnected` 等状态 |
+| **查看泵组状态** | `rostopic echo /usv/pump_status` | 检查自动化和泵执行状态 |
+| **查看话题频率** | `rostopic hz /usv/bridge_diagnostics` | 也可替换为 `/usv/spectrometer_voltage` 等 |
+| **查看系统日志** | `tail -f ~/usv_ws/.usv_run/logs/usv_system.log` | 监控 `roslaunch` 主日志 |
+| **查看 router 日志** | `tail -f ~/usv_ws/.usv_run/logs/mavlink_router.log` | 检查 5760/TCP 与串口路由异常 |
+| **查看 roscore 日志** | `tail -f ~/usv_ws/.usv_run/logs/roscore.log` | 检查 ROS Master 异常 |
 | **开启热点** | `sudo ./src/usv_ros/scripts/setup_hotspot.sh USV_Control 12345678` | 创建默认 WPA-PSK 热点 |
 | **关闭热点** | `sudo ./src/usv_ros/scripts/stop_hotspot.sh` | 关闭并尝试回连原 WiFi |
 | **脚本赋权** | `chmod +x src/usv_ros/scripts/*.sh` | 首次运行前需执行 |
-| **查看日志** | `tail -f ~/usv_ws/.usv_run/logs/usv_system.log` | 监控系统主日志 |
 
 ## 1. 测试前准备
 
@@ -160,6 +171,118 @@ rostopic echo /usv/pump_status
 ---
 
 ## 4. 故障排查 (Troubleshooting)
+
+### 4.1 启动后先做最小基线确认
+当 `status_usv_all.sh` 已显示 `RUNNING` 时，继续执行以下检查，确认不是“进程活着但节点没起来”：
+
+```bash
+cd ~/usv_ws
+source /opt/ros/noetic/setup.bash
+source devel/setup.bash
+
+./src/usv_ros/scripts/status_usv_all.sh
+rosnode list
+rosnode ping /pump_control_node -c 1
+rosnode ping /web_config_server -c 1
+rosnode ping /mavlink_trigger_node -c 1
+rosnode ping /usv_mavlink_bridge -c 1
+rostopic echo -n 1 /mavros/state
+```
+
+> **通过判据：**
+> - `rosnode list` 中至少包含 `/pump_control_node`、`/web_config_server`、`/mavlink_trigger_node`、`/usv_mavlink_bridge`。
+> - `/mavros/state` 中 `connected: True`。
+> - 若脚本显示 `usv_system: RUNNING` 但 `rosnode ping` 失败，说明 `roslaunch` 进程仍在，但内部节点有启动失败或已退出，需要立即查看 `usv_system.log`。
+
+### 4.2 QGC-ROS 链路专项排障步骤
+适用现象：
+- 刚启动时 QGC 面板有数据，重开 QGC 后面板显示载荷离线。
+- 点击 QGC 按钮后，QGC 面板无反馈或很快显示通信中断。
+- `status_usv_all.sh` 显示 RUNNING，但不确定是路由、MAVROS、bridge 还是 trigger 有问题。
+
+#### 步骤 1：确认 ROS 主节点是否全部注册
+```bash
+rosnode list
+rosnode info /usv_mavlink_bridge
+rosnode info /mavlink_trigger_node
+```
+**判定：**
+- 若 `/usv_mavlink_bridge` 不存在，问题在 `usv_system` 启动链或 Python 依赖。
+- 若节点存在但 `rosnode info` 无 `Publications`/`Subscriptions`，说明节点初始化未完成或卡在启动阶段。
+
+#### 步骤 2：确认 MAVROS 是否真正连上飞控
+```bash
+rostopic echo -n 1 /mavros/state
+rostopic hz /mavros/state
+```
+**判定：**
+- `connected: False`：先排查飞控串口、`mavlink-routerd`、`tcp://127.0.0.1:5760`。
+- `connected: True` 但频率异常低或长时间无输出：优先看 `mavlink_router.log` 与飞控心跳。
+
+#### 步骤 3：确认 bridge 是否持续发送遥测
+```bash
+rostopic echo /usv/bridge_diagnostics
+```
+重点字段：
+- `mavros_connected`
+- `tx_total`
+- `tx_named_value`
+- `pkt_count`
+- `pub_errors`
+- `mavros_drops`
+
+**判定：**
+- `mavros_connected=false`：bridge 已进入“遥测暂停”，QGC 很快会判定载荷离线。
+- `tx_named_value` / `pkt_count` 持续增长：说明 Jetson 仍在向 router/飞控发载荷遥测。
+- `pub_errors` 增长：说明 bridge 发包异常，应查看 `usv_system.log`。
+- `mavros_drops` 增长：说明链路波动发生在 MAVROS/route/飞控一侧。
+
+#### 步骤 4：确认 QGC 指令是否到达 Jetson
+```bash
+rostopic echo /usv/mavlink_cmd_rx
+rostopic echo /usv/trigger_status
+rostopic echo /usv/pump_status
+```
+在 QGC 点击“开始采样/停止采样/校准”时观察：
+- `/usv/mavlink_cmd_rx` 是否立刻出现 `Float32MultiArray`
+- `/usv/trigger_status` 是否出现 `sampling_started` / `sampling_stopped` / `calibrate_started`
+- `/usv/pump_status` 是否跟随变化
+
+**判定：**
+- QGC 点击后 `mavlink_cmd_rx` 无输出：问题在 QGC -> 飞控 -> router -> bridge 下行链路。
+- `mavlink_cmd_rx` 有输出但 `trigger_status` 无变化：问题在 `mavlink_trigger_node.py`。
+- `trigger_status` 有变化但泵无动作：问题在 `pump_control_node.py` 或串口硬件。
+
+#### 步骤 5：确认是否只是 QGC 面板侧超时
+```bash
+tail -f ~/usv_ws/.usv_run/logs/usv_system.log
+tail -f ~/usv_ws/.usv_run/logs/mavlink_router.log
+```
+若同时满足：
+- `bridge_diagnostics` 中 `tx_named_value` 仍持续增长；
+- `mavros_connected=true`；
+- Jetson 日志无 bridge 异常；
+- 只有 QGC 面板显示载荷离线；
+
+则优先怀疑：
+- 当前连接的不是带 `USVPayloadFactGroup` 的定制 QGC；
+- QGC 面板对 `NAMED_VALUE_FLOAT` 的接收/超时逻辑异常；
+- 重开 QGC 后还未重新看到飞控转发的载荷字段。
+
+### 4.3 停止脚本前的保护检查
+为避免误判“stop 脚本把 SSH 也停掉”，停止前先记录 PID 与端口占用：
+
+```bash
+cat ~/usv_ws/.usv_run/roscore.pid 2>/dev/null
+cat ~/usv_ws/.usv_run/mavlink_router.pid 2>/dev/null
+cat ~/usv_ws/.usv_run/usv_system.pid 2>/dev/null
+lsof -iTCP:5000 -n -P
+lsof -iTCP:5760 -n -P
+```
+
+> 若 5000/5760 端口由非 `python` / `mavlink-routerd` / `roslaunch` 相关进程占用，先不要执行 stop，先确认是否为调试代理或端口转发。
+
+### 4.4 常见现象对照表
 
 | 现象 | 可能原因与解决方案 |
 |---|---|
