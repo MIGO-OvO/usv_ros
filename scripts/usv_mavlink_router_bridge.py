@@ -14,7 +14,7 @@ from std_msgs.msg import String, Float32MultiArray
 from mavros_msgs.msg import State
 from pymavlink import mavutil
 
-TELEMETRY_RATE_HZ = 1  # 降至 1Hz，减轻参数下载期间的串口拥塞
+TELEMETRY_RATE_HZ = 2
 HEARTBEAT_RATE_HZ = 1
 DIAG_REPORT_INTERVAL = 10
 SYS_ID = 1
@@ -273,14 +273,15 @@ class USVMavlinkRouterBridge(object):
                 self._send_heartbeat()
                 self._last_heartbeat = now
 
-            # 载荷遥测始终发送：bridge 通过 pymavlink 直连 router，不依赖 MAVROS。
-            # MAVROS 连接状态仅用于诊断统计，不影响遥测发送。
-            with self._lock:
-                voltage = self._voltage
-                absorbance = self._absorbance
-                angles = self._pump_angles.copy()
-                status = self._status_code
-            self._send_payload(voltage, absorbance, angles, status)
+            if self._mavros_connected:
+                with self._lock:
+                    voltage = self._voltage
+                    absorbance = self._absorbance
+                    angles = self._pump_angles.copy()
+                    status = self._status_code
+                self._send_payload(voltage, absorbance, angles, status)
+            else:
+                rospy.logwarn_throttle(10, "MAVROS not connected, telemetry paused (cmd rx active)")
 
             if now - self._diag_last_report >= DIAG_REPORT_INTERVAL:
                 self._publish_diagnostics()

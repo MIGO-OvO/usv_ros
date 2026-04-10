@@ -32,7 +32,6 @@ import json
 import os
 import struct
 import threading
-import time
 
 import rospy
 from std_msgs.msg import String, Float32MultiArray
@@ -59,10 +58,6 @@ MAV_RESULT_FAILED = 5
 # 配置文件路径
 CONFIG_FILE = os.path.expanduser("~/usv_ws/config/sampling_config.json")
 
-# 命令去重窗口（秒）：同一 command_id 在此窗口内只执行一次
-# 防止 bridge 和 MAVROS 两条路径同时送达导致重复执行
-CMD_DEDUP_WINDOW = 2.0
-
 
 class MAVLinkTriggerNode(object):
     """
@@ -87,7 +82,6 @@ class MAVLinkTriggerNode(object):
         self.is_sampling = False
         self.current_waypoint = 0
         self.state_lock = threading.Lock()
-        self._last_cmd_dispatch = {}  # {command_id: timestamp} 用于去重
 
         # 服务客户端
         self.set_mode_client = None
@@ -111,10 +105,7 @@ class MAVLinkTriggerNode(object):
 
         # 监听 MAVROS 原始 MAVLink 入站消息 (从飞控/GCS 收到的所有 MAVLink 帧)
         # mavros_msgs/Mavlink 包含 msgid、payload64 等字段。
-        #
-        # 注意：COMMAND_LONG 的接收已由 usv_mavlink_router_bridge.py 通过 router
-        # 直连处理并转发到 /usv/mavlink_cmd_rx，此处不再重复处理 COMMAND_LONG，
-        # 仅保留订阅以备后续扩展其他消息类型。
+        # 当前现场配置下，QGC 可见 nano 侧使用 source 1/240 发送 HEARTBEAT、SYSTEM_TIME 等消息。
         self.mavlink_sub = rospy.Subscriber(
             '/mavros/mavlink/from', Mavlink, self._mavlink_from_cb, queue_size=20
         )
@@ -166,10 +157,8 @@ class MAVLinkTriggerNode(object):
           - payload64: uint64[]  载荷数据 (8 字节对齐的 little-endian 块)
           - sysid: uint8      发送方系统 ID
           - compid: uint8     发送方组件 ID
-
-        与 bridge /usv/mavlink_cmd_rx 互为冗余入口，通过 _dispatch_command_long
-        的时间窗去重确保同一条指令只执行一次。
         """
+        # 只处理 COMMAND_LONG (msgid=76)
         if msg.msgid != MAVLINK_MSG_ID_COMMAND_LONG:
             return
 
@@ -206,20 +195,9 @@ class MAVLinkTriggerNode(object):
             rospy.logerr("Error handling forwarded COMMAND_LONG payload: %s", str(e))
 
     def _dispatch_command_long(self, command, param1, param2, sender_system, sender_component, log_prefix):
-        """处理并确认自定义 COMMAND_LONG（含时间窗去重）。"""
+        """处理并确认自定义 COMMAND_LONG。"""
         if command < CMD_START_SAMPLING or command > CMD_CALIBRATE:
             return
-
-        # ── 去重：同一 command 在 CMD_DEDUP_WINDOW 内只执行一次 ──
-        now = time.time()
-        last = self._last_cmd_dispatch.get(command, 0)
-        if (now - last) < CMD_DEDUP_WINDOW:
-            rospy.logdebug(
-                "Dedup skip %s cmd=%d (%.1fs since last)",
-                log_prefix, command, now - last
-            )
-            return
-        self._last_cmd_dispatch[command] = now
 
         rospy.loginfo(
             "%s from sysid=%d compid=%d: cmd=%d param1=%.1f param2=%.1f",
