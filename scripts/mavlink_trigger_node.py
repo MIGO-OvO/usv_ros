@@ -105,7 +105,10 @@ class MAVLinkTriggerNode(object):
 
         # 监听 MAVROS 原始 MAVLink 入站消息 (从飞控/GCS 收到的所有 MAVLink 帧)
         # mavros_msgs/Mavlink 包含 msgid、payload64 等字段。
-        # 当前现场配置下，QGC 可见 nano 侧使用 source 1/240 发送 HEARTBEAT、SYSTEM_TIME 等消息。
+        #
+        # 注意：COMMAND_LONG 的接收已由 usv_mavlink_router_bridge.py 通过 router
+        # 直连处理并转发到 /usv/mavlink_cmd_rx，此处不再重复处理 COMMAND_LONG，
+        # 仅保留订阅以备后续扩展其他消息类型。
         self.mavlink_sub = rospy.Subscriber(
             '/mavros/mavlink/from', Mavlink, self._mavlink_from_cb, queue_size=20
         )
@@ -157,12 +160,17 @@ class MAVLinkTriggerNode(object):
           - payload64: uint64[]  载荷数据 (8 字节对齐的 little-endian 块)
           - sysid: uint8      发送方系统 ID
           - compid: uint8     发送方组件 ID
+
+        COMMAND_LONG (msgid=76) 已由 usv_mavlink_router_bridge.py 通过 router
+        直连接收并转发到 /usv/mavlink_cmd_rx，此处不再重复处理，避免同一条
+        指令被执行两次、ACK 矛盾导致 QGC 判定通信异常。
         """
-        # 只处理 COMMAND_LONG (msgid=76)
-        if msg.msgid != MAVLINK_MSG_ID_COMMAND_LONG:
+        # 跳过 COMMAND_LONG，由 bridge 统一处理
+        if msg.msgid == MAVLINK_MSG_ID_COMMAND_LONG:
             return
 
-        self._handle_command_long_payload(msg)
+        # 保留此回调以备后续扩展其他消息类型
+        pass
 
     def _mavlink_cmd_rx_cb(self, msg):
         """兼容旧内部总线 /usv/mavlink_cmd_rx。"""

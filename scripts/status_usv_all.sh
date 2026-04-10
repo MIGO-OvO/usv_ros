@@ -94,7 +94,8 @@ print_hotspot_status
 # ── ROS 节点级健康检查 ──────────────────────────────────────────────
 # 仅在 roscore 运行时执行；使用 timeout 避免 hang；失败不中断脚本
 EXPECTED_NODES="/pump_control_node /web_config_server /mavlink_trigger_node /usv_mavlink_bridge /mavros"
-ROS_CHECK_TIMEOUT=3  # 每条 rostopic/rosnode 命令的超时秒数
+ROS_CHECK_TIMEOUT=3   # rosnode/mavros 检查超时秒数
+DIAG_CHECK_TIMEOUT=12 # bridge 诊断发布间隔为 10s，等 12s 确保能收到
 
 print_ros_nodes() {
     # 尝试加载 ROS 环境
@@ -159,7 +160,7 @@ print_ros_nodes() {
 
     # Bridge 诊断摘要
     local bridge_diag
-    bridge_diag="$(timeout "$ROS_CHECK_TIMEOUT" rostopic echo -n 1 /usv/bridge_diagnostics 2>/dev/null || true)"
+    bridge_diag="$(timeout "$DIAG_CHECK_TIMEOUT" rostopic echo -n 1 /usv/bridge_diagnostics 2>/dev/null || true)"
     if [[ -z "$bridge_diag" ]]; then
         echo "bridge_diag: UNKNOWN (超时未响应)"
     else
