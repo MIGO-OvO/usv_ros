@@ -1235,6 +1235,19 @@ class WebConfigServer(object):
                         nodes.append({"name": n, "alive": n in node_list})
                 except Exception:
                     nodes = [{"name": "unknown", "alive": False, "error": "rosnode API unavailable"}]
+
+            # 检查 mavlink-routerd 进程状态
+            router_alive = False
+            try:
+                import subprocess
+                # Check using pgrep since process might not be started from the exact pid file or pid file could be stale
+                result = subprocess.run(["pgrep", "-f", "mavlink-routerd"], capture_output=True, text=True)
+                if result.returncode == 0 and result.stdout.strip():
+                    router_alive = True
+            except Exception:
+                pass
+            nodes.append({"name": "mavlink-routerd", "alive": router_alive})
+
             return jsonify({
                 "success": True,
                 "data": {

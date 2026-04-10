@@ -46,6 +46,11 @@ class USVMavlinkRouterBridge(object):
         self._last_heartbeat = 0.0
         self._diag_last_report = time.time()
         self._diag_pub = rospy.Publisher("/usv/bridge_diagnostics", String, queue_size=5)
+        self._diag_tx_total = 0        # 总发送包数
+        self._diag_tx_heartbeat = 0    # 心跳包数
+        self._diag_tx_named = 0        # NAMED_VALUE_FLOAT 包数
+        self._diag_pub_errors = 0      # 发布错误数
+        self._diag_mavros_drops = 0    # MAVROS 断连计数
         self._cmd_rx_pub = rospy.Publisher("/usv/mavlink_cmd_rx", Float32MultiArray, queue_size=5)
         rospy.Subscriber("/usv/mavlink_cmd_ack", Float32MultiArray, self._cmd_ack_cb)
         rospy.Subscriber("/usv/spectrometer_voltage", String, self._voltage_cb)
@@ -123,7 +128,11 @@ class USVMavlinkRouterBridge(object):
                 self._send_statustext("USV: Calibrating", mavutil.mavlink.MAV_SEVERITY_NOTICE)
 
     def _mavros_state_cb(self, msg):
+        was_connected = self._mavros_connected
         self._mavros_connected = bool(msg.connected)
+        if was_connected and not self._mavros_connected:
+            with self._lock:
+                self._diag_mavros_drops += 1
 
     def _cmd_ack_cb(self, msg):
         try:
@@ -142,7 +151,11 @@ class USVMavlinkRouterBridge(object):
     def _send_statustext(self, text, severity):
         try:
             self._conn.mav.statustext_send(severity, text.encode('utf-8'))
+            with self._lock:
+                self._diag_tx_total += 1
         except Exception as exc:
+            with self._lock:
+                self._diag_pub_errors += 1
             rospy.logwarn("Failed to send STATUSTEXT: %s", str(exc))
 
     def _receive_mavlink_messages(self):
@@ -193,24 +206,61 @@ class USVMavlinkRouterBridge(object):
                 rospy.logwarn("Failed to forward COMMAND_LONG: %s", str(exc))
 
     def _publish_diagnostics(self):
-        msg = String()
-        msg.data = json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()), "router_url": self._router_url, "sysid": self._sys_id, "compid": self._comp_id, "pkt_count": self._pkt_count, "mavros_connected": self._mavros_connected, "rate_hz": TELEMETRY_RATE_HZ})
-        self._diag_pub.publish(msg)
+        now = time.time()
+        with self._lock:
+            uptime = now - self._boot_time
+            diag = {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)),
+                "uptime_s": int(uptime),
+                "sysid": self._sys_id,
+                "compid": self._comp_id,
+                "mavros_connected": self._mavros_connected,
+                "tx_total": self._diag_tx_total,
+                "tx_heartbeat": self._diag_tx_heartbeat,
+                "tx_named_value": self._diag_tx_named,
+                "pub_errors": self._diag_pub_errors,
+                "mavros_drops": self._diag_mavros_drops,
+                "pkt_count": self._pkt_count,
+                "rate_hz": TELEMETRY_RATE_HZ,
+                "router_url": self._router_url,
+            }
+        try:
+            msg = String()
+            msg.data = json.dumps(diag)
+            self._diag_pub.publish(msg)
+        except Exception:
+            pass
 
     def _send_heartbeat(self):
-        self._conn.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER, mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, mavutil.mavlink.MAV_STATE_ACTIVE)
+        try:
+            self._conn.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER, mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, mavutil.mavlink.MAV_STATE_ACTIVE)
+            with self._lock:
+                self._diag_tx_total += 1
+                self._diag_tx_heartbeat += 1
+        except Exception as exc:
+            with self._lock:
+                self._diag_pub_errors += 1
+            rospy.logwarn("Failed to send HEARTBEAT: %s", str(exc))
 
     def _send_payload(self, voltage, absorbance, angles, status):
         t = int((time.time() - self._boot_time) * 1000) & 0xFFFFFFFF
-        self._pkt_count = (self._pkt_count + 1) % 65536
-        self._conn.mav.named_value_float_send(t, b"USV_VOLT\x00\x00", voltage)
-        self._conn.mav.named_value_float_send(t, b"USV_ABS\x00\x00\x00", absorbance)
-        self._conn.mav.named_value_float_send(t, b"PUMP_X\x00\x00\x00\x00", angles["X"])
-        self._conn.mav.named_value_float_send(t, b"PUMP_Y\x00\x00\x00\x00", angles["Y"])
-        self._conn.mav.named_value_float_send(t, b"PUMP_Z\x00\x00\x00\x00", angles["Z"])
-        self._conn.mav.named_value_float_send(t, b"PUMP_A\x00\x00\x00\x00", angles["A"])
-        self._conn.mav.named_value_float_send(t, b"USV_STAT\x00\x00", float(status))
-        self._conn.mav.named_value_float_send(t, b"USV_PKT\x00\x00\x00", float(self._pkt_count))
+        try:
+            self._conn.mav.named_value_float_send(t, b"USV_VOLT\x00\x00", voltage)
+            self._conn.mav.named_value_float_send(t, b"USV_ABS\x00\x00\x00", absorbance)
+            self._conn.mav.named_value_float_send(t, b"PUMP_X\x00\x00\x00\x00", angles["X"])
+            self._conn.mav.named_value_float_send(t, b"PUMP_Y\x00\x00\x00\x00", angles["Y"])
+            self._conn.mav.named_value_float_send(t, b"PUMP_Z\x00\x00\x00\x00", angles["Z"])
+            self._conn.mav.named_value_float_send(t, b"PUMP_A\x00\x00\x00\x00", angles["A"])
+            self._conn.mav.named_value_float_send(t, b"USV_STAT\x00\x00", float(status))
+            self._conn.mav.named_value_float_send(t, b"USV_PKT\x00\x00\x00", float(self._pkt_count))
+            self._pkt_count = (self._pkt_count + 1) % 65536
+            with self._lock:
+                self._diag_tx_total += 8
+                self._diag_tx_named += 8
+        except Exception as exc:
+            with self._lock:
+                self._diag_pub_errors += 1
+            rospy.logwarn("Failed to send payload: %s", str(exc))
 
     def run(self):
         rate = rospy.Rate(TELEMETRY_RATE_HZ)

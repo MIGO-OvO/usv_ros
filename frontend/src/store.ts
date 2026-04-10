@@ -51,6 +51,7 @@ interface BridgeDiag {
   mavros_drops: number
   uptime_s: number
   rate_hz: number
+  router_url: string
 }
 
 const MAX_HISTORY_POINTS = 150

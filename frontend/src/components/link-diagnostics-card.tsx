@@ -29,8 +29,9 @@ export function LinkDiagnosticsCard() {
     return () => clearInterval(t)
   }, [connected, expanded])
 
-  const bridge = bridgeDiag
+  const bridge = bridgeDiag as any
   const mavConnected = mavrosState?.connected ?? false
+  const routerAlive = fullDiag?.nodes?.find(n => n.name === 'mavlink-routerd')?.alive ?? false
 
   return (
     <Card className="bg-card/50 backdrop-blur-sm">
@@ -45,10 +46,10 @@ export function LinkDiagnosticsCard() {
         <div className="flex items-center gap-2">
           <div className={cn(
             "h-2.5 w-2.5 rounded-full",
-            mavConnected ? "bg-emerald-500" : "bg-red-500"
+            mavConnected && routerAlive ? "bg-emerald-500" : (routerAlive ? "bg-yellow-500" : "bg-red-500")
           )} />
           <span className="text-xs text-muted-foreground">
-            {mavConnected ? "MAVROS 在线" : "MAVROS 离线"}
+            {mavConnected && routerAlive ? "链路正常" : (routerAlive ? "MAVROS 断开" : "Router 离线")}
           </span>
           {expanded ? <ChevronDown className="h-4 w-4 text-muted-foreground" /> : <ChevronRight className="h-4 w-4 text-muted-foreground" />}
         </div>
@@ -66,7 +67,7 @@ export function LinkDiagnosticsCard() {
           {/* 桥接节点统计 */}
           {bridge ? (
             <div>
-              <h4 className="text-xs font-medium text-muted-foreground mb-1">MAVLink 桥接</h4>
+              <h4 className="text-xs font-medium text-muted-foreground mb-1">MAVLink 桥接 ({bridge.router_url})</h4>
               <div className="grid grid-cols-3 gap-2">
                 <KV label="SysID" value={String(bridge.sysid)} />
                 <KV label="CompID" value={String(bridge.compid)} />
