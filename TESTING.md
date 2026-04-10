@@ -8,7 +8,7 @@ Updated: 2026-04-08T03:30:00Z
 | **一键启动** | `./src/usv_ros/scripts/start_usv_all.sh` | 启动 `roscore`、`mavlink-routerd` 与 `roslaunch usv_ros usv_bringup.launch` |
 | **一键停止** | `./src/usv_ros/scripts/stop_usv_all.sh` | 停止 `usv_system`、`mavlink-routerd`、`roscore` |
 | **重启系统** | `./src/usv_ros/scripts/restart_usv_all.sh` | 停止后重新启动 |
-| **查看脚本状态** | `./src/usv_ros/scripts/status_usv_all.sh` | 仅检查 `roscore` / `mavlink_router` / `usv_system` 进程与热点状态 |
+| **查看脚本状态** | `./src/usv_ros/scripts/status_usv_all.sh` | 检查进程 + ROS 节点 + MAVROS + bridge 诊断 |
 | **查看 ROS 节点列表** | `source /opt/ros/noetic/setup.bash && source devel/setup.bash && rosnode list` | 判断节点是否真的完成注册 |
 | **检查单节点存活** | `rosnode ping /pump_control_node -c 1` | 可替换为 `/web_config_server` `/mavlink_trigger_node` `/usv_mavlink_bridge` `/mavros` |
 | **查看节点详情** | `rosnode info /usv_mavlink_bridge` | 检查订阅/发布的话题是否完整 |
