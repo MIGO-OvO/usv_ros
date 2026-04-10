@@ -164,13 +164,23 @@ print_ros_nodes() {
     if [[ -z "$bridge_diag" ]]; then
         echo "bridge_diag: UNKNOWN (超时未响应)"
     else
-        # 用 sed 从 JSON 字符串中提取关键字段（兼容 Jetson/busybox grep）
-        local mavros_conn tx_total pkt_count mavros_drops
-        mavros_conn="$(echo "$bridge_diag" | sed -n 's/.*"mavros_connected": *\(true\|false\).*/\1/p' | tail -1)"
-        tx_total="$(echo "$bridge_diag" | sed -n 's/.*"tx_total": *\([0-9]*\).*/\1/p' | tail -1)"
-        pkt_count="$(echo "$bridge_diag" | sed -n 's/.*"pkt_count": *\([0-9]*\).*/\1/p' | tail -1)"
-        mavros_drops="$(echo "$bridge_diag" | sed -n 's/.*"mavros_drops": *\([0-9]*\).*/\1/p' | tail -1)"
-        echo "bridge_diag: mavros=${mavros_conn:-?} tx=${tx_total:-?} pkt=${pkt_count:-?} drops=${mavros_drops:-?}"
+        # 用 python3 从 rostopic YAML 输出中提取 JSON 字段（最可靠方式）
+        echo "$bridge_diag" | python3 -c "
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if not line.startswith('data:'):
+        continue
+    s = line[5:].strip().strip(\"'\").strip('\"')
+    try:
+        d = json.loads(s)
+        print('bridge_diag: mavros={} tx={} pkt={} drops={}'.format(
+            d.get('mavros_connected','?'), d.get('tx_total','?'),
+            d.get('pkt_count','?'), d.get('mavros_drops','?')))
+    except:
+        print('bridge_diag: PARSE_ERROR')
+    break
+" 2>/dev/null || echo "bridge_diag: PARSE_ERROR"
     fi
 }
 

@@ -14,7 +14,7 @@ from std_msgs.msg import String, Float32MultiArray
 from mavros_msgs.msg import State
 from pymavlink import mavutil
 
-TELEMETRY_RATE_HZ = 2
+TELEMETRY_RATE_HZ = 1  # 降至 1Hz，减轻参数下载期间的串口拥塞
 HEARTBEAT_RATE_HZ = 1
 DIAG_REPORT_INTERVAL = 10
 SYS_ID = 1
