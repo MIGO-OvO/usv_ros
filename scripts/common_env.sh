@@ -58,12 +58,15 @@ ensure_run_dirs() {
 
 load_ros_env() {
     ensure_file "$ROS_SETUP" "请确认 ROS Noetic 已安装。"
+    # 临时关闭未绑定变量检查，防止 ROS setup 脚本报错
+    set +u
     # shellcheck disable=SC1090
     source "$ROS_SETUP"
 
     ensure_file "$WORKSPACE_SETUP" "请先在工作空间根目录执行 catkin_make。"
     # shellcheck disable=SC1090
     source "$WORKSPACE_SETUP"
+    set -u
 }
 
 require_roscore() {
