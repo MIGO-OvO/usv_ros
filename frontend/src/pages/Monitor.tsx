@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { useAppStore } from '@/store'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
@@ -13,6 +13,27 @@ const MISSION_STATUS_MAP: Record<string, string> = {
   PAUSED: '已暂停',
   COMPLETED: '已完成',
   STOPPED: '已停止',
+}
+
+function computeAdaptiveDomain(values: number[], fallback: [number, number], minSpan: number): [number, number] {
+  const finiteValues = values.filter((value) => Number.isFinite(value))
+  if (finiteValues.length === 0) return fallback
+
+  let min = Math.min(...finiteValues)
+  let max = Math.max(...finiteValues)
+
+  if (min === max) {
+    const pad = Math.max(Math.abs(min) * 0.15, minSpan / 2)
+    min -= pad
+    max += pad
+  } else {
+    const span = max - min
+    const pad = Math.max(span * 0.12, minSpan / 2)
+    min -= pad
+    max += pad
+  }
+
+  return [min, max]
 }
 
 export default function Monitor() {
@@ -57,6 +78,22 @@ export default function Monitor() {
     borderColor: 'hsl(var(--border))',
     borderRadius: '8px',
   }
+
+  const voltageDomain = useMemo<[number, number]>(() => {
+    return computeAdaptiveDomain(
+      voltageHistory.map((point) => point.voltage),
+      [0, 5],
+      0.05,
+    )
+  }, [voltageHistory])
+
+  const absorbanceDomain = useMemo<[number, number]>(() => {
+    return computeAdaptiveDomain(
+      voltageHistory.map((point) => point.absorbance),
+      [-0.05, 0.05],
+      0.01,
+    )
+  }, [voltageHistory])
 
   return (
     <div className="p-4 md:p-8 space-y-6 max-w-7xl mx-auto">
@@ -139,7 +176,8 @@ export default function Monitor() {
                     <LineChart data={voltageHistory}>
                         <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" opacity={0.4} />
                         <XAxis dataKey="time" stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} />
-                        <YAxis stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} domain={['auto', 'auto']}
+                        <YAxis stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} domain={voltageDomain}
+                               allowDataOverflow
                                label={{ value: 'V', angle: -90, position: 'insideLeft', style: { fill: 'hsl(var(--muted-foreground))', fontSize: 11 } }} />
                         <Tooltip contentStyle={tooltipStyle} />
                         <Line type="monotone" dataKey="voltage" name="电压" stroke="hsl(var(--chart-1))" strokeWidth={2} dot={false} isAnimationActive={false} />
@@ -158,7 +196,8 @@ export default function Monitor() {
                     <LineChart data={voltageHistory}>
                         <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" opacity={0.4} />
                         <XAxis dataKey="time" stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} />
-                        <YAxis stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} domain={['auto', 'auto']}
+                        <YAxis stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} domain={absorbanceDomain}
+                               allowDataOverflow
                                label={{ value: 'Abs', angle: -90, position: 'insideLeft', style: { fill: 'hsl(var(--muted-foreground))', fontSize: 11 } }} />
                         <Tooltip contentStyle={tooltipStyle} />
                         <Line type="monotone" dataKey="absorbance" name="吸光度" stroke="hsl(var(--chart-2))" strokeWidth={2} dot={false} isAnimationActive={false} />
@@ -200,11 +239,8 @@ export default function Monitor() {
           </Card>
         </div>
 
-        <div className="xl:col-span-1">
+        <div className="xl:col-span-1 space-y-6">
           <InjectionPumpCard />
-        </div>
-
-        <div className="xl:col-span-1">
           <LinkDiagnosticsCard />
         </div>
       </div>
