@@ -164,13 +164,13 @@ print_ros_nodes() {
     if [[ -z "$bridge_diag" ]]; then
         echo "bridge_diag: UNKNOWN (超时未响应)"
     else
-        # 从 JSON 字符串中提取关键字段
+        # 用 sed 从 JSON 字符串中提取关键字段（兼容 Jetson/busybox grep）
         local mavros_conn tx_total pkt_count mavros_drops
-        mavros_conn="$(echo "$bridge_diag" | grep -oP '"mavros_connected":\s*\K(true|false)' || echo "?")"
-        tx_total="$(echo "$bridge_diag" | grep -oP '"tx_total":\s*\K[0-9]+' || echo "?")"
-        pkt_count="$(echo "$bridge_diag" | grep -oP '"pkt_count":\s*\K[0-9]+' || echo "?")"
-        mavros_drops="$(echo "$bridge_diag" | grep -oP '"mavros_drops":\s*\K[0-9]+' || echo "?")"
-        echo "bridge_diag: mavros=$mavros_conn tx=$tx_total pkt=$pkt_count drops=$mavros_drops"
+        mavros_conn="$(echo "$bridge_diag" | sed -n 's/.*"mavros_connected": *\(true\|false\).*/\1/p' | tail -1)"
+        tx_total="$(echo "$bridge_diag" | sed -n 's/.*"tx_total": *\([0-9]*\).*/\1/p' | tail -1)"
+        pkt_count="$(echo "$bridge_diag" | sed -n 's/.*"pkt_count": *\([0-9]*\).*/\1/p' | tail -1)"
+        mavros_drops="$(echo "$bridge_diag" | sed -n 's/.*"mavros_drops": *\([0-9]*\).*/\1/p' | tail -1)"
+        echo "bridge_diag: mavros=${mavros_conn:-?} tx=${tx_total:-?} pkt=${pkt_count:-?} drops=${mavros_drops:-?}"
     fi
 }
 

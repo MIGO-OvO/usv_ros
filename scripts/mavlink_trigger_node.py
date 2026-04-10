@@ -32,6 +32,7 @@ import json
 import os
 import struct
 import threading
+import time
 
 import rospy
 from std_msgs.msg import String, Float32MultiArray
@@ -58,6 +59,10 @@ MAV_RESULT_FAILED = 5
 # 配置文件路径
 CONFIG_FILE = os.path.expanduser("~/usv_ws/config/sampling_config.json")
 
+# 命令去重窗口（秒）：同一 command_id 在此窗口内只执行一次
+# 防止 bridge 和 MAVROS 两条路径同时送达导致重复执行
+CMD_DEDUP_WINDOW = 2.0
+
 
 class MAVLinkTriggerNode(object):
     """
@@ -82,6 +87,7 @@ class MAVLinkTriggerNode(object):
         self.is_sampling = False
         self.current_waypoint = 0
         self.state_lock = threading.Lock()
+        self._last_cmd_dispatch = {}  # {command_id: timestamp} 用于去重
 
         # 服务客户端
         self.set_mode_client = None
@@ -161,16 +167,13 @@ class MAVLinkTriggerNode(object):
           - sysid: uint8      发送方系统 ID
           - compid: uint8     发送方组件 ID
 
-        COMMAND_LONG (msgid=76) 已由 usv_mavlink_router_bridge.py 通过 router
-        直连接收并转发到 /usv/mavlink_cmd_rx，此处不再重复处理，避免同一条
-        指令被执行两次、ACK 矛盾导致 QGC 判定通信异常。
+        与 bridge /usv/mavlink_cmd_rx 互为冗余入口，通过 _dispatch_command_long
+        的时间窗去重确保同一条指令只执行一次。
         """
-        # 跳过 COMMAND_LONG，由 bridge 统一处理
-        if msg.msgid == MAVLINK_MSG_ID_COMMAND_LONG:
+        if msg.msgid != MAVLINK_MSG_ID_COMMAND_LONG:
             return
 
-        # 保留此回调以备后续扩展其他消息类型
-        pass
+        self._handle_command_long_payload(msg)
 
     def _mavlink_cmd_rx_cb(self, msg):
         """兼容旧内部总线 /usv/mavlink_cmd_rx。"""
@@ -203,9 +206,20 @@ class MAVLinkTriggerNode(object):
             rospy.logerr("Error handling forwarded COMMAND_LONG payload: %s", str(e))
 
     def _dispatch_command_long(self, command, param1, param2, sender_system, sender_component, log_prefix):
-        """处理并确认自定义 COMMAND_LONG。"""
+        """处理并确认自定义 COMMAND_LONG（含时间窗去重）。"""
         if command < CMD_START_SAMPLING or command > CMD_CALIBRATE:
             return
+
+        # ── 去重：同一 command 在 CMD_DEDUP_WINDOW 内只执行一次 ──
+        now = time.time()
+        last = self._last_cmd_dispatch.get(command, 0)
+        if (now - last) < CMD_DEDUP_WINDOW:
+            rospy.logdebug(
+                "Dedup skip %s cmd=%d (%.1fs since last)",
+                log_prefix, command, now - last
+            )
+            return
+        self._last_cmd_dispatch[command] = now
 
         rospy.loginfo(
             "%s from sysid=%d compid=%d: cmd=%d param1=%.1f param2=%.1f",
