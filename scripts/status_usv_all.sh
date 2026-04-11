@@ -164,22 +164,22 @@ print_ros_nodes() {
     if [[ -z "$bridge_diag" ]]; then
         echo "bridge_diag: UNKNOWN (超时未响应)"
     else
-        # 用 python3 从 rostopic YAML 输出中提取 JSON 字段（最可靠方式）
+        # 从 rostopic 输出中提取 JSON 并解析关键字段
         echo "$bridge_diag" | python3 -c "
-import sys, json
-for line in sys.stdin:
-    line = line.strip()
-    if not line.startswith('data:'):
-        continue
-    s = line[5:].strip().strip(\"'\").strip('\"')
+import sys, json, re
+text = sys.stdin.read()
+# 在整个输出中找第一个 {...} JSON 对象
+m = re.search(r'\{[^}]+\}', text)
+if not m:
+    print('bridge_diag: PARSE_ERROR (no JSON found)')
+else:
     try:
-        d = json.loads(s)
+        d = json.loads(m.group())
         print('bridge_diag: mavros={} tx={} pkt={} drops={}'.format(
             d.get('mavros_connected','?'), d.get('tx_total','?'),
             d.get('pkt_count','?'), d.get('mavros_drops','?')))
-    except:
-        print('bridge_diag: PARSE_ERROR')
-    break
+    except Exception as e:
+        print('bridge_diag: PARSE_ERROR ({})'.format(e))
 " 2>/dev/null || echo "bridge_diag: PARSE_ERROR"
     fi
 }
