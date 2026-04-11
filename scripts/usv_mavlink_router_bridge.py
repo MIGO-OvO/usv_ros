@@ -51,6 +51,11 @@ class USVMavlinkRouterBridge(object):
         self._diag_tx_named = 0        # NAMED_VALUE_FLOAT 包数
         self._diag_pub_errors = 0      # 发布错误数
         self._diag_mavros_drops = 0    # MAVROS 断连计数
+        # ── 跨线程发送队列 ──
+        # 回调线程不直接操作 self._conn（pymavlink TCP 非线程安全），
+        # 仅把待发送数据放入队列，由 run() 主循环统一发送。
+        self._pending_statustexts = []   # [(text, severity), ...]
+        self._pending_acks = []          # [(command, result, target_sys, target_comp), ...]
         self._cmd_rx_pub = rospy.Publisher("/usv/mavlink_cmd_rx", Float32MultiArray, queue_size=5)
         rospy.Subscriber("/usv/mavlink_cmd_ack", Float32MultiArray, self._cmd_ack_cb)
         rospy.Subscriber("/usv/spectrometer_voltage", String, self._voltage_cb)
@@ -116,16 +121,16 @@ class USVMavlinkRouterBridge(object):
         with self._lock:
             if "sampling_started" in data:
                 self._status_code = 1
-                self._send_statustext("USV: Sampling Started", mavutil.mavlink.MAV_SEVERITY_NOTICE)
+                self._pending_statustexts.append(("USV: Sampling Started", mavutil.mavlink.MAV_SEVERITY_NOTICE))
             elif "sampling_stopped" in data:
                 self._status_code = 0
-                self._send_statustext("USV: Sampling Completed", mavutil.mavlink.MAV_SEVERITY_NOTICE)
+                self._pending_statustexts.append(("USV: Sampling Completed", mavutil.mavlink.MAV_SEVERITY_NOTICE))
             elif "sampling_paused" in data:
                 self._status_code = 1
-                self._send_statustext("USV: Sampling Paused", mavutil.mavlink.MAV_SEVERITY_NOTICE)
+                self._pending_statustexts.append(("USV: Sampling Paused", mavutil.mavlink.MAV_SEVERITY_NOTICE))
             elif "calibrate" in data:
                 self._status_code = 4
-                self._send_statustext("USV: Calibrating", mavutil.mavlink.MAV_SEVERITY_NOTICE)
+                self._pending_statustexts.append(("USV: Calibrating", mavutil.mavlink.MAV_SEVERITY_NOTICE))
 
     def _mavros_state_cb(self, msg):
         was_connected = self._mavros_connected
@@ -137,16 +142,10 @@ class USVMavlinkRouterBridge(object):
     def _cmd_ack_cb(self, msg):
         try:
             command, result, target_sys, target_comp = msg.data
-            self._conn.mav.command_ack_send(
-                int(command),
-                int(result),
-                0xFF,  # progress not supported
-                0,     # result_param2
-                int(target_sys),
-                int(target_comp)
-            )
+            with self._lock:
+                self._pending_acks.append((int(command), int(result), int(target_sys), int(target_comp)))
         except Exception as exc:
-            rospy.logwarn("Failed to send COMMAND_ACK: %s", str(exc))
+            rospy.logwarn("Failed to queue COMMAND_ACK: %s", str(exc))
 
     def _send_statustext(self, text, severity):
         try:
@@ -274,15 +273,27 @@ class USVMavlinkRouterBridge(object):
                 self._last_heartbeat = now
 
             # 载荷遥测始终发送：bridge 通过 pymavlink 直连 router TCP，
-            # 不依赖 MAVROS 连接状态。MAVROS 状态仅影响诊断统计。
-            # 若绑定 _mavros_connected，set_mode 等 MAVROS 服务调用期间
-            # 会导致遥测暂停 → 飞控 3s 超时停转发 → QGC 判定离线。
+            # 不依赖 MAVROS 连接状态。
             with self._lock:
                 voltage = self._voltage
                 absorbance = self._absorbance
                 angles = self._pump_angles.copy()
                 status = self._status_code
+                # 取出回调线程排队的待发送项（在锁内取出，锁外发送）
+                pending_st = list(self._pending_statustexts)
+                self._pending_statustexts.clear()
+                pending_ack = list(self._pending_acks)
+                self._pending_acks.clear()
             self._send_payload(voltage, absorbance, angles, status)
+
+            # 主线程统一发送 STATUSTEXT 和 COMMAND_ACK（pymavlink 非线程安全）
+            for text, severity in pending_st:
+                self._send_statustext(text, severity)
+            for cmd, result, tsys, tcomp in pending_ack:
+                try:
+                    self._conn.mav.command_ack_send(cmd, result, 0xFF, 0, tsys, tcomp)
+                except Exception as exc:
+                    rospy.logwarn("Failed to send COMMAND_ACK: %s", str(exc))
 
             if now - self._diag_last_report >= DIAG_REPORT_INTERVAL:
                 self._publish_diagnostics()

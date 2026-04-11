@@ -164,30 +164,27 @@ print_ros_nodes() {
     if [[ -z "$bridge_diag" ]]; then
         echo "bridge_diag: UNKNOWN (超时未响应)"
     else
-        # rostopic echo 输出 std_msgs/String 时，YAML 可能把 JSON 内的
-        # true/false 变成 True/False、双引号变单引号（Python dict 格式）。
-        # 用 ast.literal_eval 兜底，两种格式都能解析。
+        # rostopic echo 输出 std_msgs/String 格式为:
+        #   data: "{\"key\": value, ...}"
+        # 含反斜杠转义和 YAML 续行。先清理再解析。
         echo "$bridge_diag" | python3 -c "
-import sys, json, ast, re
+import sys, json, re
 text = sys.stdin.read()
+# 去除 YAML 续行（反斜杠+换行+空格）合并为单行
+text = re.sub(r'\\\\\n\s*', '', text)
+# 反斜杠转义的双引号还原
+text = text.replace(r'\"', '\"')
 m = re.search(r'\{[^}]+\}', text)
 if not m:
-    print('bridge_diag: PARSE_ERROR (no JSON found)')
+    print('bridge_diag: PARSE_ERROR (no JSON)')
     sys.exit(0)
-s = m.group()
-d = None
 try:
-    d = json.loads(s)
-except Exception:
-    try:
-        d = ast.literal_eval(s)
-    except Exception as e:
-        print('bridge_diag: PARSE_ERROR ({})'.format(e))
-        sys.exit(0)
-if d:
+    d = json.loads(m.group())
     print('bridge_diag: mavros={} tx={} pkt={} drops={}'.format(
         d.get('mavros_connected','?'), d.get('tx_total','?'),
         d.get('pkt_count','?'), d.get('mavros_drops','?')))
+except Exception as e:
+    print('bridge_diag: PARSE_ERROR ({})'.format(e))
 " 2>/dev/null || echo "bridge_diag: PARSE_ERROR"
     fi
 }
