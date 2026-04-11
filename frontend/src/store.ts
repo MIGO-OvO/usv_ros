@@ -54,6 +54,16 @@ interface BridgeDiag {
   router_url: string
 }
 
+interface RadioStatus {
+  rssi: number
+  remrssi: number
+  noise: number
+  remnoise: number
+  rxerrors: number
+  fixed: number
+  txbuf: number
+}
+
 const MAX_HISTORY_POINTS = 150
 
 interface AppState {
@@ -72,6 +82,7 @@ interface AppState {
   logs: LogEntry[]
   mavrosState: MavrosState
   bridgeDiag: BridgeDiag | null
+  radioStatus: RadioStatus | null
 
   connect: () => void
   disconnect: () => void
@@ -104,6 +115,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   logs: [],
   mavrosState: { connected: false, armed: false, mode: '' },
   bridgeDiag: null,
+  radioStatus: null,
 
   connect: () => {
     if (get().socket) return
@@ -171,6 +183,10 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     socket.on('bridge_diagnostics', (data: BridgeDiag) => {
       set({ bridgeDiag: data })
+    })
+
+    socket.on('radio_status', (data: RadioStatus) => {
+      set({ radioStatus: data })
     })
 
     set({ socket })

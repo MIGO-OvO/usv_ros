@@ -176,12 +176,13 @@ class MissionDataManager(object):
             self.current_mission_file = None
             self.current_mission_data = []
 
-    def add_data_point(self, voltage):
-        """添加数据点。"""
+    def add_data_point(self, voltage, absorbance=0.0):
+        """添加数据点（含电压和吸光度）。"""
         if self.current_mission_file:
             point = {
                 "timestamp": datetime.now().isoformat(),
-                "voltage": voltage
+                "voltage": voltage,
+                "absorbance": absorbance
             }
             self.current_mission_data["data_points"].append(point)
             # 每 10 个点保存一次，防止数据丢失
@@ -500,6 +501,7 @@ class WebConfigServer(object):
         # ========== 通信诊断状态 ==========
         self._mavros_state = {"connected": False, "armed": False, "mode": ""}
         self._bridge_diag = {}           # 最新的桥接诊断数据
+        self._radio_status = {}          # 最新的电台链路状态
         self._diag_history = []          # 诊断历史 (最近 200 条)
         self._diag_history_max = 200
         self._link_events = []           # 链路事件日志 (最近 500 条)
@@ -516,9 +518,12 @@ class WebConfigServer(object):
                 rospy.logwarn("mavros_msgs not available, MAVROS state monitoring disabled")
             self._bridge_diag_sub = rospy.Subscriber(
                 '/usv/bridge_diagnostics', String, self._bridge_diag_cb)
+            self._radio_status_sub = rospy.Subscriber(
+                '/usv/radio_status', String, self._radio_status_cb)
         else:
             self._mavros_state_sub = None
             self._bridge_diag_sub = None
+            self._radio_status_sub = None
 
         if FLASK_AVAILABLE:
             self._setup_flask()
@@ -620,7 +625,7 @@ class WebConfigServer(object):
         self.latest_spectrometer_payload = data
 
         if self.automation_running:
-            self.data_manager.add_data_point(self.current_voltage)
+            self.data_manager.add_data_point(self.current_voltage, self.current_absorbance)
             self.voltage_history.append({
                 "timestamp": datetime.now().isoformat(),
                 "voltage": self.current_voltage,
@@ -695,6 +700,16 @@ class WebConfigServer(object):
                 self._diag_history = self._diag_history[-self._diag_history_max:]
             if self.socketio:
                 self.socketio.emit('bridge_diagnostics', data)
+        except Exception:
+            pass
+
+    def _radio_status_cb(self, msg):
+        """电台链路状态回调"""
+        try:
+            data = json.loads(msg.data)
+            self._radio_status = data
+            if self.socketio:
+                self.socketio.emit('radio_status', data)
         except Exception:
             pass
 
@@ -1011,6 +1026,70 @@ class WebConfigServer(object):
             if self.data_manager.delete_mission(mission_id):
                 return jsonify({"success": True, "message": "任务已删除"})
             return jsonify({"success": False, "message": "删除失败"}), 500
+
+        @self.app.route('/api/data/mission/<mission_id>/csv', methods=['GET'])
+        def download_mission_csv(mission_id):
+            """下载任务数据为 CSV 文件。"""
+            data = self.data_manager.get_mission(mission_id)
+            if not data:
+                return jsonify({"success": False, "message": "任务不存在"}), 404
+            import io, csv
+            output = io.StringIO()
+            writer = csv.writer(output)
+            writer.writerow(["timestamp", "voltage", "absorbance"])
+            for pt in data.get("data_points", []):
+                writer.writerow([pt.get("timestamp", ""), pt.get("voltage", ""), pt.get("absorbance", "")])
+            from flask import Response
+            return Response(
+                output.getvalue(),
+                mimetype="text/csv",
+                headers={"Content-Disposition": f"attachment; filename=mission_{mission_id}.csv"}
+            )
+
+        # ================= 系统日志 API =================
+        _LOG_WHITELIST = {"usv_system.log", "roscore.log", "mavlink_router.log"}
+
+        def _safe_log_path(filename):
+            """安全检查日志文件名（防止路径穿越）。"""
+            if not filename or '/' in filename or '\\' in filename or '..' in filename:
+                return None
+            if filename not in _LOG_WHITELIST:
+                return None
+            path = os.path.join(LOG_DIR, filename)
+            if not os.path.isfile(path):
+                return None
+            return path
+
+        @self.app.route('/api/logs/files', methods=['GET'])
+        def list_log_files():
+            """列出可查看的日志文件。"""
+            files = []
+            if os.path.isdir(LOG_DIR):
+                for name in sorted(os.listdir(LOG_DIR)):
+                    if name in _LOG_WHITELIST:
+                        path = os.path.join(LOG_DIR, name)
+                        stat = os.stat(path)
+                        files.append({
+                            "name": name,
+                            "size": stat.st_size,
+                            "modified": datetime.fromtimestamp(stat.st_mtime).isoformat(),
+                        })
+            return jsonify({"success": True, "data": files})
+
+        @self.app.route('/api/logs/<filename>', methods=['GET'])
+        def get_log_content(filename):
+            """获取日志文件最后 N 行。"""
+            path = _safe_log_path(filename)
+            if not path:
+                return jsonify({"success": False, "message": "文件不存在或不允许访问"}), 404
+            lines_count = min(int(request.args.get('lines', 100)), 2000)
+            try:
+                import collections
+                with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                    tail = collections.deque(f, maxlen=lines_count)
+                return jsonify({"success": True, "data": list(tail)})
+            except Exception as e:
+                return jsonify({"success": False, "message": str(e)}), 500
 
         # ================= 零点校准 API =================
         @self.app.route('/api/calibration/offsets', methods=['GET'])

@@ -12,7 +12,7 @@ interface LinkDiagData {
 }
 
 export function LinkDiagnosticsCard() {
-  const { mavrosState, bridgeDiag, connected } = useAppStore()
+  const { mavrosState, bridgeDiag, radioStatus, connected } = useAppStore()
   const [expanded, setExpanded] = useState(false)
   const [fullDiag, setFullDiag] = useState<LinkDiagData | null>(null)
 
@@ -103,6 +103,21 @@ export function LinkDiagnosticsCard() {
             </div>
           )}
 
+          {/* 电台链路质量 */}
+          {radioStatus && (
+            <div>
+              <h4 className="text-xs font-medium text-muted-foreground mb-1">数传电台</h4>
+              <div className="grid grid-cols-3 gap-2">
+                <RssiBar label="本地 RSSI" value={radioStatus.rssi} noise={radioStatus.noise} />
+                <RssiBar label="远端 RSSI" value={radioStatus.remrssi} noise={radioStatus.remnoise} />
+                <KV label="TX 缓冲" value={`${radioStatus.txbuf}%`} warn={radioStatus.txbuf < 30} err={radioStatus.txbuf < 10} />
+                <KV label="RX 错误" value={String(radioStatus.rxerrors)} err={radioStatus.rxerrors > 0} />
+                <KV label="已纠错" value={String(radioStatus.fixed)} />
+                <KV label="噪声底" value={`${radioStatus.noise}/${radioStatus.remnoise}`} />
+              </div>
+            </div>
+          )}
+
           {/* 导出按钮 */}
           <button
             className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground transition-colors"
@@ -128,6 +143,24 @@ function KV({ label, value, ok, warn, err }: {
         warn && "text-orange-500",
         err && "text-red-500",
       )}>{value}</span>
+    </div>
+  )
+}
+
+function RssiBar({ label, value, noise }: { label: string; value: number; noise: number }) {
+  // RSSI 0-254, signal margin = rssi - noise
+  const margin = value - noise
+  const pct = Math.min(100, Math.max(0, (margin / 60) * 100))
+  const color = margin > 25 ? 'bg-emerald-500' : margin > 10 ? 'bg-orange-500' : 'bg-red-500'
+  return (
+    <div className="flex flex-col gap-0.5">
+      <div className="flex justify-between text-muted-foreground">
+        <span>{label}</span>
+        <span className="font-medium tabular-nums">{value}</span>
+      </div>
+      <div className="h-1.5 rounded-full bg-muted overflow-hidden">
+        <div className={cn("h-full rounded-full transition-all", color)} style={{ width: `${pct}%` }} />
+      </div>
     </div>
   )
 }

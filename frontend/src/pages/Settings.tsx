@@ -9,6 +9,7 @@ import { cn } from '@/lib/utils'
 import { useAppStore } from '@/store'
 import { toast } from '@/hooks/use-toast'
 import { useConfirm } from '@/hooks/use-confirm'
+import { SystemLogViewer } from '@/components/system-log-viewer'
 
 interface SerialPort {
   path: string
@@ -382,6 +383,10 @@ export default function Settings() {
           </div>
         </CardContent>
       </Card>
+    </div>
+
+      {/* 系统日志 */}
+      <SystemLogViewer />
     </div>
   )
 }
