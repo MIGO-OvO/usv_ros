@@ -36,7 +36,7 @@
     <arg name="auto_trigger_on_waypoint" default="true" />
     <arg name="trigger_waypoints" default="[]" />
     <arg name="enable_mavros" default="true" />
-    <arg name="mavros_fcu_url" default="tcp://127.0.0.1:5760" />
+    <arg name="mavros_fcu_url" default="udp://127.0.0.1:14550@" />
     <arg name="mavros_gcs_url" default="" />
     <arg name="mavros_tgt_system" default="1" />
     <arg name="mavros_tgt_component" default="1" />
