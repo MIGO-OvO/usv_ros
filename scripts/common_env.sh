@@ -92,6 +92,17 @@ is_pid_running() {
     [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1
 }
 
+# 校验 PID 对应的进程命令行是否包含预期关键字
+# 用法: is_pid_owned_by "12345" "roscore"
+is_pid_owned_by() {
+    local pid="$1"
+    local expect="$2"
+    if [[ ! -f "/proc/$pid/cmdline" ]]; then
+        return 1
+    fi
+    tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -qi "$expect"
+}
+
 stop_pid_file() {
     local pid_file="$1"
     local process_name="$2"
@@ -103,6 +114,12 @@ stop_pid_file() {
     local pid
     pid="$(cat "$pid_file")"
     if is_pid_running "$pid"; then
+        # 安全校验：确认 PID 仍属于目标进程，防止残留 PID 文件误杀无关进程
+        if ! is_pid_owned_by "$pid" "$process_name"; then
+            log "警告: pid=$pid 非 $process_name 进程，跳过 kill 并清理残留 PID 文件"
+            rm -f "$pid_file"
+            return 0
+        fi
         log "停止 $process_name (pid=$pid)"
         kill "$pid"
         for _ in {1..20}; do
@@ -127,15 +144,26 @@ cleanup_port_process() {
         local pids
         pids="$(lsof -ti tcp:"$port" 2>/dev/null || true)"
         if [[ -n "$pids" ]]; then
-            log "清理占用端口 $port 的旧进程: $pids"
-            kill $pids >/dev/null 2>&1 || true
-            sleep 1
+            # 安全过滤：只杀 USV 相关进程（python/roslaunch/roscore/mavlink），不误杀 ssh/vscode
+            local safe_pids=()
             for pid in $pids; do
-                if is_pid_running "$pid"; then
-                    log "端口 $port 进程未退出，强制停止 pid=$pid"
-                    kill -9 "$pid" >/dev/null 2>&1 || true
+                if is_pid_owned_by "$pid" "python\|roslaunch\|roscore\|mavlink"; then
+                    safe_pids+=("$pid")
+                else
+                    log "跳过端口 $port 上的非 USV 进程 pid=$pid"
                 fi
             done
+            if [[ ${#safe_pids[@]} -gt 0 ]]; then
+                log "清理占用端口 $port 的 USV 进程: ${safe_pids[*]}"
+                kill "${safe_pids[@]}" >/dev/null 2>&1 || true
+                sleep 1
+                for pid in "${safe_pids[@]}"; do
+                    if is_pid_running "$pid"; then
+                        log "端口 $port 进程未退出，强制停止 pid=$pid"
+                        kill -9 "$pid" >/dev/null 2>&1 || true
+                    fi
+                done
+            fi
         fi
     fi
 }

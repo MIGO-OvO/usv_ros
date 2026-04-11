@@ -139,7 +139,7 @@ class MAVLinkTriggerNode(object):
         self.is_sampling = False
         self._publish_status("sampling_stopped")
         rospy.sleep(1.0)
-        self.set_mode("AUTO")
+        self._resume_auto_if_mission_exists()
 
     def _pump_status_cb(self, msg):
         data = msg.data.lower()
@@ -374,9 +374,8 @@ class MAVLinkTriggerNode(object):
         self.is_sampling = False
         self._publish_status("sampling_stopped")
 
-        # 恢复 AUTO 模式
         rospy.sleep(1.0)
-        self.set_mode("AUTO")
+        self._resume_auto_if_mission_exists()
 
     def _pause_sampling(self):
         """暂停采样。"""
@@ -387,6 +386,23 @@ class MAVLinkTriggerNode(object):
         """恢复采样。"""
         self._call_automation_service('resume')
         self._publish_status("sampling_resumed")
+
+    def _resume_auto_if_mission_exists(self):
+        """检查飞控是否有航点任务，有则切 AUTO，无则保持 HOLD。"""
+        try:
+            from mavros_msgs.srv import WaypointPull
+            rospy.wait_for_service('/mavros/mission/pull', timeout=3.0)
+            pull_srv = rospy.ServiceProxy('/mavros/mission/pull', WaypointPull)
+            resp = pull_srv()
+            if resp.success and resp.wp_received > 0:
+                rospy.loginfo("Mission has %d waypoints, resuming AUTO", resp.wp_received)
+                self.set_mode("AUTO")
+            else:
+                rospy.loginfo("No mission loaded, staying in HOLD")
+                self._publish_status("hold_no_mission")
+        except Exception as e:
+            rospy.logwarn("Cannot check mission, staying in HOLD: %s", str(e))
+            self._publish_status("hold_no_mission")
 
     def _call_automation_service(self, action):
         """调用自动化服务。"""

@@ -158,33 +158,41 @@ print_ros_nodes() {
         echo "mavros_link: DISCONNECTED (飞控未连通)"
     fi
 
+    # MAVROS 参数下载状态
+    local recent_log
+    recent_log="$(tail -10 "$LOG_DIR/usv_system.log" 2>/dev/null || true)"
+    if echo "$recent_log" | grep -q "params still missing"; then
+        local missing_count
+        missing_count="$(echo "$recent_log" | grep -o '[0-9]* params still missing' | tail -1 | grep -o '^[0-9]*')"
+        echo "mavros_params: DOWNLOADING (${missing_count:-?} params still missing)"
+    elif echo "$recent_log" | grep -q "Got all params"; then
+        echo "mavros_params: OK"
+    else
+        echo "mavros_params: OK"
+    fi
+
     # Bridge 诊断摘要
     local bridge_diag
     bridge_diag="$(timeout "$DIAG_CHECK_TIMEOUT" rostopic echo -n 1 /usv/bridge_diagnostics 2>/dev/null || true)"
     if [[ -z "$bridge_diag" ]]; then
         echo "bridge_diag: UNKNOWN (超时未响应)"
     else
-        # rostopic echo 输出 std_msgs/String 格式为:
-        #   data: "{\"key\": value, ...}"
-        # 含反斜杠转义和 YAML 续行。先清理再解析。
+        # 从 rostopic 输出中提取 JSON 并解析关键字段
         echo "$bridge_diag" | python3 -c "
 import sys, json, re
 text = sys.stdin.read()
-# 去除 YAML 续行（反斜杠+换行+空格）合并为单行
-text = re.sub(r'\\\\\n\s*', '', text)
-# 反斜杠转义的双引号还原
-text = text.replace(r'\"', '\"')
+# 在整个输出中找第一个 {...} JSON 对象
 m = re.search(r'\{[^}]+\}', text)
 if not m:
-    print('bridge_diag: PARSE_ERROR (no JSON)')
-    sys.exit(0)
-try:
-    d = json.loads(m.group())
-    print('bridge_diag: mavros={} tx={} pkt={} drops={}'.format(
-        d.get('mavros_connected','?'), d.get('tx_total','?'),
-        d.get('pkt_count','?'), d.get('mavros_drops','?')))
-except Exception as e:
-    print('bridge_diag: PARSE_ERROR ({})'.format(e))
+    print('bridge_diag: PARSE_ERROR (no JSON found)')
+else:
+    try:
+        d = json.loads(m.group())
+        print('bridge_diag: mavros={} tx={} pkt={} drops={}'.format(
+            d.get('mavros_connected','?'), d.get('tx_total','?'),
+            d.get('pkt_count','?'), d.get('mavros_drops','?')))
+    except Exception as e:
+        print('bridge_diag: PARSE_ERROR ({})'.format(e))
 " 2>/dev/null || echo "bridge_diag: PARSE_ERROR"
     fi
 }
