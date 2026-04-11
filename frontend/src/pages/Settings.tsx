@@ -383,7 +383,6 @@ export default function Settings() {
           </div>
         </CardContent>
       </Card>
-    </div>
 
       {/* 系统日志 */}
       <SystemLogViewer />
