@@ -51,6 +51,11 @@ class USVMavlinkRouterBridge(object):
         self._diag_tx_named = 0        # NAMED_VALUE_FLOAT 包数
         self._diag_pub_errors = 0      # 发布错误数
         self._diag_mavros_drops = 0    # MAVROS 断连计数
+        # pymavlink TCP 连接非线程安全：
+        # ROS 回调线程不直接操作 self._conn，只把待发送项入队，
+        # 由 run() 主循环统一发送，避免点击采样后桥接卡死。
+        self._pending_statustexts = []   # [(text, severity), ...]
+        self._pending_acks = []          # [(command, result, target_sys, target_comp), ...]
         self._cmd_rx_pub = rospy.Publisher("/usv/mavlink_cmd_rx", Float32MultiArray, queue_size=5)
         self._radio_status_pub = rospy.Publisher("/usv/radio_status", String, queue_size=5)
         rospy.Subscriber("/usv/mavlink_cmd_ack", Float32MultiArray, self._cmd_ack_cb)
@@ -117,16 +122,16 @@ class USVMavlinkRouterBridge(object):
         with self._lock:
             if "sampling_started" in data:
                 self._status_code = 1
-                self._send_statustext("USV: Sampling Started", mavutil.mavlink.MAV_SEVERITY_NOTICE)
+                self._pending_statustexts.append(("USV: Sampling Started", mavutil.mavlink.MAV_SEVERITY_NOTICE))
             elif "sampling_stopped" in data:
                 self._status_code = 0
-                self._send_statustext("USV: Sampling Completed", mavutil.mavlink.MAV_SEVERITY_NOTICE)
+                self._pending_statustexts.append(("USV: Sampling Completed", mavutil.mavlink.MAV_SEVERITY_NOTICE))
             elif "sampling_paused" in data:
                 self._status_code = 1
-                self._send_statustext("USV: Sampling Paused", mavutil.mavlink.MAV_SEVERITY_NOTICE)
+                self._pending_statustexts.append(("USV: Sampling Paused", mavutil.mavlink.MAV_SEVERITY_NOTICE))
             elif "calibrate" in data:
                 self._status_code = 4
-                self._send_statustext("USV: Calibrating", mavutil.mavlink.MAV_SEVERITY_NOTICE)
+                self._pending_statustexts.append(("USV: Calibrating", mavutil.mavlink.MAV_SEVERITY_NOTICE))
 
     def _mavros_state_cb(self, msg):
         was_connected = self._mavros_connected
@@ -138,16 +143,15 @@ class USVMavlinkRouterBridge(object):
     def _cmd_ack_cb(self, msg):
         try:
             command, result, target_sys, target_comp = msg.data
-            self._conn.mav.command_ack_send(
-                int(command),
-                int(result),
-                0xFF,  # progress not supported
-                0,     # result_param2
-                int(target_sys),
-                int(target_comp)
-            )
+            with self._lock:
+                self._pending_acks.append((
+                    int(command),
+                    int(result),
+                    int(target_sys),
+                    int(target_comp),
+                ))
         except Exception as exc:
-            rospy.logwarn("Failed to send COMMAND_ACK: %s", str(exc))
+            rospy.logwarn("Failed to queue COMMAND_ACK: %s", str(exc))
 
     def _send_statustext(self, text, severity):
         try:
@@ -158,6 +162,23 @@ class USVMavlinkRouterBridge(object):
             with self._lock:
                 self._diag_pub_errors += 1
             rospy.logwarn("Failed to send STATUSTEXT: %s", str(exc))
+
+    def _send_command_ack(self, command, result, target_sys, target_comp):
+        try:
+            self._conn.mav.command_ack_send(
+                int(command),
+                int(result),
+                0xFF,
+                0,
+                int(target_sys),
+                int(target_comp)
+            )
+            with self._lock:
+                self._diag_tx_total += 1
+        except Exception as exc:
+            with self._lock:
+                self._diag_pub_errors += 1
+            rospy.logwarn("Failed to send COMMAND_ACK: %s", str(exc))
 
     def _receive_mavlink_messages(self):
         """接收 QGC 发来的 COMMAND_LONG，并兼容转发到旧内部总线。"""
@@ -294,13 +315,22 @@ class USVMavlinkRouterBridge(object):
 
             # 载荷遥测始终发送：bridge 通过 pymavlink 直连 router TCP，
             # 不依赖 MAVROS 连接状态。MAVROS 状态仅影响诊断统计。
-            # 若绑定 _mavros_connected，set_mode 等 MAVROS 服务调用期间
-            # 会导致遥测暂停 → 飞控 3s 超时停转发 → QGC 判定离线。
+            # 回调线程只入队，所有 socket 发送都在本主循环执行。
             with self._lock:
                 voltage = self._voltage
                 absorbance = self._absorbance
                 angles = self._pump_angles.copy()
                 status = self._status_code
+                pending_st = list(self._pending_statustexts)
+                self._pending_statustexts.clear()
+                pending_ack = list(self._pending_acks)
+                self._pending_acks.clear()
+
+            for text, severity in pending_st:
+                self._send_statustext(text, severity)
+            for command, result, target_sys, target_comp in pending_ack:
+                self._send_command_ack(command, result, target_sys, target_comp)
+
             self._send_payload(voltage, absorbance, angles, status)
 
             if now - self._diag_last_report >= DIAG_REPORT_INTERVAL:
