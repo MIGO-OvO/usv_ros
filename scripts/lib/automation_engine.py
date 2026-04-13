@@ -73,6 +73,10 @@ class AutomationEngine(object):
         self._pending_pid_motors = set()
         self._pid_mode_enabled = False
 
+        # 错误状态
+        self._failed = False
+        self._last_error = None
+
         # 回调函数
         self.on_status_update = None   # func(str)
         self.on_progress_update = None  # func(int) 0-100
@@ -146,6 +150,10 @@ class AutomationEngine(object):
         self._current_loop = 1
         self._running.set()
         self._paused.clear()
+        self._pending_pid_motors.clear()
+        self._pid_complete_event.clear()
+        self._failed = False
+        self._last_error = None
 
         # 重置指令生成器
         self.command_generator.reset_for_auto_mode()
@@ -229,10 +237,13 @@ class AutomationEngine(object):
         """执行线程主循环。"""
         try:
             while self._running.is_set() and self._should_continue():
-                if not self._running.is_set():
+                if not self._running.is_set() or self._failed:
                     break
 
-                self._execute_loop()
+                loop_ok = self._execute_loop()
+                if not loop_ok:
+                    self._running.clear()
+                    break
 
         except Exception as e:
             self._handle_error("执行错误: {}".format(str(e)))
@@ -254,8 +265,8 @@ class AutomationEngine(object):
         self._update_progress(0)
 
         for step_idx, step in enumerate(self.steps):
-            if not self._running.is_set():
-                break
+            if not self._running.is_set() or self._failed:
+                return False
 
             # 处理暂停
             self._wait_if_paused()
@@ -266,11 +277,11 @@ class AutomationEngine(object):
 
             # 发送步骤指令
             if not self._send_step_command(step):
-                break
+                return False
 
             # 步骤执行完成等待
             if not self._wait_for_step_execution(step):
-                break
+                return False
 
             # 步骤完成回调
             if self.on_step_complete:
@@ -279,8 +290,11 @@ class AutomationEngine(object):
             # 等待间隔（在步骤完成后开始计时）
             interval_ms = step.get("interval", 0)
             self._wait_interval(interval_ms)
+            if not self._running.is_set() or self._failed:
+                return False
 
         self._current_loop += 1
+        return True
 
     def _wait_if_paused(self):
         """如果暂停则等待。"""
@@ -446,7 +460,10 @@ class AutomationEngine(object):
         except Exception:
             pass
 
-        self._update_status("finished")
+        if self._failed and self._last_error:
+            self._update_status("failed")
+        else:
+            self._update_status("finished")
 
     def _update_status(self, status):
         """更新状态。"""
@@ -460,6 +477,9 @@ class AutomationEngine(object):
 
     def _handle_error(self, message):
         """处理错误。"""
+        self._failed = True
+        self._last_error = message
+        self._running.clear()
         self.log("错误: {}".format(message))
         if self.on_error:
             self.on_error(message)

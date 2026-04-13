@@ -376,6 +376,9 @@ class PumpControlNode(object):
         self.automation_engine.on_step_command = self._send_automation_step
         self.automation_engine.on_step_wait = self._wait_for_automation_step
 
+        # 自动化诊断上下文
+        self._current_auto_step = None
+
         # 当前角度状态
         self.current_angles = {m: 0.0 for m in MOTOR_NAMES}
         self.angles_lock = threading.Lock()
@@ -735,6 +738,7 @@ class PumpControlNode(object):
 
     def _send_automation_step(self, step):
         """自动化引擎步骤发送钩子。"""
+        self._current_auto_step = dict(step or {})
         step_name = step.get("name", "未命名步骤")
         enabled_motors = []
         for motor in MOTOR_NAMES:
@@ -1290,6 +1294,27 @@ class PumpControlNode(object):
 
     def _on_automation_error(self, error):
         """自动化错误回调。"""
+        if "PID 等待超时" in error and self._current_auto_step:
+            step = self._current_auto_step
+            step_name = step.get("name", "未命名步骤")
+            diag_parts = []
+            for motor in sorted(self.automation_engine.get_status().get("pending_motors", [])):
+                target = self.pid_target_angles.get(motor)
+                current = self.current_angles.get(motor)
+                if target is None:
+                    target = self.command_generator.get_expected_angles().get(motor)
+                diag_parts.append(
+                    "%s(current=%s,target=%s,threshold=%.3f)" % (
+                        motor,
+                        "--" if current is None else "%.3f" % current,
+                        "--" if target is None else "%.3f" % target,
+                        self.pid_precision_threshold,
+                    )
+                )
+            rospy.logerr("[Automation] PID 超时详情: step=%s loop=%s pending=%s",
+                         step_name,
+                         self.automation_engine.get_status().get("current_loop"),
+                         ", ".join(diag_parts) if diag_parts else "none")
         rospy.logerr("[Automation] 错误: %s", error)
         self._publish_status("error: " + error)
 
