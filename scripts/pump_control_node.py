@@ -943,7 +943,11 @@ class PumpControlNode(object):
 
     def _on_text_received(self, text):
         """文本响应回调。"""
-        rospy.logdebug("MCU: %s", text)
+        # 自动化运行时提升日志级别，便于排查 PID_DONE 等固件消息
+        if self.automation_engine.is_running():
+            rospy.loginfo("MCU text: %s", text)
+        else:
+            rospy.logdebug("MCU: %s", text)
 
         if self._parse_injection_pump_text(text):
             return

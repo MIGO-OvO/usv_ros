@@ -376,13 +376,24 @@ class AutomationEngine(object):
             bool: True 表示完成，False 表示超时或中断
         """
         start_time = time.time()
+        last_log_time = start_time
+
+        self.log("等待 PID 完成: {}".format(self._pending_pid_motors))
 
         while self._running.is_set() and self._pending_pid_motors:
             # 检查暂停
             self._wait_if_paused()
 
+            elapsed = time.time() - start_time
+
+            # 每 10 秒打一次等待状态
+            if time.time() - last_log_time >= 10:
+                self.log("仍在等待 PID 完成 ({:.0f}s): 待完成={}".format(
+                    elapsed, self._pending_pid_motors))
+                last_log_time = time.time()
+
             # 检查超时
-            if time.time() - start_time > self.PID_WAIT_TIMEOUT:
+            if elapsed > self.PID_WAIT_TIMEOUT:
                 self._handle_error(
                     "PID 等待超时 ({:.0f}s)，未完成电机: {}".format(
                         self.PID_WAIT_TIMEOUT, self._pending_pid_motors
