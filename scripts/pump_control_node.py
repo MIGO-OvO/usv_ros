@@ -921,8 +921,10 @@ class PumpControlNode(object):
         msg.data = ",".join(parts)
         self.angles_pub.publish(msg)
 
-        # 检查 PID 完成
-        self._check_pid_complete(angles)
+        # 手动模式下的 PID 完成检查（仅用于 UI 反馈）
+        # 自动化模式下 PID 完成由固件 PID_DONE/PID_TIMEOUT/PID_FAIL 文本消息驱动
+        if not self.automation_engine.is_running():
+            self._check_pid_complete_manual(angles)
 
     def _on_pid_data_received(self, data):
         """PID 数据回调。"""
@@ -983,11 +985,47 @@ class PumpControlNode(object):
             self._publish_status("angle_stream_stopped")
             return
 
-        # 检查 PID 完成消息
+        # 检查 PID 完成/超时/失败消息（固件是 PID 完成的唯一权威来源）
         if text.startswith("PID_DONE:"):
-            motor = text.split(":")[1] if ":" in text else ""
-            if motor in MOTOR_NAMES:
-                self._notify_pid_complete(motor)
+            # 格式: PID_DONE:X,abs=360.0,err=0.05
+            try:
+                info = text.replace("PID_DONE:", "")
+                parts = info.split(",")
+                motor = parts[0].strip()
+                if motor in MOTOR_NAMES:
+                    rospy.loginfo("[PID] 固件确认完成: %s", info)
+                    self._notify_pid_complete(motor)
+            except Exception as e:
+                rospy.logwarn("[PID] 解析 PID_DONE 失败: %s (%s)", text, e)
+            return
+
+        if text.startswith("PID_TIMEOUT:"):
+            # 格式: PID_TIMEOUT:X,abs=360.0,err=5.0
+            try:
+                info = text.replace("PID_TIMEOUT:", "")
+                parts = info.split(",")
+                motor = parts[0].strip()
+                if motor in MOTOR_NAMES:
+                    rospy.logwarn("[PID] 固件报告超时: %s", info)
+                    self._notify_pid_complete(motor)
+            except Exception as e:
+                rospy.logwarn("[PID] 解析 PID_TIMEOUT 失败: %s (%s)", text, e)
+            return
+
+        if text.startswith("PID_FAIL:"):
+            try:
+                info = text.replace("PID_FAIL:", "")
+                motor = info.split("=")[0].strip() if "=" in info else info.strip()
+                if motor in MOTOR_NAMES:
+                    rospy.logerr("[PID] 固件报告失败: %s", info)
+                    self._notify_pid_complete(motor)
+            except Exception as e:
+                rospy.logwarn("[PID] 解析 PID_FAIL 失败: %s (%s)", text, e)
+            return
+
+        if text.startswith("PID_STOP"):
+            rospy.loginfo("[PID] 固件已停止 PID")
+            return
 
     def _publish_spectro_config_snapshot(self):
         msg = String()
@@ -999,18 +1037,24 @@ class PumpControlNode(object):
         })
         self.spectro_raw_pub.publish(msg)
 
-    def _check_pid_complete(self, angles):
-        """检查 PID 是否完成 (基于角度误差)。"""
+    def _check_pid_complete_manual(self, angles):
+        """手动模式下的 PID 完成检查（仅用于 UI/话题反馈，不驱动自动化引擎）。
+        自动化模式下 PID 完成由固件 PID_DONE 文本消息驱动，
+        因为固件使用增量角度（连续累积角度坐标系），能正确判定 360° 等整圈旋转。
+        """
         for motor, target in list(self.pid_target_angles.items()):
             if target is None:
                 continue
             current = angles.get(motor, 0.0)
             error = abs(current - target)
-            # 处理 360° 边界
             if error > 180:
                 error = 360 - error
             if error <= self.pid_precision_threshold:
-                self._notify_pid_complete(motor)
+                # 仅发布完成话题，不通知自动化引擎
+                msg = String()
+                msg.data = motor
+                self.pid_complete_pub.publish(msg)
+                rospy.loginfo("PID complete (manual): %s", motor)
                 del self.pid_target_angles[motor]
 
     def _notify_pid_complete(self, motor):
