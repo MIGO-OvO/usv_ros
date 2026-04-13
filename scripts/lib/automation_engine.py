@@ -275,6 +275,16 @@ class AutomationEngine(object):
             progress = int((step_idx + 1) / len(self.steps) * 100)
             self._update_progress(progress)
 
+            # PID 模式：在发送指令之前就设好 pending_pid_motors，
+            # 避免指令发出后 PID 立刻完成（竞态），而 pending 还没设好导致永远等不到。
+            if self._pid_mode_enabled:
+                pid_motors = self._get_step_active_motors(step)
+                if pid_motors:
+                    self._pending_pid_motors = pid_motors.copy()
+                    self._pid_complete_event.clear()
+                else:
+                    self._pending_pid_motors.clear()
+
             # 发送步骤指令
             if not self._send_step_command(step):
                 return False
@@ -389,10 +399,8 @@ class AutomationEngine(object):
     def _wait_for_step_execution(self, step):
         """等待步骤执行完成，再进入 interval 计时。"""
         if self._pid_mode_enabled:
-            pid_motors = self._get_step_active_motors(step)
-            if pid_motors:
-                self._pending_pid_motors = pid_motors.copy()
-                self._pid_complete_event.clear()
+            # _pending_pid_motors 已在发送指令前设好（避免竞态）
+            if self._pending_pid_motors:
                 if not self._wait_for_pid_complete():
                     if self._running.is_set():
                         self._update_status("PID wait timeout")
