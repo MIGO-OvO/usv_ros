@@ -42,6 +42,11 @@ class USVMavlinkRouterBridge(object):
         self._status_code = 0
         self._mavros_connected = False
         self._pkt_count = 0
+        self._automation_step = 0.0
+        self._automation_total = 0.0
+        self._sample_count = 0.0
+        self._pid_error = 0.0
+        self._pid_mode = 0.0
         self._boot_time = time.time()
         self._last_heartbeat = 0.0
         self._diag_last_report = time.time()
@@ -63,6 +68,7 @@ class USVMavlinkRouterBridge(object):
         rospy.Subscriber("/usv/pump_angles", String, self._angles_cb)
         rospy.Subscriber("/usv/pump_status", String, self._pump_status_cb)
         rospy.Subscriber("/usv/trigger_status", String, self._trigger_status_cb)
+        rospy.Subscriber("/usv/pump_pid_error", String, self._pid_error_cb)
         rospy.Subscriber("/mavros/state", State, self._mavros_state_cb, queue_size=5)
         rospy.loginfo("USV Router Bridge: sysid=%d compid=%d router=%s", self._sys_id, self._comp_id, self._router_url)
         self._conn = mavutil.mavlink_connection(
@@ -102,19 +108,37 @@ class USVMavlinkRouterBridge(object):
             rospy.logwarn_throttle(10, "parse pump angles: %s", str(exc))
 
     def _pump_status_cb(self, msg):
-        data = msg.data.lower()
+        try:
+            data_dict = json.loads(msg.data)
+        except Exception:
+            data_dict = {}
+        
+        data_str = msg.data.lower()
         with self._lock:
-            if "automation: running" in data or "automation: step" in data:
+            if isinstance(data_dict, dict):
+                self._automation_step = float(data_dict.get("automation_step", 0.0) or 0.0)
+                self._automation_total = float(data_dict.get("automation_total", 0.0) or 0.0)
+                pid_mode_str = str(data_dict.get("pid_mode", "idle")).lower()
+                if "running" in pid_mode_str:
+                    self._pid_mode = 1.0
+                elif "done" in pid_mode_str:
+                    self._pid_mode = 2.0
+                elif "error" in pid_mode_str:
+                    self._pid_mode = 3.0
+                else:
+                    self._pid_mode = 0.0
+            
+            if "automation: running" in data_str or "automation: step" in data_str:
                 self._status_code = 1
-            elif "automation: paused" in data or "sampling_paused" in data:
+            elif "automation: paused" in data_str or "sampling_paused" in data_str:
                 self._status_code = 2
-            elif "automation: finished" in data or "automation: stopped" in data or "sampling_stopped" in data:
+            elif "automation: finished" in data_str or "automation: stopped" in data_str or "sampling_stopped" in data_str:
                 self._status_code = 0
-            elif "sampling_started" in data:
+            elif "sampling_started" in data_str:
                 self._status_code = 1
-            elif "calibrate" in data:
+            elif "calibrate" in data_str:
                 self._status_code = 4
-            elif "error" in data:
+            elif "error" in data_str:
                 self._status_code = 3
 
     def _trigger_status_cb(self, msg):
@@ -122,6 +146,7 @@ class USVMavlinkRouterBridge(object):
         with self._lock:
             if "sampling_started" in data:
                 self._status_code = 1
+                self._sample_count = (self._sample_count + 1) % 65536
                 self._pending_statustexts.append(("USV: Sampling Started", mavutil.mavlink.MAV_SEVERITY_NOTICE))
             elif "sampling_stopped" in data:
                 self._status_code = 0
@@ -132,6 +157,14 @@ class USVMavlinkRouterBridge(object):
             elif "calibrate" in data:
                 self._status_code = 4
                 self._pending_statustexts.append(("USV: Calibrating", mavutil.mavlink.MAV_SEVERITY_NOTICE))
+
+    def _pid_error_cb(self, msg):
+        try:
+            data = json.loads(msg.data)
+            with self._lock:
+                self._pid_error = float(data.get("error", 0.0) or 0.0)
+        except Exception:
+            pass
 
     def _mavros_state_cb(self, msg):
         was_connected = self._mavros_connected
@@ -282,7 +315,7 @@ class USVMavlinkRouterBridge(object):
                 self._diag_pub_errors += 1
             rospy.logwarn("Failed to send HEARTBEAT: %s", str(exc))
 
-    def _send_payload(self, voltage, absorbance, angles, status):
+    def _send_payload(self, voltage, absorbance, angles, status, automation_step, automation_total, sample_count, pid_error, pid_mode):
         t = int((time.time() - self._boot_time) * 1000) & 0xFFFFFFFF
         try:
             self._conn.mav.named_value_float_send(t, b"USV_VOLT\x00\x00", voltage)
@@ -293,10 +326,15 @@ class USVMavlinkRouterBridge(object):
             self._conn.mav.named_value_float_send(t, b"PUMP_A\x00\x00\x00\x00", angles["A"])
             self._conn.mav.named_value_float_send(t, b"USV_STAT\x00\x00", float(status))
             self._conn.mav.named_value_float_send(t, b"USV_PKT\x00\x00\x00", float(self._pkt_count))
+            self._conn.mav.named_value_float_send(t, b"USV_STEP\x00\x00", automation_step)
+            self._conn.mav.named_value_float_send(t, b"USV_STOT\x00\x00", automation_total)
+            self._conn.mav.named_value_float_send(t, b"USV_SCNT\x00\x00", sample_count)
+            self._conn.mav.named_value_float_send(t, b"USV_PERR\x00\x00", pid_error)
+            self._conn.mav.named_value_float_send(t, b"USV_PMOD\x00\x00", pid_mode)
             self._pkt_count = (self._pkt_count + 1) % 65536
             with self._lock:
-                self._diag_tx_total += 8
-                self._diag_tx_named += 8
+                self._diag_tx_total += 13
+                self._diag_tx_named += 13
         except Exception as exc:
             with self._lock:
                 self._diag_pub_errors += 1
@@ -321,6 +359,11 @@ class USVMavlinkRouterBridge(object):
                 absorbance = self._absorbance
                 angles = self._pump_angles.copy()
                 status = self._status_code
+                automation_step = self._automation_step
+                automation_total = self._automation_total
+                sample_count = self._sample_count
+                pid_error = self._pid_error
+                pid_mode = self._pid_mode
                 pending_st = list(self._pending_statustexts)
                 self._pending_statustexts.clear()
                 pending_ack = list(self._pending_acks)
@@ -331,7 +374,7 @@ class USVMavlinkRouterBridge(object):
             for command, result, target_sys, target_comp in pending_ack:
                 self._send_command_ack(command, result, target_sys, target_comp)
 
-            self._send_payload(voltage, absorbance, angles, status)
+            self._send_payload(voltage, absorbance, angles, status, automation_step, automation_total, sample_count, pid_error, pid_mode)
 
             if now - self._diag_last_report >= DIAG_REPORT_INTERVAL:
                 self._publish_diagnostics()
