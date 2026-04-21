@@ -68,6 +68,7 @@ class USVMavlinkRouterBridge(object):
         rospy.Subscriber("/usv/pump_angles", String, self._angles_cb)
         rospy.Subscriber("/usv/pump_status", String, self._pump_status_cb)
         rospy.Subscriber("/usv/trigger_status", String, self._trigger_status_cb)
+        rospy.Subscriber("/usv/mission_status", String, self._mission_status_cb)
         rospy.Subscriber("/usv/pump_pid_error", String, self._pid_error_cb)
         rospy.Subscriber("/mavros/state", State, self._mavros_state_cb, queue_size=5)
         rospy.loginfo("USV Router Bridge: sysid=%d compid=%d router=%s", self._sys_id, self._comp_id, self._router_url)
@@ -157,6 +158,24 @@ class USVMavlinkRouterBridge(object):
             elif "calibrate" in data:
                 self._status_code = 4
                 self._pending_statustexts.append(("USV: Calibrating", mavutil.mavlink.MAV_SEVERITY_NOTICE))
+
+    # 任务阶段 → USV_STAT 扩展编码映射
+    _MISSION_STATE_CODES = {
+        "IDLE": 0, "NAVIGATING": 5, "WAYPOINT_REACHED": 6,
+        "HOLDING": 7, "WAITING_STABLE": 8, "SAMPLING": 1,
+        "SAMPLING_DONE": 9, "RESUMING_AUTO": 10,
+        "HOLD_NO_MISSION": 13, "FAILED": 3, "PAUSED": 11,
+        "ABORTED": 12, "DETECTING": 2, "CALIBRATING": 4,
+    }
+
+    def _mission_status_cb(self, msg):
+        """从 /usv/mission_status 解析阶段并更新 USV_STAT 编码。"""
+        raw = (msg.data or "").strip()
+        state = raw.split(":")[0].upper() if raw else "IDLE"
+        code = self._MISSION_STATE_CODES.get(state)
+        if code is not None:
+            with self._lock:
+                self._status_code = code
 
     def _pid_error_cb(self, msg):
         try:
