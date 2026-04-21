@@ -985,35 +985,23 @@ class WebConfigServer(object):
 
         @self.app.route('/api/waypoint-sampling/sync', methods=['POST'])
         def sync_waypoint_sampling_from_mavros():
-            """从 MAVROS 拉取飞控 Mission 航点列表，为缺失的 seq 自动补充默认采样配置。"""
+            """从 MAVROS 拉取飞控 Mission 航点数量，自动补充默认采样配置。"""
             if self.standalone:
                 return jsonify({"success": False, "message": "独立模式不支持飞控同步"}), 400
             try:
                 from mavros_msgs.srv import WaypointPull
-                from mavros_msgs.msg import Waypoint
                 rospy.wait_for_service('/mavros/mission/pull', timeout=5.0)
                 pull_srv = rospy.ServiceProxy('/mavros/mission/pull', WaypointPull)
                 resp = pull_srv()
                 if not resp.success:
                     return jsonify({"success": False, "message": "拉取航点失败"}), 500
 
-                # 读取当前航点列表
-                wp_list_topic = '/mavros/mission/waypoints'
-                try:
-                    from mavros_msgs.msg import WaypointList
-                    wp_msg = rospy.wait_for_message(wp_list_topic, WaypointList, timeout=5.0)
-                    waypoints = wp_msg.waypoints
-                except Exception as e:
-                    return jsonify({"success": False, "message": "读取航点列表超时: %s" % str(e)}), 500
+                wp_count = resp.wp_received
+                if wp_count <= 0:
+                    return jsonify({"success": True, "message": "飞控中无航点", "data": {}, "synced": 0})
 
-                # 筛选 NAV_WAYPOINT (cmd=16) 类型的航点
-                nav_seqs = []
-                for wp in waypoints:
-                    if wp.command == 16:  # MAV_CMD_NAV_WAYPOINT
-                        nav_seqs.append(wp.seq)
-
-                if not nav_seqs:
-                    return jsonify({"success": True, "message": "飞控中无导航航点", "data": {}, "synced": 0})
+                # 生成 0 ~ wp_count-1 的 seq 列表
+                nav_seqs = list(range(wp_count))
 
                 config = self.config_manager.get()
                 wp_cfg = dict(config.get('waypoint_sampling', {}))

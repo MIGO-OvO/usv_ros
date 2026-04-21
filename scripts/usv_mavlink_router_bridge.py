@@ -99,14 +99,21 @@ class USVMavlinkRouterBridge(object):
 
     def _angles_cb(self, msg):
         try:
-            parts = msg.data.split(",")
-            with self._lock:
-                for part in parts:
+            data = json.loads(msg.data)
+        except (ValueError, TypeError):
+            # 兼容旧的 "X:1.23,Y:4.56" 格式
+            data = {}
+            try:
+                for part in msg.data.split(","):
                     kv = part.split(":")
-                    if len(kv) == 2 and kv[0] in self._pump_angles:
-                        self._pump_angles[kv[0]] = float(kv[1])
-        except Exception as exc:
-            rospy.logwarn_throttle(10, "parse pump angles: %s", str(exc))
+                    if len(kv) == 2:
+                        data[kv[0].strip()] = float(kv[1])
+            except Exception:
+                pass
+        with self._lock:
+            for motor in ("X", "Y", "Z", "A"):
+                if motor in data:
+                    self._pump_angles[motor] = float(data[motor])
 
     def _pump_status_cb(self, msg):
         try:
