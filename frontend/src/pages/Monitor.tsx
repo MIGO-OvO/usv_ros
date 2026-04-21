@@ -60,7 +60,6 @@ export default function Monitor() {
     socket,
     connected,
     pumpConnected,
-    automationRunning,
     missionStatus,
     pumpAngles,
     currentVoltage,
