@@ -349,13 +349,17 @@ class MAVLinkTriggerNode(object):
         rospy.loginfo("Starting sampling sequence at waypoint %d", waypoint_seq)
 
         if not self.set_mode('HOLD'):
-            self._handle_completion(success=False, reason='set_hold_failed')
+            self._set_waypoint_state(waypoint_seq, WaypointSamplingState.FAILED)
+            self._set_mission_state(MissionState.FAILED, "{}:set_hold_failed".format(waypoint_seq))
+            self._handle_failure_action('set_hold_failed')
             return False
 
         self._set_waypoint_state(waypoint_seq, WaypointSamplingState.WAITING_STABLE)
         stable_ok, stable_reason = self._wait_until_stable(waypoint_cfg['hold_before_sampling_s'])
         if not stable_ok:
-            self._handle_completion(success=False, reason=stable_reason)
+            self._set_waypoint_state(waypoint_seq, WaypointSamplingState.FAILED)
+            self._set_mission_state(MissionState.FAILED, "{}:{}".format(waypoint_seq, stable_reason))
+            self._handle_failure_action(stable_reason)
             return False
 
         steps_data = self._build_steps_payload(config, waypoint_seq)
@@ -368,7 +372,9 @@ class MAVLinkTriggerNode(object):
         self.is_sampling = True
         if not self._call_automation_service('start'):
             self.is_sampling = False
-            self._handle_completion(success=False, reason='automation_start_failed')
+            self._set_waypoint_state(waypoint_seq, WaypointSamplingState.FAILED)
+            self._set_mission_state(MissionState.FAILED, "{}:automation_start_failed".format(waypoint_seq))
+            self._handle_failure_action('automation_start_failed')
             return False
 
         return True

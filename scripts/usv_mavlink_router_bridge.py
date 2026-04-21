@@ -113,8 +113,7 @@ class USVMavlinkRouterBridge(object):
             data_dict = json.loads(msg.data)
         except Exception:
             data_dict = {}
-        
-        data_str = msg.data.lower()
+
         with self._lock:
             if isinstance(data_dict, dict):
                 self._automation_step = float(data_dict.get("automation_step", 0.0) or 0.0)
@@ -128,35 +127,19 @@ class USVMavlinkRouterBridge(object):
                     self._pid_mode = 3.0
                 else:
                     self._pid_mode = 0.0
-            
-            if "automation: running" in data_str or "automation: step" in data_str:
-                self._status_code = 1
-            elif "automation: paused" in data_str or "sampling_paused" in data_str:
-                self._status_code = 2
-            elif "automation: finished" in data_str or "automation: stopped" in data_str or "sampling_stopped" in data_str:
-                self._status_code = 0
-            elif "sampling_started" in data_str:
-                self._status_code = 1
-            elif "calibrate" in data_str:
-                self._status_code = 4
-            elif "error" in data_str:
-                self._status_code = 3
+            # 注意：_status_code 现在完全由 _mission_status_cb 驱动，此处不再覆盖。
 
     def _trigger_status_cb(self, msg):
         data = msg.data.lower()
         with self._lock:
             if "sampling_started" in data:
-                self._status_code = 1
                 self._sample_count = (self._sample_count + 1) % 65536
                 self._pending_statustexts.append(("USV: Sampling Started", mavutil.mavlink.MAV_SEVERITY_NOTICE))
             elif "sampling_stopped" in data:
-                self._status_code = 0
                 self._pending_statustexts.append(("USV: Sampling Completed", mavutil.mavlink.MAV_SEVERITY_NOTICE))
             elif "sampling_paused" in data:
-                self._status_code = 1
                 self._pending_statustexts.append(("USV: Sampling Paused", mavutil.mavlink.MAV_SEVERITY_NOTICE))
             elif "calibrate" in data:
-                self._status_code = 4
                 self._pending_statustexts.append(("USV: Calibrating", mavutil.mavlink.MAV_SEVERITY_NOTICE))
 
     # 任务阶段 → USV_STAT 扩展编码映射
