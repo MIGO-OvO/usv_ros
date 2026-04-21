@@ -100,7 +100,58 @@ rosservice call /usv/automation_stop
 > - 泵组有状态更新或实际动作。
 > - 自动化启动后，`pump_control_node` 日志提示 `Automation start requested` 并开始执行步骤。
 
-### 2.4 通信链路测试 (路由桥接模式与热点)
+### 2.4 自动航点采样闭环测试
+**验证目标：** 到达采样航点后自动 HOLD → 稳定等待 → 采样 → 恢复 AUTO。
+
+```bash
+# 观察任务阶段状态变化
+rostopic echo /usv/mission_status
+
+# 观察触发节点详细状态
+rostopic echo /usv/trigger_status
+
+# 观察泵自动化执行
+rostopic echo /usv/pump_status
+```
+
+**操作流程：**
+1. 在 QGC 中上传包含至少 2 个航点的 Mission 并点击开始任务。
+2. 等待飞控进入 AUTO 模式，船开始航行。
+3. 到达第一个航点时，`/usv/mission_status` 应依次输出：
+   - `WAYPOINT_REACHED:0`
+   - `HOLDING:0`
+   - `WAITING_STABLE:0`
+   - `SAMPLING:0`
+   - `SAMPLING_DONE:0`
+   - `RESUMING_AUTO:0`
+   - `NAVIGATING:0`（恢复 AUTO 后）
+4. Web Monitor 页面"任务阶段"卡片应实时显示当前阶段和航点编号。
+
+> **通过判据：**
+> - 航点到达后飞控模式切换为 HOLD。
+> - 速度/航向稳定后才开始采样，不会立刻执行。
+> - 采样完成后自动恢复 AUTO 继续下一个航点。
+> - 同一航点不会重复触发采样。
+
+**可选调参验证：**
+```bash
+# 增大稳定窗口和启用失败重试
+roslaunch usv_ros usv_bringup.launch \
+  hold_settle_time:=5.0 \
+  stable_speed_threshold:=0.10 \
+  sampling_retry_count:=1 \
+  sampling_on_fail:=SKIP
+```
+
+> **参数说明：**
+> - `hold_settle_time`：速度和航向需持续低于阈值的秒数（默认 3.0）
+> - `stable_check_timeout`：超过此秒数仍未达标则视为稳定失败（默认 20.0）
+> - `stable_speed_threshold`：线速度阈值 m/s（默认 0.15）
+> - `stable_yaw_rate_threshold`：yaw rate 阈值 rad/s（默认 0.08）
+> - `sampling_retry_count`：采样失败后重试次数（默认 0）
+> - `sampling_on_fail`：重试用尽后的策略：`HOLD` 保持 / `SKIP` 跳过继续 / `ABORT` 中止任务（默认 HOLD）
+
+### 2.5 通信链路测试 (路由桥接模式与热点)
 
 #### 2.4.1 MAVLink 路由桥接联动
 **验证目标：** 数据不单纯走 MAVROS，而是使用 `mavlink-routerd` 及自定义桥接程序通信。

@@ -285,27 +285,36 @@ tail -f ~/usv_ws/.usv_run/logs/usv_system.log
 - `mavros_timeout`（默认 `30.0`）
 - `auto_trigger_on_waypoint`（默认 `true`）
 - `trigger_waypoints`（默认 `[]`，示例：`[1,3,5]`）
+- `hold_settle_time`（默认 `3.0`，到点后稳定判定窗口秒数）
+- `stable_check_timeout`（默认 `20.0`，稳定判定超时秒数）
+- `stable_speed_threshold`（默认 `0.15`，m/s，低于此值视为速度稳定）
+- `stable_yaw_rate_threshold`（默认 `0.08`，rad/s，低于此值视为航向稳定）
+- `sampling_retry_count`（默认 `0`，采样失败重试次数）
+- `sampling_on_fail`（默认 `HOLD`，失败策略：`HOLD|SKIP|ABORT`）
 - `mavros_fcu_url`（默认 `/dev/ttyTHS1:921600`）
 - `mavlink_source_system`（默认 `1`）
-- `mavlink_source_component`（默认 `240`）
+- `mavlink_source_component`（默认 `191`）
 - `enable_pump|enable_web|enable_mavlink_trigger|enable_mavlink_bridge`
 
 示例：仅启动泵控 + Web
 
 ```bash
 roslaunch usv_ros usv_bringup.launch \
-  
+
   enable_mavlink_trigger:=false \
   enable_mavlink_bridge:=false
 ```
 
-示例：限制自动触发航点并切换 Web UI
+示例：限制自动触发航点、调整稳定窗口、失败时跳过
 
 ```bash
 roslaunch usv_ros usv_bringup.launch \
   trigger_waypoints:="[2,4]" \
-  web_ui:=dist \
-  pump_timeout:=2.0
+  hold_settle_time:=5.0 \
+  stable_speed_threshold:=0.10 \
+  sampling_retry_count:=1 \
+  sampling_on_fail:=SKIP \
+  web_ui:=dist
 ```
 
 ### 5.5 访问 Web 控制台

@@ -29,11 +29,15 @@ QGC 发送自定义指令:
 from __future__ import print_function
 
 import json
+import math
 import os
 import struct
 import threading
+import time
 
 import rospy
+from geometry_msgs.msg import TwistStamped
+from sensor_msgs.msg import Imu
 from std_msgs.msg import String, Float32MultiArray
 from std_srvs.srv import Trigger, TriggerResponse
 from mavros_msgs.msg import State, WaypointReached, Mavlink
@@ -55,8 +59,33 @@ MAV_RESULT_ACCEPTED = 0
 MAV_RESULT_TEMPORARILY_REJECTED = 1
 MAV_RESULT_FAILED = 5
 
-# 配置文件路径
 CONFIG_FILE = os.path.expanduser("~/usv_ws/config/sampling_config.json")
+
+
+class MissionState(object):
+    IDLE = "IDLE"
+    NAVIGATING = "NAVIGATING"
+    WAYPOINT_REACHED = "WAYPOINT_REACHED"
+    HOLDING = "HOLDING"
+    WAITING_STABLE = "WAITING_STABLE"
+    SAMPLING = "SAMPLING"
+    SAMPLING_DONE = "SAMPLING_DONE"
+    RESUMING_AUTO = "RESUMING_AUTO"
+    HOLD_NO_MISSION = "HOLD_NO_MISSION"
+    FAILED = "FAILED"
+    PAUSED = "PAUSED"
+    ABORTED = "ABORTED"
+
+
+class WaypointSamplingState(object):
+    IDLE = "IDLE"
+    ARRIVED = "ARRIVED"
+    HOLDING = "HOLDING"
+    WAITING_STABLE = "WAITING_STABLE"
+    SAMPLING = "SAMPLING"
+    DONE = "DONE"
+    FAILED = "FAILED"
+    SKIPPED = "SKIPPED"
 
 
 class MAVLinkTriggerNode(object):
@@ -75,12 +104,23 @@ class MAVLinkTriggerNode(object):
         self.mavros_timeout = rospy.get_param('~mavros_timeout', 30.0)
         self.auto_trigger_on_waypoint = rospy.get_param('~auto_trigger_on_waypoint', True)
         self.trigger_waypoints = rospy.get_param('~trigger_waypoints', [])  # 空列表表示所有航点
+        self.hold_settle_time = float(rospy.get_param('~hold_settle_time', 3.0))
+        self.stable_check_timeout = float(rospy.get_param('~stable_check_timeout', 20.0))
+        self.stable_speed_threshold = float(rospy.get_param('~stable_speed_threshold', 0.15))
+        self.stable_yaw_rate_threshold = float(rospy.get_param('~stable_yaw_rate_threshold', 0.08))
+        self.default_retry_count = int(rospy.get_param('~sampling_retry_count', 0))
+        self.default_on_fail = str(rospy.get_param('~sampling_on_fail', 'HOLD')).strip().upper()
 
         # 状态
         self.mavros_state = State()
         self.mavros_connected = False
         self.is_sampling = False
         self.current_waypoint = 0
+        self.current_mission_state = MissionState.IDLE
+        self.current_sampling_context = None
+        self.last_linear_speed = 0.0
+        self.last_yaw_rate = 0.0
+        self.waypoint_states = {}
         self.state_lock = threading.Lock()
 
         # 服务客户端
@@ -88,32 +128,27 @@ class MAVLinkTriggerNode(object):
 
         # Publishers
         self.status_pub = rospy.Publisher('/usv/trigger_status', String, queue_size=10)
+        self.mission_status_pub = rospy.Publisher('/usv/mission_status', String, queue_size=10)
         self.steps_pub = rospy.Publisher('/usv/automation_steps', String, queue_size=1)
         self.pump_command_pub = rospy.Publisher('/usv/pump_command', String, queue_size=10)
-        # MAVLink ACK 发送通道
-        self.mavlink_to_pub = rospy.Publisher(
-            '/mavros/mavlink/to', Mavlink, queue_size=10
-        )
+        self.mavlink_to_pub = rospy.Publisher('/mavros/mavlink/to', Mavlink, queue_size=10)
 
         # Subscribers
         self.state_sub = rospy.Subscriber('/mavros/state', State, self._state_cb)
         self.waypoint_sub = rospy.Subscriber('/mavros/mission/reached', WaypointReached, self._waypoint_cb)
         self.pump_status_sub = rospy.Subscriber('/usv/pump_status', String, self._pump_status_cb)
-        self.mavlink_cmd_sub = rospy.Subscriber(
-            '/usv/mavlink_cmd_rx', Float32MultiArray, self._mavlink_cmd_rx_cb, queue_size=20
-        )
-
-        # 监听 MAVROS 原始 MAVLink 入站消息 (从飞控/GCS 收到的所有 MAVLink 帧)
-        # mavros_msgs/Mavlink 包含 msgid、payload64 等字段。
-        # 当前现场配置下，QGC 可见 nano 侧使用 source 1/240 发送 HEARTBEAT、SYSTEM_TIME 等消息。
-        self.mavlink_sub = rospy.Subscriber(
-            '/mavros/mavlink/from', Mavlink, self._mavlink_from_cb, queue_size=20
-        )
+        self.velocity_sub = rospy.Subscriber('/mavros/local_position/velocity_local', TwistStamped, self._velocity_cb, queue_size=10)
+        self.imu_sub = rospy.Subscriber('/mavros/imu/data', Imu, self._imu_cb, queue_size=10)
+        self.mavlink_cmd_sub = rospy.Subscriber('/usv/mavlink_cmd_rx', Float32MultiArray, self._mavlink_cmd_rx_cb, queue_size=20)
+        self.mavlink_sub = rospy.Subscriber('/mavros/mavlink/from', Mavlink, self._mavlink_from_cb, queue_size=20)
 
         rospy.loginfo("MAVLink Trigger Node initialized")
         rospy.loginfo("  Auto trigger on waypoint: %s", self.auto_trigger_on_waypoint)
         rospy.loginfo("  Listening for COMMAND_LONG on /mavros/mavlink/from")
         rospy.loginfo("  MAVLink source IDs: sysid=%d compid=%d", self._source_system_id, self._source_component_id)
+        rospy.loginfo("  Stable check: hold_settle_time=%.1fs timeout=%.1fs speed<=%.3f yaw_rate<=%.3f",
+                      self.hold_settle_time, self.stable_check_timeout,
+                      self.stable_speed_threshold, self.stable_yaw_rate_threshold)
 
     def _state_cb(self, msg):
         """MAVROS 状态回调。"""
@@ -121,32 +156,259 @@ class MAVLinkTriggerNode(object):
             self.mavros_state = msg
             self.mavros_connected = msg.connected
 
+
+    def _velocity_cb(self, msg):
+        """速度回调。"""
+        twist = msg.twist
+        self.last_linear_speed = math.sqrt(
+            twist.linear.x * twist.linear.x +
+            twist.linear.y * twist.linear.y +
+            twist.linear.z * twist.linear.z
+        )
+
+    def _imu_cb(self, msg):
+        """IMU 回调。"""
+        self.last_yaw_rate = abs(msg.angular_velocity.z)
+
+    def _set_mission_state(self, state, detail=""):
+        """设置并发布任务阶段状态。"""
+        self.current_mission_state = state
+        payload = state if not detail else "{}:{}".format(state, detail)
+        msg = String()
+        msg.data = payload
+        self.mission_status_pub.publish(msg)
+        self._publish_status("mission:{}".format(payload))
+
+    def _get_waypoint_state(self, wp_seq):
+        return self.waypoint_states.get(int(wp_seq), WaypointSamplingState.IDLE)
+
+    def _set_waypoint_state(self, wp_seq, state):
+        self.waypoint_states[int(wp_seq)] = state
+
+    def _load_config(self):
+        """加载配置文件。"""
+        try:
+            if os.path.exists(CONFIG_FILE):
+                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+        except Exception as e:
+            rospy.logwarn("Failed to load config: %s", str(e))
+        return None
+
+    def _get_default_config(self):
+        return {
+            "sampling_sequence": {"steps": [], "loop_count": 1},
+            "pump_settings": {"pid_mode": True, "pid_precision": 0.1},
+            "waypoint_sampling": {}
+        }
+
+    def _get_waypoint_sampling_config(self, config, waypoint_seq):
+        """获取指定航点采样配置。"""
+        config = config or {}
+        wp_cfg = config.get('waypoint_sampling', {}) or {}
+        seq_key = str(int(waypoint_seq))
+        waypoint_config = dict(wp_cfg.get(seq_key, {}) or {})
+
+        try:
+            loop_count = int(waypoint_config.get('loop_count', config.get('sampling_sequence', {}).get('loop_count', 1)) or 1)
+        except (TypeError, ValueError):
+            loop_count = int(config.get('sampling_sequence', {}).get('loop_count', 1) or 1)
+
+        try:
+            retry_count = int(waypoint_config.get('retry_count', self.default_retry_count) or 0)
+        except (TypeError, ValueError):
+            retry_count = self.default_retry_count
+
+        try:
+            settle_time = float(waypoint_config.get('hold_before_sampling_s', self.hold_settle_time) or self.hold_settle_time)
+        except (TypeError, ValueError):
+            settle_time = self.hold_settle_time
+
+        on_fail = str(waypoint_config.get('on_fail', self.default_on_fail) or self.default_on_fail).strip().upper()
+        enabled = waypoint_config.get('enabled', True)
+        return {
+            'enabled': bool(enabled),
+            'loop_count': max(0, loop_count),
+            'retry_count': max(0, retry_count),
+            'hold_before_sampling_s': max(0.0, settle_time),
+            'on_fail': on_fail if on_fail in ('HOLD', 'SKIP', 'ABORT') else 'HOLD',
+        }
+
+    def _build_steps_payload(self, config, waypoint_seq):
+        sampling_sequence = dict((config or {}).get('sampling_sequence', {}) or {})
+        waypoint_cfg = self._get_waypoint_sampling_config(config, waypoint_seq)
+        return {
+            'steps': sampling_sequence.get('steps', []),
+            'loop_count': waypoint_cfg['loop_count'],
+            'pid_mode': (config or {}).get('pump_settings', {}).get('pid_mode', True),
+            'pid_precision': (config or {}).get('pump_settings', {}).get('pid_precision', 0.1),
+            'waypoint_seq': int(waypoint_seq),
+            'retry_count': waypoint_cfg['retry_count'],
+            'on_fail': waypoint_cfg['on_fail'],
+        }
+
+    def _wait_until_stable(self, settle_time):
+        """轻量稳定判定：速度/角速度持续低于阈值。"""
+        self._set_mission_state(MissionState.WAITING_STABLE, str(self.current_waypoint))
+        stable_since = None
+        deadline = time.time() + self.stable_check_timeout
+        rate = rospy.Rate(5)
+        while not rospy.is_shutdown() and time.time() < deadline:
+            if self.mavros_state.mode and self.mavros_state.mode.upper() != 'HOLD':
+                rospy.logwarn("Vehicle left HOLD during stable wait: %s", self.mavros_state.mode)
+                return False, 'mode_left_hold'
+
+            linear_ok = self.last_linear_speed <= self.stable_speed_threshold
+            yaw_ok = self.last_yaw_rate <= self.stable_yaw_rate_threshold
+            if linear_ok and yaw_ok:
+                if stable_since is None:
+                    stable_since = time.time()
+                if time.time() - stable_since >= settle_time:
+                    return True, 'stable'
+            else:
+                stable_since = None
+            rate.sleep()
+        return False, 'stable_timeout'
+
     def _waypoint_cb(self, msg):
         """航点到达回调。"""
         self.current_waypoint = msg.wp_seq
         rospy.loginfo("Waypoint %d reached", msg.wp_seq)
+        self._set_mission_state(MissionState.WAYPOINT_REACHED, str(msg.wp_seq))
         self._publish_status("waypoint_reached:{}".format(msg.wp_seq))
 
-        # 自动触发采样
-        if self.auto_trigger_on_waypoint:
-            # 检查是否在触发列表中 (空列表表示所有航点)
-            if not self.trigger_waypoints or msg.wp_seq in self.trigger_waypoints:
-                rospy.loginfo("Auto-triggering sampling at waypoint %d", msg.wp_seq)
-                self._start_sampling_sequence()
+        if not self.auto_trigger_on_waypoint:
+            return
+        if self.trigger_waypoints and msg.wp_seq not in self.trigger_waypoints:
+            return
 
-    def _handle_completion(self):
-        rospy.loginfo("Handling sampling completion...")
+        current_state = self._get_waypoint_state(msg.wp_seq)
+        if current_state in (WaypointSamplingState.HOLDING,
+                             WaypointSamplingState.WAITING_STABLE,
+                             WaypointSamplingState.SAMPLING,
+                             WaypointSamplingState.DONE):
+            rospy.loginfo("Waypoint %d ignored, state=%s", msg.wp_seq, current_state)
+            return
+
+        rospy.loginfo("Auto-triggering sampling at waypoint %d", msg.wp_seq)
+        threading.Thread(target=self._start_sampling_sequence, args=(msg.wp_seq,), daemon=True).start()
+
+    def _handle_completion(self, success=True, reason='finished'):
+        with self.state_lock:
+            if not self.is_sampling:
+                return
+            self.is_sampling = False
+        rospy.loginfo("Handling sampling completion: success=%s reason=%s", success, reason)
+        wp_seq = self.current_waypoint
+        if success:
+            self._set_waypoint_state(wp_seq, WaypointSamplingState.DONE)
+            self._set_mission_state(MissionState.SAMPLING_DONE, str(wp_seq))
+            self._publish_status("sampling_stopped")
+            rospy.sleep(1.0)
+            self._resume_auto_if_mission_exists()
+        else:
+            self._set_waypoint_state(wp_seq, WaypointSamplingState.FAILED)
+            self._set_mission_state(MissionState.FAILED, "{}:{}".format(wp_seq, reason))
+            self._handle_failure_action(reason)
+
+    def _pump_status_cb(self, msg):
+        data = (msg.data or '').lower()
+        if 'automation: finished' in data:
+            with self.state_lock:
+                if self.is_sampling:
+                    threading.Thread(target=self._handle_completion, kwargs={'success': True, 'reason': 'finished'}, daemon=True).start()
+            return
+        if 'automation:' in data and ('error' in data or 'fail' in data or 'timeout' in data):
+            with self.state_lock:
+                if self.is_sampling:
+                    threading.Thread(target=self._handle_completion, kwargs={'success': False, 'reason': data[:80]}, daemon=True).start()
+
+    def _start_sampling_sequence(self, waypoint_seq=None):
+        """启动采样序列。"""
+        waypoint_seq = self.current_waypoint if waypoint_seq is None else int(waypoint_seq)
+        if self.is_sampling:
+            rospy.logwarn("Sampling already in progress")
+            return False
+
+        config = self._load_config() or self._get_default_config()
+        waypoint_cfg = self._get_waypoint_sampling_config(config, waypoint_seq)
+        if not waypoint_cfg['enabled']:
+            rospy.loginfo("Waypoint %d sampling disabled, skip and resume AUTO", waypoint_seq)
+            self._set_waypoint_state(waypoint_seq, WaypointSamplingState.SKIPPED)
+            self._resume_auto_if_mission_exists()
+            return True
+
+        self.current_waypoint = waypoint_seq
+        self.current_sampling_context = {
+            'waypoint_seq': waypoint_seq,
+            'retry_count': waypoint_cfg['retry_count'],
+            'on_fail': waypoint_cfg['on_fail'],
+        }
+        self._set_waypoint_state(waypoint_seq, WaypointSamplingState.HOLDING)
+        self._set_mission_state(MissionState.HOLDING, str(waypoint_seq))
+        rospy.loginfo("Starting sampling sequence at waypoint %d", waypoint_seq)
+
+        if not self.set_mode('HOLD'):
+            self._handle_completion(success=False, reason='set_hold_failed')
+            return False
+
+        self._set_waypoint_state(waypoint_seq, WaypointSamplingState.WAITING_STABLE)
+        stable_ok, stable_reason = self._wait_until_stable(waypoint_cfg['hold_before_sampling_s'])
+        if not stable_ok:
+            self._handle_completion(success=False, reason=stable_reason)
+            return False
+
+        steps_data = self._build_steps_payload(config, waypoint_seq)
+        msg = String()
+        msg.data = json.dumps(steps_data)
+        self.steps_pub.publish(msg)
+
+        self._set_waypoint_state(waypoint_seq, WaypointSamplingState.SAMPLING)
+        self._set_mission_state(MissionState.SAMPLING, str(waypoint_seq))
+        self.is_sampling = True
+        if not self._call_automation_service('start'):
+            self.is_sampling = False
+            self._handle_completion(success=False, reason='automation_start_failed')
+            return False
+
+        return True
+
+    def _stop_sampling_sequence(self):
+        """停止采样序列。"""
+        rospy.loginfo("Stopping sampling sequence...")
+        self._call_automation_service('stop')
         self.is_sampling = False
+        self._set_mission_state(MissionState.HOLD_NO_MISSION, str(self.current_waypoint))
         self._publish_status("sampling_stopped")
         rospy.sleep(1.0)
         self._resume_auto_if_mission_exists()
 
-    def _pump_status_cb(self, msg):
-        data = msg.data.lower()
-        if "automation: finished" in data:
-            with self.state_lock:
-                if self.is_sampling:
-                    threading.Thread(target=self._handle_completion).start()
+    def _handle_failure_action(self, reason):
+        ctx = self.current_sampling_context or {}
+        retries_left = int(ctx.get('retry_count', 0) or 0)
+        on_fail = str(ctx.get('on_fail', self.default_on_fail) or self.default_on_fail).upper()
+        waypoint_seq = int(ctx.get('waypoint_seq', self.current_waypoint) or self.current_waypoint)
+
+        if retries_left > 0:
+            ctx['retry_count'] = retries_left - 1
+            self.current_sampling_context = ctx
+            rospy.logwarn("Sampling failed at waypoint %d, retry left=%d reason=%s", waypoint_seq, ctx['retry_count'], reason)
+            threading.Thread(target=self._start_sampling_sequence, args=(waypoint_seq,), daemon=True).start()
+            return
+
+        if on_fail == 'SKIP':
+            rospy.logwarn("Sampling failed at waypoint %d, skip and resume AUTO: %s", waypoint_seq, reason)
+            self._set_waypoint_state(waypoint_seq, WaypointSamplingState.SKIPPED)
+            self._resume_auto_if_mission_exists()
+            return
+        if on_fail == 'ABORT':
+            rospy.logerr("Sampling failed at waypoint %d, abort mission: %s", waypoint_seq, reason)
+            self._set_mission_state(MissionState.ABORTED, str(waypoint_seq))
+            self.set_mode('HOLD')
+            return
+
+        rospy.logwarn("Sampling failed at waypoint %d, staying HOLD: %s", waypoint_seq, reason)
+        self.set_mode('HOLD')
 
     def _mavlink_from_cb(self, msg):
         """
@@ -317,74 +579,17 @@ class MAVLinkTriggerNode(object):
             rospy.logerr("Set mode error: %s", str(e))
             return False
 
-    def _load_config(self):
-        """加载配置文件。"""
-        try:
-            if os.path.exists(CONFIG_FILE):
-                with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-        except Exception as e:
-            rospy.logwarn("Failed to load config: %s", str(e))
-        return None
-
-    def _start_sampling_sequence(self):
-        """启动采样序列。"""
-        if self.is_sampling:
-            rospy.logwarn("Sampling already in progress")
-            return False
-
-        rospy.loginfo("Starting sampling sequence...")
-        self._publish_status("sampling_started")
-
-        # 1. 切换到 HOLD 模式
-        self.set_mode("HOLD")
-        rospy.sleep(1.0)
-
-        # 2. 加载最新配置
-        config = self._load_config()
-        if not config:
-            rospy.logwarn("No config found, using defaults")
-            config = {
-                "sampling_sequence": {"steps": [], "loop_count": 1},
-                "pump_settings": {"pid_mode": True, "pid_precision": 0.1}
-            }
-
-        # 3. 发送步骤到泵控制节点
-        steps_data = {
-            "steps": config.get('sampling_sequence', {}).get('steps', []),
-            "loop_count": config.get('sampling_sequence', {}).get('loop_count', 1),
-            "pid_mode": config.get('pump_settings', {}).get('pid_mode', True),
-            "pid_precision": config.get('pump_settings', {}).get('pid_precision', 0.1)
-        }
-
-        msg = String()
-        msg.data = json.dumps(steps_data)
-        self.steps_pub.publish(msg)
-
-        # 4. 触发自动化启动
-        self._call_automation_service('start')
-
-        self.is_sampling = True
-        return True
-
-    def _stop_sampling_sequence(self):
-        """停止采样序列。"""
-        rospy.loginfo("Stopping sampling sequence...")
-        self._call_automation_service('stop')
-        self.is_sampling = False
-        self._publish_status("sampling_stopped")
-
-        rospy.sleep(1.0)
-        self._resume_auto_if_mission_exists()
 
     def _pause_sampling(self):
         """暂停采样。"""
         self._call_automation_service('pause')
+        self._set_mission_state(MissionState.PAUSED, str(self.current_waypoint))
         self._publish_status("sampling_paused")
 
     def _resume_sampling(self):
         """恢复采样。"""
         self._call_automation_service('resume')
+        self._set_mission_state(MissionState.SAMPLING, str(self.current_waypoint))
         self._publish_status("sampling_resumed")
 
     def _resume_auto_if_mission_exists(self):
@@ -396,12 +601,18 @@ class MAVLinkTriggerNode(object):
             resp = pull_srv()
             if resp.success and resp.wp_received > 0:
                 rospy.loginfo("Mission has %d waypoints, resuming AUTO", resp.wp_received)
-                self.set_mode("AUTO")
+                self._set_mission_state(MissionState.RESUMING_AUTO, str(self.current_waypoint))
+                if self.set_mode("AUTO"):
+                    self._set_mission_state(MissionState.NAVIGATING, str(self.current_waypoint))
+                else:
+                    self._set_mission_state(MissionState.FAILED, 'resume_auto_failed')
             else:
                 rospy.loginfo("No mission loaded, staying in HOLD")
+                self._set_mission_state(MissionState.HOLD_NO_MISSION, str(self.current_waypoint))
                 self._publish_status("hold_no_mission")
         except Exception as e:
             rospy.logwarn("Cannot check mission, staying in HOLD: %s", str(e))
+            self._set_mission_state(MissionState.HOLD_NO_MISSION, str(self.current_waypoint))
             self._publish_status("hold_no_mission")
 
     def _call_automation_service(self, action):
@@ -528,7 +739,7 @@ class MAVLinkTriggerNode(object):
         ROS 服务回调: 手动触发采样。
         可通过 rosservice call /usv/trigger_sampling 或其他 ROS 节点调用。
         """
-        success = self._start_sampling_sequence()
+        success = self._start_sampling_sequence(self.current_waypoint)
         return TriggerResponse(
             success=success,
             message="Sampling triggered" if success else "Sampling already in progress"
@@ -536,24 +747,17 @@ class MAVLinkTriggerNode(object):
 
     def run(self):
         """主循环。"""
-        # 初始化服务
         self._init_services()
-
-        # 等待 MAVROS (非阻塞)
         self.wait_for_mavros()
-
-        self._publish_status("ready")
+        self._set_mission_state(MissionState.IDLE)
         rospy.loginfo("MAVLink Trigger Node ready")
 
-        # ROS 服务入口: 允许通过 rosservice call 或其他 ROS 节点直接触发采样
-        self._trigger_srv = rospy.Service(
-            '/usv/trigger_sampling', Trigger, self._trigger_srv_cb
-        )
+        self._trigger_srv = rospy.Service('/usv/trigger_sampling', Trigger, self._trigger_srv_cb)
 
         rate = rospy.Rate(1)
         prev_connected = False
+        prev_mode = ""
         while not rospy.is_shutdown():
-            # 状态监控
             with self.state_lock:
                 connected = self.mavros_connected
                 mode = self.mavros_state.mode
@@ -567,9 +771,16 @@ class MAVLinkTriggerNode(object):
                 self._publish_status("mavros_connected")
             prev_connected = connected
 
-            rospy.logdebug_throttle(10, "Mode: %s, Armed: %s, Sampling: %s, Connected: %s",
-                                    mode, armed, self.is_sampling, connected)
+            if mode != prev_mode and not self.is_sampling:
+                if mode == 'AUTO':
+                    self._set_mission_state(MissionState.NAVIGATING, str(self.current_waypoint))
+                elif mode == 'HOLD' and self.current_mission_state == MissionState.IDLE:
+                    self._set_mission_state(MissionState.HOLD_NO_MISSION, str(self.current_waypoint))
+            prev_mode = mode
 
+            rospy.logdebug_throttle(10, "Mode: %s, Armed: %s, Sampling: %s, Connected: %s, v=%.3f, yaw=%.3f",
+                                    mode, armed, self.is_sampling, connected,
+                                    self.last_linear_speed, self.last_yaw_rate)
             rate.sleep()
 
 
