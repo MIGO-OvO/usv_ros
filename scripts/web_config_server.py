@@ -989,19 +989,31 @@ class WebConfigServer(object):
             if self.standalone:
                 return jsonify({"success": False, "message": "独立模式不支持飞控同步"}), 400
             try:
+                from mavros_msgs.msg import WaypointList
                 from mavros_msgs.srv import WaypointPull
+
+                nav_seqs = []
+                pull_error = None
                 rospy.wait_for_service('/mavros/mission/pull', timeout=5.0)
                 pull_srv = rospy.ServiceProxy('/mavros/mission/pull', WaypointPull)
                 resp = pull_srv()
-                if not resp.success:
-                    return jsonify({"success": False, "message": "拉取航点失败"}), 500
+                if resp.success and resp.wp_received > 0:
+                    nav_seqs = list(range(resp.wp_received))
+                else:
+                    pull_error = "pull success=%s wp_received=%s" % (resp.success, resp.wp_received)
 
-                wp_count = resp.wp_received
-                if wp_count <= 0:
-                    return jsonify({"success": True, "message": "飞控中无航点", "data": {}, "synced": 0})
+                if not nav_seqs:
+                    try:
+                        waypoint_list = rospy.wait_for_message('/mavros/mission/waypoints', WaypointList, timeout=3.0)
+                        nav_seqs = list(range(len(waypoint_list.waypoints or [])))
+                    except Exception as cache_exc:
+                        if pull_error is None:
+                            pull_error = str(cache_exc)
+                        else:
+                            pull_error = "%s; cache=%s" % (pull_error, cache_exc)
 
-                # 生成 0 ~ wp_count-1 的 seq 列表
-                nav_seqs = list(range(wp_count))
+                if not nav_seqs:
+                    return jsonify({"success": False, "message": "拉取航点失败: %s" % (pull_error or "mission empty")}), 500
 
                 config = self.config_manager.get()
                 wp_cfg = dict(config.get('waypoint_sampling', {}))
@@ -1019,7 +1031,6 @@ class WebConfigServer(object):
                         wp_cfg[seq_key] = dict(default_item)
                         synced += 1
 
-                # 清理不在飞控 mission 中的旧航点
                 valid_keys = set(str(s) for s in nav_seqs)
                 removed_keys = [k for k in list(wp_cfg.keys()) if k not in valid_keys]
                 for k in removed_keys:

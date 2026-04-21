@@ -48,7 +48,7 @@
     <arg name="mavros_tgt_component" default="1" />
     <arg name="mavros_fcu_protocol" default="v2.0" />
     <arg name="mavros_respawn" default="false" />
-    <arg name="mavlink_source_system" default="1" />
+    <arg name="mavlink_source_system" default="2" />
     <arg name="mavlink_source_component" default="191" />
     <arg name="mavlink_router_url" default="tcp:127.0.0.1:5760" />
 
