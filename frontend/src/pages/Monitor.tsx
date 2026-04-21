@@ -2,17 +2,36 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { useAppStore } from '@/store'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
-import { Activity, Zap, Play, Square } from 'lucide-react'
+import { Activity, Zap, Play, Square, Anchor, Navigation, Pause, AlertTriangle, CheckCircle, Loader } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { InjectionPumpCard } from '@/components/injection-pump-card'
 import { LinkDiagnosticsCard } from '@/components/link-diagnostics-card'
 
-const MISSION_STATUS_MAP: Record<string, string> = {
-  IDLE: '空闲',
-  RUNNING: '运行中',
-  PAUSED: '已暂停',
-  COMPLETED: '已完成',
-  STOPPED: '已停止',
+const MISSION_STATUS_MAP: Record<string, { label: string; color: string; icon: typeof Play }> = {
+  IDLE:             { label: '空闲',       color: 'text-muted-foreground', icon: Square },
+  NAVIGATING:       { label: '航行中',     color: 'text-blue-500',        icon: Navigation },
+  WAYPOINT_REACHED: { label: '到达航点',   color: 'text-amber-500',       icon: Anchor },
+  HOLDING:          { label: '保持',       color: 'text-amber-500',       icon: Pause },
+  WAITING_STABLE:   { label: '稳定等待',   color: 'text-amber-500',       icon: Loader },
+  SAMPLING:         { label: '采样中',     color: 'text-emerald-500',     icon: Play },
+  SAMPLING_DONE:    { label: '采样完成',   color: 'text-emerald-500',     icon: CheckCircle },
+  RESUMING_AUTO:    { label: '恢复航行',   color: 'text-blue-500',        icon: Navigation },
+  HOLD_NO_MISSION:  { label: '无任务保持', color: 'text-muted-foreground', icon: Square },
+  FAILED:           { label: '失败',       color: 'text-red-500',         icon: AlertTriangle },
+  PAUSED:           { label: '已暂停',     color: 'text-amber-500',       icon: Pause },
+  ABORTED:          { label: '已中止',     color: 'text-red-500',         icon: AlertTriangle },
+  RUNNING:          { label: '运行中',     color: 'text-emerald-500',     icon: Play },
+  COMPLETED:        { label: '已完成',     color: 'text-emerald-500',     icon: CheckCircle },
+  STOPPED:          { label: '已停止',     color: 'text-muted-foreground', icon: Square },
+}
+
+function parseMissionStatus(raw: string): { state: string; waypointSeq: string; detail: string } {
+  const parts = raw.split(':')
+  return {
+    state: parts[0] || 'IDLE',
+    waypointSeq: parts[1] || '',
+    detail: parts.slice(2).join(':') || '',
+  }
 }
 
 function computeAdaptiveDomain(values: number[], fallback: [number, number], minSpan: number): [number, number] {
@@ -138,15 +157,25 @@ export default function Monitor() {
             </CardContent>
         </Card>
 
-        <Card className="bg-card/50 backdrop-blur-sm">
-            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                <CardTitle className="text-sm font-medium">任务状态</CardTitle>
-                {automationRunning ? <Play className="h-4 w-4 text-emerald-500" /> : <Square className="h-4 w-4 text-muted-foreground" />}
-            </CardHeader>
-            <CardContent>
-                <div className="text-2xl font-bold">{MISSION_STATUS_MAP[missionStatus] ?? missionStatus}</div>
-            </CardContent>
-        </Card>
+        {(() => {
+          const parsed = parseMissionStatus(missionStatus)
+          const info = MISSION_STATUS_MAP[parsed.state] ?? { label: parsed.state, color: 'text-muted-foreground', icon: Square }
+          const StatusIcon = info.icon
+          return (
+            <Card className="bg-card/50 backdrop-blur-sm">
+              <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
+                <CardTitle className="text-sm font-medium">任务阶段</CardTitle>
+                <StatusIcon className={cn("h-4 w-4", info.color)} />
+              </CardHeader>
+              <CardContent>
+                <div className={cn("text-xl font-bold", info.color)}>{info.label}</div>
+                {parsed.waypointSeq && (
+                  <div className="text-xs text-muted-foreground mt-1">航点 #{parsed.waypointSeq}{parsed.detail ? ` · ${parsed.detail}` : ''}</div>
+                )}
+              </CardContent>
+            </Card>
+          )
+        })()}
 
         <Card className="bg-card/50 backdrop-blur-sm">
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">

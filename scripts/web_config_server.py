@@ -32,7 +32,7 @@ import time
 from datetime import datetime
 
 try:
-    from flask import Flask, request, jsonify, send_from_directory, abort
+    from flask import Flask, request, jsonify, send_from_directory, abort, Response
     from flask_cors import CORS
     from flask_socketio import SocketIO, emit
     FLASK_AVAILABLE = True
@@ -285,6 +285,15 @@ DEFAULT_CONFIG = {
             }
         ]
     },
+    "waypoint_sampling": {
+        "0": {
+            "enabled": True,
+            "loop_count": 1,
+            "retry_count": 0,
+            "hold_before_sampling_s": 3.0,
+            "on_fail": "HOLD"
+        }
+    },
     "detection_settings": {
         "duration": 5.0,
         "sample_rate": 100
@@ -344,6 +353,38 @@ class ConfigManager(object):
             normalized['loop_count'] = 1
         return normalized
 
+    @staticmethod
+    def _normalize_waypoint_sampling(data):
+        normalized = {}
+        raw = data if isinstance(data, dict) else {}
+        for key, value in raw.items():
+            try:
+                seq_key = str(int(key))
+            except (TypeError, ValueError):
+                continue
+            item = dict(value or {}) if isinstance(value, dict) else {}
+            try:
+                loop_count = int(item.get('loop_count', 1) or 1)
+            except (TypeError, ValueError):
+                loop_count = 1
+            try:
+                retry_count = int(item.get('retry_count', 0) or 0)
+            except (TypeError, ValueError):
+                retry_count = 0
+            try:
+                hold_before_sampling_s = float(item.get('hold_before_sampling_s', 3.0) or 3.0)
+            except (TypeError, ValueError):
+                hold_before_sampling_s = 3.0
+            on_fail = str(item.get('on_fail', 'HOLD') or 'HOLD').strip().upper()
+            normalized[seq_key] = {
+                'enabled': bool(item.get('enabled', True)),
+                'loop_count': max(0, loop_count),
+                'retry_count': max(0, retry_count),
+                'hold_before_sampling_s': max(0.0, hold_before_sampling_s),
+                'on_fail': on_fail if on_fail in ('HOLD', 'SKIP', 'ABORT') else 'HOLD',
+            }
+        return normalized
+
     def __init__(self, config_file=CONFIG_FILE):
         self.config_file = config_file
         self.config = DEFAULT_CONFIG.copy()
@@ -373,6 +414,9 @@ class ConfigManager(object):
             self.config['sampling_sequence'] = self._normalize_sampling_sequence(
                 self.config.get('sampling_sequence', {})
             )
+            self.config['waypoint_sampling'] = self._normalize_waypoint_sampling(
+                self.config.get('waypoint_sampling', {})
+            )
             self.config['updated_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
@@ -393,6 +437,9 @@ class ConfigManager(object):
         self.config['sampling_sequence'] = self._normalize_sampling_sequence(
             self.config.get('sampling_sequence', {})
         )
+        self.config['waypoint_sampling'] = self._normalize_waypoint_sampling(
+            self.config.get('waypoint_sampling', {})
+        )
 
     def update(self, data):
         """更新配置。"""
@@ -405,6 +452,9 @@ class ConfigManager(object):
         self.config['sampling_sequence'] = self._normalize_sampling_sequence(
             self.config.get('sampling_sequence', {})
         )
+        self.config['waypoint_sampling'] = self._normalize_waypoint_sampling(
+            self.config.get('waypoint_sampling', {})
+        )
         return self.save()
 
     def get(self):
@@ -412,6 +462,9 @@ class ConfigManager(object):
         config = self.config.copy()
         config['sampling_sequence'] = self._normalize_sampling_sequence(
             config.get('sampling_sequence', {})
+        )
+        config['waypoint_sampling'] = self._normalize_waypoint_sampling(
+            config.get('waypoint_sampling', {})
         )
         return config
 
@@ -546,22 +599,18 @@ class WebConfigServer(object):
             self.pump_connected = False
 
         # automation_running 从 automation: 前缀中提取
+        # 注意：mission_status 已由 /usv/mission_status（mavlink_trigger_node）统一驱动，
+        # 此处仅更新 automation_running 标志，不再覆盖 mission_status 以避免与新阶段状态冲突。
         if 'automation:' in status:
             automation_status = status.split('automation:', 1)[1].strip()
             if '运行' in automation_status or 'running' in automation_status:
                 self.automation_running = True
-                self.mission_status = "RUNNING"
             elif '已完成' in automation_status or 'finished' in automation_status or '完成' in automation_status:
                 self.automation_running = False
-                self.mission_status = "IDLE"
             elif '已停止' in automation_status or 'stopped' in automation_status:
                 self.automation_running = False
-                self.mission_status = "IDLE"
-            elif '暂停' in automation_status or 'paused' in automation_status:
-                self.mission_status = "PAUSED"
         elif status == 'stopped':
             self.automation_running = False
-            self.mission_status = "IDLE"
 
     def _injection_status_cb(self, msg):
         """进样泵状态回调。"""
@@ -867,6 +916,118 @@ class WebConfigServer(object):
                 return jsonify({"success": True, "message": "预设已删除"})
             return jsonify({"success": False, "message": "删除失败"}), 500
 
+        # ================= 航点采样配置 API =================
+        @self.app.route('/api/waypoint-sampling', methods=['GET'])
+        def get_waypoint_sampling():
+            """获取全部航点采样配置。"""
+            config = self.config_manager.get()
+            return jsonify({"success": True, "data": config.get('waypoint_sampling', {})})
+
+        @self.app.route('/api/waypoint-sampling', methods=['POST'])
+        def save_waypoint_sampling():
+            """保存全部航点采样配置（整体覆盖）。"""
+            data = request.get_json()
+            if not isinstance(data, dict):
+                return jsonify({"success": False, "message": "请求体应为对象"}), 400
+            normalized = ConfigManager._normalize_waypoint_sampling(data)
+            if self.config_manager.update({'waypoint_sampling': normalized}):
+                self._add_log("航点采样配置已保存", "success")
+                return jsonify({"success": True, "message": "航点采样配置已保存", "data": normalized})
+            return jsonify({"success": False, "message": "保存失败"}), 500
+
+        @self.app.route('/api/waypoint-sampling/<seq>', methods=['GET'])
+        def get_waypoint_sampling_item(seq):
+            """获取单个航点的采样配置。"""
+            config = self.config_manager.get()
+            wp_cfg = config.get('waypoint_sampling', {})
+            try:
+                seq_key = str(int(seq))
+            except (TypeError, ValueError):
+                return jsonify({"success": False, "message": "航点编号无效"}), 400
+            item = wp_cfg.get(seq_key)
+            if item is None:
+                return jsonify({"success": True, "data": None, "message": "该航点未配置，将使用全局默认值"})
+            return jsonify({"success": True, "data": item})
+
+        @self.app.route('/api/waypoint-sampling/<seq>', methods=['POST'])
+        def save_waypoint_sampling_item(seq):
+            """保存单个航点的采样配置。"""
+            try:
+                seq_key = str(int(seq))
+            except (TypeError, ValueError):
+                return jsonify({"success": False, "message": "航点编号无效"}), 400
+            data = request.get_json() or {}
+            config = self.config_manager.get()
+            wp_cfg = dict(config.get('waypoint_sampling', {}))
+            wp_cfg[seq_key] = data
+            normalized = ConfigManager._normalize_waypoint_sampling(wp_cfg)
+            if self.config_manager.update({'waypoint_sampling': normalized}):
+                self._add_log(f"航点 {seq_key} 采样配置已保存", "success")
+                return jsonify({"success": True, "message": "已保存", "data": normalized.get(seq_key)})
+            return jsonify({"success": False, "message": "保存失败"}), 500
+
+        @self.app.route('/api/waypoint-sampling/<seq>', methods=['DELETE'])
+        def delete_waypoint_sampling_item(seq):
+            """删除单个航点的采样配置。"""
+            try:
+                seq_key = str(int(seq))
+            except (TypeError, ValueError):
+                return jsonify({"success": False, "message": "航点编号无效"}), 400
+            config = self.config_manager.get()
+            wp_cfg = dict(config.get('waypoint_sampling', {}))
+            if seq_key in wp_cfg:
+                del wp_cfg[seq_key]
+                if self.config_manager.update({'waypoint_sampling': wp_cfg}):
+                    self._add_log(f"航点 {seq_key} 采样配置已删除", "warning")
+                    return jsonify({"success": True, "message": "已删除"})
+                return jsonify({"success": False, "message": "保存失败"}), 500
+            return jsonify({"success": True, "message": "该航点本无配置"})
+
+        # ================= 任务配置导入导出 API =================
+        @self.app.route('/api/mission-config/export', methods=['GET'])
+        def export_mission_config():
+            """导出完整任务配置为 JSON 文件。"""
+            config = self.config_manager.get()
+            export_data = {
+                "version": config.get("version", "1.0"),
+                "exported_at": datetime.now().isoformat(),
+                "mission": config.get("mission", {}),
+                "pump_settings": config.get("pump_settings", {}),
+                "sampling_sequence": config.get("sampling_sequence", {}),
+                "waypoint_sampling": config.get("waypoint_sampling", {}),
+            }
+            return Response(
+                json.dumps(export_data, ensure_ascii=False, indent=2),
+                mimetype="application/json",
+                headers={"Content-Disposition": "attachment; filename=usv_mission_config_%s.json" %
+                         datetime.now().strftime("%Y%m%d_%H%M%S")}
+            )
+
+        @self.app.route('/api/mission-config/import', methods=['POST'])
+        def import_mission_config():
+            """导入任务配置 JSON。"""
+            data = request.get_json()
+            if not isinstance(data, dict):
+                return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
+
+            patch = {}
+            if 'mission' in data and isinstance(data['mission'], dict):
+                patch['mission'] = data['mission']
+            if 'pump_settings' in data and isinstance(data['pump_settings'], dict):
+                patch['pump_settings'] = data['pump_settings']
+            if 'sampling_sequence' in data and isinstance(data['sampling_sequence'], dict):
+                patch['sampling_sequence'] = ConfigManager._normalize_sampling_sequence(data['sampling_sequence'])
+            if 'waypoint_sampling' in data and isinstance(data['waypoint_sampling'], dict):
+                patch['waypoint_sampling'] = ConfigManager._normalize_waypoint_sampling(data['waypoint_sampling'])
+
+            if not patch:
+                return jsonify({"success": False, "message": "未找到可导入的配置字段"}), 400
+
+            if self.config_manager.update(patch):
+                self._add_log("任务配置已导入 (%d 个字段)" % len(patch), "success")
+                return jsonify({"success": True, "message": "任务配置已导入", "fields": list(patch.keys())})
+            return jsonify({"success": False, "message": "保存失败"}), 500
+
         # ================= 电机控制 API =================
         @self.app.route('/api/motor/command', methods=['POST'])
         def send_motor_command():
@@ -1039,7 +1200,6 @@ class WebConfigServer(object):
             writer.writerow(["timestamp", "voltage", "absorbance"])
             for pt in data.get("data_points", []):
                 writer.writerow([pt.get("timestamp", ""), pt.get("voltage", ""), pt.get("absorbance", "")])
-            from flask import Response
             return Response(
                 output.getvalue(),
                 mimetype="text/csv",
@@ -1361,7 +1521,6 @@ class WebConfigServer(object):
                     "gcs_url": rospy.get_param('/mavros/gcs_url', '') if ROS_AVAILABLE and not self.standalone else '',
                 },
             }
-            from flask import Response
             return Response(
                 json.dumps(report, indent=2, ensure_ascii=False),
                 mimetype='application/json',
@@ -1395,13 +1554,15 @@ class WebConfigServer(object):
             # 如果是启动，优先使用请求中携带的最新配置
             if action == 'start':
                 sampling_sequence = request_data.get('sampling_sequence')
+                waypoint_sampling = request_data.get('waypoint_sampling')
+                config_patch = {}
                 if isinstance(sampling_sequence, dict):
                     normalized_sequence = ConfigManager._normalize_sampling_sequence(sampling_sequence)
-                    config = self.config_manager.get()
-                    updated_sequence = dict(config.get('sampling_sequence', {}))
-                    updated_sequence['steps'] = normalized_sequence.get('steps', [])
-                    updated_sequence['loop_count'] = normalized_sequence.get('loop_count', 1)
-                    self.config_manager.update({'sampling_sequence': updated_sequence})
+                    config_patch['sampling_sequence'] = normalized_sequence
+                if isinstance(waypoint_sampling, dict):
+                    config_patch['waypoint_sampling'] = ConfigManager._normalize_waypoint_sampling(waypoint_sampling)
+                if config_patch:
+                    self.config_manager.update(config_patch)
                 self._publish_steps()
                 # 开始记录数据
                 self.data_manager.start_mission(self.config_manager.get().get('mission', {}).get('name', ''))
@@ -1433,7 +1594,8 @@ class WebConfigServer(object):
             "steps": config.get('sampling_sequence', {}).get('steps', []),
             "loop_count": config.get('sampling_sequence', {}).get('loop_count', 1),
             "pid_mode": config.get('pump_settings', {}).get('pid_mode', True),
-            "pid_precision": config.get('pump_settings', {}).get('pid_precision', 0.1)
+            "pid_precision": config.get('pump_settings', {}).get('pid_precision', 0.1),
+            "waypoint_sampling": config.get('waypoint_sampling', {}),
         }
         msg = String()
         msg.data = json.dumps(steps_data)

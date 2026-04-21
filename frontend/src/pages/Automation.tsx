@@ -5,9 +5,10 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { NumericInput } from "@/components/ui/numeric-input"
-import { Play, Square, Pause, Save, FolderOpen, Plus, Trash2, ArrowUp, ArrowDown } from 'lucide-react'
+import { Play, Square, Pause, Save, FolderOpen, Plus, Trash2, ArrowUp, ArrowDown, Download, Upload } from 'lucide-react'
 import { useAppStore } from '@/store'
 import { InjectionPumpCard } from '@/components/injection-pump-card'
+import { WaypointSamplingCard } from '@/components/waypoint-sampling-card'
 import { toast } from '@/hooks/use-toast'
 
 interface PumpConfig {
@@ -106,13 +107,21 @@ export default function Automation() {
     const options: RequestInit = { method: 'POST' }
 
     if (action === 'start') {
+      // 启动前先获取最新 waypoint_sampling 并一并下发
+      let wpSampling: Record<string, unknown> | null = null
+      try {
+        const wpRes = await fetch('/api/waypoint-sampling')
+        const wpJson = await wpRes.json()
+        if (wpJson.success && wpJson.data) wpSampling = wpJson.data
+      } catch (_) { /* 获取失败时不传该字段，后端会用 config 中已有值 */ }
+
+      const body: Record<string, unknown> = {
+        sampling_sequence: { steps, loop_count: loopCount },
+      }
+      if (wpSampling !== null) body.waypoint_sampling = wpSampling
+
       options.headers = { 'Content-Type': 'application/json' }
-      options.body = JSON.stringify({
-        sampling_sequence: {
-          steps,
-          loop_count: loopCount,
-        },
-      })
+      options.body = JSON.stringify(body)
     }
 
     try {
@@ -154,6 +163,34 @@ export default function Automation() {
     } catch (e) {
         console.error(e)
     }
+  }
+
+  const handleExport = () => {
+    window.open('/api/mission-config/export', '_blank')
+  }
+
+  const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0]
+    if (!file) return
+    try {
+      const text = await file.text()
+      const data = JSON.parse(text)
+      const res = await fetch('/api/mission-config/import', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(data),
+      })
+      const result = await res.json()
+      if (result.success) {
+        toast({ title: '任务配置已导入', description: `已导入 ${(result.fields || []).join(', ')}` })
+        fetchConfig()
+      } else {
+        toast({ title: '导入失败', description: result.message, variant: 'destructive' })
+      }
+    } catch (err) {
+      toast({ title: '导入失败', description: '文件解析错误', variant: 'destructive' })
+    }
+    e.target.value = ''
   }
 
   const moveStep = (index: number, direction: -1 | 1) => {
@@ -238,11 +275,23 @@ export default function Automation() {
                     </div>
                 </div>
                 <Button className="w-full" onClick={saveConfig}>应用配置</Button>
+                <div className="flex gap-2 pt-2">
+                    <Button variant="outline" size="sm" className="flex-1" onClick={handleExport}>
+                        <Download className="w-4 h-4 mr-1" />导出
+                    </Button>
+                    <Button variant="outline" size="sm" className="flex-1 relative" asChild>
+                        <label>
+                            <Upload className="w-4 h-4 mr-1" />导入
+                            <input type="file" accept=".json" className="absolute inset-0 opacity-0 cursor-pointer" onChange={handleImport} />
+                        </label>
+                    </Button>
+                </div>
             </CardContent>
         </Card>
 
-        <div className="lg:col-span-2">
+        <div className="lg:col-span-2 space-y-6">
           <InjectionPumpCard />
+          <WaypointSamplingCard />
         </div>
 
         <Card className="lg:col-span-3">
