@@ -983,6 +983,74 @@ class WebConfigServer(object):
                 return jsonify({"success": False, "message": "保存失败"}), 500
             return jsonify({"success": True, "message": "该航点本无配置"})
 
+        @self.app.route('/api/waypoint-sampling/sync', methods=['POST'])
+        def sync_waypoint_sampling_from_mavros():
+            """从 MAVROS 拉取飞控 Mission 航点列表，为缺失的 seq 自动补充默认采样配置。"""
+            if self.standalone:
+                return jsonify({"success": False, "message": "独立模式不支持飞控同步"}), 400
+            try:
+                from mavros_msgs.srv import WaypointPull
+                from mavros_msgs.msg import Waypoint
+                rospy.wait_for_service('/mavros/mission/pull', timeout=5.0)
+                pull_srv = rospy.ServiceProxy('/mavros/mission/pull', WaypointPull)
+                resp = pull_srv()
+                if not resp.success:
+                    return jsonify({"success": False, "message": "拉取航点失败"}), 500
+
+                # 读取当前航点列表
+                wp_list_topic = '/mavros/mission/waypoints'
+                try:
+                    from mavros_msgs.msg import WaypointList
+                    wp_msg = rospy.wait_for_message(wp_list_topic, WaypointList, timeout=5.0)
+                    waypoints = wp_msg.waypoints
+                except Exception as e:
+                    return jsonify({"success": False, "message": "读取航点列表超时: %s" % str(e)}), 500
+
+                # 筛选 NAV_WAYPOINT (cmd=16) 类型的航点
+                nav_seqs = []
+                for wp in waypoints:
+                    if wp.command == 16:  # MAV_CMD_NAV_WAYPOINT
+                        nav_seqs.append(wp.seq)
+
+                if not nav_seqs:
+                    return jsonify({"success": True, "message": "飞控中无导航航点", "data": {}, "synced": 0})
+
+                config = self.config_manager.get()
+                wp_cfg = dict(config.get('waypoint_sampling', {}))
+                default_item = {
+                    'enabled': True,
+                    'loop_count': int(config.get('sampling_sequence', {}).get('loop_count', 1) or 1),
+                    'retry_count': 0,
+                    'hold_before_sampling_s': 3.0,
+                    'on_fail': 'HOLD',
+                }
+                synced = 0
+                for seq in nav_seqs:
+                    seq_key = str(seq)
+                    if seq_key not in wp_cfg:
+                        wp_cfg[seq_key] = dict(default_item)
+                        synced += 1
+
+                # 清理不在飞控 mission 中的旧航点
+                valid_keys = set(str(s) for s in nav_seqs)
+                removed_keys = [k for k in list(wp_cfg.keys()) if k not in valid_keys]
+                for k in removed_keys:
+                    del wp_cfg[k]
+
+                normalized = ConfigManager._normalize_waypoint_sampling(wp_cfg)
+                self.config_manager.update({'waypoint_sampling': normalized})
+                self._add_log("已从飞控同步 %d 个航点采样配置" % len(nav_seqs), "success")
+                return jsonify({
+                    "success": True,
+                    "message": "已同步 %d 个航点（新增 %d，移除 %d）" % (len(nav_seqs), synced, len(removed_keys)),
+                    "data": normalized,
+                    "synced": synced,
+                    "total": len(nav_seqs),
+                    "removed": len(removed_keys),
+                })
+            except Exception as e:
+                return jsonify({"success": False, "message": "同步失败: %s" % str(e)}), 500
+
         # ================= 任务配置导入导出 API =================
         @self.app.route('/api/mission-config/export', methods=['GET'])
         def export_mission_config():

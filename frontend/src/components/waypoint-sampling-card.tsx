@@ -5,7 +5,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { NumericInput } from "@/components/ui/numeric-input"
-import { Plus, Trash2, Save, RefreshCw } from 'lucide-react'
+import { Plus, Trash2, Save, RefreshCw, Download } from 'lucide-react'
 import { toast } from '@/hooks/use-toast'
 
 interface WaypointSamplingItem {
@@ -59,6 +59,21 @@ export function WaypointSamplingCard() {
     }
   }
 
+  const syncFromMavros = async () => {
+    try {
+      const res = await fetch('/api/waypoint-sampling/sync', { method: 'POST' })
+      const json = await res.json()
+      if (json.success) {
+        toast({ title: '航点已同步', description: json.message })
+        if (json.data) setData(json.data)
+      } else {
+        toast({ title: '同步失败', description: json.message, variant: 'destructive' })
+      }
+    } catch (e) {
+      toast({ title: '同步请求失败', variant: 'destructive' })
+    }
+  }
+
   const addWaypoint = () => {
     const seq = newSeq.trim()
     if (!seq || isNaN(Number(seq))) return
@@ -85,6 +100,7 @@ export function WaypointSamplingCard() {
       <CardHeader className="flex flex-row items-center justify-between">
         <CardTitle className="text-base">航点采样配置</CardTitle>
         <div className="flex gap-2">
+          <Button size="sm" variant="outline" onClick={syncFromMavros} title="从飞控同步航点"><Download className="w-4 h-4 mr-1" />同步飞控</Button>
           <Button size="sm" variant="ghost" onClick={fetchData}><RefreshCw className="w-4 h-4" /></Button>
           <Button size="sm" onClick={saveAll}><Save className="w-4 h-4 mr-1" />保存</Button>
         </div>
