@@ -985,32 +985,60 @@ class WebConfigServer(object):
 
         @self.app.route('/api/waypoint-sampling/sync', methods=['POST'])
         def sync_waypoint_sampling_from_mavros():
-            """从 MAVROS 拉取飞控 Mission 航点数量，自动补充默认采样配置。"""
+            """从飞控拉取 Mission 航点数量，自动补充默认采样配置。
+            三级回退策略:
+              1. MAVROS WaypointPull 服务
+              2. /mavros/mission/waypoints topic 缓存
+              3. pymavlink 直连 router TCP 向飞控请求 MISSION_COUNT
+            """
             if self.standalone:
                 return jsonify({"success": False, "message": "独立模式不支持飞控同步"}), 400
             try:
-                from mavros_msgs.msg import WaypointList
-                from mavros_msgs.srv import WaypointPull
-
                 nav_seqs = []
                 pull_error = None
-                rospy.wait_for_service('/mavros/mission/pull', timeout=5.0)
-                pull_srv = rospy.ServiceProxy('/mavros/mission/pull', WaypointPull)
-                resp = pull_srv()
-                if resp.success and resp.wp_received > 0:
-                    nav_seqs = list(range(resp.wp_received))
-                else:
-                    pull_error = "pull success=%s wp_received=%s" % (resp.success, resp.wp_received)
 
+                # --- 通道 1: MAVROS WaypointPull 服务 ---
+                try:
+                    from mavros_msgs.srv import WaypointPull
+                    rospy.wait_for_service('/mavros/mission/pull', timeout=5.0)
+                    pull_srv = rospy.ServiceProxy('/mavros/mission/pull', WaypointPull)
+                    resp = pull_srv()
+                    if resp.success and resp.wp_received > 0:
+                        nav_seqs = list(range(resp.wp_received))
+                    else:
+                        pull_error = "pull success=%s wp_received=%s" % (resp.success, resp.wp_received)
+                except Exception as e1:
+                    pull_error = "mavros pull: %s" % str(e1)
+
+                # --- 通道 2: MAVROS mission/waypoints topic 缓存 ---
                 if not nav_seqs:
                     try:
+                        from mavros_msgs.msg import WaypointList
                         waypoint_list = rospy.wait_for_message('/mavros/mission/waypoints', WaypointList, timeout=3.0)
                         nav_seqs = list(range(len(waypoint_list.waypoints or [])))
-                    except Exception as cache_exc:
-                        if pull_error is None:
-                            pull_error = str(cache_exc)
+                    except Exception as e2:
+                        pull_error = "%s; cache: %s" % (pull_error or "", str(e2))
+
+                # --- 通道 3: pymavlink 直连 router TCP 请求 MISSION_COUNT ---
+                if not nav_seqs:
+                    try:
+                        from pymavlink import mavutil
+                        router_url = rospy.get_param('~router_url',
+                                     rospy.get_param('/mavlink_router_url', 'tcp:127.0.0.1:5760'))
+                        conn = mavutil.mavlink_connection(router_url, source_system=254, source_component=190,
+                                                         retries=1, timeout=5)
+                        conn.wait_heartbeat(timeout=3)
+                        target_sys = conn.target_system or 1
+                        target_comp = conn.target_component or 1
+                        conn.mav.mission_request_list_send(target_sys, target_comp)
+                        ack = conn.recv_match(type='MISSION_COUNT', blocking=True, timeout=5)
+                        if ack and ack.count > 0:
+                            nav_seqs = list(range(ack.count))
                         else:
-                            pull_error = "%s; cache=%s" % (pull_error, cache_exc)
+                            pull_error = "%s; pymavlink: count=%s" % (pull_error or "", getattr(ack, 'count', None))
+                        conn.close()
+                    except Exception as e3:
+                        pull_error = "%s; pymavlink: %s" % (pull_error or "", str(e3))
 
                 if not nav_seqs:
                     return jsonify({"success": False, "message": "拉取航点失败: %s" % (pull_error or "mission empty")}), 500
@@ -1698,6 +1726,29 @@ class WebConfigServer(object):
             else:
                 threading.Event().wait(1.0/rate)
 
+    def _apply_saved_hardware_on_startup(self):
+        """启动后延迟推送已保存的硬件配置到 pump_control_node ROS 参数并调用 reconnect。"""
+        try:
+            rospy.sleep(5.0)  # 等待 pump_control_node 服务注册
+            hw = self.config_manager.get().get('hardware', {})
+            saved_port = hw.get('pump_serial_port', '')
+            if not saved_port or saved_port == '/dev/ttyUSB0':
+                return  # 默认值无需覆盖
+            rospy.loginfo("[HW-AutoApply] 推送已保存硬件配置: port=%s baud=%s",
+                          saved_port, hw.get('pump_baudrate', 115200))
+            rospy.set_param('/pump_control_node/serial_port', saved_port)
+            rospy.set_param('/pump_control_node/baudrate', int(hw.get('pump_baudrate', 115200)))
+            rospy.set_param('/pump_control_node/timeout', float(hw.get('pump_timeout', 1.0)))
+            svc = rospy.ServiceProxy('/usv/pump_reconnect', Trigger)
+            svc.wait_for_service(timeout=5.0)
+            resp = svc()
+            if resp.success:
+                rospy.loginfo("[HW-AutoApply] 泵控重连成功: %s", resp.message)
+            else:
+                rospy.logwarn("[HW-AutoApply] 泵控重连失败: %s", resp.message)
+        except Exception as e:
+            rospy.logwarn("[HW-AutoApply] 自动应用硬件配置跳过: %s", str(e))
+
     def run(self):
         """运行服务器。"""
         if not FLASK_AVAILABLE:
@@ -1713,6 +1764,12 @@ class WebConfigServer(object):
         data_thread = threading.Thread(target=self._data_push_loop)
         data_thread.daemon = True
         data_thread.start()
+
+        # 启动后自动推送已保存的硬件配置 (延迟执行)
+        if not self.standalone:
+            hw_apply_thread = threading.Thread(target=self._apply_saved_hardware_on_startup)
+            hw_apply_thread.daemon = True
+            hw_apply_thread.start()
 
         # 启动 SocketIO 服务器
         try:
