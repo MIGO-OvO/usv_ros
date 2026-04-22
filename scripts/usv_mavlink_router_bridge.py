@@ -63,6 +63,7 @@ class USVMavlinkRouterBridge(object):
         # 由 run() 主循环统一发送，避免点击采样后桥接卡死。
         self._pending_statustexts = []   # [(text, severity), ...]
         self._pending_acks = []          # [(command, result, target_sys, target_comp), ...]
+        self._fcu_sample_id = 0          # current sampling id from FCU NAV_SCRIPT_TIME
         self._cmd_rx_pub = rospy.Publisher("/usv/mavlink_cmd_rx", Float32MultiArray, queue_size=5)
         self._radio_status_pub = rospy.Publisher("/usv/radio_status", String, queue_size=5)
         rospy.Subscriber("/usv/mavlink_cmd_ack", Float32MultiArray, self._cmd_ack_cb)
@@ -146,6 +147,16 @@ class USVMavlinkRouterBridge(object):
                 self._pending_statustexts.append(("USV: Sampling Started", mavutil.mavlink.MAV_SEVERITY_NOTICE))
             elif "sampling_stopped" in data:
                 self._pending_statustexts.append(("USV: Sampling Completed", mavutil.mavlink.MAV_SEVERITY_NOTICE))
+                # notify FCU that sampling is done (for NAV_SCRIPT_TIME)
+                if self._fcu_sample_id > 0:
+                    sample_id = self._fcu_sample_id
+                    self._fcu_sample_id = 0
+                    try:
+                        t = int((time.time() - self._boot_time) * 1000) & 0xFFFFFFFF
+                        self._conn.mav.named_value_float_send(t, b"USV_DONE\x00\x00", float(sample_id))
+                        rospy.loginfo("Sent USV_DONE id=%d to FCU", sample_id)
+                    except Exception as exc:
+                        rospy.logwarn("Failed to send USV_DONE: %s", str(exc))
             elif "sampling_paused" in data:
                 self._pending_statustexts.append(("USV: Sampling Paused", mavutil.mavlink.MAV_SEVERITY_NOTICE))
             elif "calibrate" in data:
@@ -249,6 +260,29 @@ class USVMavlinkRouterBridge(object):
                         "txbuf": int(getattr(msg, "txbuf", 0)),
                     })
                     self._radio_status_pub.publish(radio_msg)
+                except Exception:
+                    pass
+                continue
+
+            # USV_SMPL / USV_SURV: 飞控 mission 原生采样触发
+            if msg_type == "NAMED_VALUE_FLOAT":
+                try:
+                    name = msg.name.rstrip('\x00')
+                    if name == "USV_SMPL":
+                        sample_id = int(msg.value)
+                        rospy.loginfo("FCU triggered point sampling id=%d", sample_id)
+                        rx = Float32MultiArray()
+                        rx.data = [float(CMD_START_SAMPLING), float(sample_id), 0.0, 0.0, 0.0, 0.0, 0.0]
+                        self._cmd_rx_pub.publish(rx)
+                        with self._lock:
+                            self._fcu_sample_id = sample_id
+                    elif name == "USV_SURV":
+                        survey_on = int(msg.value)
+                        cmd = CMD_START_SURVEY if survey_on else CMD_STOP_SURVEY
+                        rospy.loginfo("FCU triggered survey cmd=%d", cmd)
+                        rx = Float32MultiArray()
+                        rx.data = [float(cmd), float(msg.value), 0.0, 0.0, 0.0, 0.0, 0.0]
+                        self._cmd_rx_pub.publish(rx)
                 except Exception:
                     pass
                 continue
