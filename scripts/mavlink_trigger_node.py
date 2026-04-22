@@ -104,8 +104,6 @@ class MAVLinkTriggerNode(object):
 
         # 参数
         self.mavros_timeout = rospy.get_param('~mavros_timeout', 30.0)
-        self.auto_trigger_on_waypoint = rospy.get_param('~auto_trigger_on_waypoint', True)
-        self.trigger_waypoints = rospy.get_param('~trigger_waypoints', [])  # 空列表表示所有航点
         self.hold_settle_time = float(rospy.get_param('~hold_settle_time', 3.0))
         self.stable_check_timeout = float(rospy.get_param('~stable_check_timeout', 20.0))
         self.stable_speed_threshold = float(rospy.get_param('~stable_speed_threshold', 0.15))
@@ -278,27 +276,11 @@ class MAVLinkTriggerNode(object):
         return False, 'stable_timeout'
 
     def _waypoint_cb(self, msg):
-        """航点到达回调。"""
+        """航点到达回调 — 仅记录状态，采样由飞控 mission 原生触发。"""
         self.current_waypoint = msg.wp_seq
         rospy.loginfo("Waypoint %d reached", msg.wp_seq)
         self._set_mission_state(MissionState.WAYPOINT_REACHED, str(msg.wp_seq))
         self._publish_status("waypoint_reached:{}".format(msg.wp_seq))
-
-        if not self.auto_trigger_on_waypoint:
-            return
-        if self.trigger_waypoints and msg.wp_seq not in self.trigger_waypoints:
-            return
-
-        current_state = self._get_waypoint_state(msg.wp_seq)
-        if current_state in (WaypointSamplingState.HOLDING,
-                             WaypointSamplingState.WAITING_STABLE,
-                             WaypointSamplingState.SAMPLING,
-                             WaypointSamplingState.DONE):
-            rospy.loginfo("Waypoint %d ignored, state=%s", msg.wp_seq, current_state)
-            return
-
-        rospy.loginfo("Auto-triggering sampling at waypoint %d", msg.wp_seq)
-        threading.Thread(target=self._start_sampling_sequence, args=(msg.wp_seq,), daemon=True).start()
 
     def _handle_completion(self, success=True, reason='finished'):
         with self.state_lock:
@@ -606,27 +588,14 @@ class MAVLinkTriggerNode(object):
         self._publish_status("sampling_resumed")
 
     def _resume_auto_if_mission_exists(self):
-        """检查飞控是否有航点任务，有则切 AUTO，无则保持 HOLD。"""
-        try:
-            from mavros_msgs.srv import WaypointPull
-            rospy.wait_for_service('/mavros/mission/pull', timeout=3.0)
-            pull_srv = rospy.ServiceProxy('/mavros/mission/pull', WaypointPull)
-            resp = pull_srv()
-            if resp.success and resp.wp_received > 0:
-                rospy.loginfo("Mission has %d waypoints, resuming AUTO", resp.wp_received)
-                self._set_mission_state(MissionState.RESUMING_AUTO, str(self.current_waypoint))
-                if self.set_mode("AUTO"):
-                    self._set_mission_state(MissionState.NAVIGATING, str(self.current_waypoint))
-                else:
-                    self._set_mission_state(MissionState.FAILED, 'resume_auto_failed')
-            else:
-                rospy.loginfo("No mission loaded, staying in HOLD")
-                self._set_mission_state(MissionState.HOLD_NO_MISSION, str(self.current_waypoint))
-                self._publish_status("hold_no_mission")
-        except Exception as e:
-            rospy.logwarn("Cannot check mission, staying in HOLD: %s", str(e))
-            self._set_mission_state(MissionState.HOLD_NO_MISSION, str(self.current_waypoint))
-            self._publish_status("hold_no_mission")
+        """采样完成后的模式处理。
+
+        飞控原生 mission 模式下（NAV_SCRIPT_TIME）：飞控自行恢复 AUTO，
+        ROS 只负责通过 USV_DONE 通知飞控采样完成。
+        手动采样模式下：维持当前模式不变。
+        """
+        self._set_mission_state(MissionState.SAMPLING_DONE, str(self.current_waypoint))
+        rospy.loginfo("Sampling done at waypoint %d, FCU manages mode transition", self.current_waypoint)
 
     def _call_automation_service(self, action):
         """调用自动化服务。"""
