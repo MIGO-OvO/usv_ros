@@ -49,6 +49,8 @@ CMD_STOP_SAMPLING = 31011
 CMD_PAUSE_SAMPLING = 31012
 CMD_RESUME_SAMPLING = 31013
 CMD_CALIBRATE = 31014
+CMD_START_SURVEY = 31015
+CMD_STOP_SURVEY = 31016
 
 # MAVLink 协议常量
 MAVLINK_MSG_ID_COMMAND_LONG = 76
@@ -122,6 +124,11 @@ class MAVLinkTriggerNode(object):
         self.last_yaw_rate = 0.0
         self.waypoint_states = {}
         self.state_lock = threading.Lock()
+
+        # 走航采样状态
+        self._survey_active = False
+        self._survey_interval = 5.0
+        self._survey_thread = None
 
         # 服务客户端
         self.set_mode_client = None
@@ -464,7 +471,7 @@ class MAVLinkTriggerNode(object):
 
     def _dispatch_command_long(self, command, param1, param2, sender_system, sender_component, log_prefix):
         """处理并确认自定义 COMMAND_LONG。"""
-        if command < CMD_START_SAMPLING or command > CMD_CALIBRATE:
+        if command < CMD_START_SAMPLING or command > CMD_STOP_SURVEY:
             return
 
         rospy.loginfo(
@@ -699,24 +706,20 @@ class MAVLinkTriggerNode(object):
         """
         处理 MAVLink 自定义指令。
 
-        调用来源:
-        1. QGC USVPayloadPanel 按钮 (COMMAND_LONG via MAVLink)
-        2. QGC MAVLink Inspector
-        3. pymavlink 脚本
-        4. ROS 服务 /usv/trigger_sampling
-
-        Args:
-            cmd_id: 指令 ID (31010~31014)
-            param1: 参数1
-            param2: 参数2
-
-        Returns:
-            bool: 命令是否被成功处理
+        31010: 根据飞控模式自动判断手动/定点采样
+        31011~31014: 停止/暂停/恢复/校准
+        31015/31016: 走航采样开启/停止
         """
-        rospy.loginfo("Processing MAVLink command: %d", cmd_id)
+        rospy.loginfo("Processing MAVLink command: %d param1=%.1f param2=%.1f", cmd_id, param1, param2)
 
         if cmd_id == CMD_START_SAMPLING:
-            return self._start_sampling_sequence()
+            # 判断是否在 AUTO 模式中（定点采样 vs 手动采样）
+            with self.state_lock:
+                mode = self.mavros_state.mode or ""
+            if mode.upper() == "AUTO":
+                return self._do_waypoint_sample(self.current_waypoint)
+            else:
+                return self._do_manual_sample()
         elif cmd_id == CMD_STOP_SAMPLING:
             self._stop_sampling_sequence()
             return True
@@ -736,9 +739,95 @@ class MAVLinkTriggerNode(object):
             cmd_msg.data = "CALXYZA\r\n"
             self.pump_command_pub.publish(cmd_msg)
             return True
+        elif cmd_id == CMD_START_SURVEY:
+            return self._start_survey(param1)
+        elif cmd_id == CMD_STOP_SURVEY:
+            return self._stop_survey()
         else:
             rospy.logwarn("Unknown command: %d", cmd_id)
             return False
+
+    def _do_manual_sample(self):
+        """手动采样：不切模式，不判稳定，直接执行当前配置的采样序列。"""
+        if self.is_sampling:
+            rospy.logwarn("Sampling already in progress")
+            return False
+
+        config = self._load_config() or self._get_default_config()
+        steps_data = self._build_steps_payload(config, self.current_waypoint)
+
+        msg = String()
+        msg.data = json.dumps(steps_data)
+        self.steps_pub.publish(msg)
+
+        self._set_mission_state(MissionState.SAMPLING, str(self.current_waypoint))
+        self.is_sampling = True
+        if not self._call_automation_service('start'):
+            self.is_sampling = False
+            self._set_mission_state(MissionState.FAILED, "manual_start_failed")
+            return False
+
+        rospy.loginfo("Manual sampling started (no HOLD, no stable wait)")
+        return True
+
+    def _do_waypoint_sample(self, waypoint_seq):
+        """定点采样：HOLD → 稳定判定 → 采样 → 恢复 AUTO。即原 _start_sampling_sequence。"""
+        return self._start_sampling_sequence(waypoint_seq)
+
+    def _start_survey(self, interval=0):
+        """启动走航采样：边走边测，不切 HOLD。"""
+        if self._survey_active:
+            rospy.logwarn("Survey already active")
+            return False
+        if self.is_sampling:
+            rospy.logwarn("Cannot start survey while point sampling is active")
+            return False
+
+        self._survey_interval = max(1.0, float(interval) if interval > 0 else 5.0)
+        self._survey_active = True
+        self._survey_thread = threading.Thread(target=self._survey_loop, daemon=True)
+        self._survey_thread.start()
+        rospy.loginfo("Survey started, interval=%.1fs", self._survey_interval)
+        self._publish_status("survey_started")
+        return True
+
+    def _stop_survey(self):
+        """停止走航采样。"""
+        if not self._survey_active:
+            rospy.logwarn("Survey not active")
+            return True
+        self._survey_active = False
+        rospy.loginfo("Survey stopped")
+        self._publish_status("survey_stopped")
+        return True
+
+    def _survey_loop(self):
+        """走航采样循环线程：按间隔反复触发单次采样。"""
+        rospy.loginfo("Survey loop thread started, interval=%.1fs", self._survey_interval)
+        while self._survey_active and not rospy.is_shutdown():
+            if not self.is_sampling:
+                config = self._load_config() or self._get_default_config()
+                steps_data = self._build_steps_payload(config, self.current_waypoint)
+                # 走航模式强制 loop_count=1，单次采样
+                steps_data['loop_count'] = 1
+
+                msg = String()
+                msg.data = json.dumps(steps_data)
+                self.steps_pub.publish(msg)
+
+                self.is_sampling = True
+                self._call_automation_service('start')
+                # 等待本次采样完成
+                while self.is_sampling and self._survey_active and not rospy.is_shutdown():
+                    rospy.sleep(0.2)
+
+            # 采样完成后等待间隔
+            wait_end = time.time() + self._survey_interval
+            while self._survey_active and not rospy.is_shutdown() and time.time() < wait_end:
+                rospy.sleep(0.2)
+
+        self._survey_active = False
+        rospy.loginfo("Survey loop thread exited")
 
     def _trigger_srv_cb(self, req):
         """

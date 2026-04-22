@@ -25,6 +25,8 @@ WAIT_HEARTBEAT_TIMEOUT = 10.0
 # USV 自定义命令范围
 CMD_START_SAMPLING = 31010
 CMD_CALIBRATE = 31014
+CMD_START_SURVEY = 31015
+CMD_STOP_SURVEY = 31016
 
 
 class USVMavlinkRouterBridge(object):
@@ -256,7 +258,7 @@ class USVMavlinkRouterBridge(object):
 
             try:
                 command = int(msg.command)
-                if command < CMD_START_SAMPLING or command > CMD_CALIBRATE:
+                if command < CMD_START_SAMPLING or command > CMD_STOP_SURVEY:
                     continue
 
                 target_system = int(getattr(msg, "target_system", 0) or 0)
