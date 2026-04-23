@@ -272,7 +272,8 @@ class USVMavlinkRouterBridge(object):
                         sample_id = int(msg.value)
                         rospy.loginfo("FCU triggered point sampling id=%d", sample_id)
                         rx = Float32MultiArray()
-                        rx.data = [float(CMD_START_SAMPLING), float(sample_id), 0.0, 0.0, 0.0, 0.0, 0.0]
+                        # param1=0, param2=sample_id — trigger uses param2>0 to detect FCU origin
+                        rx.data = [float(CMD_START_SAMPLING), 0.0, float(sample_id), 0.0, 0.0, 0.0, 0.0]
                         self._cmd_rx_pub.publish(rx)
                         with self._lock:
                             self._fcu_sample_id = sample_id

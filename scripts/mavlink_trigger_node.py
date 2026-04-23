@@ -675,19 +675,19 @@ class MAVLinkTriggerNode(object):
         """
         处理 MAVLink 自定义指令。
 
-        31010: 根据飞控模式自动判断手动/定点采样
+        31010: param2 > 0 表示飞控 NAV_SCRIPT_TIME 原生触发(不切模式)，
+               param2 == 0 表示 QGC 手动按钮触发。
         31011~31014: 停止/暂停/恢复/校准
         31015/31016: 走航采样开启/停止
         """
         rospy.loginfo("Processing MAVLink command: %d param1=%.1f param2=%.1f", cmd_id, param1, param2)
 
         if cmd_id == CMD_START_SAMPLING:
-            # 判断是否在 AUTO 模式中（定点采样 vs 手动采样）
-            with self.state_lock:
-                mode = self.mavros_state.mode or ""
-            if mode.upper() == "AUTO":
-                return self._do_waypoint_sample(self.current_waypoint)
+            if param2 > 0:
+                # 飞控原生触发（NAV_SCRIPT_TIME）：不切 HOLD、不判稳定
+                return self._do_fcu_sample(int(param2))
             else:
+                # QGC 手动按钮或 Web 触发
                 return self._do_manual_sample()
         elif cmd_id == CMD_STOP_SAMPLING:
             self._stop_sampling_sequence()
@@ -739,9 +739,31 @@ class MAVLinkTriggerNode(object):
         rospy.loginfo("Manual sampling started (no HOLD, no stable wait)")
         return True
 
-    def _do_waypoint_sample(self, waypoint_seq):
-        """定点采样：HOLD → 稳定判定 → 采样 → 恢复 AUTO。即原 _start_sampling_sequence。"""
-        return self._start_sampling_sequence(waypoint_seq)
+    def _do_fcu_sample(self, sample_id):
+        """飞控原生定点采样：飞控已暂停 mission（NavScriptTime），不切模式、不判稳定。
+
+        采样完成后 bridge 会通过 USV_DONE 通知飞控恢复 mission。
+        """
+        if self.is_sampling:
+            rospy.logwarn("Sampling already in progress")
+            return False
+
+        config = self._load_config() or self._get_default_config()
+        steps_data = self._build_steps_payload(config, self.current_waypoint)
+
+        msg = String()
+        msg.data = json.dumps(steps_data)
+        self.steps_pub.publish(msg)
+
+        self._set_mission_state(MissionState.SAMPLING, str(self.current_waypoint))
+        self.is_sampling = True
+        if not self._call_automation_service('start'):
+            self.is_sampling = False
+            self._set_mission_state(MissionState.FAILED, "fcu_sample_start_failed")
+            return False
+
+        rospy.loginfo("FCU-triggered sampling started (id=%d, no HOLD, no stable wait)", sample_id)
+        return True
 
     def _start_survey(self, interval=0):
         """启动走航采样：边走边测，不切 HOLD。"""
