@@ -66,6 +66,9 @@ PACKET_SIZE_TEST = 18
 PACKET_SIZE_SPECTRO = 18
 TAIL = 0x0A
 
+DETECTOR_HANDSHAKE_CMD = "HELLO?\r\n"
+DETECTOR_ID_PREFIX = "DET_ID:USV_DETECTOR"
+
 SPECTRO_STATUS_VALID = 0x01
 SPECTRO_STATUS_I2C_ERROR = 0x02
 SPECTRO_STATUS_NOT_CONFIG = 0x04
@@ -100,7 +103,35 @@ DEFAULT_ANGLE_STREAM = {
 }
 
 
-
+def perform_detector_handshake(serial_conn, timeout=2.0):
+    """发送握手命令并等待检测装置身份响应。"""
+    deadline = time.time() + max(0.5, float(timeout))
+    old_timeout = getattr(serial_conn, 'timeout', None)
+    serial_conn.timeout = 0.1
+    serial_conn.reset_input_buffer()
+    line = b""
+    next_probe = 0
+    try:
+        while time.time() < deadline:
+            if time.time() >= next_probe:
+                serial_conn.write(DETECTOR_HANDSHAKE_CMD.encode('utf-8'))
+                serial_conn.flush()
+                next_probe = time.time() + 0.5
+            chunk = serial_conn.read(1)
+            if not chunk:
+                continue
+            if chunk in (b"\n", b"\r"):
+                text = line.decode('utf-8', errors='ignore').strip()
+                if text.startswith(DETECTOR_ID_PREFIX):
+                    return True, text
+                line = b""
+            else:
+                line += chunk
+                if len(line) > 120:
+                    line = b""
+    finally:
+        serial_conn.timeout = old_timeout
+    return False, "handshake timeout"
 
 
 class PumpSerialReader(object):
@@ -447,6 +478,11 @@ class PumpControlNode(object):
             )
             self.serial_conn.reset_input_buffer()
             self.serial_conn.reset_output_buffer()
+            ok, identity = perform_detector_handshake(self.serial_conn, timeout=max(2.5, self.timeout))
+            if not ok:
+                self.serial_conn.close()
+                raise serial.SerialException("detector handshake failed: %s" % identity)
+            rospy.loginfo("Detector handshake: %s", identity)
             self._publish_injection_pump_status()
 
             # 启动读取器

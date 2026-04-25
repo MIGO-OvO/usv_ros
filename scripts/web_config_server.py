@@ -1509,13 +1509,41 @@ class WebConfigServer(object):
             port = data.get('serial_port', '/dev/ttyUSB0')
             baud = int(data.get('baudrate', 115200))
             tout = float(data.get('timeout', 1.0))
+            conn = None
             try:
                 import serial as pyserial
-                conn = pyserial.Serial(port=port, baudrate=baud, timeout=tout)
-                conn.close()
-                return jsonify({"success": True, "message": f"串口 {port} 可打开"})
+                deadline = time.time() + max(2.5, tout)
+                conn = pyserial.Serial(port=port, baudrate=baud, timeout=0.1, write_timeout=tout)
+                conn.reset_input_buffer()
+                line = b''
+                identity = ''
+                next_probe = 0
+                while time.time() < deadline:
+                    if time.time() >= next_probe:
+                        conn.write(b'HELLO?\r\n')
+                        conn.flush()
+                        next_probe = time.time() + 0.5
+                    chunk = conn.read(1)
+                    if not chunk:
+                        continue
+                    if chunk in (b'\n', b'\r'):
+                        text = line.decode('utf-8', errors='ignore').strip()
+                        if text.startswith('DET_ID:USV_DETECTOR'):
+                            identity = text
+                            break
+                        line = b''
+                    else:
+                        line += chunk
+                        if len(line) > 120:
+                            line = b''
+                if identity:
+                    return jsonify({"success": True, "message": f"已识别检测装置: {identity}", "identity": identity})
+                return jsonify({"success": False, "message": f"串口 {port} 可打开，但未收到检测装置握手响应"})
             except Exception as e:
                 return jsonify({"success": False, "message": str(e)})
+            finally:
+                if conn:
+                    conn.close()
 
 
 
