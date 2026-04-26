@@ -8,6 +8,7 @@ from __future__ import print_function
 import json
 import threading
 import time
+from collections import deque
 
 import rospy
 from std_msgs.msg import String, Float32MultiArray
@@ -21,6 +22,7 @@ SYS_ID = 2
 COMP_ID = 191   # MAV_COMP_ID_ONBOARD_COMPUTER, matches QGC USVPayloadPanel target
 ROUTER_URL = "tcp:127.0.0.1:5760"
 WAIT_HEARTBEAT_TIMEOUT = 10.0
+MAX_PENDING_SENDS = 50
 
 # USV 自定义命令范围
 CMD_START_SAMPLING = 31010
@@ -61,8 +63,9 @@ class USVMavlinkRouterBridge(object):
         # pymavlink TCP 连接非线程安全：
         # ROS 回调线程不直接操作 self._conn，只把待发送项入队，
         # 由 run() 主循环统一发送，避免点击采样后桥接卡死。
-        self._pending_statustexts = []   # [(text, severity), ...]
-        self._pending_acks = []          # [(command, result, target_sys, target_comp), ...]
+        self._pending_statustexts = deque(maxlen=MAX_PENDING_SENDS)   # [(text, severity), ...]
+        self._pending_acks = deque(maxlen=MAX_PENDING_SENDS)          # [(command, result, target_sys, target_comp), ...]
+        self._pending_usv_done = deque(maxlen=MAX_PENDING_SENDS)      # [sample_id, ...]
         self._fcu_sample_id = 0          # current sampling id from FCU NAV_SCRIPT_TIME
         self._cmd_rx_pub = rospy.Publisher("/usv/mavlink_cmd_rx", Float32MultiArray, queue_size=5)
         self._radio_status_pub = rospy.Publisher("/usv/radio_status", String, queue_size=5)
@@ -151,12 +154,7 @@ class USVMavlinkRouterBridge(object):
                 if self._fcu_sample_id > 0:
                     sample_id = self._fcu_sample_id
                     self._fcu_sample_id = 0
-                    try:
-                        t = int((time.time() - self._boot_time) * 1000) & 0xFFFFFFFF
-                        self._conn.mav.named_value_float_send(t, b"USV_DONE\x00\x00", float(sample_id))
-                        rospy.loginfo("Sent USV_DONE id=%d to FCU", sample_id)
-                    except Exception as exc:
-                        rospy.logwarn("Failed to send USV_DONE: %s", str(exc))
+                    self._pending_usv_done.append(sample_id)
             elif "sampling_paused" in data:
                 self._pending_statustexts.append(("USV: Sampling Paused", mavutil.mavlink.MAV_SEVERITY_NOTICE))
             elif "calibrate" in data:
@@ -234,6 +232,19 @@ class USVMavlinkRouterBridge(object):
             with self._lock:
                 self._diag_pub_errors += 1
             rospy.logwarn("Failed to send COMMAND_ACK: %s", str(exc))
+
+    def _send_usv_done(self, sample_id):
+        try:
+            t = int((time.time() - self._boot_time) * 1000) & 0xFFFFFFFF
+            self._conn.mav.named_value_float_send(t, b"USV_DONE\x00\x00", float(sample_id))
+            with self._lock:
+                self._diag_tx_total += 1
+                self._diag_tx_named += 1
+            rospy.loginfo("Sent USV_DONE id=%d to FCU", sample_id)
+        except Exception as exc:
+            with self._lock:
+                self._diag_pub_errors += 1
+            rospy.logwarn("Failed to send USV_DONE: %s", str(exc))
 
     def _receive_mavlink_messages(self):
         """接收 QGC 发来的 COMMAND_LONG，并兼容转发到旧内部总线。"""
@@ -414,11 +425,15 @@ class USVMavlinkRouterBridge(object):
                 self._pending_statustexts.clear()
                 pending_ack = list(self._pending_acks)
                 self._pending_acks.clear()
+                pending_done = list(self._pending_usv_done)
+                self._pending_usv_done.clear()
 
             for text, severity in pending_st:
                 self._send_statustext(text, severity)
             for command, result, target_sys, target_comp in pending_ack:
                 self._send_command_ack(command, result, target_sys, target_comp)
+            for sample_id in pending_done:
+                self._send_usv_done(sample_id)
 
             self._send_payload(voltage, absorbance, angles, status, automation_step, automation_total, sample_count, pid_error, pid_mode)
 
