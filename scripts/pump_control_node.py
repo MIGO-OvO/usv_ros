@@ -388,6 +388,8 @@ class PumpControlNode(object):
         self.pid_precision = rospy.get_param('~pid_precision', 0.1)
         self.auto_injection_command_delay = float(rospy.get_param('~auto_injection_command_delay', 0.15))
         self.auto_injection_retry_delay = float(rospy.get_param('~auto_injection_retry_delay', 0.2))
+        self.spectro_sample_wait_timeout = float(rospy.get_param('~spectro_sample_wait_timeout', 2.0))
+
         self.i2c_mapping = rospy.get_param('~i2c_mapping', rospy.get_param('/i2c_mapping', DEFAULT_I2C_MAPPING))
         self.spectro_config = rospy.get_param('~spectrometer', rospy.get_param('/spectrometer', DEFAULT_SPECTRO_CONFIG))
         self.angle_stream = rospy.get_param('~angle_stream', rospy.get_param('/angle_stream', DEFAULT_ANGLE_STREAM))
@@ -436,6 +438,8 @@ class PumpControlNode(object):
         self.spectro_baseline_voltage = float(self.spectro_config.get('baseline_voltage', 0.0))
         self.spectro_command_event = threading.Event()
         self.spectro_command_result = None
+        self._current_step_spectro_timestamp = None
+        self._latest_spectro_received_at = 0.0
 
         # Publishers
         self.angles_pub = rospy.Publisher('/usv/pump_angles', String, queue_size=10)
@@ -796,6 +800,7 @@ class PumpControlNode(object):
     def _send_automation_step(self, step):
         """自动化引擎步骤发送钩子。"""
         self._current_auto_step = dict(step or {})
+        self._current_step_spectro_timestamp = self._latest_spectro_received_at
         step_name = step.get("name", "未命名步骤")
         enabled_motors = []
         for motor in MOTOR_NAMES:
@@ -881,6 +886,27 @@ class PumpControlNode(object):
             time.sleep(min(0.05, max(0.0, end_time - time.time())))
         return self.automation_engine.is_running()
 
+    def _wait_for_new_spectro_sample(self, previous_timestamp):
+        """ADS 采集中时等待一条新的有效分光样本。"""
+        if not self.spectro_config.get('enabled', True):
+            return True
+        if self.spectro_state != 'acquiring':
+            return True
+        timeout = max(0.1, self.spectro_sample_wait_timeout)
+        deadline = time.time() + timeout
+        previous_timestamp = previous_timestamp or 0.0
+        while self.automation_engine.is_running() and time.time() < deadline:
+            while self.automation_engine.is_paused() and self.automation_engine.is_running():
+                time.sleep(0.1)
+                deadline += 0.1
+            if self.latest_spectro and self.latest_spectro.get('valid', False):
+                if self._latest_spectro_received_at > previous_timestamp:
+                    return True
+            time.sleep(0.02)
+        rospy.logerr("[Automation] 分光有效样本等待超时: %.1fs", timeout)
+        return False
+
+
     def _wait_for_automation_step(self, step):
         """等待自动化步骤实际完成。"""
         if not self.automation_engine.is_running():
@@ -909,6 +935,9 @@ class PumpControlNode(object):
                 rospy.logerr("[Automation] 进样泵定时关闭失败")
                 return False
             rospy.loginfo("[Automation] 进样泵定时运行完成，已关闭")
+
+        if not self._wait_for_new_spectro_sample(self._current_step_spectro_timestamp):
+            return False
 
         return self.automation_engine.is_running()
 
@@ -1134,6 +1163,7 @@ class PumpControlNode(object):
         """分光数据回调。"""
         self.latest_spectro = data
         if data.get('valid', False):
+            self._latest_spectro_received_at = time.time()
             self.spectro_state = 'acquiring'
         elif data.get('i2c_error', False):
             self.spectro_state = 'i2c_error'
