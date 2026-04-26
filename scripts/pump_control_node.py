@@ -156,14 +156,16 @@ class PumpSerialReader(object):
         self.on_test_result_received = None  # func(dict) - 测试结果 [0xBB]
         self.on_spectro_received = None  # func(dict) - 分光数据 [0xDD]
         self.on_text_received = None    # func(str) - 文本响应
+        self.on_error = None            # func(Exception) - 读取异常
 
-    def start(self, on_angle=None, on_pid=None, on_test=None, on_spectro=None, on_text=None):
+    def start(self, on_angle=None, on_pid=None, on_test=None, on_spectro=None, on_text=None, on_error=None):
         """启动后台读取线程。"""
         self.on_angle_received = on_angle
         self.on_pid_data_received = on_pid
         self.on_test_result_received = on_test
         self.on_spectro_received = on_spectro
         self.on_text_received = on_text
+        self.on_error = on_error
         self.running = True
         self.read_thread = threading.Thread(target=self._read_loop, daemon=True)
         self.read_thread.start()
@@ -185,8 +187,11 @@ class PumpSerialReader(object):
                         raw_data = self.serial_conn.read(self.serial_conn.in_waiting)
                         self._process_data(raw_data)
                 rospy.sleep(0.005)
-            except serial.SerialException as e:
+            except (serial.SerialException, OSError) as e:
                 rospy.logerr("Serial read error: %s", str(e))
+                self.running = False
+                if self.on_error:
+                    self.on_error(e)
                 break
             except Exception as e:
                 rospy.logerr("Reader error: %s", str(e))
@@ -492,7 +497,8 @@ class PumpControlNode(object):
                 on_pid=self._on_pid_data_received,
                 on_test=self._on_test_result_received,
                 on_spectro=self._on_spectro_received,
-                on_text=self._on_text_received
+                on_text=self._on_text_received,
+                on_error=self._on_serial_reader_error
             )
 
             self._apply_runtime_configuration()
@@ -517,8 +523,23 @@ class PumpControlNode(object):
                 self.serial_conn.close()
             except Exception as e:
                 rospy.logwarn("Error closing serial: %s", str(e))
-
+        self.serial_conn = None
         rospy.loginfo("Disconnected from pump controller")
+
+    def _on_serial_reader_error(self, error):
+        """读取线程异常后异步重连，避免在读取线程内 join 自身。"""
+        rospy.logwarn("Serial reader stopped: %s", str(error))
+        self._publish_status("error: " + str(error))
+        threading.Thread(target=self._reconnect_after_reader_error, daemon=True).start()
+
+    def _reconnect_after_reader_error(self):
+        rospy.sleep(1.0)
+        with self.serial_lock:
+            self.disconnect()
+        if not rospy.is_shutdown() and self.connect():
+            rospy.loginfo("Recovered pump serial connection")
+        else:
+            self._publish_status("disconnected")
 
     def _reconnect_callback(self, req):
         """运行时重连串口服务回调。从 ROS 参数读取最新配置并重连。"""
