@@ -807,6 +807,52 @@ class WebConfigServer(object):
         # 使用 threading 模式以兼容 ROS
         self.socketio = SocketIO(self.app, cors_allowed_origins="*", async_mode='threading')
 
+        def json_object():
+            data = request.get_json(silent=True)
+            return data if isinstance(data, dict) else None
+
+        def to_float(value, default, min_value=None, max_value=None):
+            try:
+                result = float(value)
+            except (TypeError, ValueError):
+                result = default
+            if min_value is not None:
+                result = max(min_value, result)
+            if max_value is not None:
+                result = min(max_value, result)
+            return result
+
+        def to_int(value, default, min_value=None, max_value=None):
+            try:
+                result = int(float(value))
+            except (TypeError, ValueError):
+                result = default
+            if min_value is not None:
+                result = max(min_value, result)
+            if max_value is not None:
+                result = min(max_value, result)
+            return result
+
+        def clean_string(value, default='', max_len=160):
+            if value is None:
+                value = default
+            if not isinstance(value, str):
+                value = str(value)
+            return value.strip()[:max_len]
+
+        def normalize_hardware(data, current_hw=None):
+            hw = dict(current_hw or DEFAULT_CONFIG['hardware'])
+            for key in DEFAULT_CONFIG['hardware']:
+                if key in data:
+                    hw[key] = data[key]
+            hw['pump_serial_port'] = clean_string(
+                hw.get('pump_serial_port'), DEFAULT_CONFIG['hardware']['pump_serial_port'], 128
+            ) or DEFAULT_CONFIG['hardware']['pump_serial_port']
+            hw['pump_baudrate'] = to_int(hw.get('pump_baudrate'), 115200, 1200, 3000000)
+            hw['pump_timeout'] = to_float(hw.get('pump_timeout'), 1.0, 0.1, 10.0)
+            return hw
+
+
         # ================= HTTP 路由 =================
         def get_ui_mode():
             ui_mode = None
@@ -854,7 +900,9 @@ class WebConfigServer(object):
 
         @self.app.route('/api/config', methods=['POST'])
         def save_config():
-            data = request.get_json()
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
             if self.config_manager.update(data):
                 self._add_log("配置已保存", "success")
                 return jsonify({"success": True, "message": "配置已保存"})
@@ -899,7 +947,9 @@ class WebConfigServer(object):
 
         @self.app.route('/api/preset/auto/<name>', methods=['POST'])
         def save_auto_preset(name):
-            data = request.get_json()
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
             normalized = ConfigManager._normalize_sampling_sequence({
                 'steps': data.get('steps', []),
                 'loop_count': data.get('loop_count', 1),
@@ -926,9 +976,9 @@ class WebConfigServer(object):
         @self.app.route('/api/waypoint-sampling', methods=['POST'])
         def save_waypoint_sampling():
             """保存全部航点采样配置（整体覆盖）。"""
-            data = request.get_json()
-            if not isinstance(data, dict):
-                return jsonify({"success": False, "message": "请求体应为对象"}), 400
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
             normalized = ConfigManager._normalize_waypoint_sampling(data)
             if self.config_manager.update({'waypoint_sampling': normalized}):
                 self._add_log("航点采样配置已保存", "success")
@@ -956,7 +1006,9 @@ class WebConfigServer(object):
                 seq_key = str(int(seq))
             except (TypeError, ValueError):
                 return jsonify({"success": False, "message": "航点编号无效"}), 400
-            data = request.get_json() or {}
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
             config = self.config_manager.get()
             wp_cfg = dict(config.get('waypoint_sampling', {}))
             wp_cfg[seq_key] = data
@@ -1101,8 +1153,8 @@ class WebConfigServer(object):
         @self.app.route('/api/mission-config/import', methods=['POST'])
         def import_mission_config():
             """导入任务配置 JSON。"""
-            data = request.get_json()
-            if not isinstance(data, dict):
+            data = json_object()
+            if data is None:
                 return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
 
             patch = {}
@@ -1127,10 +1179,12 @@ class WebConfigServer(object):
         @self.app.route('/api/motor/command', methods=['POST'])
         def send_motor_command():
             """发送电机控制指令"""
-            data = request.get_json()
-            command = data.get('command', '')
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
+            command = clean_string(data.get('command', ''), '', 256)
             if not command:
-                return jsonify({"success": False, "message": "指令为空"})
+                return jsonify({"success": False, "message": "指令为空"}), 400
 
             if self.standalone:
                 self._add_log(f"[模拟] 发送指令: {command}", "info")
@@ -1177,14 +1231,20 @@ class WebConfigServer(object):
         @self.app.route('/api/pid/config', methods=['POST'])
         def set_pid_config():
             """设置 PID 参数"""
-            data = request.get_json()
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
             self.pid_config = {
-                "Kp": data.get("Kp", 0.14),
-                "Ki": data.get("Ki", 0.015),
-                "Kd": data.get("Kd", 0.06),
-                "output_min": data.get("output_min", 1.0),
-                "output_max": data.get("output_max", 8.0)
+                "Kp": to_float(data.get("Kp"), 0.14, 0.0, 100.0),
+                "Ki": to_float(data.get("Ki"), 0.015, 0.0, 100.0),
+                "Kd": to_float(data.get("Kd"), 0.06, 0.0, 100.0),
+                "output_min": to_float(data.get("output_min"), 1.0, -1000.0, 1000.0),
+                "output_max": to_float(data.get("output_max"), 8.0, -1000.0, 1000.0)
             }
+            if self.pid_config["output_min"] > self.pid_config["output_max"]:
+                self.pid_config["output_min"], self.pid_config["output_max"] = (
+                    self.pid_config["output_max"], self.pid_config["output_min"]
+                )
 
             # 生成 PIDCFG 指令
             cmd = "PIDCFG:{Kp},{Ki},{Kd},{output_min},{output_max}\r\n".format(**self.pid_config)
@@ -1198,11 +1258,17 @@ class WebConfigServer(object):
         @self.app.route('/api/pid/test', methods=['POST'])
         def start_pid_test():
             """启动 PID 测试"""
-            data = request.get_json()
-            motor = data.get('motor', 'X')
-            direction = data.get('direction', 'F')
-            angle = data.get('angle', 90.0)
-            runs = data.get('runs', 5)
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
+            motor = clean_string(data.get('motor', 'X'), 'X', 1).upper()
+            direction = clean_string(data.get('direction', 'F'), 'F', 1).upper()
+            if motor not in ('X', 'Y', 'Z', 'A'):
+                return jsonify({"success": False, "message": "电机轴无效"}), 400
+            if direction not in ('F', 'B'):
+                return jsonify({"success": False, "message": "方向无效"}), 400
+            angle = to_float(data.get('angle'), 90.0, 0.0, 3600.0)
+            runs = to_int(data.get('runs'), 5, 1, 50)
 
             cmd = f"PIDTEST:{motor},{direction},{angle},{runs}\r\n"
 
@@ -1221,8 +1287,12 @@ class WebConfigServer(object):
         @self.app.route('/api/calibration/start', methods=['POST'])
         def start_calibration():
             """启动电机校准"""
-            data = request.get_json()
-            motors = data.get('motors', 'XYZA')
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
+            motors = ''.join(ch for ch in clean_string(data.get('motors', 'XYZA'), 'XYZA', 4).upper() if ch in 'XYZA')
+            if not motors:
+                return jsonify({"success": False, "message": "校准电机无效"}), 400
 
             cmd = f"CAL{motors}\r\n"
 
@@ -1353,8 +1423,10 @@ class WebConfigServer(object):
 
         @self.app.route('/api/calibration/zero', methods=['POST'])
         def set_zero():
-            data = request.get_json()
-            axis = data.get('axis')
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
+            axis = clean_string(data.get('axis'), '', 1).upper()
 
             if not axis:
                 if hasattr(self, 'raw_angles'):
@@ -1371,8 +1443,10 @@ class WebConfigServer(object):
 
         @self.app.route('/api/calibration/reset', methods=['POST'])
         def reset_zero():
-            data = request.get_json()
-            axis = data.get('axis')
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
+            axis = clean_string(data.get('axis'), '', 1).upper() or None
             self.calibration_manager.reset(axis)
             return jsonify({"success": True, "message": "零点已重置"})
 
@@ -1426,9 +1500,10 @@ class WebConfigServer(object):
 
         @self.app.route('/api/injection-pump/set', methods=['POST'])
         def set_injection_pump_speed():
-            data = request.get_json() or {}
-            speed = int(data.get('speed', 0))
-            speed = max(0, min(100, speed))
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
+            speed = to_int(data.get('speed'), 0, 0, 100)
             command = f'PUMP:SET:{speed}'
 
             if self.standalone:
@@ -1456,14 +1531,11 @@ class WebConfigServer(object):
 
         @self.app.route('/api/hardware/config', methods=['POST'])
         def save_hardware_config():
-            data = request.get_json()
-            if not data:
-                return jsonify({"success": False, "message": "请求体为空"}), 400
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
             current = self.config_manager.get()
-            hw = current.get('hardware', dict(DEFAULT_CONFIG['hardware']))
-            for key in DEFAULT_CONFIG['hardware']:
-                if key in data:
-                    hw[key] = data[key]
+            hw = normalize_hardware(data, current.get('hardware', dict(DEFAULT_CONFIG['hardware'])))
             current['hardware'] = hw
             if self.config_manager.update(current):
                 self._add_log("硬件配置已保存", "success")
@@ -1505,10 +1577,12 @@ class WebConfigServer(object):
 
         @self.app.route('/api/hardware/test-pump-port', methods=['POST'])
         def test_pump_port():
-            data = request.get_json() or {}
-            port = data.get('serial_port', '/dev/ttyUSB0')
-            baud = int(data.get('baudrate', 115200))
-            tout = float(data.get('timeout', 1.0))
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
+            port = clean_string(data.get('serial_port'), '/dev/ttyUSB0', 128) or '/dev/ttyUSB0'
+            baud = to_int(data.get('baudrate'), 115200, 1200, 3000000)
+            tout = to_float(data.get('timeout'), 1.0, 0.1, 10.0)
             conn = None
             try:
                 import serial as pyserial
@@ -1550,13 +1624,12 @@ class WebConfigServer(object):
         @self.app.route('/api/hardware/apply', methods=['POST'])
         def apply_hardware_config():
             """保存硬件配置并通知节点运行时重连。"""
-            data = request.get_json() or {}
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
             # 先保存
             current = self.config_manager.get()
-            hw = current.get('hardware', dict(DEFAULT_CONFIG['hardware']))
-            for key in DEFAULT_CONFIG['hardware']:
-                if key in data:
-                    hw[key] = data[key]
+            hw = normalize_hardware(data, current.get('hardware', dict(DEFAULT_CONFIG['hardware'])))
             current['hardware'] = hw
             if not self.config_manager.update(current):
                 return jsonify({"success": False, "message": "保存失败"}), 500
