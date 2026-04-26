@@ -249,7 +249,13 @@ class USVMavlinkRouterBridge(object):
     def _receive_mavlink_messages(self):
         """接收 QGC 发来的 COMMAND_LONG，并兼容转发到旧内部总线。"""
         while True:
-            msg = self._conn.recv_match(blocking=False)
+            try:
+                msg = self._conn.recv_match(blocking=False)
+            except Exception as exc:
+                with self._lock:
+                    self._diag_pub_errors += 1
+                rospy.logwarn_throttle(5.0, "Failed to receive MAVLink: %s", str(exc))
+                break
             if not msg:
                 break
 

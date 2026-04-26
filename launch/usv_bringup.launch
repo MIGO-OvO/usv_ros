@@ -23,6 +23,7 @@
     <arg name="pump_timeout" default="1.0" />
     <arg name="pid_mode" default="true" />
     <arg name="pid_precision" default="0.1" />
+    <arg name="spectro_sample_wait_timeout" default="2.0" />
 
     <!-- 分光检测器参数已并入 pump_control_node，通过 usv_params.yaml 下发 -->
 
@@ -77,6 +78,7 @@
         <param name="timeout" value="$(arg pump_timeout)" />
         <param name="pid_mode" value="$(arg pid_mode)" />
         <param name="pid_precision" value="$(arg pid_precision)" />
+        <param name="spectro_sample_wait_timeout" value="$(arg spectro_sample_wait_timeout)" />
     </node>
 
     <!-- 分光功能已并入 pump_control_node -->
@@ -87,6 +89,14 @@
         <param name="host" value="$(arg web_host)" />
         <param name="port" value="$(arg web_port)" />
         <param name="web_ui" value="$(arg web_ui)" />
+    </node>
+
+    <!-- ==================== MAVLink Telemetry Bridge ==================== -->
+    <node name="usv_mavlink_bridge" pkg="usv_ros" type="usv_mavlink_router_bridge.py"
+          output="screen" if="$(arg enable_mavlink_bridge)">
+        <param name="source_system_id" value="$(arg mavlink_source_system)" />
+        <param name="source_component_id" value="$(arg mavlink_source_component)" />
+        <param name="router_url" value="$(arg mavlink_router_url)" />
     </node>
 
     <!-- ==================== MAVLink Trigger Node ==================== -->
@@ -101,13 +111,5 @@
         <param name="sampling_on_fail" value="$(arg sampling_on_fail)" />
         <param name="source_system_id" value="$(arg mavlink_source_system)" />
         <param name="source_component_id" value="$(arg mavlink_source_component)" />
-    </node>
-
-    <!-- ==================== MAVLink Telemetry Bridge ==================== -->
-    <node name="usv_mavlink_bridge" pkg="usv_ros" type="usv_mavlink_router_bridge.py"
-          output="screen" if="$(arg enable_mavlink_bridge)">
-        <param name="source_system_id" value="$(arg mavlink_source_system)" />
-        <param name="source_component_id" value="$(arg mavlink_source_component)" />
-        <param name="router_url" value="$(arg mavlink_router_url)" />
     </node>
 </launch>
