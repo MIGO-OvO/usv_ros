@@ -104,10 +104,16 @@ DEFAULT_ANGLE_STREAM = {
 
 
 def perform_detector_handshake(serial_conn, timeout=2.0):
-    """发送握手命令并等待检测装置身份响应。"""
+    """发送握手命令并等待检测装置身份响应。
+
+    NodeMCU-32S 的 DTR/RTS 自动复位电路会在串口打开时触发 ESP32
+    硬件复位。需要等待 bootloader + setup() 完成后再开始探测。
+    """
     deadline = time.time() + max(0.5, float(timeout))
     old_timeout = getattr(serial_conn, 'timeout', None)
     serial_conn.timeout = 0.1
+    # 等待 ESP32 完成 bootloader + setup()
+    time.sleep(0.8)
     serial_conn.reset_input_buffer()
     line = b""
     next_probe = 0
