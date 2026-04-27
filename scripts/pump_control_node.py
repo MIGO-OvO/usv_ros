@@ -106,22 +106,29 @@ DEFAULT_ANGLE_STREAM = {
 def perform_detector_handshake(serial_conn, timeout=2.0):
     """发送握手命令并等待检测装置身份响应。
 
-    NodeMCU-32S 的 DTR/RTS 自动复位电路会在串口打开时触发 ESP32
-    硬件复位。需要等待 bootloader + setup() 完成后再开始探测。
+    不主动触发 ESP32 自动复位；只释放 DTR/RTS 后探测运行中的固件。
     """
     deadline = time.time() + max(0.5, float(timeout))
     old_timeout = getattr(serial_conn, 'timeout', None)
     serial_conn.timeout = 0.1
-    # 等待 ESP32 完成 bootloader + setup()
-    time.sleep(0.8)
+    try:
+        serial_conn.dtr = False
+        serial_conn.rts = False
+    except (OSError, serial.SerialException, ValueError):
+        pass
+    time.sleep(0.05)
     serial_conn.reset_input_buffer()
+    commands = (DETECTOR_HANDSHAKE_CMD, "DET?\r\n")
     line = b""
     next_probe = 0
+    probe_count = 0
     try:
         while time.time() < deadline:
             if time.time() >= next_probe:
-                serial_conn.write(DETECTOR_HANDSHAKE_CMD.encode('utf-8'))
+                cmd = commands[probe_count % len(commands)]
+                serial_conn.write(cmd.encode('utf-8'))
                 serial_conn.flush()
+                probe_count += 1
                 next_probe = time.time() + 0.5
             chunk = serial_conn.read(1)
             if not chunk:
@@ -485,12 +492,16 @@ class PumpControlNode(object):
     def connect(self):
         """连接串口。"""
         try:
-            self.serial_conn = serial.Serial(
-                port=self.serial_port,
-                baudrate=self.baudrate,
-                timeout=self.timeout,
-                write_timeout=self.timeout
-            )
+            self.serial_conn = serial.Serial()
+            self.serial_conn.port = self.serial_port
+            self.serial_conn.baudrate = self.baudrate
+            self.serial_conn.timeout = self.timeout
+            self.serial_conn.write_timeout = self.timeout
+            self.serial_conn.rtscts = False
+            self.serial_conn.dsrdtr = False
+            self.serial_conn.dtr = False
+            self.serial_conn.rts = False
+            self.serial_conn.open()
             self.serial_conn.reset_input_buffer()
             self.serial_conn.reset_output_buffer()
             ok, identity = perform_detector_handshake(self.serial_conn, timeout=max(2.5, self.timeout))

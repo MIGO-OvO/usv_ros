@@ -1587,15 +1587,34 @@ class WebConfigServer(object):
             try:
                 import serial as pyserial
                 deadline = time.time() + max(2.5, tout)
-                conn = pyserial.Serial(port=port, baudrate=baud, timeout=0.1, write_timeout=tout)
+                conn = pyserial.Serial()
+                conn.port = port
+                conn.baudrate = baud
+                conn.timeout = 0.1
+                conn.write_timeout = tout
+                conn.rtscts = False
+                conn.dsrdtr = False
+                conn.dtr = False
+                conn.rts = False
+                conn.open()
+                try:
+                    conn.dtr = False
+                    conn.rts = False
+                except (OSError, pyserial.SerialException, ValueError):
+                    pass
+                time.sleep(0.05)
                 conn.reset_input_buffer()
                 line = b''
                 identity = ''
+                commands = (b'HELLO?\r\n', b'DET?\r\n')
                 next_probe = 0
+                probe_count = 0
                 while time.time() < deadline:
                     if time.time() >= next_probe:
-                        conn.write(b'HELLO?\r\n')
+                        cmd = commands[probe_count % len(commands)]
+                        conn.write(cmd)
                         conn.flush()
+                        probe_count += 1
                         next_probe = time.time() + 0.5
                     chunk = conn.read(1)
                     if not chunk:
