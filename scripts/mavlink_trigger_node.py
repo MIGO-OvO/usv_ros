@@ -110,6 +110,7 @@ class MAVLinkTriggerNode(object):
         self.stable_yaw_rate_threshold = float(rospy.get_param('~stable_yaw_rate_threshold', 0.08))
         self.default_retry_count = int(rospy.get_param('~sampling_retry_count', 0))
         self.default_on_fail = str(rospy.get_param('~sampling_on_fail', 'HOLD')).strip().upper()
+        self.auto_trigger_on_waypoint = bool(rospy.get_param('~auto_trigger_on_waypoint', False))
 
         # 状态
         self.mavros_state = State()
@@ -315,7 +316,7 @@ class MAVLinkTriggerNode(object):
                 if self.is_sampling:
                     threading.Thread(target=self._handle_completion, kwargs={'success': False, 'reason': data[:80]}, daemon=True).start()
 
-    def _start_sampling_sequence(self, waypoint_seq=None):
+    def _start_sampling_sequence(self, waypoint_seq=None, retry_count_override=None, on_fail_override=None):
         """启动采样序列。"""
         waypoint_seq = self.current_waypoint if waypoint_seq is None else int(waypoint_seq)
         if self.is_sampling:
@@ -324,6 +325,14 @@ class MAVLinkTriggerNode(object):
 
         config = self._load_config() or self._get_default_config()
         waypoint_cfg = self._get_waypoint_sampling_config(config, waypoint_seq)
+        if retry_count_override is not None:
+            try:
+                waypoint_cfg['retry_count'] = max(0, int(retry_count_override))
+            except (TypeError, ValueError):
+                waypoint_cfg['retry_count'] = 0
+        if on_fail_override is not None:
+            on_fail = str(on_fail_override).strip().upper()
+            waypoint_cfg['on_fail'] = on_fail if on_fail in ('HOLD', 'SKIP', 'ABORT') else self.default_on_fail
         if not waypoint_cfg['enabled']:
             rospy.loginfo("Waypoint %d sampling disabled, skip and resume AUTO", waypoint_seq)
             self._set_waypoint_state(waypoint_seq, WaypointSamplingState.SKIPPED)
@@ -355,6 +364,8 @@ class MAVLinkTriggerNode(object):
             return False
 
         steps_data = self._build_steps_payload(config, waypoint_seq)
+        steps_data['retry_count'] = waypoint_cfg['retry_count']
+        steps_data['on_fail'] = waypoint_cfg['on_fail']
         msg = String()
         msg.data = json.dumps(steps_data)
         self.steps_pub.publish(msg)
@@ -391,7 +402,15 @@ class MAVLinkTriggerNode(object):
             ctx['retry_count'] = retries_left - 1
             self.current_sampling_context = ctx
             rospy.logwarn("Sampling failed at waypoint %d, retry left=%d reason=%s", waypoint_seq, ctx['retry_count'], reason)
-            threading.Thread(target=self._start_sampling_sequence, args=(waypoint_seq,), daemon=True).start()
+            threading.Thread(
+                target=self._start_sampling_sequence,
+                args=(waypoint_seq,),
+                kwargs={
+                    'retry_count_override': ctx['retry_count'],
+                    'on_fail_override': on_fail,
+                },
+                daemon=True,
+            ).start()
             return
 
         if on_fail == 'SKIP':

@@ -18,7 +18,7 @@ from pymavlink import mavutil
 TELEMETRY_RATE_HZ = 2
 HEARTBEAT_RATE_HZ = 1
 DIAG_REPORT_INTERVAL = 10
-SYS_ID = 2
+SYS_ID = 1
 COMP_ID = 191   # MAV_COMP_ID_ONBOARD_COMPUTER, matches QGC USVPayloadPanel target
 ROUTER_URL = "tcp:127.0.0.1:5760"
 WAIT_HEARTBEAT_TIMEOUT = 10.0
@@ -44,6 +44,9 @@ class USVMavlinkRouterBridge(object):
         self._absorbance = 0.0
         self._pump_angles = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
         self._status_code = 0
+        self._last_mission_state = "IDLE"
+        self._automation_running = False
+        self._automation_paused = False
         self._mavros_connected = False
         self._pkt_count = 0
         self._automation_step = 0.0
@@ -73,6 +76,7 @@ class USVMavlinkRouterBridge(object):
         rospy.Subscriber("/usv/spectrometer_voltage", String, self._voltage_cb)
         rospy.Subscriber("/usv/pump_angles", String, self._angles_cb)
         rospy.Subscriber("/usv/pump_status", String, self._pump_status_cb)
+        rospy.Subscriber("/usv/automation_status", String, self._automation_status_cb)
         rospy.Subscriber("/usv/trigger_status", String, self._trigger_status_cb)
         rospy.Subscriber("/usv/mission_status", String, self._mission_status_cb)
         rospy.Subscriber("/usv/pump_pid_error", String, self._pid_error_cb)
@@ -128,19 +132,42 @@ class USVMavlinkRouterBridge(object):
             data_dict = {}
 
         with self._lock:
-            if isinstance(data_dict, dict):
-                self._automation_step = float(data_dict.get("automation_step", 0.0) or 0.0)
-                self._automation_total = float(data_dict.get("automation_total", 0.0) or 0.0)
-                pid_mode_str = str(data_dict.get("pid_mode", "idle")).lower()
-                if "running" in pid_mode_str:
-                    self._pid_mode = 1.0
-                elif "done" in pid_mode_str:
-                    self._pid_mode = 2.0
-                elif "error" in pid_mode_str:
-                    self._pid_mode = 3.0
-                else:
-                    self._pid_mode = 0.0
-            # 注意：_status_code 现在完全由 _mission_status_cb 驱动，此处不再覆盖。
+            self._apply_automation_status_locked(data_dict)
+            # Legacy JSON compatibility; structured updates use /usv/automation_status.
+
+    def _automation_status_cb(self, msg):
+        try:
+            data_dict = json.loads(msg.data)
+        except Exception:
+            data_dict = {}
+
+        with self._lock:
+            self._apply_automation_status_locked(data_dict)
+
+    def _apply_automation_status_locked(self, data_dict):
+        if not isinstance(data_dict, dict):
+            return
+
+        self._automation_step = float(data_dict.get("automation_step", 0.0) or 0.0)
+        self._automation_total = float(data_dict.get("automation_total", 0.0) or 0.0)
+        self._automation_running = bool(data_dict.get("running", False))
+        self._automation_paused = bool(data_dict.get("paused", False))
+
+        pid_mode_str = str(data_dict.get("pid_mode", "idle")).lower()
+        if "running" in pid_mode_str or "paused" in pid_mode_str:
+            self._pid_mode = 1.0
+        elif "done" in pid_mode_str or "finish" in pid_mode_str:
+            self._pid_mode = 2.0
+        elif "error" in pid_mode_str or "fail" in pid_mode_str:
+            self._pid_mode = 3.0
+        else:
+            self._pid_mode = 0.0
+
+        last_state = getattr(self, "_last_mission_state", "IDLE")
+        if self._automation_running and last_state in ("IDLE", "HOLD_NO_MISSION"):
+            self._status_code = self._MISSION_STATE_CODES["SAMPLING"]
+        elif not self._automation_running and last_state in ("IDLE", "HOLD_NO_MISSION"):
+            self._status_code = self._MISSION_STATE_CODES.get(last_state, 0)
 
     def _trigger_status_cb(self, msg):
         data = msg.data.lower()
@@ -176,6 +203,9 @@ class USVMavlinkRouterBridge(object):
         code = self._MISSION_STATE_CODES.get(state)
         if code is not None:
             with self._lock:
+                self._last_mission_state = state
+                if self._automation_running and state in ("IDLE", "HOLD_NO_MISSION"):
+                    code = self._MISSION_STATE_CODES["SAMPLING"]
                 self._status_code = code
 
     def _pid_error_cb(self, msg):

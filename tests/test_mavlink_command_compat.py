@@ -1,5 +1,7 @@
 import importlib.util
+import json
 import sys
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -24,6 +26,12 @@ def _install_fake_ros_modules():
     class Float32MultiArray:
         def __init__(self):
             self.data = []
+
+    class TwistStamped:
+        pass
+
+    class Imu:
+        pass
 
     class State:
         connected = False
@@ -74,6 +82,16 @@ def _install_fake_ros_modules():
     std_msgs_msg.Float32MultiArray = Float32MultiArray
     std_msgs.msg = std_msgs_msg
 
+    geometry_msgs = types.ModuleType("geometry_msgs")
+    geometry_msgs_msg = types.ModuleType("geometry_msgs.msg")
+    geometry_msgs_msg.TwistStamped = TwistStamped
+    geometry_msgs.msg = geometry_msgs_msg
+
+    sensor_msgs = types.ModuleType("sensor_msgs")
+    sensor_msgs_msg = types.ModuleType("sensor_msgs.msg")
+    sensor_msgs_msg.Imu = Imu
+    sensor_msgs.msg = sensor_msgs_msg
+
     std_srvs = types.ModuleType("std_srvs")
     std_srvs_srv = types.ModuleType("std_srvs.srv")
     std_srvs_srv.Trigger = object
@@ -106,6 +124,10 @@ def _install_fake_ros_modules():
     sys.modules["rospy"] = rospy
     sys.modules["std_msgs"] = std_msgs
     sys.modules["std_msgs.msg"] = std_msgs_msg
+    sys.modules["geometry_msgs"] = geometry_msgs
+    sys.modules["geometry_msgs.msg"] = geometry_msgs_msg
+    sys.modules["sensor_msgs"] = sensor_msgs
+    sys.modules["sensor_msgs.msg"] = sensor_msgs_msg
     sys.modules["std_srvs"] = std_srvs
     sys.modules["std_srvs.srv"] = std_srvs_srv
     sys.modules["mavros_msgs"] = mavros_msgs
@@ -155,6 +177,20 @@ class FakeConnection:
 
 
 class MavlinkCommandCompatibilityTests(unittest.TestCase):
+    def test_trigger_node_constructs_without_auto_trigger_attr_crash(self):
+        module = _load_script("mavlink_trigger_node_construct_test", "scripts/mavlink_trigger_node.py")
+
+        node = module.MAVLinkTriggerNode()
+
+        self.assertFalse(node.auto_trigger_on_waypoint)
+        self.assertEqual(node._source_system_id, 1)
+        self.assertEqual(node._source_component_id, 191)
+
+    def test_bringup_launch_defaults_mavlink_source_system_to_fcu_system(self):
+        launch_text = (REPO_ROOT / "launch" / "usv_bringup.launch").read_text(encoding="utf-8")
+
+        self.assertIn('<arg name="mavlink_source_system" default="1" />', launch_text)
+
     def test_router_bridge_forwards_usv_command_long_to_internal_bus(self):
         module = _load_script("usv_mavlink_router_bridge_test", "scripts/usv_mavlink_router_bridge.py")
         bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
@@ -201,6 +237,69 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
             acknowledgements,
             [(31010, module.MAV_RESULT_ACCEPTED, 255, 190)],
         )
+
+    def test_router_bridge_updates_automation_named_values_from_structured_status(self):
+        module = _load_script("usv_mavlink_router_bridge_automation_test", "scripts/usv_mavlink_router_bridge.py")
+        bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
+        bridge._lock = threading.Lock()
+        bridge._automation_step = 0.0
+        bridge._automation_total = 0.0
+        bridge._pid_mode = 0.0
+        bridge._status_code = 0
+
+        msg = sys.modules["std_msgs.msg"].String()
+        msg.data = json.dumps({
+            "status": "running",
+            "running": True,
+            "paused": False,
+            "automation_step": 2,
+            "automation_total": 5,
+            "current_loop": 1,
+            "total_loops": 3,
+            "pid_mode": "running",
+        })
+
+        bridge._automation_status_cb(msg)
+
+        self.assertEqual(bridge._automation_step, 2.0)
+        self.assertEqual(bridge._automation_total, 5.0)
+        self.assertEqual(bridge._pid_mode, 1.0)
+        self.assertEqual(bridge._status_code, module.USVMavlinkRouterBridge._MISSION_STATE_CODES["SAMPLING"])
+
+    def test_trigger_retry_passes_decremented_retry_count_to_next_attempt(self):
+        module = _load_script("mavlink_trigger_node_retry_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.current_waypoint = 7
+        node.default_on_fail = "HOLD"
+        node.current_sampling_context = {
+            "waypoint_seq": 7,
+            "retry_count": 1,
+            "on_fail": "HOLD",
+        }
+        calls = []
+
+        def fake_start_sampling_sequence(waypoint_seq=None, retry_count_override=None, on_fail_override=None):
+            calls.append((waypoint_seq, retry_count_override, on_fail_override))
+
+        class ImmediateThread:
+            def __init__(self, target, args=(), kwargs=None, daemon=None):
+                self.target = target
+                self.args = args
+                self.kwargs = kwargs or {}
+
+            def start(self):
+                self.target(*self.args, **self.kwargs)
+
+        node._start_sampling_sequence = fake_start_sampling_sequence
+        original_thread = module.threading.Thread
+        module.threading.Thread = ImmediateThread
+        try:
+            node._handle_failure_action("automation_start_failed")
+        finally:
+            module.threading.Thread = original_thread
+
+        self.assertEqual(node.current_sampling_context["retry_count"], 0)
+        self.assertEqual(calls, [(7, 0, "HOLD")])
 
 
 if __name__ == "__main__":

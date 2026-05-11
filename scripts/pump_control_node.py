@@ -457,6 +457,7 @@ class PumpControlNode(object):
         # Publishers
         self.angles_pub = rospy.Publisher('/usv/pump_angles', String, queue_size=10)
         self.status_pub = rospy.Publisher('/usv/pump_status', String, queue_size=10, latch=True)
+        self.automation_status_pub = rospy.Publisher('/usv/automation_status', String, queue_size=10, latch=True)
         self.pid_complete_pub = rospy.Publisher('/usv/pump_pid_complete', String, queue_size=10)
         self.pid_error_pub = rospy.Publisher('/usv/pump_pid_error', String, queue_size=50)
         self.injection_status_pub = rospy.Publisher('/usv/injection_pump_status', String, queue_size=10, latch=True)
@@ -1395,6 +1396,7 @@ class PumpControlNode(object):
         message = "Automation started" if success else "Automation start failed"
         if success:
             rospy.loginfo("Automation engine thread started successfully")
+            self._publish_automation_status("running")
         else:
             rospy.logerr("Automation engine failed to start despite pre-check passing")
         return TriggerResponse(success=success, message=message)
@@ -1406,11 +1408,13 @@ class PumpControlNode(object):
             self.automation_engine.stop()
         success = self.stop_all_pumps()
         message = "Automation stopped and pumps halted" if success else "Automation stopped but pump halt failed"
+        self._publish_automation_status("stopped")
         return TriggerResponse(success=success, message=message)
 
     def _auto_pause_callback(self, req):
         """暂停自动化服务回调。"""
         self.automation_engine.pause()
+        self._publish_automation_status("paused")
         return TriggerResponse(success=True, message="Automation paused")
 
     def _injection_on_callback(self, req):
@@ -1437,12 +1441,14 @@ class PumpControlNode(object):
     def _auto_resume_callback(self, req):
         """恢复自动化服务回调。"""
         self.automation_engine.resume()
+        self._publish_automation_status("running")
         return TriggerResponse(success=True, message="Automation resumed")
 
     def _on_automation_status(self, status):
         """自动化状态更新回调。"""
         rospy.loginfo("[Automation] 状态更新: %s", status)
         self._publish_status("automation: " + status)
+        self._publish_automation_status(status)
 
     def _on_automation_error(self, error):
         """自动化错误回调。"""
@@ -1469,12 +1475,65 @@ class PumpControlNode(object):
                          ", ".join(diag_parts) if diag_parts else "none")
         rospy.logerr("[Automation] 错误: %s", error)
         self._publish_status("error: " + error)
+        self._publish_automation_status("error")
 
     def _publish_status(self, status):
         """发布状态消息。"""
         msg = String()
         msg.data = status
         self.status_pub.publish(msg)
+
+    def _publish_automation_status(self, status):
+        """Publish structured automation status for telemetry consumers."""
+        try:
+            engine_status = self.automation_engine.get_status()
+        except Exception:
+            engine_status = {}
+
+        running = bool(engine_status.get("running", False))
+        paused = bool(engine_status.get("paused", False))
+        try:
+            current_step = int(engine_status.get("current_step", 0) or 0)
+        except (TypeError, ValueError):
+            current_step = 0
+        try:
+            total_steps = int(engine_status.get("total_steps", 0) or 0)
+        except (TypeError, ValueError):
+            total_steps = 0
+
+        status_text = str(status or "idle")
+        status_lower = status_text.lower()
+        if total_steps > 0 and (running or paused):
+            automation_step = min(current_step + 1, total_steps)
+        elif total_steps > 0 and ("finish" in status_lower or "done" in status_lower):
+            automation_step = total_steps
+        else:
+            automation_step = 0
+
+        if "error" in status_lower or "fail" in status_lower:
+            pid_mode = "error"
+        elif "finish" in status_lower or "done" in status_lower:
+            pid_mode = "done"
+        elif paused:
+            pid_mode = "paused"
+        elif running:
+            pid_mode = "running"
+        else:
+            pid_mode = "idle"
+
+        payload = {
+            "status": status_text,
+            "running": running,
+            "paused": paused,
+            "automation_step": automation_step,
+            "automation_total": total_steps,
+            "current_loop": int(engine_status.get("current_loop", 0) or 0),
+            "total_loops": int(engine_status.get("total_loops", 0) or 0),
+            "pid_mode": pid_mode,
+        }
+        msg = String()
+        msg.data = json.dumps(payload, ensure_ascii=False)
+        self.automation_status_pub.publish(msg)
 
     def get_current_angles(self):
         """获取当前角度。"""
