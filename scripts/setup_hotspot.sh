@@ -17,9 +17,9 @@ set -euo pipefail
 
 SSID="${1:-USV_Control}"
 PASSWORD="${2:-12345678}"
-INTERFACE="wlan0"
-CON_NAME="USV_AP"
-HOTSPOT_IP="10.42.0.1"
+INTERFACE="${HOTSPOT_IFACE:-wlan0}"
+CON_NAME="${HOTSPOT_CONN_NAME:-USV_AP}"
+HOTSPOT_IP="${HOTSPOT_IP:-10.42.0.1}"
 WS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN_DIR="$WS_DIR/.usv_run"
 PREV_WIFI_FILE="$RUN_DIR/previous_wifi_connection"
