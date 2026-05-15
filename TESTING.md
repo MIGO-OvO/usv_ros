@@ -23,6 +23,9 @@ Updated: 2026-04-08T03:30:00Z
 | **查看 roscore 日志** | `tail -f ~/usv_ws/.usv_run/logs/roscore.log` | 检查 ROS Master 异常 |
 | **开启热点** | `sudo ./src/usv_ros/scripts/setup_hotspot.sh USV_Control 12345678` | 创建默认 WPA-PSK 热点 |
 | **关闭热点** | `sudo ./src/usv_ros/scripts/stop_hotspot.sh` | 关闭并尝试回连原 WiFi |
+| **安装开机自启** | `sudo ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678` | 开机启动热点 + ROS 主系统 + 自检 |
+| **查看自启日志** | `sudo journalctl -u usv-boot.service -f` | systemd 日志；自检日志在 `.usv_run/logs/boot_check.log` |
+| **卸载开机自启** | `sudo ./src/usv_ros/scripts/uninstall_boot_service.sh` | 停止并删除 `usv-boot.service` |
 | **脚本赋权** | `chmod +x src/usv_ros/scripts/*.sh` | 首次运行前需执行 |
 
 ## 1. 测试前准备

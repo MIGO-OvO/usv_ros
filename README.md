@@ -269,7 +269,40 @@ tail -f ~/usv_ws/.usv_run/logs/usv_system.log
 - `start_usv_system.sh`
 - `start_usv_minimal.sh`
 
-### 5.4 按需覆盖 launch 参数
+### 5.4 开机自启（ROS 主系统 + 热点 + 自检）
+
+Jetson Nano 更新代码并完成 `catkin_make` 后，可安装 systemd 开机自启服务：
+
+```bash
+cd ~/usv_ws
+sudo ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
+```
+
+默认行为：
+
+- 以 root 启动/管理 Wi-Fi 热点（`USV_AP`，默认 IP `10.42.0.1`）。
+- 以安装脚本调用者作为 ROS 运行用户启动 `start_usv_all.sh`，避免运行日志变成 root 专属。
+- 启动后执行 `status_usv_all.sh` 自检，并写入 `~/usv_ws/.usv_run/logs/boot_check.log`。
+- 严格自检默认开启，要求热点、Web 端口、ROS 节点、MAVROS 链路均正常。
+
+常用命令：
+
+```bash
+sudo systemctl status usv-boot.service
+sudo journalctl -u usv-boot.service -f
+sudo systemctl restart usv-boot.service
+sudo ./src/usv_ros/scripts/uninstall_boot_service.sh
+```
+
+如需现场临时放宽 MAVROS/ROS 节点严格检查：
+
+```bash
+sudo USV_STRICT_SELF_CHECK=false ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
+```
+
+> 注意：热点密码会写入 `/etc/systemd/system/usv-boot.service`，请使用现场专用密码。
+
+### 5.5 按需覆盖 launch 参数
 
 常用参数（见 `launch/usv_bringup.launch`）：
 
@@ -317,13 +350,13 @@ roslaunch usv_ros usv_bringup.launch \
   web_ui:=dist
 ```
 
-### 5.5 访问 Web 控制台
+### 5.6 访问 Web 控制台
 
 - 局域网：`http://<Jetson-IP>:5000`
 - 热点模式：`http://10.42.0.1:5000`
 - 本机调试：`http://127.0.0.1:5000`
 
-### 5.6 Web Settings 硬件连接配置
+### 5.7 Web Settings 硬件连接配置
 
 Settings 页面第三张卡片“硬件连接设置”对应 `frontend/src/pages/Settings.tsx`，当前已接入：
 

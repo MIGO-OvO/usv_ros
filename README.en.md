@@ -268,7 +268,40 @@ If you still want separate-terminal debugging, you can continue using:
 - `start_usv_system.sh`
 - `start_usv_minimal.sh`
 
-### 5.4 Override Launch Arguments
+### 5.4 Boot Autostart (ROS Main System + Hotspot + Self-Check)
+
+After updating code on Jetson Nano and running `catkin_make`, install the systemd boot service:
+
+```bash
+cd ~/usv_ws
+sudo ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
+```
+
+Default behavior:
+
+- Starts and manages the Wi-Fi hotspot as root (`USV_AP`, default IP `10.42.0.1`).
+- Starts `start_usv_all.sh` as the user that ran the installer, so runtime logs are not owned by root.
+- Runs `status_usv_all.sh` after startup and writes the self-check log to `~/usv_ws/.usv_run/logs/boot_check.log`.
+- Strict self-check is enabled by default and requires hotspot, Web port, ROS nodes, and MAVROS link to be healthy.
+
+Common commands:
+
+```bash
+sudo systemctl status usv-boot.service
+sudo journalctl -u usv-boot.service -f
+sudo systemctl restart usv-boot.service
+sudo ./src/usv_ros/scripts/uninstall_boot_service.sh
+```
+
+To temporarily relax strict ROS/MAVROS checks in field debugging:
+
+```bash
+sudo USV_STRICT_SELF_CHECK=false ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
+```
+
+Note: the hotspot password is written to `/etc/systemd/system/usv-boot.service`; use a field-specific password.
+
+### 5.5 Override Launch Arguments
 
 Common args in `launch/usv_bringup.launch`:
 
@@ -307,7 +340,7 @@ roslaunch usv_ros usv_bringup.launch \
   pump_timeout:=2.0
 ```
 
-### 5.5 Access Web Console
+### 5.6 Access Web Console
 
 - LAN: `http://<Jetson-IP>:5000`
 - AP mode: `http://10.42.0.1:5000`
@@ -383,4 +416,3 @@ curl -X POST http://127.0.0.1:5000/api/injection-pump/off
 ## 9. License
 
 MIT License
-
