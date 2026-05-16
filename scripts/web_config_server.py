@@ -815,6 +815,39 @@ class WebConfigServer(object):
         except Exception as e:
             return False, str(e)
 
+
+    @staticmethod
+    def _hardware_to_pump_runtime_params(hw):
+        mapping = {
+            "angles": dict(hw.get("i2c_mapping", {})),
+            "spectro_channel": int(hw.get("spectro_channel", 0)),
+        }
+        spectrometer = {
+            "enabled": True,
+            "auto_start": bool(hw.get("auto_start", False)),
+            "ads_address": hw.get("ads_address", "0x40"),
+            "mux": hw.get("mux", "AIN0"),
+            "gain": int(hw.get("gain", 1)),
+            "vref_mode": hw.get("vref_mode", "AVDD"),
+            "adc_rate": int(hw.get("adc_rate", 90)),
+            "publish_rate": int(hw.get("publish_rate", 20)),
+            "continuous_mode": bool(hw.get("continuous_mode", True)),
+            "reference_voltage": float(hw.get("reference_voltage", 2.5)),
+            "baseline_voltage": float(hw.get("baseline_voltage", 0.0)),
+        }
+        angle_stream = {"enabled": True, "auto_start": True}
+        return mapping, spectrometer, angle_stream
+
+    def _set_pump_runtime_params(self, hw):
+        mapping, spectrometer, angle_stream = self._hardware_to_pump_runtime_params(hw)
+        rospy.set_param('/pump_control_node/serial_port', hw['pump_serial_port'])
+        rospy.set_param('/pump_control_node/baudrate', int(hw['pump_baudrate']))
+        rospy.set_param('/pump_control_node/timeout', float(hw['pump_timeout']))
+        rospy.set_param('/pump_control_node/i2c_mapping', mapping)
+        rospy.set_param('/pump_control_node/spectrometer', spectrometer)
+        rospy.set_param('/pump_control_node/angle_stream', angle_stream)
+        return mapping, spectrometer, angle_stream
+
     def _publish_hardware_runtime_config(self, hw):
         """Push saved hardware config into pump_control_node after serial reconnect."""
         mapping = {
@@ -1785,9 +1818,7 @@ class WebConfigServer(object):
             pump_ready = True
             if not self.standalone:
                 try:
-                    rospy.set_param('/pump_control_node/serial_port', hw['pump_serial_port'])
-                    rospy.set_param('/pump_control_node/baudrate', int(hw['pump_baudrate']))
-                    rospy.set_param('/pump_control_node/timeout', float(hw['pump_timeout']))
+                    self._set_pump_runtime_params(hw)
                     svc = rospy.ServiceProxy('/usv/pump_reconnect', Trigger)
                     svc.wait_for_service(timeout=3.0)
                     resp = svc()
@@ -2000,9 +2031,7 @@ class WebConfigServer(object):
                 return  # 默认值无需覆盖
             rospy.loginfo("[HW-AutoApply] 推送已保存硬件配置: port=%s baud=%s",
                           saved_port, hw.get('pump_baudrate', 115200))
-            rospy.set_param('/pump_control_node/serial_port', saved_port)
-            rospy.set_param('/pump_control_node/baudrate', int(hw.get('pump_baudrate', 115200)))
-            rospy.set_param('/pump_control_node/timeout', float(hw.get('pump_timeout', 1.0)))
+            self._set_pump_runtime_params(hw)
             svc = rospy.ServiceProxy('/usv/pump_reconnect', Trigger)
             svc.wait_for_service(timeout=5.0)
             resp = svc()
