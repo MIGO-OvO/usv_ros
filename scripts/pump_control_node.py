@@ -97,10 +97,10 @@ DEFAULT_SPECTRO_CONFIG = {
 }
 
 
-DEFAULT_ANGLE_STREAM = {
-    "enabled": True,
-    "auto_start": True,
-}
+MOTOR_CONTROL_APP_SETTINGS_ENV = "USV_LOWER_DEVICE_SETTINGS_FILE"
+MOTOR_CONTROL_APP_SETTINGS_PATH = os.path.abspath(
+    os.path.join(script_dir, '..', '..', '..', 'MotorControlApp_Pyside6', 'data', 'settings.json')
+)
 
 
 def perform_detector_handshake(serial_conn, timeout=2.0):
@@ -452,7 +452,8 @@ class PumpControlNode(object):
         self.spectro_command_event = threading.Event()
         self.spectro_command_result = None
         self._current_step_spectro_timestamp = None
-        self._latest_spectro_received_at = 0.0
+        self._lower_device_settings_file = self._resolve_lower_device_settings_file()
+        self._lower_device_settings = self._load_lower_device_settings()
 
         # Publishers
         self.angles_pub = rospy.Publisher('/usv/pump_angles', String, queue_size=10)
@@ -595,16 +596,108 @@ class PumpControlNode(object):
             self._publish_status("error: " + str(e))
             return TriggerResponse(success=False, message=msg)
 
+    def _resolve_lower_device_settings_file(self):
+        candidates = []
+        env_path = os.environ.get(MOTOR_CONTROL_APP_SETTINGS_ENV, '').strip()
+        if env_path:
+            candidates.append(env_path)
+        candidates.append(MOTOR_CONTROL_APP_SETTINGS_PATH)
+        local_default = os.path.join(script_dir, '..', '..', 'data', 'settings.json')
+        candidates.append(os.path.abspath(local_default))
+        for path in candidates:
+            if path and os.path.exists(path):
+                return os.path.abspath(path)
+        return None
+
+    @staticmethod
+    def _normalize_lower_device_i2c_mapping(raw_mapping):
+        mapping = dict(DEFAULT_I2C_MAPPING)
+        if isinstance(raw_mapping, dict):
+            angles = raw_mapping.get('angles', {})
+            if isinstance(angles, dict):
+                normalized_angles = dict(mapping.get('angles', {}))
+                for motor in ('X', 'Y', 'Z', 'A'):
+                    try:
+                        normalized_angles[motor] = int(angles.get(motor, normalized_angles.get(motor, 0)))
+                    except (TypeError, ValueError):
+                        pass
+                mapping['angles'] = normalized_angles
+            try:
+                mapping['spectro_channel'] = int(raw_mapping.get('spectro_channel', mapping.get('spectro_channel', 2)))
+            except (TypeError, ValueError):
+                pass
+        return mapping
+
+    @staticmethod
+    def _normalize_lower_device_spectro_config(raw_config):
+        cfg = dict(DEFAULT_SPECTRO_CONFIG)
+        if isinstance(raw_config, dict):
+            cfg.update(raw_config)
+        cfg['enabled'] = bool(cfg.get('enabled', True))
+        cfg['auto_start'] = bool(cfg.get('auto_start', False))
+        cfg['ads_address'] = str(cfg.get('ads_address', '0x40')).strip() or '0x40'
+        cfg['mux'] = str(cfg.get('mux', 'AIN0')).strip().upper() or 'AIN0'
+        cfg['gain'] = int(cfg.get('gain', 1) or 1)
+        cfg['publish_rate'] = max(1, int(cfg.get('publish_rate', 20) or 20))
+        cfg['adc_rate'] = int(cfg.get('adc_rate', 90) or 90)
+        cfg['reference_voltage'] = float(cfg.get('reference_voltage', 2.5) or 2.5)
+        cfg['baseline_voltage'] = float(cfg.get('baseline_voltage', 0.0) or 0.0)
+        return cfg
+
+    def _load_lower_device_settings(self):
+        if not self._lower_device_settings_file:
+            return {}
+        try:
+            with open(self._lower_device_settings_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+        except Exception as e:
+            rospy.logdebug('Lower device settings load skipped: %s', str(e))
+            return {}
+        if not isinstance(data, dict):
+            return {}
+        return data
+
+    def _apply_lower_device_settings(self):
+        settings = self._lower_device_settings or {}
+        i2c_mapping = self._normalize_lower_device_i2c_mapping(settings.get('i2c_mapping'))
+        spectro_config = self._normalize_lower_device_spectro_config(settings.get('spectrometer'))
+        self.i2c_mapping = i2c_mapping
+        self.spectro_config.update(spectro_config)
+        self.spectro_reference_voltage = float(self.spectro_config.get('reference_voltage', self.spectro_reference_voltage))
+        self.spectro_baseline_voltage = float(self.spectro_config.get('baseline_voltage', self.spectro_baseline_voltage))
+        rospy.loginfo('Applied lower device settings: source=%s', self._lower_device_settings_file or 'builtin-defaults')
+        rospy.loginfo('Lower device I2C mapping: %s', self.i2c_mapping)
+        rospy.loginfo('Lower device spectrometer config: %s', self.spectro_config)
+        return True
+
+    def _refresh_runtime_settings(self):
+        loaded_from_params = False
+        try:
+            if rospy.has_param('~i2c_mapping'):
+                self.i2c_mapping = rospy.get_param('~i2c_mapping')
+                loaded_from_params = True
+            if rospy.has_param('~spectrometer'):
+                self.spectro_config.update(rospy.get_param('~spectrometer'))
+                loaded_from_params = True
+            if rospy.has_param('~angle_stream'):
+                self.angle_stream.update(rospy.get_param('~angle_stream'))
+                loaded_from_params = True
+            if loaded_from_params:
+                self.i2c_mapping = self._normalize_lower_device_i2c_mapping(self.i2c_mapping)
+                self.spectro_config = self._normalize_lower_device_spectro_config(self.spectro_config)
+                self.spectro_reference_voltage = float(self.spectro_config.get('reference_voltage', self.spectro_reference_voltage))
+                self.spectro_baseline_voltage = float(self.spectro_config.get('baseline_voltage', self.spectro_baseline_voltage))
+                rospy.loginfo('Applied runtime hardware params from ROS parameter server')
+                return True
+            self._lower_device_settings = self._load_lower_device_settings()
+            if self._lower_device_settings:
+                return self._apply_lower_device_settings()
+        except Exception as e:
+            rospy.logwarn('Failed to refresh runtime hardware settings: %s', str(e))
+        return False
+
     def send_command(self, command):
-        """
-        发送指令到电机控制板。
-
-        Args:
-            command: 指令字符串
-
-        Returns:
-            bool: 是否成功
-        """
+        """发送指令到电机控制板；返回 True 仅表示写入串口成功。"""
         if not self.serial_conn or not self.serial_conn.is_open:
             rospy.logwarn("Serial not connected")
             return False
@@ -627,6 +720,7 @@ class PumpControlNode(object):
 
     def _apply_runtime_configuration(self):
         """连接后同步 I2C 映射和 ADS 采样配置。"""
+        self._refresh_runtime_settings()
         self._query_i2c_mapping()
         self._apply_i2c_mapping()
         self._query_ads_status()
