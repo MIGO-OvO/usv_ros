@@ -64,6 +64,7 @@ export default function Monitor() {
     pumpAngles,
     currentVoltage,
     currentAbsorbance,
+    spectrometerStatus,
     voltageHistory,
     refreshInjectionPumpStatus,
   } = useAppStore()
@@ -113,6 +114,20 @@ export default function Monitor() {
     )
   }, [voltageHistory])
 
+  const spectroStatusLabels: Record<string, string> = {
+    configured: '已配置，未采集',
+    stopped: '已停止',
+    idle: '未采集',
+    disabled: '已禁用',
+    acquiring: '采集中',
+    i2c_error: 'I2C 错误',
+    not_configured: '未配置',
+    saturated: '数据饱和',
+  }
+  const spectroStatusLabel = spectroStatusLabels[spectrometerStatus] ?? spectrometerStatus
+  const hasSpectroSample = voltageHistory.length > 0
+  const showSpectroPlaceholder = !hasSpectroSample
+
   return (
     <div className="p-4 md:p-8 space-y-6 max-w-7xl mx-auto">
       <header className="flex flex-col md:flex-row md:items-center justify-between gap-4">
@@ -142,7 +157,8 @@ export default function Monitor() {
                 <Activity className="h-4 w-4 text-muted-foreground" />
             </CardHeader>
             <CardContent>
-                <div className="text-2xl font-bold">{currentVoltage.toFixed(3)} V</div>
+                <div className="text-2xl font-bold">{showSpectroPlaceholder ? '--' : `${currentVoltage.toFixed(3)} V`}</div>
+                <div className="text-xs text-muted-foreground mt-1">{spectroStatusLabel}</div>
             </CardContent>
         </Card>
 
@@ -152,7 +168,8 @@ export default function Monitor() {
                 <Activity className="h-4 w-4 text-muted-foreground" />
             </CardHeader>
             <CardContent>
-                <div className="text-2xl font-bold">{currentAbsorbance.toFixed(4)}</div>
+                <div className="text-2xl font-bold">{showSpectroPlaceholder ? '--' : currentAbsorbance.toFixed(4)}</div>
+                <div className="text-xs text-muted-foreground mt-1">{spectroStatusLabel}</div>
             </CardContent>
         </Card>
 

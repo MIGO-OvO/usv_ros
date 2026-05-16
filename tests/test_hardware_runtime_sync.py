@@ -1,0 +1,211 @@
+import importlib.util
+import json
+import sys
+import tempfile
+import types
+import unittest
+from pathlib import Path
+
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+class RecordingPublisher:
+    def __init__(self, topic=""):
+        self.topic = topic
+        self.messages = []
+
+    def publish(self, msg):
+        self.messages.append(msg)
+
+
+class FakeTriggerService:
+    def wait_for_service(self, timeout=None):
+        return None
+
+    def __call__(self):
+        return types.SimpleNamespace(success=True, message="reconnected")
+
+
+class RecordingSocket:
+    def __init__(self):
+        self.events = []
+
+    def emit(self, event, payload):
+        self.events.append((event, payload))
+
+
+def _install_fake_ros_modules():
+    publishers = {}
+
+    class String:
+        def __init__(self, data=""):
+            self.data = data
+
+    class TriggerResponse:
+        def __init__(self, success=False, message=""):
+            self.success = success
+            self.message = message
+
+    rospy = types.ModuleType("rospy")
+    rospy.Publisher = lambda topic, *args, **kwargs: publishers.setdefault(topic, RecordingPublisher(topic))
+    rospy.Subscriber = lambda *args, **kwargs: None
+    rospy.Service = lambda *args, **kwargs: None
+    rospy.ServiceProxy = lambda *args, **kwargs: FakeTriggerService()
+    rospy.init_node = lambda *args, **kwargs: None
+    rospy.get_param = lambda name, default=None: default
+    rospy.set_param = lambda *args, **kwargs: None
+    rospy.wait_for_service = lambda *args, **kwargs: None
+    rospy.loginfo = lambda *args, **kwargs: None
+    rospy.logwarn = lambda *args, **kwargs: None
+    rospy.logerr = lambda *args, **kwargs: None
+    rospy.logdebug = lambda *args, **kwargs: None
+    rospy.logdebug_throttle = lambda *args, **kwargs: None
+    rospy.sleep = lambda *args, **kwargs: None
+    rospy.is_shutdown = lambda: True
+    rospy.Rate = lambda hz: types.SimpleNamespace(sleep=lambda: None)
+
+    std_msgs = types.ModuleType("std_msgs")
+    std_msgs_msg = types.ModuleType("std_msgs.msg")
+    std_msgs_msg.String = String
+    std_msgs.msg = std_msgs_msg
+
+    std_srvs = types.ModuleType("std_srvs")
+    std_srvs_srv = types.ModuleType("std_srvs.srv")
+    std_srvs_srv.Trigger = object
+    std_srvs_srv.TriggerResponse = TriggerResponse
+    std_srvs.srv = std_srvs_srv
+
+    sys.modules["rospy"] = rospy
+    sys.modules["std_msgs"] = std_msgs
+    sys.modules["std_msgs.msg"] = std_msgs_msg
+    sys.modules["std_srvs"] = std_srvs
+    sys.modules["std_srvs.srv"] = std_srvs_srv
+    return publishers, String
+
+
+def _load_script(module_name, relative_path):
+    publishers, string_cls = _install_fake_ros_modules()
+    spec = importlib.util.spec_from_file_location(module_name, REPO_ROOT / relative_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module, publishers, string_cls
+
+
+class HardwareRuntimeSyncTests(unittest.TestCase):
+    def test_web_apply_publishes_i2c_ads_and_start_commands(self):
+        module, publishers, _ = _load_script(
+            "web_config_server_hardware_sync_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            client = server.app.test_client()
+
+            response = client.post(
+                "/api/hardware/apply",
+                json={
+                    "pump_serial_port": "/dev/ttyUSB0",
+                    "pump_baudrate": 115200,
+                    "pump_timeout": 1.0,
+                    "ads_address": "0x40",
+                    "spectro_channel": 0,
+                    "mux": "AIN0_AVSS",
+                    "gain": 128,
+                    "vref_mode": "INTERNAL",
+                    "adc_rate": 90,
+                    "publish_rate": 250,
+                    "continuous_mode": True,
+                    "auto_start": True,
+                    "reference_voltage": 2.5,
+                    "baseline_voltage": 0.0,
+                    "i2c_mapping": {"X": 2, "Y": 3, "Z": 6, "A": 7},
+                },
+            )
+
+        body = response.get_json()
+        self.assertTrue(body["success"])
+        self.assertEqual(body["results"]["i2c_mapping"]["success"], True)
+        self.assertEqual(body["results"]["spectrometer"]["success"], True)
+
+        messages = [
+            json.loads(msg.data)
+            for msg in publishers["/usv/spectrometer_command"].messages
+        ]
+        self.assertEqual(messages[0]["cmd"], "set_i2c_map")
+        self.assertEqual(messages[0]["mapping"], {
+            "angles": {"X": 2, "Y": 3, "Z": 6, "A": 7},
+            "spectro_channel": 0,
+        })
+        self.assertEqual(messages[1]["cmd"], "configure")
+        self.assertEqual(messages[1]["gain"], 4)
+        self.assertEqual(messages[1]["publish_rate"], 200)
+        self.assertEqual(messages[1]["vref_mode"], "INT")
+        self.assertEqual(messages[2]["cmd"], "start")
+
+    def test_pump_node_runtime_commands_generate_expected_serial_commands(self):
+        module, _, string_cls = _load_script(
+            "pump_control_node_hardware_sync_test",
+            "scripts/pump_control_node.py",
+        )
+        node = module.PumpControlNode()
+        sent = []
+        node.send_command = lambda cmd: sent.append(cmd) or True
+
+        node._spectro_cmd_callback(string_cls(json.dumps({
+            "cmd": "set_i2c_map",
+            "mapping": {
+                "angles": {"X": 2, "Y": 3, "Z": 6, "A": 7},
+                "spectro_channel": 0,
+            },
+        })))
+        node._spectro_cmd_callback(string_cls(json.dumps({
+            "cmd": "configure",
+            "ads_address": "0x40",
+            "mux": "AIN0_AVSS",
+            "gain": 4,
+            "vref_mode": "INTERNAL",
+            "adc_rate": 90,
+            "publish_rate": 200,
+            "continuous_mode": True,
+            "reference_voltage": 2.5,
+            "baseline_voltage": 0.0,
+        })))
+
+        self.assertEqual(sent[0], "I2CMAP:X=2,Y=3,Z=6,A=7,SPEC=0")
+        self.assertIn("ADSCFG:CH=0,ADDR=0x40,AIN=AIN0,REF=INT,GAIN=4,DR=90,MODE=CONT,PR=200", sent[1])
+
+    def test_web_status_callback_emits_spectrometer_status_without_sample(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_spectro_status_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            server.socketio = RecordingSocket()
+
+            server._spectro_status_cb(string_cls("configured"))
+
+        self.assertEqual(server.spectrometer_status, "configured")
+        self.assertIn(("spectrometer_status", "configured"), server.socketio.events)
+
+
+if __name__ == "__main__":
+    unittest.main()

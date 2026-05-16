@@ -303,7 +303,7 @@ DEFAULT_CONFIG = {
         "pump_baudrate": 115200,
         "pump_timeout": 1.0,
         "ads_address": "0x40",
-        "spectro_channel": 2,
+        "spectro_channel": 0,
         "mux": "AIN0_AVSS",
         "gain": 1,
         "vref_mode": "AVDD",
@@ -311,7 +311,9 @@ DEFAULT_CONFIG = {
         "publish_rate": 20,
         "continuous_mode": True,
         "auto_start": False,
-        "i2c_mapping": {"X": 0, "Y": 3, "Z": 4, "A": 7}
+        "reference_voltage": 2.5,
+        "baseline_voltage": 0.0,
+        "i2c_mapping": {"X": 2, "Y": 3, "Z": 6, "A": 7}
     }
 }
 
@@ -532,19 +534,23 @@ class WebConfigServer(object):
             self.angles_sub = rospy.Subscriber('/usv/pump_angles', String, self._angles_cb)
             self.injection_status_sub = rospy.Subscriber('/usv/injection_pump_status', String, self._injection_status_cb)
             self.voltage_sub = rospy.Subscriber('/usv/spectrometer_voltage', String, self._voltage_cb)
+            self.spectro_status_sub = rospy.Subscriber('/usv/spectrometer_status', String, self._spectro_status_cb)
             self.mission_sub = rospy.Subscriber('/usv/mission_status', String, self._mission_status_cb)
             self.pid_error_sub = rospy.Subscriber('/usv/pump_pid_error', String, self._pid_error_cb)
             self.steps_pub = rospy.Publisher('/usv/automation_steps', String, queue_size=1)
             self.command_pub = rospy.Publisher('/usv/pump_command', String, queue_size=10)
+            self.spectro_cmd_pub = rospy.Publisher('/usv/spectrometer_command', String, queue_size=10)
         else:
             self.status_sub = None
             self.angles_sub = None
             self.injection_status_sub = None
             self.voltage_sub = None
+            self.spectro_status_sub = None
             self.mission_sub = None
             self.pid_error_sub = None
             self.steps_pub = None
             self.command_pub = None
+            self.spectro_cmd_pub = None
 
         # Flask & SocketIO
         self.app = None
@@ -690,6 +696,13 @@ class WebConfigServer(object):
                 "raw": data,
             })
 
+    def _spectro_status_cb(self, msg):
+        """分光采集状态回调。"""
+        status = (msg.data or "").strip() or self.spectrometer_status
+        self.spectrometer_status = status
+        if self.socketio:
+            self.socketio.emit('spectrometer_status', status)
+
     def _mission_status_cb(self, msg):
         """任务状态回调"""
         self.mission_status = msg.data
@@ -790,6 +803,74 @@ class WebConfigServer(object):
                 return folder
         return candidates[-1]
 
+    def _publish_spectrometer_command(self, payload):
+        """Publish a JSON command to pump_control_node's runtime spectrometer channel."""
+        if not getattr(self, 'spectro_cmd_pub', None):
+            return False, "spectrometer command publisher not initialized"
+        try:
+            msg = String()
+            msg.data = json.dumps(payload)
+            self.spectro_cmd_pub.publish(msg)
+            return True, "published"
+        except Exception as e:
+            return False, str(e)
+
+    def _publish_hardware_runtime_config(self, hw):
+        """Push saved hardware config into pump_control_node after serial reconnect."""
+        mapping = {
+            "angles": dict(hw.get("i2c_mapping", {})),
+            "spectro_channel": int(hw.get("spectro_channel", 0)),
+        }
+        ok, message = self._publish_spectrometer_command({
+            "cmd": "set_i2c_map",
+            "mapping": mapping,
+        })
+        results = {
+            "i2c_mapping": {
+                "success": ok,
+                "message": "I2C 映射已下发" if ok else message,
+            },
+            "spectrometer": None,
+        }
+        if not ok:
+            results["spectrometer"] = {
+                "success": False,
+                "message": "I2C 映射下发失败，跳过分光配置",
+            }
+            return results
+
+        ok, message = self._publish_spectrometer_command({
+            "cmd": "configure",
+            "ads_address": hw.get("ads_address", "0x40"),
+            "mux": hw.get("mux", "AIN0"),
+            "gain": int(hw.get("gain", 1)),
+            "vref_mode": hw.get("vref_mode", "AVDD"),
+            "adc_rate": int(hw.get("adc_rate", 90)),
+            "publish_rate": int(hw.get("publish_rate", 20)),
+            "continuous_mode": bool(hw.get("continuous_mode", True)),
+            "reference_voltage": float(hw.get("reference_voltage", 2.5)),
+            "baseline_voltage": float(hw.get("baseline_voltage", 0.0)),
+        })
+        if not ok:
+            results["spectrometer"] = {
+                "success": False,
+                "message": message,
+            }
+            return results
+
+        if hw.get("auto_start", False):
+            ok, message = self._publish_spectrometer_command({"cmd": "start"})
+            results["spectrometer"] = {
+                "success": ok,
+                "message": "分光配置已下发并启动" if ok else message,
+            }
+        else:
+            results["spectrometer"] = {
+                "success": True,
+                "message": "分光配置已下发，未自动启动",
+            }
+        return results
+
     def _setup_flask(self):
         """设置 Flask 和 SocketIO 应用。"""
         # 设置静态文件目录
@@ -841,6 +922,32 @@ class WebConfigServer(object):
             return value.strip()[:max_len]
 
         def normalize_hardware(data, current_hw=None):
+            def clamp_channel(value, default=0):
+                return to_int(value, default, 0, 7)
+
+            def to_bool(value, default=False):
+                if isinstance(value, bool):
+                    return value
+                if isinstance(value, str):
+                    text = value.strip().lower()
+                    if text in ('1', 'true', 'yes', 'on', 'enabled'):
+                        return True
+                    if text in ('0', 'false', 'no', 'off', 'disabled'):
+                        return False
+                return default if value is None else bool(value)
+
+            def normalize_gain(value, default=1):
+                raw = to_int(value, default, 1, 128)
+                return min((1, 2, 4), key=lambda allowed: abs(allowed - raw))
+
+            def normalize_vref(value):
+                text = clean_string(value, 'AVDD', 32).upper()
+                if text in ('INT', 'INTERNAL', 'INT_2V048'):
+                    return 'INT'
+                if text == 'AVDD':
+                    return 'AVDD'
+                return 'AVDD'
+
             hw = dict(current_hw or DEFAULT_CONFIG['hardware'])
             for key in DEFAULT_CONFIG['hardware']:
                 if key in data:
@@ -850,6 +957,25 @@ class WebConfigServer(object):
             ) or DEFAULT_CONFIG['hardware']['pump_serial_port']
             hw['pump_baudrate'] = to_int(hw.get('pump_baudrate'), 115200, 1200, 3000000)
             hw['pump_timeout'] = to_float(hw.get('pump_timeout'), 1.0, 0.1, 10.0)
+            hw['ads_address'] = clean_string(hw.get('ads_address'), '0x40', 16) or '0x40'
+            hw['spectro_channel'] = clamp_channel(hw.get('spectro_channel'), 0)
+            mux = clean_string(hw.get('mux'), 'AIN0', 32).upper()
+            hw['mux'] = mux if mux.startswith('AIN') else 'AIN0'
+            hw['gain'] = normalize_gain(hw.get('gain'), 1)
+            hw['vref_mode'] = normalize_vref(hw.get('vref_mode'))
+            hw['adc_rate'] = to_int(hw.get('adc_rate'), 90, 1, 2000)
+            hw['publish_rate'] = to_int(hw.get('publish_rate'), 20, 1, 200)
+            hw['continuous_mode'] = to_bool(hw.get('continuous_mode'), True)
+            hw['auto_start'] = to_bool(hw.get('auto_start'), False)
+            hw['reference_voltage'] = to_float(hw.get('reference_voltage'), 2.5, 0.0, 10.0)
+            hw['baseline_voltage'] = to_float(hw.get('baseline_voltage'), 0.0, -10.0, 10.0)
+
+            mapping = hw.get('i2c_mapping') if isinstance(hw.get('i2c_mapping'), dict) else {}
+            default_map = DEFAULT_CONFIG['hardware']['i2c_mapping']
+            hw['i2c_mapping'] = {
+                axis: clamp_channel(mapping.get(axis, default_map[axis]), default_map[axis])
+                for axis in ('X', 'Y', 'Z', 'A')
+            }
             return hw
 
 
@@ -1653,9 +1779,10 @@ class WebConfigServer(object):
             if not self.config_manager.update(current):
                 return jsonify({"success": False, "message": "保存失败"}), 500
 
-            results = {"pump": None}
+            results = {"pump": None, "i2c_mapping": None, "spectrometer": None}
 
             # 通知 pump 节点重连
+            pump_ready = True
             if not self.standalone:
                 try:
                     rospy.set_param('/pump_control_node/serial_port', hw['pump_serial_port'])
@@ -1665,11 +1792,28 @@ class WebConfigServer(object):
                     svc.wait_for_service(timeout=3.0)
                     resp = svc()
                     results["pump"] = {"success": resp.success, "message": resp.message}
+                    pump_ready = bool(resp.success)
                 except Exception as e:
                     results["pump"] = {"success": False, "message": str(e)}
+                    pump_ready = False
+
+                if pump_ready:
+                    runtime_results = self._publish_hardware_runtime_config(hw)
+                    results.update(runtime_results)
+                else:
+                    results["i2c_mapping"] = {
+                        "success": False,
+                        "message": "泵控重连失败，未下发 I2C 映射",
+                    }
+                    results["spectrometer"] = {
+                        "success": False,
+                        "message": "泵控重连失败，未下发分光配置",
+                    }
 
             else:
                 results["pump"] = {"success": True, "message": "独立模式，跳过"}
+                results["i2c_mapping"] = {"success": True, "message": "独立模式，跳过"}
+                results["spectrometer"] = {"success": True, "message": "独立模式，跳过"}
 
             self._add_log("硬件配置已应用", "info")
             return jsonify({"success": True, "message": "硬件配置已应用", "data": hw, "results": results})

@@ -70,11 +70,11 @@ automation:
 # ==================== 分光检测器参数 ====================
 i2c_mapping:
   angles:
-    X: 0
+    X: 2
     Y: 3
-    Z: 4
+    Z: 6
     A: 7
-  spectro_channel: 2
+  spectro_channel: 0
 
 spectrometer:
   enabled: true

@@ -76,6 +76,7 @@ interface AppState {
   rawAngles: PumpAngles
   currentVoltage: number
   currentAbsorbance: number
+  spectrometerStatus: string
   voltageHistory: VoltagePoint[]
   pidErrors: PidErrorState
   injectionPump: InjectionPumpStatus
@@ -109,6 +110,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   rawAngles: { X: 0, Y: 0, Z: 0, A: 0 },
   currentVoltage: 0,
   currentAbsorbance: 0,
+  spectrometerStatus: 'idle',
   voltageHistory: [],
   pidErrors: { X: 0, Y: 0, Z: 0, A: 0 },
   injectionPump: DEFAULT_INJECTION_PUMP_STATUS,
@@ -140,6 +142,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         pumpConnected: data.pump_connected,
         automationRunning: data.automation_running,
         missionStatus: data.mission_status || 'IDLE',
+        spectrometerStatus: data.spectrometer_status || 'idle',
       })
     })
 
@@ -155,18 +158,30 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ rawAngles: data })
     })
 
-    socket.on('voltage', (data: { value: number; absorbance?: number }) => {
+    socket.on('voltage', (data: { value: number; absorbance?: number; status?: string; raw?: { valid?: boolean; raw_code?: number } }) => {
       const voltage = data.value ?? 0
       const absorbance = data.absorbance ?? 0
       const time = new Date().toLocaleTimeString()
-      set((state) => ({
-        currentVoltage: voltage,
-        currentAbsorbance: absorbance,
-        voltageHistory: [
-          ...state.voltageHistory.slice(-(MAX_HISTORY_POINTS - 1)),
-          { time, voltage, absorbance },
-        ],
-      }))
+      set((state) => {
+        const hasSample = data.raw
+          ? data.raw.valid === true || typeof data.raw.raw_code === 'number'
+          : data.status === undefined || data.status === 'acquiring'
+        return {
+          currentVoltage: hasSample ? voltage : state.currentVoltage,
+          currentAbsorbance: hasSample ? absorbance : state.currentAbsorbance,
+          spectrometerStatus: data.status || state.spectrometerStatus,
+          voltageHistory: hasSample
+            ? [
+                ...state.voltageHistory.slice(-(MAX_HISTORY_POINTS - 1)),
+                { time, voltage, absorbance },
+              ]
+            : state.voltageHistory,
+        }
+      })
+    })
+
+    socket.on('spectrometer_status', (status: string) => {
+      set({ spectrometerStatus: status || 'idle' })
     })
 
     socket.on('injection_pump_status', (data: InjectionPumpStatus) => {

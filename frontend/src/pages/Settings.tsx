@@ -41,7 +41,7 @@ const DEFAULT_HW: HardwareConfig = {
   pump_baudrate: 115200,
   pump_timeout: 1.0,
   ads_address: '0x40',
-  spectro_channel: 2,
+  spectro_channel: 0,
   mux: 'AIN0',
   gain: 1,
   vref_mode: 'AVDD',
@@ -51,7 +51,7 @@ const DEFAULT_HW: HardwareConfig = {
   auto_start: false,
   reference_voltage: 2.5,
   baseline_voltage: 0.0,
-  i2c_mapping: { X: 0, Y: 3, Z: 4, A: 7 },
+  i2c_mapping: { X: 2, Y: 3, Z: 6, A: 7 },
 }
 
 export default function Settings() {

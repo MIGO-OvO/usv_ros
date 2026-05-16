@@ -684,7 +684,8 @@ class PumpControlNode(object):
         cfg = self.spectro_config
         mux = str(cfg.get('mux', 'AIN0')).strip().upper()
         ain = mux.split('_', 1)[0] if mux.startswith('AIN') else 'AIN0'
-        vref_mode = str(cfg.get('vref_mode', 'AVDD')).strip().upper()
+        vref_raw = str(cfg.get('vref_mode', 'AVDD')).strip().upper()
+        vref_mode = 'INT' if vref_raw in ('INT', 'INTERNAL', 'INT_2V048') else 'AVDD'
         adc_rate = int(cfg.get('adc_rate', 90) or 90)
         publish_rate = max(1, int(cfg.get('publish_rate', 20) or 20))
         return (
