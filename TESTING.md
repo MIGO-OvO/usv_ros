@@ -65,6 +65,17 @@ catkin_make
 sudo ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
 ```
 
+推荐现场双网卡并行：`wlan1` 专门创建 `USV_Control` 热点，`wlan0`、`eth0` 或 `usb0`
+保留外网上游，用于 `git pull`、`apt update`。
+
+```bash
+nmcli dev status
+nmcli dev wifi connect "<外网SSID>" password "<外网密码>" ifname wlan0
+
+cd ~/usv_ws
+sudo HOTSPOT_IFACE=wlan1 ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
+```
+
 参数：
 
 | 参数/环境变量 | 默认值 | 说明 |
@@ -75,6 +86,7 @@ sudo ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
 | `HOTSPOT_IFACE` | `wlan0` | 热点无线网卡 |
 | `HOTSPOT_CONN_NAME` | `USV_AP` | NetworkManager 连接名 |
 | `HOTSPOT_IP` | `10.42.0.1` | 热点网关 IP |
+| `HOTSPOT_ROUTE_METRIC` | `900` | 热点连接 route metric；同时设置 never-default，避免抢默认路由 |
 | `WEB_PORT` | `5000` | Web 服务端口 |
 | `USV_BOOT_WAIT_SECONDS` | `90` | 热点/Web 等待超时 |
 | `USV_STRICT_SELF_CHECK` | `true` | 严格自检，要求 ROS 节点和 MAVROS 均正常 |
@@ -112,6 +124,7 @@ tail -n 120 .usv_run/logs/boot_check.log
 | systemd | `enabled` + `active` |
 | 自检日志 | `boot start complete` |
 | 热点 | `hotspot: ... conn=active ... ip=assigned ... web_port=listening` |
+| 外网 | `internet: ... source=external ... dns=ok github=reachable`，且默认路由不走热点网卡 |
 | ROS 进程 | `roscore: RUNNING`、`mavlink_router: RUNNING`、`usv_system: RUNNING` |
 | ROS 节点 | 严格模式下 `ros_nodes: ALL_OK` |
 | MAVROS | 严格模式下 `mavros_link: CONNECTED` |
@@ -160,7 +173,7 @@ sudo ./src/usv_ros/scripts/uninstall_boot_service.sh
 | 启动 ROS 主系统 | `./src/usv_ros/scripts/start_usv_all.sh` | `.usv_run/logs/{roscore,mavlink_router,usv_system}.log` |
 | 停止 ROS 主系统 | `./src/usv_ros/scripts/stop_usv_all.sh` | 停 `roslaunch`、router、roscore |
 | 重启 ROS 主系统 | `./src/usv_ros/scripts/restart_usv_all.sh` | 停止后重新启动 |
-| 状态总览 | `./src/usv_ros/scripts/status_usv_all.sh` | 进程、热点、ROS 节点、MAVROS、bridge |
+| 状态总览 | `./src/usv_ros/scripts/status_usv_all.sh` | 进程、热点、外网默认路由、ROS 节点、MAVROS、bridge |
 | 创建热点 | `sudo ./src/usv_ros/scripts/setup_hotspot.sh USV_Control 12345678` | NetworkManager 连接 `USV_AP` |
 | 关闭热点 | `sudo ./src/usv_ros/scripts/stop_hotspot.sh` | 尝试回连原 Wi-Fi |
 | 安装上电自启 | `sudo ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678` | 创建并启动 `usv-boot.service` |
@@ -270,10 +283,13 @@ rostopic echo /usv/trigger_status
 ```bash
 sudo ./src/usv_ros/scripts/setup_hotspot.sh USV_Control 12345678
 nmcli -f GENERAL.NAME,802-11-wireless.ssid,802-11-wireless-security.key-mgmt con show USV_AP
+ip route show default
 ./src/usv_ros/scripts/status_usv_all.sh
 ```
 
-通过判据：客户端能连接 `USV_Control`；访问 `http://10.42.0.1:5000`；状态显示 `conn=active ip=assigned web_port=listening`。
+通过判据：客户端能连接 `USV_Control`；访问 `http://10.42.0.1:5000`；状态显示
+`conn=active ip=assigned web_port=listening`；双网卡场景下 `internet` 行显示 `source=external`，
+默认路由走 `wlan0`、`eth0` 或 `usb0`，不走热点网卡。
 
 <a id="field-e2e"></a>
 

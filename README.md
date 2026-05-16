@@ -306,7 +306,22 @@ sudo ./src/usv_ros/scripts/stop_hotspot.sh
 ```
 
 默认热点连接名为 `USV_AP`，默认地址为 `10.42.0.1`。可通过 `HOTSPOT_IFACE`、`HOTSPOT_CONN_NAME`、
-`HOTSPOT_IP` 覆盖。
+`HOTSPOT_IP`、`HOTSPOT_ROUTE_METRIC` 覆盖。
+
+推荐现场使用双网卡并行：USB Wi-Fi 作为热点网卡，板载 Wi-Fi、网线或手机 USB 共享作为外网上游。
+
+```bash
+nmcli dev status
+nmcli dev wifi connect "<外网SSID>" password "<外网密码>" ifname wlan0
+
+cd ~/usv_ws
+sudo HOTSPOT_IFACE=wlan1 ./src/usv_ros/scripts/setup_hotspot.sh USV_Control 12345678
+ip route
+./src/usv_ros/scripts/status_usv_all.sh
+```
+
+热点连接会设置 `ipv4.never-default=yes`、`ipv6.never-default=yes` 和较高 route metric，避免 `USV_AP`
+抢默认路由。`status_usv_all.sh` 会输出 `internet: ... source=external ...`，用于确认默认路由仍走外网接口。
 
 ### 开机自启
 
@@ -315,6 +330,13 @@ sudo ./src/usv_ros/scripts/stop_hotspot.sh
 ```bash
 cd ~/usv_ws
 sudo ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
+```
+
+双网卡并行安装推荐指定热点网卡：
+
+```bash
+cd ~/usv_ws
+sudo HOTSPOT_IFACE=wlan1 ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
 ```
 
 默认启动顺序：

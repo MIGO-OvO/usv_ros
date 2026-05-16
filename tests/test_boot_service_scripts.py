@@ -26,6 +26,7 @@ class BootServiceScriptTests(unittest.TestCase):
         self.assertIn("USV_RUN_USER=", text)
         self.assertIn("USV_HOTSPOT_SSID=", text)
         self.assertIn("USV_HOTSPOT_PASSWORD=", text)
+        self.assertIn("HOTSPOT_ROUTE_METRIC=", text)
         self.assertIn("systemctl enable --now", text)
 
     def test_boot_start_runs_hotspot_then_ros_then_self_check_log(self):
@@ -44,6 +45,24 @@ class BootServiceScriptTests(unittest.TestCase):
         self.assertIn("require_command nmcli", text)
         self.assertIn("require_command ip", text)
         self.assertIn("require_command mavlink-routerd", text)
+
+    def test_setup_hotspot_does_not_take_default_route(self):
+        text = self._read_script("setup_hotspot.sh")
+
+        self.assertIn("HOTSPOT_ROUTE_METRIC", text)
+        self.assertIn("ipv4.never-default yes", text)
+        self.assertIn("ipv6.never-default yes", text)
+        self.assertIn("ipv4.route-metric", text)
+        self.assertIn("ipv6.route-metric", text)
+
+    def test_status_reports_external_internet_path(self):
+        text = self._read_script("status_usv_all.sh")
+
+        self.assertIn("print_internet_status", text)
+        self.assertIn("ip route show default", text)
+        self.assertIn("getent hosts github.com", text)
+        self.assertIn("https://github.com/", text)
+        self.assertIn("internet:", text)
 
     def test_boot_stop_stops_ros_before_hotspot(self):
         text = self._read_script("usv_boot_stop.sh")
