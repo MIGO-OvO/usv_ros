@@ -84,12 +84,70 @@ print_hotspot_status() {
     fi
 }
 
+print_internet_status() {
+    local route_state="missing"
+    local default_iface="none"
+    local route_source="none"
+    local dns_state="unknown"
+    local github_state="unknown"
+    local default_route=""
+
+    if command -v ip >/dev/null 2>&1; then
+        default_route="$(ip route show default 2>/dev/null | head -n 1 || true)"
+        if [[ -n "$default_route" ]]; then
+            route_state="present"
+            default_iface="$(echo "$default_route" | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}')"
+            if [[ -z "$default_iface" ]]; then
+                default_iface="unknown"
+            fi
+            if [[ "$default_iface" == "$HOTSPOT_IFACE" ]]; then
+                route_source="hotspot"
+            else
+                route_source="external"
+            fi
+        fi
+    else
+        route_state="ip-missing"
+    fi
+
+    if command -v getent >/dev/null 2>&1; then
+        if getent hosts github.com >/dev/null 2>&1; then
+            dns_state="ok"
+        else
+            dns_state="failed"
+        fi
+    else
+        dns_state="getent-missing"
+    fi
+
+    if command -v curl >/dev/null 2>&1; then
+        if [[ "$dns_state" == "ok" ]] && curl -fsS --connect-timeout 3 --max-time 5 https://github.com/ >/dev/null 2>&1; then
+            github_state="reachable"
+        elif [[ "$dns_state" != "ok" ]]; then
+            github_state="skipped-dns"
+        else
+            github_state="unreachable"
+        fi
+    else
+        github_state="curl-missing"
+    fi
+
+    echo "internet: route=$route_state iface=$default_iface source=$route_source dns=$dns_state github=$github_state"
+
+    if [[ "$route_source" == "hotspot" ]]; then
+        echo "  issue=default-route-uses-hotspot-interface"
+    elif [[ "$route_state" != "present" ]]; then
+        echo "  issue=default-route-missing"
+    fi
+}
+
 echo "USV Runtime Status"
 echo "run_dir=$RUN_DIR"
 print_status "roscore" "$MASTER_PID_FILE" "$MASTER_LOG_FILE"
 print_status "mavlink_router" "$ROUTER_PID_FILE" "$ROUTER_LOG_FILE"
 print_status "usv_system" "$LAUNCH_PID_FILE" "$LAUNCH_LOG_FILE"
 print_hotspot_status
+print_internet_status
 
 # ── ROS 节点级健康检查 ──────────────────────────────────────────────
 # 仅在 roscore 运行时执行；使用 timeout 避免 hang；失败不中断脚本
@@ -227,4 +285,3 @@ else:
 set +e
 print_ros_nodes
 set -e
-

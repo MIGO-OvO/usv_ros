@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # USV Wi-Fi Hotspot Setup Script
 # 在 Jetson Nano 上创建 Wi-Fi 热点。
 #
@@ -20,6 +20,7 @@ PASSWORD="${2:-12345678}"
 INTERFACE="${HOTSPOT_IFACE:-wlan0}"
 CON_NAME="${HOTSPOT_CONN_NAME:-USV_AP}"
 HOTSPOT_IP="${HOTSPOT_IP:-10.42.0.1}"
+HOTSPOT_ROUTE_METRIC="${HOTSPOT_ROUTE_METRIC:-900}"
 WS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN_DIR="$WS_DIR/.usv_run"
 PREV_WIFI_FILE="$RUN_DIR/previous_wifi_connection"
@@ -33,6 +34,7 @@ echo "SSID: $SSID"
 echo "Password: $PASSWORD"
 echo "Security: WPA-PSK"
 echo "Interface: $INTERFACE"
+echo "Route metric: $HOTSPOT_ROUTE_METRIC"
 echo ""
 
 if [ "$EUID" -ne 0 ]; then
@@ -76,7 +78,11 @@ nmcli connection modify "$CON_NAME" \
     802-11-wireless.mode ap \
     802-11-wireless.band bg \
     ipv4.method shared \
+    ipv4.never-default yes \
+    ipv4.route-metric "$HOTSPOT_ROUTE_METRIC" \
     ipv6.method ignore \
+    ipv6.never-default yes \
+    ipv6.route-metric "$HOTSPOT_ROUTE_METRIC" \
     wifi-sec.key-mgmt wpa-psk \
     wifi-sec.psk "$PASSWORD" \
     connection.autoconnect yes >/dev/null

@@ -312,7 +312,24 @@ sudo ./src/usv_ros/scripts/stop_hotspot.sh
 ```
 
 The default connection name is `USV_AP`, and the default address is `10.42.0.1`. Override with
-`HOTSPOT_IFACE`, `HOTSPOT_CONN_NAME`, and `HOTSPOT_IP` when needed.
+`HOTSPOT_IFACE`, `HOTSPOT_CONN_NAME`, `HOTSPOT_IP`, and `HOTSPOT_ROUTE_METRIC` when needed.
+
+Recommended field networking uses two adapters in parallel: a USB Wi-Fi adapter for the USV hotspot, and
+onboard Wi-Fi, Ethernet, or USB tethering for upstream internet access.
+
+```bash
+nmcli dev status
+nmcli dev wifi connect "<internet-ssid>" password "<internet-password>" ifname wlan0
+
+cd ~/usv_ws
+sudo HOTSPOT_IFACE=wlan1 ./src/usv_ros/scripts/setup_hotspot.sh USV_Control 12345678
+ip route
+./src/usv_ros/scripts/status_usv_all.sh
+```
+
+The hotspot connection sets `ipv4.never-default=yes`, `ipv6.never-default=yes`, and a high route metric so
+`USV_AP` does not take the default route. `status_usv_all.sh` reports `internet: ... source=external ...`
+when the default route still uses the upstream interface.
 
 ### Boot Autostart
 
@@ -321,6 +338,13 @@ Install the systemd service:
 ```bash
 cd ~/usv_ws
 sudo ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
+```
+
+For the recommended two-adapter setup, pin the hotspot to the USB Wi-Fi interface:
+
+```bash
+cd ~/usv_ws
+sudo HOTSPOT_IFACE=wlan1 ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
 ```
 
 Default boot sequence:
