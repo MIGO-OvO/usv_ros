@@ -1519,7 +1519,12 @@ class PumpControlNode(object):
 
     def _injection_on_callback(self, req):
         """开启进样泵服务。"""
-        success = self._send_injection_pump_command(enabled=True)
+        if self.inject_pump_speed <= 0:
+            message = "Injection pump speed is 0; set speed first"
+            self._update_injection_pump_state(enabled=False, error=message)
+            return TriggerResponse(success=False, message=message)
+
+        success = self._send_injection_pump_command(speed=self.inject_pump_speed)
         return TriggerResponse(success=success, message="Injection pump on" if success else "Injection pump on failed")
 
     def _injection_off_callback(self, req):
