@@ -347,11 +347,27 @@ cd ~/usv_ws
 sudo HOTSPOT_IFACE=wlan1 ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
 ```
 
+If Web configuration is accessed through SSH, disable the autostart hotspot and keep only ROS/Web autostart:
+
+```bash
+cd ~/usv_ws
+sudo USV_ENABLE_HOTSPOT=false ./src/usv_ros/scripts/install_boot_service.sh
+```
+
+On the client machine, forward the Web port over SSH:
+
+```bash
+ssh -N -L 5000:127.0.0.1:5000 jetson@<Jetson_IP>
+```
+
+Open `http://127.0.0.1:5000` in the browser. If local port 5000 is already in use, use
+`-L 5050:127.0.0.1:5000` and open `http://127.0.0.1:5050`.
+
 Default boot sequence:
 
-1. Create or restore the hotspot.
+1. Create or restore the hotspot by default; skip it when `USV_ENABLE_HOTSPOT=false`.
 2. Start `start_usv_all.sh` as the user that ran the installer.
-3. Wait for Web, hotspot, ROS nodes, MAVROS, and bridge diagnostics.
+3. Wait for Web, ROS nodes, MAVROS, and bridge diagnostics; when enabled, also wait for hotspot readiness.
 4. Write self-check output to `~/usv_ws/.usv_run/logs/boot_check.log`.
 
 Common commands:

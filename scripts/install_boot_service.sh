@@ -10,6 +10,7 @@ SSID="${1:-USV_Control}"
 PASSWORD="${2:-12345678}"
 RUN_USER="${3:-${SUDO_USER:-$(id -un)}}"
 WEB_PORT="${WEB_PORT:-5000}"
+USV_ENABLE_HOTSPOT="${USV_ENABLE_HOTSPOT:-true}"
 HOTSPOT_IFACE="${HOTSPOT_IFACE:-wlan0}"
 HOTSPOT_CONN_NAME="${HOTSPOT_CONN_NAME:-USV_AP}"
 HOTSPOT_IP="${HOTSPOT_IP:-10.42.0.1}"
@@ -57,6 +58,7 @@ Environment="USV_RUN_USER=$esc_user"
 Environment="USV_HOTSPOT_SSID=$esc_ssid"
 Environment="USV_HOTSPOT_PASSWORD=$esc_password"
 Environment="WEB_PORT=$WEB_PORT"
+Environment="USV_ENABLE_HOTSPOT=$USV_ENABLE_HOTSPOT"
 Environment="HOTSPOT_IFACE=$HOTSPOT_IFACE"
 Environment="HOTSPOT_CONN_NAME=$HOTSPOT_CONN_NAME"
 Environment="HOTSPOT_IP=$HOTSPOT_IP"
@@ -78,7 +80,7 @@ EOF
 main() {
     require_root
 
-    if [[ ${#PASSWORD} -lt 8 ]]; then
+    if [[ "$USV_ENABLE_HOTSPOT" == "true" && ${#PASSWORD} -lt 8 ]]; then
         log "ERROR: WPA-PSK password length must be >= 8"
         exit 1
     fi
@@ -105,6 +107,7 @@ main() {
     systemctl enable --now "$SERVICE_NAME"
 
     log "installed and started: $SERVICE_NAME"
+    log "hotspot enabled: $USV_ENABLE_HOTSPOT"
     log "hotspot iface: $HOTSPOT_IFACE"
     log "hotspot route metric: $HOTSPOT_ROUTE_METRIC"
     log "status: sudo systemctl status $SERVICE_NAME"

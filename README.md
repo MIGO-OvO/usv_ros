@@ -339,11 +339,27 @@ cd ~/usv_ws
 sudo HOTSPOT_IFACE=wlan1 ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
 ```
 
+如果只通过 SSH 访问 Web 配置页，可以关闭自启热点，只保留 ROS/Web 自启：
+
+```bash
+cd ~/usv_ws
+sudo USV_ENABLE_HOTSPOT=false ./src/usv_ros/scripts/install_boot_service.sh
+```
+
+电脑侧通过 SSH 端口转发访问：
+
+```bash
+ssh -N -L 5000:127.0.0.1:5000 jetson@<Jetson_IP>
+```
+
+浏览器打开 `http://127.0.0.1:5000`。如果本机 5000 被占用，可改成 `-L 5050:127.0.0.1:5000`
+并访问 `http://127.0.0.1:5050`。
+
 默认启动顺序：
 
-1. 创建/恢复热点。
+1. 默认创建/恢复热点；`USV_ENABLE_HOTSPOT=false` 时跳过。
 2. 以安装脚本调用者作为运行用户启动 `start_usv_all.sh`。
-3. 等待 Web、热点、ROS 节点、MAVROS 和 bridge 诊断就绪。
+3. 等待 Web、ROS 节点、MAVROS 和 bridge 诊断就绪；启用热点时额外等待热点就绪。
 4. 自检结果写入 `~/usv_ws/.usv_run/logs/boot_check.log`。
 
 常用命令：

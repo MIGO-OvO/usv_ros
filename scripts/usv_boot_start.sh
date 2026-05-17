@@ -9,6 +9,7 @@ SERVICE_NAME="${SERVICE_NAME:-usv-boot.service}"
 USV_RUN_USER="${USV_RUN_USER:-${SUDO_USER:-$(id -un)}}"
 USV_HOTSPOT_SSID="${USV_HOTSPOT_SSID:-USV_Control}"
 USV_HOTSPOT_PASSWORD="${USV_HOTSPOT_PASSWORD:-12345678}"
+USV_ENABLE_HOTSPOT="${USV_ENABLE_HOTSPOT:-true}"
 HOTSPOT_IFACE="${HOTSPOT_IFACE:-wlan0}"
 HOTSPOT_IP="${HOTSPOT_IP:-10.42.0.1}"
 WEB_PORT="${WEB_PORT:-5000}"
@@ -45,9 +46,14 @@ require_command() {
     fi
 }
 
+is_hotspot_enabled() {
+    [[ "$USV_ENABLE_HOTSPOT" == "true" ]]
+}
+
 run_as_usv_user() {
     local env_args=(
         "WEB_PORT=$WEB_PORT"
+        "USV_ENABLE_HOTSPOT=$USV_ENABLE_HOTSPOT"
         "HOTSPOT_IFACE=$HOTSPOT_IFACE"
         "HOTSPOT_IP=$HOTSPOT_IP"
         "HOTSPOT_CONN_NAME=${HOTSPOT_CONN_NAME:-USV_AP}"
@@ -117,8 +123,7 @@ run_self_check() {
     require_status_line "roscore: RUNNING" "roscore"
     require_status_line "mavlink_router: RUNNING" "mavlink-router"
     require_status_line "usv_system: RUNNING" "usv roslaunch"
-    require_status_line "conn=active" "hotspot active"
-    require_status_line "ip=assigned" "hotspot ip"
+    require_hotspot_self_check
     require_status_line "web_port=listening" "web port"
 
     if [[ "$USV_STRICT_SELF_CHECK" == "true" ]]; then
@@ -126,6 +131,15 @@ run_self_check() {
         require_status_line "mavros_link: CONNECTED" "MAVROS link"
     else
         log_boot "strict self-check disabled; ROS node and MAVROS diagnostics are informational"
+    fi
+}
+
+require_hotspot_self_check() {
+    if is_hotspot_enabled; then
+        require_status_line "conn=active" "hotspot active"
+        require_status_line "ip=assigned" "hotspot ip"
+    else
+        log_boot "hotspot self-check skipped: disabled"
     fi
 }
 
@@ -148,17 +162,23 @@ main() {
     trap cleanup_on_error ERR
 
     log_boot "boot start"
-    log_boot "run_user=$USV_RUN_USER ssid=$USV_HOTSPOT_SSID strict=$USV_STRICT_SELF_CHECK"
+    log_boot "run_user=$USV_RUN_USER ssid=$USV_HOTSPOT_SSID hotspot=$USV_ENABLE_HOTSPOT strict=$USV_STRICT_SELF_CHECK"
 
     require_root
-    require_command nmcli
-    require_command ip
+    if is_hotspot_enabled; then
+        require_command nmcli
+        require_command ip
+    fi
     require_command runuser
     require_command mavlink-routerd
 
-    HOTSPOT_ATTEMPTED="true"
-    "$SCRIPT_DIR/setup_hotspot.sh" "$USV_HOTSPOT_SSID" "$USV_HOTSPOT_PASSWORD" | tee -a "$BOOT_CHECK_LOG_FILE"
-    wait_for_hotspot
+    if is_hotspot_enabled; then
+        HOTSPOT_ATTEMPTED="true"
+        "$SCRIPT_DIR/setup_hotspot.sh" "$USV_HOTSPOT_SSID" "$USV_HOTSPOT_PASSWORD" | tee -a "$BOOT_CHECK_LOG_FILE"
+        wait_for_hotspot
+    else
+        log_boot "skip hotspot setup: disabled"
+    fi
 
     run_as_usv_user "$SCRIPT_DIR/start_usv_all.sh"
     STARTED_ROS="true"

@@ -26,6 +26,7 @@ class BootServiceScriptTests(unittest.TestCase):
         self.assertIn("USV_RUN_USER=", text)
         self.assertIn("USV_HOTSPOT_SSID=", text)
         self.assertIn("USV_HOTSPOT_PASSWORD=", text)
+        self.assertIn("USV_ENABLE_HOTSPOT=", text)
         self.assertIn("HOTSPOT_ROUTE_METRIC=", text)
         self.assertIn("systemctl enable --now", text)
 
@@ -45,6 +46,22 @@ class BootServiceScriptTests(unittest.TestCase):
         self.assertIn("require_command nmcli", text)
         self.assertIn("require_command ip", text)
         self.assertIn("require_command mavlink-routerd", text)
+
+    def test_boot_start_can_skip_hotspot_when_disabled(self):
+        text = self._read_script("usv_boot_start.sh")
+
+        self.assertIn('USV_ENABLE_HOTSPOT="${USV_ENABLE_HOTSPOT:-true}"', text)
+        self.assertIn("is_hotspot_enabled", text)
+        self.assertIn("skip hotspot setup: disabled", text)
+        self.assertIn("require_hotspot_self_check", text)
+        self.assertIn("hotspot self-check skipped: disabled", text)
+
+    def test_boot_stop_can_skip_hotspot_when_disabled(self):
+        text = self._read_script("usv_boot_stop.sh")
+
+        self.assertIn('USV_ENABLE_HOTSPOT="${USV_ENABLE_HOTSPOT:-true}"', text)
+        self.assertIn("is_hotspot_enabled", text)
+        self.assertIn("skip hotspot stop: disabled", text)
 
     def test_setup_hotspot_does_not_take_default_route(self):
         text = self._read_script("setup_hotspot.sh")

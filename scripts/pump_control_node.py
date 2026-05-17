@@ -96,6 +96,11 @@ DEFAULT_SPECTRO_CONFIG = {
     "path_length_cm": 1.0,
 }
 
+DEFAULT_ANGLE_STREAM = {
+    "enabled": True,
+    "auto_start": True,
+}
+
 
 MOTOR_CONTROL_APP_SETTINGS_ENV = "USV_LOWER_DEVICE_SETTINGS_FILE"
 MOTOR_CONTROL_APP_SETTINGS_PATH = os.path.abspath(

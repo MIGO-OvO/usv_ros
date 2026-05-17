@@ -76,6 +76,18 @@ cd ~/usv_ws
 sudo HOTSPOT_IFACE=wlan1 ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
 ```
 
+仅使用 SSH 访问 Web 配置页时，关闭自启热点：
+
+```bash
+cd ~/usv_ws
+sudo USV_ENABLE_HOTSPOT=false ./src/usv_ros/scripts/install_boot_service.sh
+
+# 电脑侧执行
+ssh -N -L 5000:127.0.0.1:5000 jetson@<Jetson_IP>
+```
+
+然后在电脑浏览器打开 `http://127.0.0.1:5000`。
+
 参数：
 
 | 参数/环境变量 | 默认值 | 说明 |
@@ -83,6 +95,7 @@ sudo HOTSPOT_IFACE=wlan1 ./src/usv_ros/scripts/install_boot_service.sh USV_Contr
 | 第 1 参数 | `USV_Control` | 热点 SSID |
 | 第 2 参数 | `12345678` | WPA-PSK 密码，至少 8 位 |
 | 第 3 参数 | `SUDO_USER` | ROS 运行用户，默认安装脚本调用者 |
+| `USV_ENABLE_HOTSPOT` | `true` | 是否在自启服务中创建/停止热点；设为 `false` 时只启动 ROS/Web |
 | `HOTSPOT_IFACE` | `wlan0` | 热点无线网卡 |
 | `HOTSPOT_CONN_NAME` | `USV_AP` | NetworkManager 连接名 |
 | `HOTSPOT_IP` | `10.42.0.1` | 热点网关 IP |
@@ -123,7 +136,7 @@ tail -n 120 .usv_run/logs/boot_check.log
 |---|---|
 | systemd | `enabled` + `active` |
 | 自检日志 | `boot start complete` |
-| 热点 | `hotspot: ... conn=active ... ip=assigned ... web_port=listening` |
+| 热点 | 启用热点时 `hotspot: ... conn=active ... ip=assigned ... web_port=listening`；禁用热点时 `boot_check.log` 出现 `skip hotspot setup: disabled` |
 | 外网 | `internet: ... source=external ... dns=ok github=reachable`，且默认路由不走热点网卡 |
 | ROS 进程 | `roscore: RUNNING`、`mavlink_router: RUNNING`、`usv_system: RUNNING` |
 | ROS 节点 | 严格模式下 `ros_nodes: ALL_OK` |
@@ -177,6 +190,7 @@ sudo ./src/usv_ros/scripts/uninstall_boot_service.sh
 | 创建热点 | `sudo ./src/usv_ros/scripts/setup_hotspot.sh USV_Control 12345678` | NetworkManager 连接 `USV_AP` |
 | 关闭热点 | `sudo ./src/usv_ros/scripts/stop_hotspot.sh` | 尝试回连原 Wi-Fi |
 | 安装上电自启 | `sudo ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678` | 创建并启动 `usv-boot.service` |
+| 安装无热点自启 | `sudo USV_ENABLE_HOTSPOT=false ./src/usv_ros/scripts/install_boot_service.sh` | 只启动 ROS/Web，适合 SSH 端口转发 |
 | 卸载上电自启 | `sudo ./src/usv_ros/scripts/uninstall_boot_service.sh` | 停止并删除 unit |
 
 启动参数透传示例：
