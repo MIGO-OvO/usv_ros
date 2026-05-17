@@ -120,7 +120,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertIn("angles", event_names)
         self.assertNotIn("voltage", event_names)
 
-    def test_web_spectrometer_start_and_stop_routes_publish_runtime_commands(self):
+    def test_web_spectrometer_start_reapplies_runtime_config_before_start(self):
         module, publishers, _ = _load_script(
             "web_config_server_spectrometer_routes_test",
             "scripts/web_config_server.py",
@@ -138,15 +138,40 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             client = server.app.test_client()
 
             start_resp = client.post("/api/spectrometer/start")
-            stop_resp = client.post("/api/spectrometer/stop")
 
         self.assertEqual(start_resp.status_code, 200)
+        messages = [
+            json.loads(msg.data)
+            for msg in publishers["/usv/spectrometer_command"].messages
+        ]
+        self.assertEqual([msg["cmd"] for msg in messages[-3:]], ["set_i2c_map", "configure", "start"])
+        self.assertEqual(messages[-3]["mapping"]["spectro_channel"], 0)
+
+    def test_web_spectrometer_stop_route_publishes_stop_command(self):
+        module, publishers, _ = _load_script(
+            "web_config_server_spectrometer_stop_route_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            client = server.app.test_client()
+
+            stop_resp = client.post("/api/spectrometer/stop")
+
         self.assertEqual(stop_resp.status_code, 200)
         messages = [
             json.loads(msg.data)
             for msg in publishers["/usv/spectrometer_command"].messages
         ]
-        self.assertEqual(messages[-2:], [{"cmd": "start"}, {"cmd": "stop"}])
+        self.assertEqual(messages[-1], {"cmd": "stop"})
 
     def test_web_injection_on_with_speed_sends_set_command(self):
         module, publishers, _ = _load_script(
@@ -207,6 +232,26 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         config_text = (REPO_ROOT / "config" / "usv_params.yaml").read_text(encoding="utf-8")
         self.assertIn("baseline_voltage: 0.0", config_text)
 
+    def test_config_manager_preserves_correct_zero_spectro_channel(self):
+        module, _, _ = _load_script(
+            "web_config_server_legacy_spectro_channel_migration_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = Path(tmpdir) / "sampling_config.json"
+            config_file.write_text(json.dumps({
+                "hardware": {
+                    "spectro_channel": 0,
+                    "i2c_mapping": {"X": 2, "Y": 3, "Z": 6, "A": 7},
+                }
+            }), encoding="utf-8")
+
+            manager = module.ConfigManager(str(config_file))
+            manager.load()
+
+        self.assertEqual(manager.get()["hardware"]["spectro_channel"], 0)
+
     def test_frontend_voltage_handler_ignores_unmarked_periodic_snapshots(self):
         store_text = (REPO_ROOT / "frontend" / "src" / "store.ts").read_text(encoding="utf-8")
         self.assertNotIn("data.status === undefined || data.status === 'acquiring'", store_text)
@@ -245,7 +290,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
                     "pump_baudrate": 115200,
                     "pump_timeout": 1.0,
                     "ads_address": "0x40",
-                    "spectro_channel": 0,
+                    "spectro_channel": 2,
                     "mux": "AIN0_AVSS",
                     "gain": 128,
                     "vref_mode": "INTERNAL",
@@ -271,7 +316,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(messages[0]["cmd"], "set_i2c_map")
         self.assertEqual(messages[0]["mapping"], {
             "angles": {"X": 2, "Y": 3, "Z": 6, "A": 7},
-            "spectro_channel": 0,
+            "spectro_channel": 2,
         })
         self.assertEqual(messages[1]["cmd"], "configure")
         self.assertEqual(messages[1]["gain"], 4)
@@ -292,7 +337,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             "cmd": "set_i2c_map",
             "mapping": {
                 "angles": {"X": 2, "Y": 3, "Z": 6, "A": 7},
-                "spectro_channel": 0,
+                "spectro_channel": 2,
             },
         })))
         node._spectro_cmd_callback(string_cls(json.dumps({
@@ -308,8 +353,26 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             "baseline_voltage": 0.0,
         })))
 
-        self.assertEqual(sent[0], "I2CMAP:X=2,Y=3,Z=6,A=7,SPEC=0")
-        self.assertIn("ADSCFG:CH=0,ADDR=0x40,AIN=AIN0,REF=INT,GAIN=4,DR=90,MODE=CONT,PR=200", sent[1])
+        self.assertEqual(sent[0], "I2CMAP:X=2,Y=3,Z=6,A=7,SPEC=2")
+        self.assertIn("ADSCFG:CH=2,ADDR=0x40,AIN=AIN0,REF=INT,GAIN=4,DR=90,MODE=CONT,PR=200", sent[1])
+
+    def test_pump_node_spectrometer_start_reapplies_i2c_and_ads_before_adsstart(self):
+        module, _, _ = _load_script(
+            "pump_control_node_spectro_start_reconfigure_test",
+            "scripts/pump_control_node.py",
+        )
+        node = module.PumpControlNode()
+        sent = []
+        node.send_command = lambda cmd: sent.append(cmd) or True
+        node._wait_for_spectro_command_result = lambda timeout=2.0: (True, "ADS_OK:START")
+
+        success, message = node._spectro_start()
+
+        self.assertTrue(success)
+        self.assertEqual(message, "ADS_OK:START")
+        self.assertEqual(sent[0], "I2CMAP:X=0,Y=3,Z=4,A=7,SPEC=2")
+        self.assertIn("ADSCFG:CH=2,ADDR=0x40,AIN=AIN0,REF=AVDD,GAIN=1,DR=90,MODE=CONT,PR=20", sent[1])
+        self.assertEqual(sent[2], "ADSSTART")
 
     def test_web_status_callback_emits_spectrometer_status_without_sample(self):
         module, _, string_cls = _load_script(

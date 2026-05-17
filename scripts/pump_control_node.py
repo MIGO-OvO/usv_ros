@@ -75,8 +75,8 @@ SPECTRO_STATUS_NOT_CONFIG = 0x04
 SPECTRO_STATUS_SATURATED = 0x08
 
 DEFAULT_I2C_MAPPING = {
-    "angles": {"X": 0, "Y": 3, "Z": 4, "A": 7},
-    "spectro_channel": 2,
+    "angles": {"X": 2, "Y": 3, "Z": 6, "A": 7},
+    "spectro_channel": 0,
 }
 
 DEFAULT_SPECTRO_CONFIG = {
@@ -628,7 +628,7 @@ class PumpControlNode(object):
                         pass
                 mapping['angles'] = normalized_angles
             try:
-                mapping['spectro_channel'] = int(raw_mapping.get('spectro_channel', mapping.get('spectro_channel', 2)))
+                mapping['spectro_channel'] = int(raw_mapping.get('spectro_channel', mapping.get('spectro_channel', 0)))
             except (TypeError, ValueError):
                 pass
         return mapping
@@ -759,11 +759,11 @@ class PumpControlNode(object):
     def _apply_i2c_mapping(self):
         angles = self.i2c_mapping.get('angles', {})
         cmd = "I2CMAP:X={x},Y={y},Z={z},A={a},SPEC={spec}".format(
-            x=angles.get('X', 0),
+            x=angles.get('X', 2),
             y=angles.get('Y', 3),
-            z=angles.get('Z', 4),
+            z=angles.get('Z', 6),
             a=angles.get('A', 7),
-            spec=self.i2c_mapping.get('spectro_channel', 2)
+            spec=self.i2c_mapping.get('spectro_channel', 0)
         )
         ok = self.send_command(cmd)
         if ok:
@@ -790,7 +790,7 @@ class PumpControlNode(object):
         return (
             "ADSCFG:CH={ch},ADDR={addr},AIN={ain},REF={vref},GAIN={gain},DR={rate},MODE={mode},PR={pub}"
             .format(
-                ch=int(self.i2c_mapping.get('spectro_channel', 2)),
+                ch=int(self.i2c_mapping.get('spectro_channel', 0)),
                 addr=str(cfg.get('ads_address', '0x40')).strip(),
                 ain=ain,
                 vref=vref_mode,
@@ -809,6 +809,11 @@ class PumpControlNode(object):
         return False, 'timeout'
 
     def _spectro_start(self):
+        if not self._apply_i2c_mapping():
+            return False, 'Spectrometer I2C mapping apply failed'
+        if not self._apply_spectro_config():
+            return False, 'Spectrometer config command send failed'
+        time.sleep(0.1)
         ok = self.send_command('ADSSTART')
         if not ok:
             return False, 'Spectrometer start command send failed'

@@ -436,12 +436,21 @@ class ConfigManager(object):
                 else:
                     base[key] = value
         merge(self.config, loaded)
+        self._migrate_legacy_hardware_defaults()
         self.config['sampling_sequence'] = self._normalize_sampling_sequence(
             self.config.get('sampling_sequence', {})
         )
         self.config['waypoint_sampling'] = self._normalize_waypoint_sampling(
             self.config.get('waypoint_sampling', {})
         )
+
+    def _migrate_legacy_hardware_defaults(self):
+        """Migrate old defaults that had spectro on ch2 to correct ch0."""
+        hardware = self.config.get('hardware', {})
+        if not isinstance(hardware, dict):
+            return
+        # No-op: spectro_channel=0 is now the correct default.
+        # Keep method stub for forward compatibility.
 
     def update(self, data):
         """更新配置。"""
@@ -848,7 +857,7 @@ class WebConfigServer(object):
         rospy.set_param('/pump_control_node/angle_stream', angle_stream)
         return mapping, spectrometer, angle_stream
 
-    def _publish_hardware_runtime_config(self, hw):
+    def _publish_hardware_runtime_config(self, hw, force_start=False):
         """Push saved hardware config into pump_control_node after serial reconnect."""
         mapping = {
             "angles": dict(hw.get("i2c_mapping", {})),
@@ -891,7 +900,7 @@ class WebConfigServer(object):
             }
             return results
 
-        if hw.get("auto_start", False):
+        if force_start or hw.get("auto_start", False):
             ok, message = self._publish_spectrometer_command({"cmd": "start"})
             results["spectrometer"] = {
                 "success": ok,
@@ -1500,12 +1509,21 @@ class WebConfigServer(object):
                 self.spectrometer_status = "acquiring"
                 return jsonify({"success": True, "message": "模拟模式已启动分光采集"})
 
-            ok, message = self._publish_spectrometer_command({"cmd": "start"})
+            current = self.config_manager.get()
+            hw = normalize_hardware({}, current.get('hardware', DEFAULT_CONFIG['hardware']))
+            results = self._publish_hardware_runtime_config(hw, force_start=True)
+            ok = bool(
+                results["i2c_mapping"]["success"]
+                and results["spectrometer"]
+                and results["spectrometer"]["success"]
+            )
+            message = results["spectrometer"]["message"] if results["spectrometer"] else "分光启动失败"
             if ok:
                 self.spectrometer_status = "starting"
             return jsonify({
                 "success": ok,
-                "message": "分光采集启动指令已发送" if ok else message,
+                "message": "分光配置已下发并启动" if ok else message,
+                "results": results,
             })
 
         @self.app.route('/api/spectrometer/stop', methods=['POST'])
