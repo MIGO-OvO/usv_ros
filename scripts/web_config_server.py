@@ -1494,6 +1494,34 @@ class WebConfigServer(object):
             self.voltage_history = []
             return jsonify({"success": True, "message": "历史数据已清除"})
 
+        @self.app.route('/api/spectrometer/start', methods=['POST'])
+        def start_spectrometer():
+            if self.standalone:
+                self.spectrometer_status = "acquiring"
+                return jsonify({"success": True, "message": "模拟模式已启动分光采集"})
+
+            ok, message = self._publish_spectrometer_command({"cmd": "start"})
+            if ok:
+                self.spectrometer_status = "starting"
+            return jsonify({
+                "success": ok,
+                "message": "分光采集启动指令已发送" if ok else message,
+            })
+
+        @self.app.route('/api/spectrometer/stop', methods=['POST'])
+        def stop_spectrometer():
+            if self.standalone:
+                self.spectrometer_status = "stopped"
+                return jsonify({"success": True, "message": "模拟模式已停止分光采集"})
+
+            ok, message = self._publish_spectrometer_command({"cmd": "stop"})
+            if ok:
+                self.spectrometer_status = "stopping"
+            return jsonify({
+                "success": ok,
+                "message": "分光采集停止指令已发送" if ok else message,
+            })
+
         # ================= 任务数据 API =================
         @self.app.route('/api/data/missions', methods=['GET'])
         def list_missions():
@@ -1632,11 +1660,39 @@ class WebConfigServer(object):
 
         @self.app.route('/api/injection-pump/on', methods=['POST'])
         def turn_injection_pump_on():
+            data = request.get_json(silent=True) or {}
+            requested_speed = data.get('speed')
+            current_speed = int(self.injection_pump_status.get("speed", 0) or 0)
+            speed = (
+                to_int(requested_speed, current_speed, 0, 100)
+                if requested_speed is not None
+                else current_speed
+            )
+
             if self.standalone:
+                if speed <= 0:
+                    self.injection_pump_status["last_error"] = "进样泵转速为 0，请先设置转速"
+                    return jsonify({"success": False, "data": self.injection_pump_status, "message": self.injection_pump_status["last_error"]}), 400
                 self.injection_pump_status["enabled"] = True
+                self.injection_pump_status["speed"] = speed
+                self.injection_pump_status["last_response"] = f"PUMP:SET:{speed}"
+                self.injection_pump_status["last_error"] = ""
                 return jsonify({"success": True, "data": self.injection_pump_status, "message": "模拟模式已开启"})
 
             try:
+                if speed > 0:
+                    command = f'PUMP:SET:{speed}'
+                    if not self.command_pub:
+                        return jsonify({"success": False, "message": "ROS Publisher 未初始化", "data": self.injection_pump_status}), 500
+                    msg = String()
+                    msg.data = command
+                    self.command_pub.publish(msg)
+                    self.injection_pump_status["enabled"] = True
+                    self.injection_pump_status["speed"] = speed
+                    self.injection_pump_status["last_response"] = command
+                    self.injection_pump_status["last_error"] = ""
+                    return jsonify({"success": True, "data": self.injection_pump_status, "message": "进样泵启动指令已发送"})
+
                 service = rospy.ServiceProxy('/usv/injection_pump_on', Trigger)
                 resp = service()
                 return jsonify({"success": resp.success, "data": self.injection_pump_status, "message": resp.message})
@@ -1673,7 +1729,9 @@ class WebConfigServer(object):
                 return jsonify({"success": True, "data": self.injection_pump_status, "message": "模拟模式已设置"})
 
             if self.command_pub:
-                self.command_pub.publish(command)
+                msg = String()
+                msg.data = command
+                self.command_pub.publish(msg)
                 self.injection_pump_status["enabled"] = speed > 0
                 self.injection_pump_status["speed"] = speed
                 self.injection_pump_status["last_response"] = command
@@ -1994,16 +2052,16 @@ class WebConfigServer(object):
 
     def _data_push_loop(self):
         """后台线程：定时推送实时数据"""
-        rate = 20 # Hz
+        rate = 2 # Hz
         while not rospy.is_shutdown():
             if self.socketio:
                 self.socketio.emit('status', {
                     "pump_connected": self.pump_connected,
                     "automation_running": self.automation_running,
-                    "mission_status": self.mission_status
+                    "mission_status": self.mission_status,
+                    "spectrometer_status": self.spectrometer_status,
                 })
                 self.socketio.emit('angles', self.current_angles)
-                self.socketio.emit('voltage', {"value": self.current_voltage})
 
             if self.standalone:
                 # 独立模式模拟数据变化 (测试用)

@@ -50,6 +50,12 @@ export function InjectionPumpCard() {
     await withSubmit(() => setInjectionPumpSpeed(speed))
   }
 
+  const handleTurnOn = async () => {
+    const speed = Math.max(0, Math.min(100, Number(speedInput) || 0))
+    setSpeedInput(String(speed))
+    await withSubmit(() => turnInjectionPumpOn(speed))
+  }
+
   return (
     <Card className="bg-card/50 backdrop-blur-sm border-border/60 shadow-sm">
       <CardHeader className="pb-3">
@@ -98,7 +104,7 @@ export function InjectionPumpCard() {
         </div>
 
         <div className="grid grid-cols-3 gap-2">
-          <Button onClick={() => withSubmit(turnInjectionPumpOn)} disabled={submitting}>
+          <Button onClick={handleTurnOn} disabled={submitting}>
             开启
           </Button>
           <Button variant="secondary" onClick={() => withSubmit(turnInjectionPumpOff)} disabled={submitting}>
@@ -121,4 +127,3 @@ export function InjectionPumpCard() {
     </Card>
   )
 }
-

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
+import { Button } from "@/components/ui/button"
 import { useAppStore } from '@/store'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
 import { Activity, Zap, Play, Square, Anchor, Navigation, Pause, AlertTriangle, CheckCircle, Loader } from 'lucide-react'
@@ -71,6 +72,7 @@ export default function Monitor() {
 
   const pidErrorsRef = useRef<Record<string, number>>({ X: 0, Y: 0, Z: 0, A: 0 })
   const [pidErrors, setPidErrors] = useState<Record<string, number>>({ X: 0, Y: 0, Z: 0, A: 0 })
+  const [spectroSubmitting, setSpectroSubmitting] = useState<'start' | 'stop' | null>(null)
 
   useEffect(() => {
     if (!socket) return
@@ -91,6 +93,16 @@ export default function Monitor() {
   useEffect(() => {
     refreshInjectionPumpStatus().catch(() => {})
   }, [refreshInjectionPumpStatus])
+
+  const handleSpectrometerCommand = async (action: 'start' | 'stop') => {
+    setSpectroSubmitting(action)
+    try {
+      const url = action === 'start' ? '/api/spectrometer/start' : '/api/spectrometer/stop'
+      await fetch(url, { method: 'POST' })
+    } finally {
+      setSpectroSubmitting(null)
+    }
+  }
 
   const tooltipStyle = {
     backgroundColor: 'hsl(var(--card))',
@@ -136,6 +148,22 @@ export default function Monitor() {
             <p className="text-muted-foreground">实时遥测数据与系统状态</p>
         </div>
         <div className="flex items-center gap-3">
+             <Button
+               size="sm"
+               variant="outline"
+               onClick={() => handleSpectrometerCommand('start')}
+               disabled={spectroSubmitting !== null}
+             >
+               <Play className="w-4 h-4 mr-2" />开始分光
+             </Button>
+             <Button
+               size="sm"
+               variant="secondary"
+               onClick={() => handleSpectrometerCommand('stop')}
+               disabled={spectroSubmitting !== null}
+             >
+               <Square className="w-4 h-4 mr-2" />停止分光
+             </Button>
              <div className={cn("px-3 py-1 rounded-full text-xs font-medium border flex items-center gap-2",
                 connected ? "bg-emerald-500/10 text-emerald-500 border-emerald-500/20" : "bg-red-500/10 text-red-500 border-red-500/20")}>
                 <div className={cn("w-2 h-2 rounded-full", connected ? "bg-emerald-500" : "bg-red-500")} />

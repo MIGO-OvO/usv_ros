@@ -94,6 +94,133 @@ def _load_script(module_name, relative_path):
 
 
 class HardwareRuntimeSyncTests(unittest.TestCase):
+    def test_web_periodic_snapshot_does_not_emit_synthetic_voltage_sample(self):
+        module, _, _ = _load_script(
+            "web_config_server_no_synthetic_voltage_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            server.socketio = RecordingSocket()
+
+            shutdown_checks = iter([False, True])
+            module.rospy.is_shutdown = lambda: next(shutdown_checks, True)
+            server._data_push_loop()
+
+        event_names = [event for event, _ in server.socketio.events]
+        self.assertIn("status", event_names)
+        self.assertIn("angles", event_names)
+        self.assertNotIn("voltage", event_names)
+
+    def test_web_spectrometer_start_and_stop_routes_publish_runtime_commands(self):
+        module, publishers, _ = _load_script(
+            "web_config_server_spectrometer_routes_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            client = server.app.test_client()
+
+            start_resp = client.post("/api/spectrometer/start")
+            stop_resp = client.post("/api/spectrometer/stop")
+
+        self.assertEqual(start_resp.status_code, 200)
+        self.assertEqual(stop_resp.status_code, 200)
+        messages = [
+            json.loads(msg.data)
+            for msg in publishers["/usv/spectrometer_command"].messages
+        ]
+        self.assertEqual(messages[-2:], [{"cmd": "start"}, {"cmd": "stop"}])
+
+    def test_web_injection_on_with_speed_sends_set_command(self):
+        module, publishers, _ = _load_script(
+            "web_config_server_injection_on_speed_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            client = server.app.test_client()
+
+            response = client.post("/api/injection-pump/on", json={"speed": 60})
+
+        body = response.get_json()
+        self.assertTrue(body["success"])
+        self.assertEqual(body["data"]["enabled"], True)
+        self.assertEqual(body["data"]["speed"], 60)
+        self.assertEqual(publishers["/usv/pump_command"].messages[-1].data, "PUMP:SET:60")
+
+    def test_pump_node_injection_on_service_uses_cached_nonzero_speed(self):
+        module, _, _ = _load_script(
+            "pump_control_node_injection_on_speed_test",
+            "scripts/pump_control_node.py",
+        )
+        node = module.PumpControlNode()
+        node.inject_pump_speed = 60
+        sent = []
+        node.send_command = lambda cmd: sent.append(cmd) or True
+
+        response = node._injection_on_callback(None)
+
+        self.assertTrue(response.success)
+        self.assertEqual(sent, ["PUMP:SET:60"])
+
+    def test_pump_node_injection_on_rejects_zero_speed(self):
+        module, _, _ = _load_script(
+            "pump_control_node_injection_on_zero_speed_test",
+            "scripts/pump_control_node.py",
+        )
+        node = module.PumpControlNode()
+        sent = []
+        node.send_command = lambda cmd: sent.append(cmd) or True
+
+        response = node._injection_on_callback(None)
+
+        self.assertFalse(response.success)
+        self.assertEqual(sent, [])
+        self.assertIn("speed", response.message.lower())
+
+    def test_ros_spectrometer_default_baseline_is_zero(self):
+        config_text = (REPO_ROOT / "config" / "usv_params.yaml").read_text(encoding="utf-8")
+        self.assertIn("baseline_voltage: 0.0", config_text)
+
+    def test_frontend_voltage_handler_ignores_unmarked_periodic_snapshots(self):
+        store_text = (REPO_ROOT / "frontend" / "src" / "store.ts").read_text(encoding="utf-8")
+        self.assertNotIn("data.status === undefined || data.status === 'acquiring'", store_text)
+        self.assertIn("data.raw?.valid === true", store_text)
+
+    def test_frontend_injection_on_passes_current_speed_input(self):
+        card_text = (REPO_ROOT / "frontend" / "src" / "components" / "injection-pump-card.tsx").read_text(encoding="utf-8")
+        self.assertIn("turnInjectionPumpOn(speed)", card_text)
+
+    def test_frontend_monitor_has_spectrometer_start_stop_controls(self):
+        monitor_text = (REPO_ROOT / "frontend" / "src" / "pages" / "Monitor.tsx").read_text(encoding="utf-8")
+        self.assertIn("/api/spectrometer/start", monitor_text)
+        self.assertIn("/api/spectrometer/stop", monitor_text)
+
     def test_web_apply_publishes_i2c_ads_and_start_commands(self):
         module, publishers, _ = _load_script(
             "web_config_server_hardware_sync_test",

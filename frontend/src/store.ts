@@ -64,6 +64,13 @@ interface RadioStatus {
   txbuf: number
 }
 
+interface StatusPayload {
+  pump_connected?: boolean
+  automation_running?: boolean
+  mission_status?: string
+  spectrometer_status?: string
+}
+
 const MAX_HISTORY_POINTS = 150
 
 interface AppState {
@@ -89,7 +96,7 @@ interface AppState {
   disconnect: () => void
   refreshInjectionPumpStatus: () => Promise<void>
   setInjectionPumpSpeed: (speed: number) => Promise<{ success: boolean; message: string }>
-  turnInjectionPumpOn: () => Promise<{ success: boolean; message: string }>
+  turnInjectionPumpOn: (speed?: number) => Promise<{ success: boolean; message: string }>
   turnInjectionPumpOff: () => Promise<{ success: boolean; message: string }>
 }
 
@@ -137,10 +144,10 @@ export const useAppStore = create<AppState>((set, get) => ({
       console.log('Socket disconnected')
     })
 
-    socket.on('status', (data: any) => {
+    socket.on('status', (data: StatusPayload) => {
       set({
-        pumpConnected: data.pump_connected,
-        automationRunning: data.automation_running,
+        pumpConnected: data.pump_connected ?? false,
+        automationRunning: data.automation_running ?? false,
         missionStatus: data.mission_status || 'IDLE',
         spectrometerStatus: data.spectrometer_status || 'idle',
       })
@@ -158,14 +165,15 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ rawAngles: data })
     })
 
-    socket.on('voltage', (data: { value: number; absorbance?: number; status?: string; raw?: { valid?: boolean; raw_code?: number } }) => {
+    socket.on('voltage', (data: { value?: number; absorbance?: number; status?: string; raw?: { valid?: boolean; raw_code?: number }; sample?: boolean }) => {
       const voltage = data.value ?? 0
       const absorbance = data.absorbance ?? 0
       const time = new Date().toLocaleTimeString()
       set((state) => {
-        const hasSample = data.raw
-          ? data.raw.valid === true || typeof data.raw.raw_code === 'number'
-          : data.status === undefined || data.status === 'acquiring'
+        const hasSample =
+          data.raw?.valid === true ||
+          typeof data.raw?.raw_code === 'number' ||
+          data.sample === true
         return {
           currentVoltage: hasSample ? voltage : state.currentVoltage,
           currentAbsorbance: hasSample ? absorbance : state.currentAbsorbance,
@@ -236,8 +244,13 @@ export const useAppStore = create<AppState>((set, get) => ({
     return { success: !!json.success, message: json.message || '' }
   },
 
-  turnInjectionPumpOn: async () => {
-    const res = await fetch('/api/injection-pump/on', { method: 'POST' })
+  turnInjectionPumpOn: async (speed?: number) => {
+    const options: RequestInit = { method: 'POST' }
+    if (typeof speed === 'number') {
+      options.headers = { 'Content-Type': 'application/json' }
+      options.body = JSON.stringify({ speed })
+    }
+    const res = await fetch('/api/injection-pump/on', options)
     const json = await res.json()
     if (json.success && json.data) {
       set({ injectionPump: { ...DEFAULT_INJECTION_PUMP_STATUS, ...json.data } })
