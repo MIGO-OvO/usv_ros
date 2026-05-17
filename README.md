@@ -138,6 +138,8 @@ usv_ros/
 │   ├── start_usv_all.sh             # 后台启动 roscore + router + 主系统
 │   ├── stop_usv_all.sh              # 安全停止主系统、router、roscore
 │   ├── status_usv_all.sh            # 进程、热点、ROS、MAVROS、bridge 诊断
+│   ├── usvctl.sh                    # 全局 usvctl/usvon/usvoff 命令入口
+│   ├── install_usv_commands.sh      # 安装 ~/.local/bin 下的全局命令 symlink
 │   └── lib/
 │       ├── automation_engine.py
 │       └── command_generator.py
@@ -211,6 +213,50 @@ chmod +x src/usv_ros/scripts/*.sh
 ```
 
 ## 启动与部署
+
+### 全局命令
+
+如需像 `clashon` / `clashoff` 一样在任意目录管理船载 ROS 系统，可安装全局命令到
+`~/.local/bin`：
+
+```bash
+cd ~/usv_ws
+./src/usv_ros/scripts/install_usv_commands.sh install
+```
+
+安装脚本会创建以下 symlink，不需要 sudo：
+
+```bash
+usvon       # 启动 roscore + mavlink-routerd + usv_ros
+usvoff      # 停止 usv_ros + mavlink-routerd + roscore
+usvstatus   # 查看进程、热点、ROS、MAVROS、bridge 状态
+usvrestart  # 停止后重新启动，参数透传给 roslaunch
+usvupdate   # 只在 ~/usv_ws/src/usv_ros 执行 git pull --ff-only
+usvbuild    # 在 ~/usv_ws 执行 catkin_make，参数透传给 catkin_make
+usvdeploy   # stop -> update -> build -> start
+```
+
+也可以使用统一入口：
+
+```bash
+usvctl start
+usvctl stop
+usvctl restart web_port:=5050 pump_port:=/dev/ttyUSB1
+usvctl status
+usvctl update
+usvctl build -j2
+usvctl deploy
+```
+
+`usvupdate` 和 `usvbuild` 会在主系统运行时拒绝执行，避免一边拉代码或编译，一边运行旧节点。
+需要现场更新并重启时使用 `usvdeploy`，或先执行 `usvoff`。
+
+如果 `~/.local/bin` 不在 `PATH`，安装脚本只会打印需要加入 `~/.bashrc` 的命令，不会自动修改用户配置。
+卸载：
+
+```bash
+./src/usv_ros/scripts/install_usv_commands.sh uninstall
+```
 
 ### 完整船载启动
 
