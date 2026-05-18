@@ -139,7 +139,7 @@ mavros:
 #
 # === 新增下位机配置命令参考 ===
 # 1. I2C 通道映射:
-#    "I2CMAP:X=0,Y=3,Z=4,A=7,SPEC=2\r\n"
+#    "I2CMAP:X=2,Y=3,Z=6,A=7,SPEC=0\r\n"
 # 2. ADS 配置:
 #    "ADSCFG:ADDR=0x40,CH=2,MUX=AIN0_AVSS,GAIN=1,VREF=AVDD,RATE=90,PUB=20,MODE=CONT\r\n"
 # 3. ADS 启停:

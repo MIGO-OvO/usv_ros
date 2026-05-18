@@ -370,8 +370,8 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
 
         self.assertTrue(success)
         self.assertEqual(message, "ADS_OK:START")
-        self.assertEqual(sent[0], "I2CMAP:X=0,Y=3,Z=4,A=7,SPEC=2")
-        self.assertIn("ADSCFG:CH=2,ADDR=0x40,AIN=AIN0,REF=AVDD,GAIN=1,DR=90,MODE=CONT,PR=20", sent[1])
+        self.assertEqual(sent[0], "I2CMAP:X=2,Y=3,Z=6,A=7,SPEC=0")
+        self.assertIn("ADSCFG:CH=0,ADDR=0x40,AIN=AIN0,REF=AVDD,GAIN=1,DR=90,MODE=CONT,PR=20", sent[1])
         self.assertEqual(sent[2], "ADSSTART")
 
     def test_web_status_callback_emits_spectrometer_status_without_sample(self):

@@ -624,7 +624,7 @@ Common downlink commands:
 | Stop | `XDFV0J0` | Stop X axis |
 | PID parameters | `PIDCFG:0.14,0.015,0.06,1.0,8.0` | Configure PID |
 | Injection pump | `PUMP:ON`, `PUMP:OFF`, `PUMP:SET:60` | On/off and speed |
-| I2C mapping | `I2CMAP:X=0,Y=3,Z=4,A=7,SPEC=2` | TCA channel mapping |
+| I2C mapping | `I2CMAP:X=2,Y=3,Z=6,A=7,SPEC=0` | TCA channel mapping |
 | ADS config | `ADSCFG:CH=2,ADDR=0x40,AIN=AIN0,REF=AVDD,GAIN=1,DR=90,MODE=CONT,PR=20` | Spectrometer ADC |
 | ADS start/stop | `ADSSTART`, `ADSSTOP` | Spectrometer acquisition |
 | Calibration | `CALXYZA` | Four-axis calibration |
