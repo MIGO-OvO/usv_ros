@@ -51,6 +51,7 @@ CMD_RESUME_SAMPLING = 31013
 CMD_CALIBRATE = 31014
 CMD_START_SURVEY = 31015
 CMD_STOP_SURVEY = 31016
+CMD_SET_BASELINE = 31017
 
 # MAVLink 协议常量
 MAVLINK_MSG_ID_COMMAND_LONG = 76
@@ -76,6 +77,7 @@ class MissionState(object):
     FAILED = "FAILED"
     PAUSED = "PAUSED"
     ABORTED = "ABORTED"
+    SURVEYING = "SURVEYING"
 
 
 class WaypointSamplingState(object):
@@ -119,6 +121,7 @@ class MAVLinkTriggerNode(object):
         self.current_waypoint = 0
         self.current_mission_state = MissionState.IDLE
         self.current_sampling_context = None
+        self.latest_spectrometer_payload = {}
         self.last_linear_speed = 0.0
         self.last_yaw_rate = 0.0
         self.waypoint_states = {}
@@ -126,6 +129,7 @@ class MAVLinkTriggerNode(object):
 
         # 走航采样状态
         self._survey_active = False
+        self._survey_sample_active = False
         self._survey_interval = 5.0
         self._survey_thread = None
 
@@ -137,12 +141,14 @@ class MAVLinkTriggerNode(object):
         self.mission_status_pub = rospy.Publisher('/usv/mission_status', String, queue_size=10)
         self.steps_pub = rospy.Publisher('/usv/automation_steps', String, queue_size=1)
         self.pump_command_pub = rospy.Publisher('/usv/pump_command', String, queue_size=10)
+        self.spectrometer_command_pub = rospy.Publisher('/usv/spectrometer_command', String, queue_size=10)
         self.cmd_ack_pub = rospy.Publisher('/usv/mavlink_cmd_ack', Float32MultiArray, queue_size=10)
 
         # Subscribers
         self.state_sub = rospy.Subscriber('/mavros/state', State, self._state_cb)
         self.waypoint_sub = rospy.Subscriber('/mavros/mission/reached', WaypointReached, self._waypoint_cb)
         self.pump_status_sub = rospy.Subscriber('/usv/pump_status', String, self._pump_status_cb)
+        self.spectrometer_voltage_sub = rospy.Subscriber('/usv/spectrometer_voltage', String, self._spectrometer_voltage_cb)
         self.velocity_sub = rospy.Subscriber('/mavros/local_position/velocity_local', TwistStamped, self._velocity_cb, queue_size=10)
         self.imu_sub = rospy.Subscriber('/mavros/imu/data', Imu, self._imu_cb, queue_size=10)
         self.mavlink_cmd_sub = rospy.Subscriber('/usv/mavlink_cmd_rx', Float32MultiArray, self._mavlink_cmd_rx_cb, queue_size=20)
@@ -290,11 +296,22 @@ class MAVLinkTriggerNode(object):
         with self.state_lock:
             if not self.is_sampling:
                 return
+            was_survey_sample = getattr(self, "_survey_sample_active", False)
+            if was_survey_sample:
+                self._survey_sample_active = False
             self.is_sampling = False
         rospy.loginfo("Handling sampling completion: success=%s reason=%s", success, reason)
         wp_seq = self.current_waypoint
         if success:
             self._set_waypoint_state(wp_seq, WaypointSamplingState.DONE)
+            if was_survey_sample:
+                if getattr(self, "_survey_active", False):
+                    self._set_mission_state(MissionState.SURVEYING, "{:.1f}".format(getattr(self, "_survey_interval", 5.0)))
+                    self._publish_status("survey_sample_done")
+                else:
+                    self._set_mission_state(MissionState.IDLE)
+                    self._publish_status("survey_stopped")
+                return
             self._set_mission_state(MissionState.SAMPLING_DONE, str(wp_seq))
             self._publish_status("sampling_stopped")
             rospy.sleep(1.0)
@@ -315,6 +332,14 @@ class MAVLinkTriggerNode(object):
             with self.state_lock:
                 if self.is_sampling:
                     threading.Thread(target=self._handle_completion, kwargs={'success': False, 'reason': data[:80]}, daemon=True).start()
+
+    def _spectrometer_voltage_cb(self, msg):
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError):
+            payload = {}
+        with self.state_lock:
+            self.latest_spectrometer_payload = payload if isinstance(payload, dict) else {}
 
     def _start_sampling_sequence(self, waypoint_seq=None, retry_count_override=None, on_fail_override=None):
         """启动采样序列。"""
@@ -475,7 +500,7 @@ class MAVLinkTriggerNode(object):
 
     def _dispatch_command_long(self, command, param1, param2, sender_system, sender_component, log_prefix):
         """处理并确认自定义 COMMAND_LONG。"""
-        if command < CMD_START_SAMPLING or command > CMD_STOP_SURVEY:
+        if command < CMD_START_SAMPLING or command > CMD_SET_BASELINE:
             return
 
         rospy.loginfo(
@@ -671,6 +696,7 @@ class MAVLinkTriggerNode(object):
                param2 == 0 表示 QGC 手动按钮触发。
         31011~31014: 停止/暂停/恢复/校准
         31015/31016: 走航采样开启/停止
+        31017: 设置分光 baseline；param1=0 使用最新有效电压，param1>0 使用显式电压
         """
         rospy.loginfo("Processing MAVLink command: %d param1=%.1f param2=%.1f", cmd_id, param1, param2)
 
@@ -704,9 +730,42 @@ class MAVLinkTriggerNode(object):
             return self._start_survey(param1)
         elif cmd_id == CMD_STOP_SURVEY:
             return self._stop_survey()
+        elif cmd_id == CMD_SET_BASELINE:
+            return self._set_spectrometer_baseline(param1)
         else:
             rospy.logwarn("Unknown command: %d", cmd_id)
             return False
+
+    def _set_spectrometer_baseline(self, reference_voltage=0.0):
+        try:
+            voltage = float(reference_voltage or 0.0)
+        except (TypeError, ValueError):
+            voltage = 0.0
+
+        if voltage <= 0.0:
+            state_lock = getattr(self, "state_lock", None)
+            if state_lock is not None:
+                with state_lock:
+                    payload = dict(getattr(self, "latest_spectrometer_payload", {}) or {})
+            else:
+                payload = dict(getattr(self, "latest_spectrometer_payload", {}) or {})
+            if not payload.get("valid", False):
+                rospy.logwarn("Cannot set spectrometer baseline: no valid voltage sample")
+                return False
+            try:
+                voltage = float(payload.get("voltage", payload.get("sample_voltage", 0.0)) or 0.0)
+            except (TypeError, ValueError):
+                voltage = 0.0
+
+        if voltage <= 0.0:
+            rospy.logwarn("Cannot set spectrometer baseline: reference voltage %.6f invalid", voltage)
+            return False
+
+        msg = String()
+        msg.data = json.dumps({"cmd": "set_baseline", "reference_voltage": voltage})
+        self.spectrometer_command_pub.publish(msg)
+        rospy.loginfo("Requested spectrometer baseline reference %.6f V", voltage)
+        return True
 
     def _do_manual_sample(self):
         """手动采样：不切模式，不判稳定，直接执行当前配置的采样序列。"""
@@ -771,6 +830,7 @@ class MAVLinkTriggerNode(object):
         self._survey_thread = threading.Thread(target=self._survey_loop, daemon=True)
         self._survey_thread.start()
         rospy.loginfo("Survey started, interval=%.1fs", self._survey_interval)
+        self._set_mission_state(MissionState.SURVEYING, "{:.1f}".format(self._survey_interval))
         self._publish_status("survey_started")
         return True
 
@@ -781,6 +841,7 @@ class MAVLinkTriggerNode(object):
             return True
         self._survey_active = False
         rospy.loginfo("Survey stopped")
+        self._set_mission_state(MissionState.IDLE)
         self._publish_status("survey_stopped")
         return True
 
@@ -798,7 +859,9 @@ class MAVLinkTriggerNode(object):
                 msg.data = json.dumps(steps_data)
                 self.steps_pub.publish(msg)
 
-                self.is_sampling = True
+                with self.state_lock:
+                    self.is_sampling = True
+                    self._survey_sample_active = True
                 self._call_automation_service('start')
                 # 等待本次采样完成
                 while self.is_sampling and self._survey_active and not rospy.is_shutdown():

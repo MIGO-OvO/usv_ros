@@ -62,6 +62,7 @@ STATUS_TEXT_MAP = {
     2: "DETECTING",
     3: "FAULT",
     4: "CALIBRATING",
+    14: "SURVEYING",
 }
 
 SYS_ID = 1
@@ -81,6 +82,9 @@ class USVMavlinkBridge(object):
         self._lock = threading.Lock()
         self._voltage = 0.0
         self._absorbance = 0.0
+        self._baseline_set = 0.0
+        self._reference_voltage = 0.0
+        self._baseline_voltage = 0.0
         self._pump_angles = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
         self._status_code = 0
         self._mavros_connected = False
@@ -119,6 +123,9 @@ class USVMavlinkBridge(object):
         with self._lock:
             self._voltage = float(data.get('voltage', data.get('sample_voltage', 0.0)) or 0.0)
             self._absorbance = float(data.get('absorbance', 0.0) or 0.0)
+            self._baseline_set = 1.0 if data.get('baseline_set', False) else 0.0
+            self._reference_voltage = float(data.get('reference_voltage', 0.0) or 0.0)
+            self._baseline_voltage = float(data.get('baseline_voltage', 0.0) or 0.0)
 
     def _angles_cb(self, msg):
         try:
@@ -144,6 +151,10 @@ class USVMavlinkBridge(object):
     def _trigger_status_cb(self, msg):
         data = msg.data.lower()
         with self._lock:
+            if "survey_started" in data:
+                self._status_code = 14
+            elif "survey_stopped" in data:
+                self._status_code = 0
             if "sampling_started" in data:
                 self._status_code = 1
             elif "sampling_stopped" in data:
@@ -325,6 +336,9 @@ class USVMavlinkBridge(object):
             with self._lock:
                 voltage = self._voltage
                 absorbance = self._absorbance
+                baseline_set = self._baseline_set
+                reference_voltage = self._reference_voltage
+                baseline_voltage = self._baseline_voltage
                 angles = self._pump_angles.copy()
                 status = self._status_code
 
@@ -343,6 +357,9 @@ class USVMavlinkBridge(object):
             self._send_named_value_float("PUMP_Z", angles["Z"])
             self._send_named_value_float("PUMP_A", angles["A"])
             self._send_named_value_float("USV_STAT", float(status))
+            self._send_named_value_float("USV_BSET", baseline_set)
+            self._send_named_value_float("USV_REF", reference_voltage)
+            self._send_named_value_float("USV_BASE", baseline_voltage)
             self._pkt_count = (self._pkt_count + 1) % 65536
             self._send_named_value_float("USV_PKT", float(self._pkt_count))
 
