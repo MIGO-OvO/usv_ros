@@ -176,6 +176,15 @@ class FakeConnection:
         return None
 
 
+class RecordingMav:
+    def __init__(self):
+        self.named_values = []
+
+    def named_value_float_send(self, timestamp, name, value):
+        clean_name = name.decode("ascii").rstrip("\x00")
+        self.named_values.append((clean_name, value))
+
+
 class MavlinkCommandCompatibilityTests(unittest.TestCase):
     def test_trigger_node_constructs_without_auto_trigger_attr_crash(self):
         module = _load_script("mavlink_trigger_node_construct_test", "scripts/mavlink_trigger_node.py")
@@ -265,6 +274,88 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         self.assertEqual(bridge._automation_total, 5.0)
         self.assertEqual(bridge._pid_mode, 1.0)
         self.assertEqual(bridge._status_code, module.USVMavlinkRouterBridge._MISSION_STATE_CODES["SAMPLING"])
+
+    def test_router_bridge_sends_baseline_named_values_with_payload(self):
+        module = _load_script("usv_mavlink_router_bridge_baseline_payload_test", "scripts/usv_mavlink_router_bridge.py")
+        bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
+        bridge._boot_time = 0
+        bridge._pkt_count = 10
+        bridge._diag_tx_total = 0
+        bridge._diag_tx_named = 0
+        bridge._diag_pub_errors = 0
+        bridge._lock = threading.Lock()
+        mav = RecordingMav()
+        bridge._conn = types.SimpleNamespace(mav=mav)
+
+        bridge._send_payload(
+            voltage=1.23,
+            absorbance=0.12,
+            angles={"X": 1.0, "Y": 2.0, "Z": 3.0, "A": 4.0},
+            status=14,
+            automation_step=2,
+            automation_total=5,
+            sample_count=7,
+            pid_error=0.01,
+            pid_mode=1,
+            baseline_set=1.0,
+            reference_voltage=1.23,
+            baseline_voltage=0.0,
+        )
+
+        names = [name for name, _ in mav.named_values]
+        self.assertIn("USV_BSET", names)
+        self.assertIn("USV_REF", names)
+        self.assertIn("USV_BASE", names)
+        self.assertEqual(len(mav.named_values), 16)
+        self.assertEqual(bridge._diag_tx_named, 16)
+
+    def test_trigger_node_set_baseline_uses_latest_valid_voltage(self):
+        module = _load_script("mavlink_trigger_node_baseline_valid_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.spectrometer_command_pub = RecordingPublisher()
+        node.latest_spectrometer_payload = {"valid": True, "voltage": 1.234}
+
+        accepted = node.handle_mavlink_command(31017, 0.0, 0.0)
+
+        self.assertTrue(accepted)
+        payload = json.loads(node.spectrometer_command_pub.messages[-1].data)
+        self.assertEqual(payload, {"cmd": "set_baseline", "reference_voltage": 1.234})
+
+    def test_trigger_node_set_baseline_rejects_missing_valid_voltage(self):
+        module = _load_script("mavlink_trigger_node_baseline_missing_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.spectrometer_command_pub = RecordingPublisher()
+        node.latest_spectrometer_payload = {"valid": False, "voltage": 0.0}
+
+        accepted = node.handle_mavlink_command(31017, 0.0, 0.0)
+
+        self.assertFalse(accepted)
+        self.assertEqual(node.spectrometer_command_pub.messages, [])
+
+    def test_survey_sample_completion_stays_in_surveying_without_auto_resume(self):
+        module = _load_script("mavlink_trigger_node_survey_completion_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.state_lock = threading.Lock()
+        node.is_sampling = True
+        node._survey_active = True
+        node._survey_sample_active = True
+        node._survey_interval = 5.0
+        node.current_waypoint = 4
+        states = []
+        statuses = []
+        resumed = []
+        node._set_waypoint_state = lambda *args: None
+        node._set_mission_state = lambda state, context=None: states.append((state, context))
+        node._publish_status = lambda status: statuses.append(status)
+        node._resume_auto_if_mission_exists = lambda: resumed.append(True)
+
+        node._handle_completion(success=True, reason="finished")
+
+        self.assertFalse(node.is_sampling)
+        self.assertFalse(node._survey_sample_active)
+        self.assertIn((module.MissionState.SURVEYING, "5.0"), states)
+        self.assertIn("survey_sample_done", statuses)
+        self.assertEqual(resumed, [])
 
     def test_trigger_retry_passes_decremented_retry_count_to_next_attempt(self):
         module = _load_script("mavlink_trigger_node_retry_test", "scripts/mavlink_trigger_node.py")
