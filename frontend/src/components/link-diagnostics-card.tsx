@@ -12,7 +12,10 @@ interface LinkDiagData {
 }
 
 export function LinkDiagnosticsCard() {
-  const { mavrosState, bridgeDiag, radioStatus, connected } = useAppStore()
+  const mavrosState = useAppStore((state) => state.mavrosState)
+  const bridgeDiag = useAppStore((state) => state.bridgeDiag)
+  const radioStatus = useAppStore((state) => state.radioStatus)
+  const connected = useAppStore((state) => state.connected)
   const [expanded, setExpanded] = useState(false)
   const [fullDiag, setFullDiag] = useState<LinkDiagData | null>(null)
 
@@ -29,7 +32,7 @@ export function LinkDiagnosticsCard() {
     return () => clearInterval(t)
   }, [connected, expanded])
 
-  const bridge = bridgeDiag as any
+  const bridge = bridgeDiag
   const mavConnected = mavrosState?.connected ?? false
   const routerAlive = fullDiag?.nodes?.find(n => n.name === 'mavlink-routerd')?.alive ?? false
 

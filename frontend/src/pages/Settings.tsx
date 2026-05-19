@@ -49,13 +49,14 @@ const DEFAULT_HW: HardwareConfig = {
   publish_rate: 20,
   continuous_mode: true,
   auto_start: false,
-  reference_voltage: 2.5,
+  reference_voltage: 0.0,
   baseline_voltage: 0.0,
   i2c_mapping: { X: 2, Y: 3, Z: 6, A: 7 },
 }
 
 export default function Settings() {
-  const { pumpAngles, rawAngles } = useAppStore()
+  const pumpAngles = useAppStore((state) => state.pumpAngles)
+  const rawAngles = useAppStore((state) => state.rawAngles)
   const confirm = useConfirm()
   const [config, setConfig] = useState({
       Kp: 0, Ki: 0, Kd: 0, output_min: -255, output_max: 255
@@ -334,7 +335,7 @@ export default function Settings() {
               <div className="space-y-2"><Label>参考电压</Label><select className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" value={hw.vref_mode} onChange={e => setHw(p => ({ ...p, vref_mode: e.target.value }))}><option value="AVDD">AVDD</option><option value="INTERNAL">INTERNAL</option><option value="EXTERNAL">EXTERNAL</option></select></div>
               <div className="space-y-2"><Label>ADC 速率</Label><Input type="number" value={hw.adc_rate} onChange={e => setHw(p => ({ ...p, adc_rate: parseInt(e.target.value) || 90 }))} /></div>
               <div className="space-y-2"><Label>发布频率</Label><Input type="number" value={hw.publish_rate} onChange={e => setHw(p => ({ ...p, publish_rate: parseInt(e.target.value) || 20 }))} /></div>
-              <div className="space-y-2"><Label>参考电压值</Label><Input type="number" step="0.001" value={hw.reference_voltage} onChange={e => setHw(p => ({ ...p, reference_voltage: parseFloat(e.target.value) || 0 }))} /></div>
+              <div className="space-y-2"><Label>基线参考电压</Label><Input type="number" step="0.001" value={hw.reference_voltage} readOnly /></div>
               <div className="space-y-2"><Label>基线电压</Label><Input type="number" step="0.001" value={hw.baseline_voltage} onChange={e => setHw(p => ({ ...p, baseline_voltage: parseFloat(e.target.value) || 0 }))} /></div>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">

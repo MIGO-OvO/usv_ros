@@ -311,7 +311,7 @@ DEFAULT_CONFIG = {
         "publish_rate": 20,
         "continuous_mode": True,
         "auto_start": False,
-        "reference_voltage": 2.5,
+        "reference_voltage": 0.0,
         "baseline_voltage": 0.0,
         "i2c_mapping": {"X": 2, "Y": 3, "Z": 6, "A": 7}
     }
@@ -702,6 +702,9 @@ class WebConfigServer(object):
                 "value": self.current_voltage,
                 "absorbance": self.current_absorbance,
                 "status": self.spectrometer_status,
+                "reference_voltage": data.get('reference_voltage'),
+                "baseline_voltage": data.get('baseline_voltage'),
+                "baseline_set": data.get('baseline_set'),
                 "raw": data,
             })
 
@@ -841,7 +844,7 @@ class WebConfigServer(object):
             "adc_rate": int(hw.get("adc_rate", 90)),
             "publish_rate": int(hw.get("publish_rate", 20)),
             "continuous_mode": bool(hw.get("continuous_mode", True)),
-            "reference_voltage": float(hw.get("reference_voltage", 2.5)),
+            "reference_voltage": float(hw.get("reference_voltage", 0.0)),
             "baseline_voltage": float(hw.get("baseline_voltage", 0.0)),
         }
         angle_stream = {"enabled": True, "auto_start": True}
@@ -890,7 +893,7 @@ class WebConfigServer(object):
             "adc_rate": int(hw.get("adc_rate", 90)),
             "publish_rate": int(hw.get("publish_rate", 20)),
             "continuous_mode": bool(hw.get("continuous_mode", True)),
-            "reference_voltage": float(hw.get("reference_voltage", 2.5)),
+            "reference_voltage": float(hw.get("reference_voltage", 0.0)),
             "baseline_voltage": float(hw.get("baseline_voltage", 0.0)),
         })
         if not ok:
@@ -1009,7 +1012,7 @@ class WebConfigServer(object):
             hw['publish_rate'] = to_int(hw.get('publish_rate'), 20, 1, 200)
             hw['continuous_mode'] = to_bool(hw.get('continuous_mode'), True)
             hw['auto_start'] = to_bool(hw.get('auto_start'), False)
-            hw['reference_voltage'] = to_float(hw.get('reference_voltage'), 2.5, 0.0, 10.0)
+            hw['reference_voltage'] = to_float(hw.get('reference_voltage'), 0.0, 0.0, 10.0)
             hw['baseline_voltage'] = to_float(hw.get('baseline_voltage'), 0.0, -10.0, 10.0)
 
             mapping = hw.get('i2c_mapping') if isinstance(hw.get('i2c_mapping'), dict) else {}
@@ -1489,6 +1492,9 @@ class WebConfigServer(object):
                 "value": self.current_voltage,
                 "absorbance": self.current_absorbance,
                 "status": self.spectrometer_status,
+                "reference_voltage": self.latest_spectrometer_payload.get('reference_voltage'),
+                "baseline_voltage": self.latest_spectrometer_payload.get('baseline_voltage'),
+                "baseline_set": self.latest_spectrometer_payload.get('baseline_set'),
                 "raw": self.latest_spectrometer_payload,
             })
             emit('injection_pump_status', self.injection_pump_status)
@@ -1538,6 +1544,64 @@ class WebConfigServer(object):
             return jsonify({
                 "success": ok,
                 "message": "分光采集停止指令已发送" if ok else message,
+            })
+
+        # ================= Spectrometer API =================
+        @self.app.route('/api/spectrometer/baseline', methods=['POST'])
+        def set_spectrometer_baseline():
+            raw = self.latest_spectrometer_payload if isinstance(self.latest_spectrometer_payload, dict) else {}
+            reference_voltage = self.current_voltage
+            has_valid_sample = self.standalone or bool(raw.get('valid', False))
+            if not has_valid_sample or reference_voltage <= 0:
+                return jsonify({
+                    "success": False,
+                    "message": "No valid spectrometer sample is available for baseline reference",
+                }), 400
+
+            if self.standalone:
+                ok, message = True, "baseline reference set"
+            else:
+                ok, message = self._publish_spectrometer_command({
+                    "cmd": "set_baseline",
+                    "reference_voltage": reference_voltage,
+                })
+
+            if not ok:
+                return jsonify({"success": False, "message": message}), 500
+
+            current = self.config_manager.get()
+            hw = normalize_hardware(
+                {"reference_voltage": reference_voltage},
+                current.get('hardware', dict(DEFAULT_CONFIG['hardware'])),
+            )
+            current['hardware'] = hw
+            config_saved = self.config_manager.update(current)
+
+            self.current_absorbance = 0.0
+            self.spectrometer_status = "baseline_set"
+            self.latest_spectrometer_payload = dict(raw)
+            self.latest_spectrometer_payload.update({
+                "reference_voltage": reference_voltage,
+                "baseline_voltage": hw.get("baseline_voltage", 0.0),
+                "baseline_set": True,
+            })
+            if self.socketio:
+                self.socketio.emit('voltage', {
+                    "value": self.current_voltage,
+                    "absorbance": self.current_absorbance,
+                    "status": self.spectrometer_status,
+                    "reference_voltage": reference_voltage,
+                    "baseline_voltage": hw.get("baseline_voltage", 0.0),
+                    "baseline_set": True,
+                    "sample": True,
+                    "raw": self.latest_spectrometer_payload,
+                })
+
+            return jsonify({
+                "success": True,
+                "message": "Baseline reference voltage set",
+                "reference_voltage": reference_voltage,
+                "config_saved": bool(config_saved),
             })
 
         # ================= 任务数据 API =================

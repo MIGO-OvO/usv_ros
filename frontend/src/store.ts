@@ -27,6 +27,25 @@ interface VoltagePoint {
   absorbance: number
 }
 
+interface SpectrometerRawPayload {
+  valid?: boolean
+  raw_code?: number
+  reference_voltage?: number
+  baseline_voltage?: number
+  baseline_set?: boolean
+}
+
+interface VoltagePayload {
+  value?: number
+  absorbance?: number | null
+  status?: string
+  reference_voltage?: number
+  baseline_voltage?: number
+  baseline_set?: boolean
+  raw?: SpectrometerRawPayload
+  sample?: boolean
+}
+
 interface PidErrorState {
   X: number
   Y: number
@@ -72,6 +91,46 @@ interface StatusPayload {
 }
 
 const MAX_HISTORY_POINTS = 150
+const VOLTAGE_UI_INTERVAL_MS = 200
+const FAST_TELEMETRY_INTERVAL_MS = 100
+
+function createThrottledCommit<T>(intervalMs: number, commit: (data: T) => void) {
+  let latest: T | null = null
+  let timer: ReturnType<typeof setTimeout> | null = null
+  let lastCommitAt = 0
+
+  const flush = () => {
+    timer = null
+    if (latest === null) return
+    const data = latest
+    latest = null
+    lastCommitAt = Date.now()
+    commit(data)
+  }
+
+  return {
+    push(data: T) {
+      latest = data
+      const delay = Math.max(0, intervalMs - (Date.now() - lastCommitAt))
+      if (delay === 0) {
+        if (timer) {
+          clearTimeout(timer)
+          timer = null
+        }
+        flush()
+        return
+      }
+      if (!timer) {
+        timer = setTimeout(flush, delay)
+      }
+    },
+    cancel() {
+      if (timer) clearTimeout(timer)
+      timer = null
+      latest = null
+    },
+  }
+}
 
 interface AppState {
   socket: Socket | null
@@ -83,6 +142,9 @@ interface AppState {
   rawAngles: PumpAngles
   currentVoltage: number
   currentAbsorbance: number
+  currentReferenceVoltage: number | null
+  currentBaselineVoltage: number
+  spectrometerBaselineSet: boolean
   spectrometerStatus: string
   voltageHistory: VoltagePoint[]
   pidErrors: PidErrorState
@@ -117,6 +179,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   rawAngles: { X: 0, Y: 0, Z: 0, A: 0 },
   currentVoltage: 0,
   currentAbsorbance: 0,
+  currentReferenceVoltage: null,
+  currentBaselineVoltage: 0,
+  spectrometerBaselineSet: false,
   spectrometerStatus: 'idle',
   voltageHistory: [],
   pidErrors: { X: 0, Y: 0, Z: 0, A: 0 },
@@ -139,7 +204,56 @@ export const useAppStore = create<AppState>((set, get) => ({
       console.log('Socket connected')
     })
 
+    const angleCommitter = createThrottledCommit<PumpAngles>(FAST_TELEMETRY_INTERVAL_MS, (data) => {
+      set({ pumpAngles: data })
+    })
+    const rawAngleCommitter = createThrottledCommit<PumpAngles>(FAST_TELEMETRY_INTERVAL_MS, (data) => {
+      set({ rawAngles: data })
+    })
+    const voltageCommitter = createThrottledCommit<VoltagePayload>(VOLTAGE_UI_INTERVAL_MS, (data) => {
+      const voltage = data.value ?? 0
+      const absorbance = data.absorbance ?? 0
+      const hasSample =
+        data.raw?.valid === true ||
+        typeof data.raw?.raw_code === 'number' ||
+        data.sample === true
+      const referenceVoltage =
+        typeof data.reference_voltage === 'number'
+          ? data.reference_voltage
+          : data.raw?.reference_voltage
+      const baselineVoltage =
+        typeof data.baseline_voltage === 'number'
+          ? data.baseline_voltage
+          : data.raw?.baseline_voltage
+      const baselineSet =
+        typeof data.baseline_set === 'boolean'
+          ? data.baseline_set
+          : data.raw?.baseline_set
+      const time = new Date().toLocaleTimeString()
+
+      set((state) => ({
+        currentVoltage: hasSample ? voltage : state.currentVoltage,
+        currentAbsorbance: hasSample ? absorbance : state.currentAbsorbance,
+        currentReferenceVoltage:
+          typeof referenceVoltage === 'number' ? referenceVoltage : state.currentReferenceVoltage,
+        currentBaselineVoltage:
+          typeof baselineVoltage === 'number' ? baselineVoltage : state.currentBaselineVoltage,
+        spectrometerBaselineSet:
+          typeof baselineSet === 'boolean' ? baselineSet : state.spectrometerBaselineSet,
+        spectrometerStatus: data.status || state.spectrometerStatus,
+        voltageHistory: hasSample
+          ? [
+              ...state.voltageHistory.slice(-(MAX_HISTORY_POINTS - 1)),
+              { time, voltage, absorbance },
+            ]
+          : state.voltageHistory,
+      }))
+    })
+
     socket.on('disconnect', () => {
+      angleCommitter.cancel()
+      rawAngleCommitter.cancel()
+      voltageCommitter.cancel()
       set({ connected: false })
       console.log('Socket disconnected')
     })
@@ -154,38 +268,19 @@ export const useAppStore = create<AppState>((set, get) => ({
     })
 
     socket.on('angles', (data: PumpAngles) => {
-      set({ pumpAngles: data })
+      angleCommitter.push(data)
     })
 
     socket.on('pump_angles', (data: PumpAngles) => {
-      set({ pumpAngles: data })
+      angleCommitter.push(data)
     })
 
     socket.on('raw_angles', (data: PumpAngles) => {
-      set({ rawAngles: data })
+      rawAngleCommitter.push(data)
     })
 
-    socket.on('voltage', (data: { value?: number; absorbance?: number; status?: string; raw?: { valid?: boolean; raw_code?: number }; sample?: boolean }) => {
-      const voltage = data.value ?? 0
-      const absorbance = data.absorbance ?? 0
-      const time = new Date().toLocaleTimeString()
-      set((state) => {
-        const hasSample =
-          data.raw?.valid === true ||
-          typeof data.raw?.raw_code === 'number' ||
-          data.sample === true
-        return {
-          currentVoltage: hasSample ? voltage : state.currentVoltage,
-          currentAbsorbance: hasSample ? absorbance : state.currentAbsorbance,
-          spectrometerStatus: data.status || state.spectrometerStatus,
-          voltageHistory: hasSample
-            ? [
-                ...state.voltageHistory.slice(-(MAX_HISTORY_POINTS - 1)),
-                { time, voltage, absorbance },
-              ]
-            : state.voltageHistory,
-        }
-      })
+    socket.on('voltage', (data: VoltagePayload) => {
+      voltageCommitter.push(data)
     })
 
     socket.on('spectrometer_status', (status: string) => {

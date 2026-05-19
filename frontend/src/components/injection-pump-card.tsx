@@ -8,14 +8,12 @@ import { useAppStore } from '@/store'
 import { cn } from '@/lib/utils'
 
 export function InjectionPumpCard() {
-  const {
-    connected,
-    injectionPump,
-    refreshInjectionPumpStatus,
-    setInjectionPumpSpeed,
-    turnInjectionPumpOn,
-    turnInjectionPumpOff,
-  } = useAppStore()
+  const connected = useAppStore((state) => state.connected)
+  const injectionPump = useAppStore((state) => state.injectionPump)
+  const refreshInjectionPumpStatus = useAppStore((state) => state.refreshInjectionPumpStatus)
+  const setInjectionPumpSpeed = useAppStore((state) => state.setInjectionPumpSpeed)
+  const turnInjectionPumpOn = useAppStore((state) => state.turnInjectionPumpOn)
+  const turnInjectionPumpOff = useAppStore((state) => state.turnInjectionPumpOff)
   const [speedInput, setSpeedInput] = useState('0')
   const [submitting, setSubmitting] = useState(false)
 
