@@ -535,6 +535,7 @@ REST API 和 Socket.IO 实时事件。
 | `GET/POST /api/pid/config`、`POST /api/pid/test` | PID 参数与测试 |
 | `GET /api/calibration/offsets`、`POST /api/calibration/zero|reset|start` | 角度校准 |
 | `GET /api/data/voltage`、`POST /api/data/voltage/clear` | 当前内存电压历史 |
+| `POST /api/spectrometer/start`、`POST /api/spectrometer/stop`、`POST /api/spectrometer/baseline` | 分光采集启停；基线稳定后用当前有效电压设定吸光度参考电压 |
 | `GET /api/data/missions` | 历史任务文件列表 |
 | `GET /api/data/mission/<id>` | 历史任务 JSON |
 | `GET /api/data/mission/<id>/csv` | 历史任务 CSV 下载 |

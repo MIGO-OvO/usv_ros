@@ -91,7 +91,7 @@ DEFAULT_SPECTRO_CONFIG = {
     "vref_mode": "AVDD",
     "adc_rate": 90,
     "publish_rate": 20,
-    "reference_voltage": 2.5,
+    "reference_voltage": 0.0,
     "baseline_voltage": 0.0,
     "path_length_cm": 1.0,
 }
@@ -452,7 +452,7 @@ class PumpControlNode(object):
         # 分光状态
         self.latest_spectro = None
         self.spectro_state = "idle"
-        self.spectro_reference_voltage = float(self.spectro_config.get('reference_voltage', 2.5))
+        self.spectro_reference_voltage = float(self.spectro_config.get('reference_voltage', 0.0))
         self.spectro_baseline_voltage = float(self.spectro_config.get('baseline_voltage', 0.0))
         self.spectro_command_event = threading.Event()
         self.spectro_command_result = None
@@ -645,7 +645,7 @@ class PumpControlNode(object):
         cfg['gain'] = int(cfg.get('gain', 1) or 1)
         cfg['publish_rate'] = max(1, int(cfg.get('publish_rate', 20) or 20))
         cfg['adc_rate'] = int(cfg.get('adc_rate', 90) or 90)
-        cfg['reference_voltage'] = float(cfg.get('reference_voltage', 2.5) or 2.5)
+        cfg['reference_voltage'] = float(cfg.get('reference_voltage', 0.0) or 0.0)
         cfg['baseline_voltage'] = float(cfg.get('baseline_voltage', 0.0) or 0.0)
         return cfg
 
@@ -813,6 +813,7 @@ class PumpControlNode(object):
             return False, 'Spectrometer I2C mapping apply failed'
         if not self._apply_spectro_config():
             return False, 'Spectrometer config command send failed'
+        self._clear_spectro_reference()
         time.sleep(0.1)
         ok = self.send_command('ADSSTART')
         if not ok:
@@ -1310,6 +1311,7 @@ class PumpControlNode(object):
             'saturated': data.get('saturated', False),
             'reference_voltage': self.spectro_reference_voltage,
             'baseline_voltage': self.spectro_baseline_voltage,
+            'baseline_set': self._spectro_reference_ready(),
         }
         self._publish_spectro_status(self.spectro_state)
 
@@ -1327,10 +1329,34 @@ class PumpControlNode(object):
             'reference_voltage': self.spectro_reference_voltage,
             'baseline_voltage': self.spectro_baseline_voltage,
             'sample_voltage': data.get('voltage', 0.0),
+            'baseline_set': self._spectro_reference_ready(),
         })
         self.spectro_absorbance_pub.publish(absorbance_msg)
 
+    def _spectro_reference_ready(self):
+        return (self.spectro_reference_voltage - self.spectro_baseline_voltage) > 1e-6
+
+    def _clear_spectro_reference(self):
+        self.spectro_reference_voltage = 0.0
+        self.spectro_config['reference_voltage'] = 0.0
+
+    def _set_spectro_reference_voltage(self, voltage):
+        try:
+            reference_voltage = float(voltage)
+        except (TypeError, ValueError):
+            return False, 'invalid reference voltage'
+        if reference_voltage - self.spectro_baseline_voltage <= 1e-6:
+            return False, 'reference voltage must be above baseline voltage'
+        self.spectro_reference_voltage = reference_voltage
+        self.spectro_config['reference_voltage'] = reference_voltage
+        self._publish_spectro_config_snapshot()
+        self._publish_spectro_status('baseline_set')
+        rospy.loginfo('Spectrometer baseline reference set to %.6f V', reference_voltage)
+        return True, 'baseline reference set'
+
     def _calculate_absorbance(self, voltage):
+        if not self._spectro_reference_ready():
+            return None
         ref = max(self.spectro_reference_voltage - self.spectro_baseline_voltage, 1e-6)
         sample = max(voltage - self.spectro_baseline_voltage, 1e-6)
         return round(math.log10(ref / sample), 6)
@@ -1399,6 +1425,13 @@ class PumpControlNode(object):
             self.spectro_reference_voltage = float(self.spectro_config.get('reference_voltage', self.spectro_reference_voltage))
             self.spectro_baseline_voltage = float(self.spectro_config.get('baseline_voltage', self.spectro_baseline_voltage))
             self._apply_spectro_config()
+        elif cmd == 'set_baseline':
+            reference_voltage = payload.get('reference_voltage')
+            if reference_voltage is None and self.latest_spectro and self.latest_spectro.get('valid', False):
+                reference_voltage = self.latest_spectro.get('voltage')
+            ok, message = self._set_spectro_reference_voltage(reference_voltage)
+            if not ok:
+                rospy.logwarn('Failed to set spectrometer baseline reference: %s', message)
         elif cmd == 'set_i2c_map':
             mapping = payload.get('mapping', {})
             if 'angles' in mapping:
@@ -1415,8 +1448,10 @@ class PumpControlNode(object):
             self._stop_angle_stream()
         elif cmd == 'set_reference':
             if 'voltage' in payload:
-                self.spectro_reference_voltage = float(payload['voltage'])
-        elif cmd == 'set_baseline':
+                ok, message = self._set_spectro_reference_voltage(payload['voltage'])
+                if not ok:
+                    rospy.logwarn('Failed to set spectrometer reference: %s', message)
+        elif cmd == 'set_baseline_offset':
             if 'voltage' in payload:
                 self.spectro_baseline_voltage = float(payload['voltage'])
         else:

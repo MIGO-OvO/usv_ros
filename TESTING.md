@@ -252,9 +252,10 @@ rostopic echo /usv/spectrometer_status
 rostopic echo /usv/spectrometer_voltage
 rosservice call /usv/spectrometer_start
 rosservice call /usv/spectrometer_stop
+curl -X POST http://127.0.0.1:5000/api/spectrometer/baseline
 ```
 
-通过判据：`/usv/spectrometer_voltage.data` 是 JSON 字符串，包含 `voltage`、`timestamp_ms` 等字段；启动后状态变为 `acquiring`。
+通过判据：`/usv/spectrometer_voltage.data` 是 JSON 字符串，包含 `voltage`、`timestamp_ms` 等字段；启动后状态变为 `acquiring`；基线稳定后调用 baseline API，后续消息包含 `baseline_set=true`，且 `reference_voltage` 等于点击时的当前电压。
 
 <a id="pump-automation"></a>
 

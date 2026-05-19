@@ -173,6 +173,42 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         ]
         self.assertEqual(messages[-1], {"cmd": "stop"})
 
+    def test_web_spectrometer_baseline_route_uses_current_valid_voltage(self):
+        module, publishers, _ = _load_script(
+            "web_config_server_spectrometer_baseline_route_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            server.current_voltage = 1.234
+            server.latest_spectrometer_payload = {
+                "valid": True,
+                "voltage": 1.234,
+                "reference_voltage": 0.0,
+                "baseline_set": False,
+            }
+            client = server.app.test_client()
+
+            response = client.post("/api/spectrometer/baseline")
+
+        body = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(body["success"])
+        self.assertAlmostEqual(body["reference_voltage"], 1.234)
+        messages = [
+            json.loads(msg.data)
+            for msg in publishers["/usv/spectrometer_command"].messages
+        ]
+        self.assertEqual(messages[-1], {"cmd": "set_baseline", "reference_voltage": 1.234})
+
     def test_web_injection_on_with_speed_sends_set_command(self):
         module, publishers, _ = _load_script(
             "web_config_server_injection_on_speed_test",
@@ -232,6 +268,10 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         config_text = (REPO_ROOT / "config" / "usv_params.yaml").read_text(encoding="utf-8")
         self.assertIn("baseline_voltage: 0.0", config_text)
 
+    def test_ros_spectrometer_default_reference_is_unset(self):
+        config_text = (REPO_ROOT / "config" / "usv_params.yaml").read_text(encoding="utf-8")
+        self.assertIn("reference_voltage: 0.0", config_text)
+
     def test_config_manager_preserves_correct_zero_spectro_channel(self):
         module, _, _ = _load_script(
             "web_config_server_legacy_spectro_channel_migration_test",
@@ -256,6 +296,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         store_text = (REPO_ROOT / "frontend" / "src" / "store.ts").read_text(encoding="utf-8")
         self.assertNotIn("data.status === undefined || data.status === 'acquiring'", store_text)
         self.assertIn("data.raw?.valid === true", store_text)
+        self.assertIn("VOLTAGE_UI_INTERVAL_MS = 200", store_text)
 
     def test_frontend_injection_on_passes_current_speed_input(self):
         card_text = (REPO_ROOT / "frontend" / "src" / "components" / "injection-pump-card.tsx").read_text(encoding="utf-8")
@@ -265,6 +306,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         monitor_text = (REPO_ROOT / "frontend" / "src" / "pages" / "Monitor.tsx").read_text(encoding="utf-8")
         self.assertIn("/api/spectrometer/start", monitor_text)
         self.assertIn("/api/spectrometer/stop", monitor_text)
+        self.assertIn("/api/spectrometer/baseline", monitor_text)
 
     def test_web_apply_publishes_i2c_ads_and_start_commands(self):
         module, publishers, _ = _load_script(
@@ -373,6 +415,32 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(sent[0], "I2CMAP:X=2,Y=3,Z=6,A=7,SPEC=0")
         self.assertIn("ADSCFG:CH=0,ADDR=0x40,AIN=AIN0,REF=AVDD,GAIN=1,DR=90,MODE=CONT,PR=20", sent[1])
         self.assertEqual(sent[2], "ADSSTART")
+        self.assertEqual(node.spectro_reference_voltage, 0.0)
+
+    def test_pump_node_spectrometer_baseline_command_sets_reference_voltage(self):
+        module, _, string_cls = _load_script(
+            "pump_control_node_spectro_baseline_reference_test",
+            "scripts/pump_control_node.py",
+        )
+        node = module.PumpControlNode()
+
+        node._spectro_cmd_callback(string_cls(json.dumps({
+            "cmd": "set_baseline",
+            "reference_voltage": 1.234,
+        })))
+
+        self.assertAlmostEqual(node.spectro_reference_voltage, 1.234)
+        self.assertAlmostEqual(node.spectro_config["reference_voltage"], 1.234)
+        self.assertEqual(node._calculate_absorbance(1.234), 0.0)
+
+    def test_pump_node_absorbance_is_unset_until_baseline_reference(self):
+        module, _, _ = _load_script(
+            "pump_control_node_absorbance_without_reference_test",
+            "scripts/pump_control_node.py",
+        )
+        node = module.PumpControlNode()
+
+        self.assertIsNone(node._calculate_absorbance(1.234))
 
     def test_web_status_callback_emits_spectrometer_status_without_sample(self):
         module, _, string_cls = _load_script(

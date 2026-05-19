@@ -3,7 +3,7 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { useAppStore } from '@/store'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
-import { Activity, Zap, Play, Square, Anchor, Navigation, Pause, AlertTriangle, CheckCircle, Loader } from 'lucide-react'
+import { Activity, Zap, Play, Square, Anchor, Navigation, Pause, AlertTriangle, CheckCircle, Loader, Target } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { InjectionPumpCard } from '@/components/injection-pump-card'
 import { LinkDiagnosticsCard } from '@/components/link-diagnostics-card'
@@ -57,22 +57,22 @@ function computeAdaptiveDomain(values: number[], fallback: [number, number], min
 }
 
 export default function Monitor() {
-  const {
-    socket,
-    connected,
-    pumpConnected,
-    missionStatus,
-    pumpAngles,
-    currentVoltage,
-    currentAbsorbance,
-    spectrometerStatus,
-    voltageHistory,
-    refreshInjectionPumpStatus,
-  } = useAppStore()
+  const socket = useAppStore((state) => state.socket)
+  const connected = useAppStore((state) => state.connected)
+  const pumpConnected = useAppStore((state) => state.pumpConnected)
+  const missionStatus = useAppStore((state) => state.missionStatus)
+  const pumpAngles = useAppStore((state) => state.pumpAngles)
+  const currentVoltage = useAppStore((state) => state.currentVoltage)
+  const currentAbsorbance = useAppStore((state) => state.currentAbsorbance)
+  const currentReferenceVoltage = useAppStore((state) => state.currentReferenceVoltage)
+  const spectrometerBaselineSet = useAppStore((state) => state.spectrometerBaselineSet)
+  const spectrometerStatus = useAppStore((state) => state.spectrometerStatus)
+  const voltageHistory = useAppStore((state) => state.voltageHistory)
+  const refreshInjectionPumpStatus = useAppStore((state) => state.refreshInjectionPumpStatus)
 
   const pidErrorsRef = useRef<Record<string, number>>({ X: 0, Y: 0, Z: 0, A: 0 })
   const [pidErrors, setPidErrors] = useState<Record<string, number>>({ X: 0, Y: 0, Z: 0, A: 0 })
-  const [spectroSubmitting, setSpectroSubmitting] = useState<'start' | 'stop' | null>(null)
+  const [spectroSubmitting, setSpectroSubmitting] = useState<'start' | 'stop' | 'baseline' | null>(null)
 
   useEffect(() => {
     if (!socket) return
@@ -99,6 +99,15 @@ export default function Monitor() {
     try {
       const url = action === 'start' ? '/api/spectrometer/start' : '/api/spectrometer/stop'
       await fetch(url, { method: 'POST' })
+    } finally {
+      setSpectroSubmitting(null)
+    }
+  }
+
+  const handleSetSpectrometerBaseline = async () => {
+    setSpectroSubmitting('baseline')
+    try {
+      await fetch('/api/spectrometer/baseline', { method: 'POST' })
     } finally {
       setSpectroSubmitting(null)
     }
@@ -132,6 +141,7 @@ export default function Monitor() {
     idle: '未采集',
     disabled: '已禁用',
     acquiring: '采集中',
+    baseline_set: '基线已设定',
     i2c_error: 'I2C 错误',
     not_configured: '未配置',
     saturated: '数据饱和',
@@ -164,6 +174,14 @@ export default function Monitor() {
              >
                <Square className="w-4 h-4 mr-2" />停止分光
              </Button>
+             <Button
+               size="sm"
+               variant="outline"
+               onClick={handleSetSpectrometerBaseline}
+               disabled={spectroSubmitting !== null || !hasSpectroSample}
+             >
+               <Target className="w-4 h-4 mr-2" />设定基线
+             </Button>
              <div className={cn("px-3 py-1 rounded-full text-xs font-medium border flex items-center gap-2",
                 connected ? "bg-emerald-500/10 text-emerald-500 border-emerald-500/20" : "bg-red-500/10 text-red-500 border-red-500/20")}>
                 <div className={cn("w-2 h-2 rounded-full", connected ? "bg-emerald-500" : "bg-red-500")} />
@@ -186,7 +204,11 @@ export default function Monitor() {
             </CardHeader>
             <CardContent>
                 <div className="text-2xl font-bold">{showSpectroPlaceholder ? '--' : `${currentVoltage.toFixed(3)} V`}</div>
-                <div className="text-xs text-muted-foreground mt-1">{spectroStatusLabel}</div>
+                <div className="text-xs text-muted-foreground mt-1">
+                  {spectrometerBaselineSet && currentReferenceVoltage !== null
+                    ? `参考 ${currentReferenceVoltage.toFixed(3)} V`
+                    : '未设定基线'}
+                </div>
             </CardContent>
         </Card>
 
