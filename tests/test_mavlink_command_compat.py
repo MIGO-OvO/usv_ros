@@ -247,6 +247,88 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
             [(31010, module.MAV_RESULT_ACCEPTED, 255, 190)],
         )
 
+    def test_trigger_node_dispatches_spectrometer_commands(self):
+        module = _load_script("mavlink_trigger_node_spectro_dispatch_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.is_sampling = False
+
+        handled = []
+        acknowledgements = []
+
+        def fake_handle(command, param1, param2):
+            handled.append((command, param1, param2))
+            return True
+
+        node.handle_mavlink_command = fake_handle
+        node._send_command_ack = lambda command, result, target_system, target_component: acknowledgements.append(
+            (command, result, target_system, target_component)
+        )
+
+        node._dispatch_command_long(31018, 0.0, 0.0, 255, 190, "test")
+        node._dispatch_command_long(31019, 0.0, 0.0, 255, 190, "test")
+
+        self.assertEqual(handled, [(31018, 0.0, 0.0), (31019, 0.0, 0.0)])
+        self.assertEqual(
+            acknowledgements,
+            [
+                (31018, module.MAV_RESULT_ACCEPTED, 255, 190),
+                (31019, module.MAV_RESULT_ACCEPTED, 255, 190),
+            ],
+        )
+
+    def test_trigger_node_spectrometer_start_and_stop_use_services_for_ack_result(self):
+        module = _load_script("mavlink_trigger_node_spectro_service_test", "scripts/mavlink_trigger_node.py")
+        rospy = sys.modules["rospy"]
+        calls = []
+
+        class Response:
+            def __init__(self, success, message):
+                self.success = success
+                self.message = message
+
+        def fake_service_proxy(name, service_type):
+            def call():
+                calls.append(name)
+                if name.endswith("_start"):
+                    return Response(True, "started")
+                return Response(False, "stop failed")
+            return call
+
+        original_service_proxy = rospy.ServiceProxy
+        original_wait_for_service = rospy.wait_for_service
+        rospy.ServiceProxy = fake_service_proxy
+        rospy.wait_for_service = lambda *args, **kwargs: None
+        try:
+            node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+            self.assertTrue(node.handle_mavlink_command(31018, 0.0, 0.0))
+            self.assertFalse(node.handle_mavlink_command(31019, 0.0, 0.0))
+        finally:
+            rospy.ServiceProxy = original_service_proxy
+            rospy.wait_for_service = original_wait_for_service
+
+        self.assertEqual(calls, ["/usv/spectrometer_start", "/usv/spectrometer_stop"])
+
+    def test_manual_sample_start_rejection_does_not_publish_failed_mission_state(self):
+        module = _load_script("mavlink_trigger_node_manual_reject_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.is_sampling = False
+        node.current_waypoint = 0
+        node.steps_pub = RecordingPublisher()
+        states = []
+
+        node._load_config = lambda: {"steps": []}
+        node._get_default_config = lambda: {"steps": []}
+        node._build_steps_payload = lambda config, waypoint: {"steps": []}
+        node._call_automation_service = lambda name: False
+        node._set_mission_state = lambda state, context=None: states.append((state, context))
+
+        accepted = node._do_manual_sample()
+
+        self.assertFalse(accepted)
+        self.assertFalse(node.is_sampling)
+        self.assertNotIn((module.MissionState.FAILED, "manual_start_failed"), states)
+        self.assertEqual(states[-1], (module.MissionState.IDLE, "manual_start_rejected"))
+
     def test_router_bridge_updates_automation_named_values_from_structured_status(self):
         module = _load_script("usv_mavlink_router_bridge_automation_test", "scripts/usv_mavlink_router_bridge.py")
         bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
@@ -300,14 +382,34 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
             baseline_set=1.0,
             reference_voltage=1.23,
             baseline_voltage=0.0,
+            spectrometer_valid=1.0,
         )
 
         names = [name for name, _ in mav.named_values]
         self.assertIn("USV_BSET", names)
         self.assertIn("USV_REF", names)
         self.assertIn("USV_BASE", names)
-        self.assertEqual(len(mav.named_values), 16)
-        self.assertEqual(bridge._diag_tx_named, 16)
+        self.assertIn("USV_VLD", names)
+        self.assertEqual(len(mav.named_values), 17)
+        self.assertEqual(bridge._diag_tx_named, 17)
+
+    def test_router_bridge_caches_spectrometer_valid_from_voltage_payload(self):
+        module = _load_script("usv_mavlink_router_bridge_valid_payload_test", "scripts/usv_mavlink_router_bridge.py")
+        bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
+        bridge._lock = threading.Lock()
+        bridge._voltage = 0.0
+        bridge._absorbance = 0.0
+        bridge._baseline_set = 0.0
+        bridge._reference_voltage = 0.0
+        bridge._baseline_voltage = 0.0
+        bridge._spectrometer_valid = 0.0
+
+        msg = sys.modules["std_msgs.msg"].String()
+        msg.data = json.dumps({"voltage": 1.23, "valid": True})
+
+        bridge._voltage_cb(msg)
+
+        self.assertEqual(bridge._spectrometer_valid, 1.0)
 
     def test_trigger_node_set_baseline_uses_latest_valid_voltage(self):
         module = _load_script("mavlink_trigger_node_baseline_valid_test", "scripts/mavlink_trigger_node.py")

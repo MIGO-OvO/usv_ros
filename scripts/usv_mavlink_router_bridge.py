@@ -30,6 +30,8 @@ CMD_CALIBRATE = 31014
 CMD_START_SURVEY = 31015
 CMD_STOP_SURVEY = 31016
 CMD_SET_BASELINE = 31017
+CMD_SPECTROMETER_START = 31018
+CMD_SPECTROMETER_STOP = 31019
 
 
 class USVMavlinkRouterBridge(object):
@@ -46,6 +48,7 @@ class USVMavlinkRouterBridge(object):
         self._baseline_set = 0.0
         self._reference_voltage = 0.0
         self._baseline_voltage = 0.0
+        self._spectrometer_valid = 0.0
         self._pump_angles = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
         self._status_code = 0
         self._last_mission_state = "IDLE"
@@ -113,6 +116,7 @@ class USVMavlinkRouterBridge(object):
             self._baseline_set = 1.0 if data.get("baseline_set", False) else 0.0
             self._reference_voltage = float(data.get("reference_voltage", 0.0) or 0.0)
             self._baseline_voltage = float(data.get("baseline_voltage", 0.0) or 0.0)
+            self._spectrometer_valid = 1.0 if data.get("valid", False) else 0.0
 
     def _angles_cb(self, msg):
         try:
@@ -348,7 +352,7 @@ class USVMavlinkRouterBridge(object):
 
             try:
                 command = int(msg.command)
-                if command < CMD_START_SAMPLING or command > CMD_SET_BASELINE:
+                if command < CMD_START_SAMPLING or command > CMD_SPECTROMETER_STOP:
                     continue
 
                 target_system = int(getattr(msg, "target_system", 0) or 0)
@@ -416,7 +420,7 @@ class USVMavlinkRouterBridge(object):
                 self._diag_pub_errors += 1
             rospy.logwarn("Failed to send HEARTBEAT: %s", str(exc))
 
-    def _send_payload(self, voltage, absorbance, angles, status, automation_step, automation_total, sample_count, pid_error, pid_mode, baseline_set, reference_voltage, baseline_voltage):
+    def _send_payload(self, voltage, absorbance, angles, status, automation_step, automation_total, sample_count, pid_error, pid_mode, baseline_set, reference_voltage, baseline_voltage, spectrometer_valid):
         t = int((time.time() - self._boot_time) * 1000) & 0xFFFFFFFF
         try:
             self._conn.mav.named_value_float_send(t, b"USV_VOLT\x00\x00", voltage)
@@ -435,10 +439,11 @@ class USVMavlinkRouterBridge(object):
             self._conn.mav.named_value_float_send(t, b"USV_BSET\x00\x00", baseline_set)
             self._conn.mav.named_value_float_send(t, b"USV_REF\x00\x00\x00", reference_voltage)
             self._conn.mav.named_value_float_send(t, b"USV_BASE\x00\x00", baseline_voltage)
+            self._conn.mav.named_value_float_send(t, b"USV_VLD\x00\x00\x00", spectrometer_valid)
             self._pkt_count = (self._pkt_count + 1) % 65536
             with self._lock:
-                self._diag_tx_total += 16
-                self._diag_tx_named += 16
+                self._diag_tx_total += 17
+                self._diag_tx_named += 17
         except Exception as exc:
             with self._lock:
                 self._diag_pub_errors += 1
@@ -471,6 +476,7 @@ class USVMavlinkRouterBridge(object):
                 baseline_set = self._baseline_set
                 reference_voltage = self._reference_voltage
                 baseline_voltage = self._baseline_voltage
+                spectrometer_valid = self._spectrometer_valid
                 pending_st = list(self._pending_statustexts)
                 self._pending_statustexts.clear()
                 pending_ack = list(self._pending_acks)
@@ -485,7 +491,7 @@ class USVMavlinkRouterBridge(object):
             for sample_id in pending_done:
                 self._send_usv_done(sample_id)
 
-            self._send_payload(voltage, absorbance, angles, status, automation_step, automation_total, sample_count, pid_error, pid_mode, baseline_set, reference_voltage, baseline_voltage)
+            self._send_payload(voltage, absorbance, angles, status, automation_step, automation_total, sample_count, pid_error, pid_mode, baseline_set, reference_voltage, baseline_voltage, spectrometer_valid)
 
             if now - self._diag_last_report >= DIAG_REPORT_INTERVAL:
                 self._publish_diagnostics()
