@@ -276,37 +276,16 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
             ],
         )
 
-    def test_trigger_node_spectrometer_start_and_stop_use_services_for_ack_result(self):
-        module = _load_script("mavlink_trigger_node_spectro_service_test", "scripts/mavlink_trigger_node.py")
-        rospy = sys.modules["rospy"]
-        calls = []
+    def test_trigger_node_spectrometer_start_and_stop_publish_async_commands(self):
+        module = _load_script("mavlink_trigger_node_spectro_async_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.spectrometer_command_pub = RecordingPublisher()
 
-        class Response:
-            def __init__(self, success, message):
-                self.success = success
-                self.message = message
+        self.assertTrue(node.handle_mavlink_command(31018, 0.0, 0.0))
+        self.assertTrue(node.handle_mavlink_command(31019, 0.0, 0.0))
 
-        def fake_service_proxy(name, service_type):
-            def call():
-                calls.append(name)
-                if name.endswith("_start"):
-                    return Response(True, "started")
-                return Response(False, "stop failed")
-            return call
-
-        original_service_proxy = rospy.ServiceProxy
-        original_wait_for_service = rospy.wait_for_service
-        rospy.ServiceProxy = fake_service_proxy
-        rospy.wait_for_service = lambda *args, **kwargs: None
-        try:
-            node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
-            self.assertTrue(node.handle_mavlink_command(31018, 0.0, 0.0))
-            self.assertFalse(node.handle_mavlink_command(31019, 0.0, 0.0))
-        finally:
-            rospy.ServiceProxy = original_service_proxy
-            rospy.wait_for_service = original_wait_for_service
-
-        self.assertEqual(calls, ["/usv/spectrometer_start", "/usv/spectrometer_stop"])
+        payloads = [json.loads(msg.data) for msg in node.spectrometer_command_pub.messages]
+        self.assertEqual(payloads, [{"cmd": "start"}, {"cmd": "stop"}])
 
     def test_manual_sample_start_rejection_does_not_publish_failed_mission_state(self):
         module = _load_script("mavlink_trigger_node_manual_reject_test", "scripts/mavlink_trigger_node.py")

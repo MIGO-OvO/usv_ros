@@ -735,35 +735,20 @@ class MAVLinkTriggerNode(object):
         elif cmd_id == CMD_SET_BASELINE:
             return self._set_spectrometer_baseline(param1)
         elif cmd_id == CMD_SPECTROMETER_START:
-            return self._call_spectrometer_service('/usv/spectrometer_start', 'spectrometer_start')
+            return self._publish_spectrometer_command('start')
         elif cmd_id == CMD_SPECTROMETER_STOP:
-            return self._call_spectrometer_service('/usv/spectrometer_stop', 'spectrometer_stop')
+            return self._publish_spectrometer_command('stop')
         else:
             rospy.logwarn("Unknown command: %d", cmd_id)
             return False
 
-    def _call_spectrometer_service(self, service_name, status_prefix, timeout=0.5):
-        def publish_result(suffix):
-            if getattr(self, 'status_pub', None) is not None:
-                self._publish_status("%s_%s" % (status_prefix, suffix))
+    def _publish_spectrometer_command(self, command):
+        msg = String()
+        msg.data = json.dumps({"cmd": command})
+        self.spectrometer_command_pub.publish(msg)
+        rospy.loginfo("Published spectrometer command: %s", command)
+        return True
 
-        try:
-            rospy.wait_for_service(service_name, timeout=timeout)
-            response = rospy.ServiceProxy(service_name, Trigger)()
-        except (rospy.ROSException, rospy.ServiceException) as exc:
-            rospy.logwarn("%s failed: %s", service_name, str(exc))
-            publish_result("failed")
-            return False
-
-        success = bool(getattr(response, 'success', False))
-        message = getattr(response, 'message', '')
-        if success:
-            rospy.loginfo("%s accepted: %s", service_name, message)
-            publish_result("accepted")
-        else:
-            rospy.logwarn("%s rejected: %s", service_name, message)
-            publish_result("failed")
-        return success
 
     def _set_spectrometer_baseline(self, reference_voltage=0.0):
         try:
