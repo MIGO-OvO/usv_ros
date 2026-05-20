@@ -801,9 +801,11 @@ class PumpControlNode(object):
             )
         )
 
-    def _wait_for_spectro_command_result(self, timeout=2.0):
+    def _begin_spectro_command_wait(self):
         self.spectro_command_event.clear()
         self.spectro_command_result = None
+
+    def _wait_for_spectro_command_result(self, timeout=2.0):
         if self.spectro_command_event.wait(timeout):
             return self.spectro_command_result
         return False, 'timeout'
@@ -815,6 +817,7 @@ class PumpControlNode(object):
             return False, 'Spectrometer config command send failed'
         self._clear_spectro_reference()
         time.sleep(0.1)
+        self._begin_spectro_command_wait()
         ok = self.send_command('ADSSTART')
         if not ok:
             return False, 'Spectrometer start command send failed'
@@ -822,6 +825,7 @@ class PumpControlNode(object):
         return success, message if message != 'timeout' else 'Spectrometer start timeout'
 
     def _spectro_stop(self):
+        self._begin_spectro_command_wait()
         ok = self.send_command('ADSSTOP')
         if not ok:
             return False, 'Spectrometer stop command send failed'
