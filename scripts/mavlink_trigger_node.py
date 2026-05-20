@@ -52,6 +52,8 @@ CMD_CALIBRATE = 31014
 CMD_START_SURVEY = 31015
 CMD_STOP_SURVEY = 31016
 CMD_SET_BASELINE = 31017
+CMD_SPECTROMETER_START = 31018
+CMD_SPECTROMETER_STOP = 31019
 
 # MAVLink 协议常量
 MAVLINK_MSG_ID_COMMAND_LONG = 76
@@ -500,7 +502,7 @@ class MAVLinkTriggerNode(object):
 
     def _dispatch_command_long(self, command, param1, param2, sender_system, sender_component, log_prefix):
         """处理并确认自定义 COMMAND_LONG。"""
-        if command < CMD_START_SAMPLING or command > CMD_SET_BASELINE:
+        if command < CMD_START_SAMPLING or command > CMD_SPECTROMETER_STOP:
             return
 
         rospy.loginfo(
@@ -732,9 +734,36 @@ class MAVLinkTriggerNode(object):
             return self._stop_survey()
         elif cmd_id == CMD_SET_BASELINE:
             return self._set_spectrometer_baseline(param1)
+        elif cmd_id == CMD_SPECTROMETER_START:
+            return self._call_spectrometer_service('/usv/spectrometer_start', 'spectrometer_start')
+        elif cmd_id == CMD_SPECTROMETER_STOP:
+            return self._call_spectrometer_service('/usv/spectrometer_stop', 'spectrometer_stop')
         else:
             rospy.logwarn("Unknown command: %d", cmd_id)
             return False
+
+    def _call_spectrometer_service(self, service_name, status_prefix, timeout=0.5):
+        def publish_result(suffix):
+            if getattr(self, 'status_pub', None) is not None:
+                self._publish_status("%s_%s" % (status_prefix, suffix))
+
+        try:
+            rospy.wait_for_service(service_name, timeout=timeout)
+            response = rospy.ServiceProxy(service_name, Trigger)()
+        except (rospy.ROSException, rospy.ServiceException) as exc:
+            rospy.logwarn("%s failed: %s", service_name, str(exc))
+            publish_result("failed")
+            return False
+
+        success = bool(getattr(response, 'success', False))
+        message = getattr(response, 'message', '')
+        if success:
+            rospy.loginfo("%s accepted: %s", service_name, message)
+            publish_result("accepted")
+        else:
+            rospy.logwarn("%s rejected: %s", service_name, message)
+            publish_result("failed")
+        return success
 
     def _set_spectrometer_baseline(self, reference_voltage=0.0):
         try:
@@ -784,7 +813,9 @@ class MAVLinkTriggerNode(object):
         self.is_sampling = True
         if not self._call_automation_service('start'):
             self.is_sampling = False
-            self._set_mission_state(MissionState.FAILED, "manual_start_failed")
+            self._set_mission_state(MissionState.IDLE, "manual_start_rejected")
+            if getattr(self, 'status_pub', None) is not None:
+                self._publish_status("manual_start_rejected")
             return False
 
         rospy.loginfo("Manual sampling started (no HOLD, no stable wait)")

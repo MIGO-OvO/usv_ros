@@ -65,7 +65,7 @@ English version: `README.en.md`
 
 ```text
 QGroundControl / 定制 USV 面板
-  |  COMMAND_LONG 31010..31016
+  |  COMMAND_LONG 31010..31019
   |  NAMED_VALUE_FLOAT 载荷字段
   v
 数传电台 -> Pixhawk 6C / 定制 ArduRover
@@ -106,8 +106,8 @@ ESP32 检测装置主控
 已实现的核心能力包括：
 
 - `mavlink-routerd` 串口复用：MAVROS 与自定义 bridge 分离。
-- 13 个 QGC 载荷遥测字段：`USV_VOLT`、`USV_ABS`、`PUMP_X/Y/Z/A`、`USV_STAT`、`USV_PKT`、
-  `USV_STEP`、`USV_STOT`、`USV_SCNT`、`USV_PERR`、`USV_PMOD`。
+- 17 个 QGC 载荷遥测字段：`USV_VOLT`、`USV_ABS`、`PUMP_X/Y/Z/A`、`USV_STAT`、`USV_PKT`、
+  `USV_STEP`、`USV_STOT`、`USV_SCNT`、`USV_PERR`、`USV_PMOD`、`USV_BSET`、`USV_REF`、`USV_BASE`、`USV_VLD`。
 - 检测装置身份握手：`HELLO?` / `DET?` 必须返回 `DET_ID:USV_DETECTOR*`。
 - Web 端硬件设置热切换：保存串口参数后调用 `/usv/pump_reconnect` 重连泵控节点。
 - 航点采样配置 CRUD、任务配置导入导出、任务数据 JSON 记录和 CSV 下载。
@@ -593,7 +593,7 @@ curl -X POST http://127.0.0.1:5000/api/hardware/apply \
 
 ### 下行命令
 
-`usv_mavlink_router_bridge.py` 从 router TCP 端点接收 `COMMAND_LONG`，筛选 `31010..31016`，转成
+`usv_mavlink_router_bridge.py` 从 router TCP 端点接收 `COMMAND_LONG`，筛选 `31010..31019`，转成
 `/usv/mavlink_cmd_rx`；`mavlink_trigger_node.py` 执行后发布 `/usv/mavlink_cmd_ack`，再由 bridge 封装
 `COMMAND_ACK`。
 
@@ -606,6 +606,9 @@ curl -X POST http://127.0.0.1:5000/api/hardware/apply \
 | `31014` | 校准，向检测装置发布 `CALXYZA\r\n` |
 | `31015` | 开始走航采样 |
 | `31016` | 停止走航采样 |
+| `31017` | 设置分光 baseline，`param1=0` 使用最新有效电压 |
+| `31018` | 启动分光检测器信号采集 |
+| `31019` | 停止分光检测器信号采集 |
 
 bridge 也兼容飞控以 `NAMED_VALUE_FLOAT` 发出的原生任务触发：
 
@@ -617,7 +620,7 @@ bridge 也兼容飞控以 `NAMED_VALUE_FLOAT` 发出的原生任务触发：
 bridge 发送：
 
 - `HEARTBEAT`：1 Hz。
-- `NAMED_VALUE_FLOAT`：2 Hz，每轮 13 个字段。
+- `NAMED_VALUE_FLOAT`：2 Hz，每轮 17 个字段。
 
 | 字段 | 说明 |
 |---|---|
@@ -631,6 +634,10 @@ bridge 发送：
 | `USV_SCNT` | 样本计数 |
 | `USV_PERR` | PID 误差 |
 | `USV_PMOD` | PID 模式：0 空闲、1 运行、2 完成、3 错误 |
+| `USV_BSET` | baseline 是否已设置，0/1 |
+| `USV_REF` | baseline 参考电压 |
+| `USV_BASE` | baseline 电压 |
+| `USV_VLD` | 分光检测器当前采样是否有效，0/1 |
 
 诊断：
 

@@ -70,7 +70,7 @@ The default launch entry is `launch/usv_bringup.launch`:
 
 ```text
 QGroundControl / custom USV panel
-  |  COMMAND_LONG 31010..31016
+  |  COMMAND_LONG 31010..31019
   |  NAMED_VALUE_FLOAT payload fields
   v
 Telemetry radio -> Pixhawk 6C / custom ArduRover
@@ -112,8 +112,8 @@ direct forwarding path that is blocked by MAVLink routing.
 Implemented core capabilities:
 
 - `mavlink-routerd` serial multiplexing: MAVROS and the custom bridge use separate endpoints.
-- 13 QGC payload telemetry fields: `USV_VOLT`, `USV_ABS`, `PUMP_X/Y/Z/A`, `USV_STAT`, `USV_PKT`,
-  `USV_STEP`, `USV_STOT`, `USV_SCNT`, `USV_PERR`, and `USV_PMOD`.
+- 17 QGC payload telemetry fields: `USV_VOLT`, `USV_ABS`, `PUMP_X/Y/Z/A`, `USV_STAT`, `USV_PKT`,
+  `USV_STEP`, `USV_STOT`, `USV_SCNT`, `USV_PERR`, `USV_PMOD`, `USV_BSET`, `USV_REF`, `USV_BASE`, and `USV_VLD`.
 - Detector identity handshake: `HELLO?` / `DET?` must return `DET_ID:USV_DETECTOR*`.
 - Web hardware hot-apply flow: saved serial settings call `/usv/pump_reconnect` and reconnect the pump node.
 - Waypoint sampling CRUD, mission config import/export, mission JSON recording, and CSV download.
@@ -554,7 +554,7 @@ curl -X POST http://127.0.0.1:5000/api/hardware/apply \
 
 ### Downlink Commands
 
-`usv_mavlink_router_bridge.py` receives `COMMAND_LONG` from the router TCP endpoint, filters `31010..31016`, and
+`usv_mavlink_router_bridge.py` receives `COMMAND_LONG` from the router TCP endpoint, filters `31010..31019`, and
 forwards the command to `/usv/mavlink_cmd_rx`. `mavlink_trigger_node.py` executes it and publishes
 `/usv/mavlink_cmd_ack`; the bridge then sends `COMMAND_ACK`.
 
@@ -567,6 +567,9 @@ forwards the command to `/usv/mavlink_cmd_rx`. `mavlink_trigger_node.py` execute
 | `31014` | Calibration; publishes `CALXYZA\r\n` to the detector |
 | `31015` | Start survey sampling |
 | `31016` | Stop survey sampling |
+| `31017` | Set spectrometer baseline; `param1=0` uses the latest valid voltage |
+| `31018` | Start spectrometer signal acquisition |
+| `31019` | Stop spectrometer signal acquisition |
 
 The bridge also supports FCU-native triggers sent as `NAMED_VALUE_FLOAT`:
 
@@ -578,7 +581,7 @@ The bridge also supports FCU-native triggers sent as `NAMED_VALUE_FLOAT`:
 The bridge sends:
 
 - `HEARTBEAT`: 1 Hz.
-- `NAMED_VALUE_FLOAT`: 2 Hz, 13 fields per cycle.
+- `NAMED_VALUE_FLOAT`: 2 Hz, 17 fields per cycle.
 
 | Field | Meaning |
 |---|---|
@@ -592,6 +595,10 @@ The bridge sends:
 | `USV_SCNT` | Sample count |
 | `USV_PERR` | PID error |
 | `USV_PMOD` | PID mode: 0 idle, 1 running, 2 complete, 3 error |
+| `USV_BSET` | Baseline set, 0/1 |
+| `USV_REF` | Baseline reference voltage |
+| `USV_BASE` | Baseline voltage |
+| `USV_VLD` | Current spectrometer sample valid flag, 0/1 |
 
 Diagnostics:
 

@@ -85,6 +85,7 @@ class USVMavlinkBridge(object):
         self._baseline_set = 0.0
         self._reference_voltage = 0.0
         self._baseline_voltage = 0.0
+        self._spectrometer_valid = 0.0
         self._pump_angles = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
         self._status_code = 0
         self._mavros_connected = False
@@ -126,6 +127,7 @@ class USVMavlinkBridge(object):
             self._baseline_set = 1.0 if data.get('baseline_set', False) else 0.0
             self._reference_voltage = float(data.get('reference_voltage', 0.0) or 0.0)
             self._baseline_voltage = float(data.get('baseline_voltage', 0.0) or 0.0)
+            self._spectrometer_valid = 1.0 if data.get('valid', False) else 0.0
 
     def _angles_cb(self, msg):
         try:
@@ -339,6 +341,7 @@ class USVMavlinkBridge(object):
                 baseline_set = self._baseline_set
                 reference_voltage = self._reference_voltage
                 baseline_voltage = self._baseline_voltage
+                spectrometer_valid = self._spectrometer_valid
                 angles = self._pump_angles.copy()
                 status = self._status_code
 
@@ -360,6 +363,7 @@ class USVMavlinkBridge(object):
             self._send_named_value_float("USV_BSET", baseline_set)
             self._send_named_value_float("USV_REF", reference_voltage)
             self._send_named_value_float("USV_BASE", baseline_voltage)
+            self._send_named_value_float("USV_VLD", spectrometer_valid)
             self._pkt_count = (self._pkt_count + 1) % 65536
             self._send_named_value_float("USV_PKT", float(self._pkt_count))
 
