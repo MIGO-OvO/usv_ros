@@ -1,10 +1,11 @@
 import { Link, useLocation } from "react-router-dom"
-import { LayoutDashboard, PlayCircle, Database, Settings } from "lucide-react"
+import { Database, LayoutDashboard, PlayCircle, Settings, SlidersHorizontal } from "lucide-react"
 import { cn } from "@/lib/utils"
 
 const navItems = [
   { name: "监控", href: "/", icon: LayoutDashboard },
-  { name: "自动化", href: "/automation", icon: PlayCircle },
+  { name: "自动", href: "/automation", icon: PlayCircle },
+  { name: "手动", href: "/manual", icon: SlidersHorizontal },
   { name: "数据", href: "/data", icon: Database },
   { name: "设置", href: "/settings", icon: Settings },
 ]
@@ -25,15 +26,10 @@ export function MobileNav() {
               to={item.href}
               className={cn(
                 "flex flex-col items-center justify-center gap-1 w-full h-full text-xs font-medium transition-colors",
-                isActive
-                  ? "text-primary"
-                  : "text-muted-foreground hover:text-foreground"
+                isActive ? "text-primary" : "text-muted-foreground hover:text-foreground",
               )}
             >
-              <div className={cn(
-                  "p-1.5 rounded-full transition-colors",
-                  isActive && "bg-primary/10"
-              )}>
+              <div className={cn("p-1.5 rounded-full transition-colors", isActive && "bg-primary/10")}>
                 <Icon className="h-5 w-5" />
               </div>
               {item.name}

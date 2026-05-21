@@ -27,6 +27,38 @@ class FakeTriggerService:
         return types.SimpleNamespace(success=True, message="reconnected")
 
 
+class FakeControlCommandService:
+    def __init__(self, calls):
+        self.calls = calls
+
+    def wait_for_service(self, timeout=None):
+        return None
+
+    def __call__(self, command_id="", source="", action="", payload_json=""):
+        self.calls.append({
+            "command_id": command_id,
+            "source": source,
+            "action": action,
+            "payload_json": payload_json,
+        })
+        if action == "injection_status":
+            return types.SimpleNamespace(
+                success=True,
+                message="status",
+                result_json=json.dumps({
+                    "enabled": False,
+                    "speed": 0,
+                    "last_response": "",
+                    "last_error": "",
+                }),
+            )
+        return types.SimpleNamespace(
+            success=True,
+            message="%s ok" % action,
+            result_json=json.dumps({"action": action}),
+        )
+
+
 class RecordingSocket:
     def __init__(self):
         self.events = []
@@ -76,11 +108,26 @@ def _install_fake_ros_modules():
     std_srvs_srv.TriggerResponse = TriggerResponse
     std_srvs.srv = std_srvs_srv
 
+    usv_ros = types.ModuleType("usv_ros")
+    usv_ros_srv = types.ModuleType("usv_ros.srv")
+    usv_ros_srv.ControlCommand = object
+
+    class ControlCommandResponse:
+        def __init__(self, success=False, message="", result_json=""):
+            self.success = success
+            self.message = message
+            self.result_json = result_json
+
+    usv_ros_srv.ControlCommandResponse = ControlCommandResponse
+    usv_ros.srv = usv_ros_srv
+
     sys.modules["rospy"] = rospy
     sys.modules["std_msgs"] = std_msgs
     sys.modules["std_msgs.msg"] = std_msgs_msg
     sys.modules["std_srvs"] = std_srvs
     sys.modules["std_srvs.srv"] = std_srvs_srv
+    sys.modules["usv_ros"] = usv_ros
+    sys.modules["usv_ros.srv"] = usv_ros_srv
     return publishers, String
 
 
@@ -125,6 +172,12 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             "web_config_server_spectrometer_routes_test",
             "scripts/web_config_server.py",
         )
+        control_calls = []
+        module.rospy.ServiceProxy = lambda name, *args, **kwargs: (
+            FakeControlCommandService(control_calls)
+            if name == "/usv/control_command"
+            else FakeTriggerService()
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             config_file = str(Path(tmpdir) / "sampling_config.json")
@@ -140,17 +193,25 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             start_resp = client.post("/api/spectrometer/start")
 
         self.assertEqual(start_resp.status_code, 200)
-        messages = [
-            json.loads(msg.data)
-            for msg in publishers["/usv/spectrometer_command"].messages
-        ]
-        self.assertEqual([msg["cmd"] for msg in messages[-3:]], ["set_i2c_map", "configure", "start"])
-        self.assertEqual(messages[-3]["mapping"]["spectro_channel"], 0)
+        self.assertEqual([call["action"] for call in control_calls[-3:]], [
+            "spectrometer_i2c_map",
+            "spectrometer_configure",
+            "spectrometer_start",
+        ])
+        first_payload = json.loads(control_calls[-3]["payload_json"])
+        self.assertEqual(first_payload["mapping"]["spectro_channel"], 0)
+        self.assertEqual(publishers["/usv/spectrometer_command"].messages, [])
 
     def test_web_spectrometer_stop_route_publishes_stop_command(self):
         module, publishers, _ = _load_script(
             "web_config_server_spectrometer_stop_route_test",
             "scripts/web_config_server.py",
+        )
+        control_calls = []
+        module.rospy.ServiceProxy = lambda name, *args, **kwargs: (
+            FakeControlCommandService(control_calls)
+            if name == "/usv/control_command"
+            else FakeTriggerService()
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -167,16 +228,20 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             stop_resp = client.post("/api/spectrometer/stop")
 
         self.assertEqual(stop_resp.status_code, 200)
-        messages = [
-            json.loads(msg.data)
-            for msg in publishers["/usv/spectrometer_command"].messages
-        ]
-        self.assertEqual(messages[-1], {"cmd": "stop"})
+        self.assertEqual(control_calls[-1]["action"], "spectrometer_stop")
+        self.assertEqual(json.loads(control_calls[-1]["payload_json"]), {"cmd": "stop"})
+        self.assertEqual(publishers["/usv/spectrometer_command"].messages, [])
 
     def test_web_spectrometer_baseline_route_uses_current_valid_voltage(self):
         module, publishers, _ = _load_script(
             "web_config_server_spectrometer_baseline_route_test",
             "scripts/web_config_server.py",
+        )
+        control_calls = []
+        module.rospy.ServiceProxy = lambda name, *args, **kwargs: (
+            FakeControlCommandService(control_calls)
+            if name == "/usv/control_command"
+            else FakeTriggerService()
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -203,16 +268,23 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         self.assertTrue(body["success"])
         self.assertAlmostEqual(body["reference_voltage"], 1.234)
-        messages = [
-            json.loads(msg.data)
-            for msg in publishers["/usv/spectrometer_command"].messages
-        ]
-        self.assertEqual(messages[-1], {"cmd": "set_baseline", "reference_voltage": 1.234})
+        self.assertEqual(control_calls[-1]["action"], "spectrometer_baseline")
+        self.assertEqual(json.loads(control_calls[-1]["payload_json"]), {
+            "cmd": "set_baseline",
+            "reference_voltage": 1.234,
+        })
+        self.assertEqual(publishers["/usv/spectrometer_command"].messages, [])
 
     def test_web_injection_on_with_speed_sends_set_command(self):
         module, publishers, _ = _load_script(
             "web_config_server_injection_on_speed_test",
             "scripts/web_config_server.py",
+        )
+        control_calls = []
+        module.rospy.ServiceProxy = lambda name, *args, **kwargs: (
+            FakeControlCommandService(control_calls)
+            if name == "/usv/control_command"
+            else FakeTriggerService()
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -230,9 +302,118 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
 
         body = response.get_json()
         self.assertTrue(body["success"])
-        self.assertEqual(body["data"]["enabled"], True)
-        self.assertEqual(body["data"]["speed"], 60)
-        self.assertEqual(publishers["/usv/pump_command"].messages[-1].data, "PUMP:SET:60")
+        self.assertEqual(control_calls[-1]["action"], "injection_on")
+        self.assertEqual(json.loads(control_calls[-1]["payload_json"])["speed"], 60)
+        self.assertEqual(publishers["/usv/pump_command"].messages, [])
+
+    def test_pump_node_control_command_requires_manual_mode_and_emits_events(self):
+        module, publishers, _ = _load_script(
+            "pump_control_node_control_command_test",
+            "scripts/pump_control_node.py",
+        )
+        node = module.PumpControlNode()
+        sent = []
+        node.send_command = lambda cmd: sent.append(cmd) or True
+
+        def request(action, payload=None, command_id="cmd-1"):
+            return types.SimpleNamespace(
+                command_id=command_id,
+                source="unit-test",
+                action=action,
+                payload_json=json.dumps(payload or {}),
+            )
+
+        rejected = node._control_command_callback(request("manual_step", {
+            "axis": "X",
+            "direction": "F",
+            "speed_rpm": 5,
+            "angle_deg": 10,
+        }))
+        self.assertFalse(rejected.success)
+        self.assertEqual(sent, [])
+
+        enabled = node._control_command_callback(request("manual_mode", {"enabled": True}, "cmd-2"))
+        self.assertTrue(enabled.success)
+
+        accepted = node._control_command_callback(request("manual_step", {
+            "axis": "X",
+            "direction": "F",
+            "speed_rpm": 5,
+            "angle_deg": 10,
+            "continuous": False,
+        }, "cmd-3"))
+        self.assertTrue(accepted.success)
+        self.assertIn("XEF", sent[-1])
+
+        events = [json.loads(msg.data) for msg in publishers["/usv/control_events"].messages]
+        self.assertIn("failed", [event["state"] for event in events])
+        self.assertIn("succeeded", [event["state"] for event in events])
+
+    def test_pump_node_manual_mode_blocks_automation_and_spectrometer_start(self):
+        module, _, _ = _load_script(
+            "pump_control_node_manual_interlock_test",
+            "scripts/pump_control_node.py",
+        )
+        node = module.PumpControlNode()
+        node.manual_mode_enabled = True
+        node.automation_engine.steps = [{"name": "step"}]
+
+        auto_response = node._auto_start_callback(None)
+        spectro_response = node._spectro_start_callback(None)
+
+        self.assertFalse(auto_response.success)
+        self.assertFalse(spectro_response.success)
+        self.assertIn("manual", auto_response.message.lower())
+        self.assertIn("manual", spectro_response.message.lower())
+
+    def test_web_manual_routes_use_control_transaction_service(self):
+        module, _, _ = _load_script(
+            "web_config_server_manual_routes_test",
+            "scripts/web_config_server.py",
+        )
+        control_calls = []
+        module.rospy.ServiceProxy = lambda name, *args, **kwargs: (
+            FakeControlCommandService(control_calls)
+            if name == "/usv/control_command"
+            else FakeTriggerService()
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            client = server.app.test_client()
+
+            mode_resp = client.post("/api/manual/mode", json={"enabled": True})
+            step_resp = client.post("/api/manual/pump-step", json={
+                "axis": "X",
+                "direction": "F",
+                "speed_rpm": 5,
+                "angle_deg": 10,
+                "continuous": False,
+            })
+
+        self.assertEqual(mode_resp.status_code, 200)
+        self.assertEqual(step_resp.status_code, 200)
+        self.assertEqual([call["action"] for call in control_calls], ["manual_mode", "manual_step"])
+
+    def test_frontend_declares_manual_page_and_control_feedback_state(self):
+        app_text = (REPO_ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+        sidebar_text = (REPO_ROOT / "frontend" / "src" / "components" / "layout" / "Sidebar.tsx").read_text(encoding="utf-8")
+        manual_page = REPO_ROOT / "frontend" / "src" / "pages" / "Manual.tsx"
+        store_text = (REPO_ROOT / "frontend" / "src" / "store.ts").read_text(encoding="utf-8")
+
+        self.assertIn('path="/manual"', app_text)
+        self.assertIn('href: "/manual"', sidebar_text)
+        self.assertTrue(manual_page.exists())
+        self.assertIn("controlEvents", store_text)
+        self.assertIn("setManualMode", store_text)
+        self.assertIn("sendManualPumpStep", store_text)
 
     def test_pump_node_injection_on_service_uses_cached_nonzero_speed(self):
         module, _, _ = _load_script(
@@ -313,6 +494,12 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             "web_config_server_hardware_sync_test",
             "scripts/web_config_server.py",
         )
+        control_calls = []
+        module.rospy.ServiceProxy = lambda name, *args, **kwargs: (
+            FakeControlCommandService(control_calls)
+            if name == "/usv/control_command"
+            else FakeTriggerService()
+        )
 
         with tempfile.TemporaryDirectory() as tmpdir:
             config_file = str(Path(tmpdir) / "sampling_config.json")
@@ -351,20 +538,23 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(body["results"]["i2c_mapping"]["success"], True)
         self.assertEqual(body["results"]["spectrometer"]["success"], True)
 
-        messages = [
-            json.loads(msg.data)
-            for msg in publishers["/usv/spectrometer_command"].messages
-        ]
-        self.assertEqual(messages[0]["cmd"], "set_i2c_map")
-        self.assertEqual(messages[0]["mapping"], {
+        self.assertEqual([call["action"] for call in control_calls[:3]], [
+            "spectrometer_i2c_map",
+            "spectrometer_configure",
+            "spectrometer_start",
+        ])
+        first_payload = json.loads(control_calls[0]["payload_json"])
+        second_payload = json.loads(control_calls[1]["payload_json"])
+        self.assertEqual(first_payload["cmd"], "set_i2c_map")
+        self.assertEqual(first_payload["mapping"], {
             "angles": {"X": 2, "Y": 3, "Z": 6, "A": 7},
             "spectro_channel": 2,
         })
-        self.assertEqual(messages[1]["cmd"], "configure")
-        self.assertEqual(messages[1]["gain"], 4)
-        self.assertEqual(messages[1]["publish_rate"], 200)
-        self.assertEqual(messages[1]["vref_mode"], "INT")
-        self.assertEqual(messages[2]["cmd"], "start")
+        self.assertEqual(second_payload["cmd"], "configure")
+        self.assertEqual(second_payload["gain"], 4)
+        self.assertEqual(second_payload["publish_rate"], 200)
+        self.assertEqual(second_payload["vref_mode"], "INT")
+        self.assertEqual(publishers["/usv/spectrometer_command"].messages, [])
 
     def test_pump_node_runtime_commands_generate_expected_serial_commands(self):
         module, _, string_cls = _load_script(

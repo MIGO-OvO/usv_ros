@@ -1,5 +1,5 @@
 import { Link, useLocation } from "react-router-dom"
-import { LayoutDashboard, PlayCircle, Database, Settings, Activity } from "lucide-react"
+import { Activity, Database, LayoutDashboard, PlayCircle, Settings, SlidersHorizontal } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAppStore } from "@/store"
 import { ModeToggle } from "@/components/mode-toggle"
@@ -7,6 +7,7 @@ import { ModeToggle } from "@/components/mode-toggle"
 const navItems = [
   { name: "监控", href: "/", icon: LayoutDashboard },
   { name: "自动化", href: "/automation", icon: PlayCircle },
+  { name: "手动控制", href: "/manual", icon: SlidersHorizontal },
   { name: "数据中心", href: "/data", icon: Database },
   { name: "设置", href: "/settings", icon: Settings },
 ]
@@ -38,7 +39,7 @@ export function Sidebar() {
                 "flex items-center gap-3 px-3 py-2.5 rounded-lg text-sm font-medium transition-colors duration-200",
                 isActive
                   ? "bg-primary text-primary-foreground shadow-sm"
-                  : "text-muted-foreground hover:bg-muted hover:text-foreground"
+                  : "text-muted-foreground hover:bg-muted hover:text-foreground",
               )}
             >
               <Icon className="h-4 w-4" />
@@ -51,10 +52,7 @@ export function Sidebar() {
       <div className="p-4 border-t border-border/40 space-y-3">
         <div className="flex items-center justify-between px-3">
           <div className="flex items-center gap-2">
-            <div className={cn(
-              "h-2 w-2 rounded-full",
-              connected ? "bg-emerald-500" : "bg-red-500"
-            )} />
+            <div className={cn("h-2 w-2 rounded-full", connected ? "bg-emerald-500" : "bg-red-500")} />
             <span className="text-xs text-muted-foreground">
               {connected ? "已连接" : "未连接"}
             </span>
@@ -63,10 +61,7 @@ export function Sidebar() {
         </div>
         {connected && (
           <div className="flex items-center gap-2 px-3">
-            <div className={cn(
-              "h-2 w-2 rounded-full",
-              pumpConnected ? "bg-blue-500" : "bg-orange-500"
-            )} />
+            <div className={cn("h-2 w-2 rounded-full", pumpConnected ? "bg-blue-500" : "bg-orange-500")} />
             <span className="text-xs text-muted-foreground">
               {pumpConnected ? "泵组在线" : "泵组离线"}
             </span>

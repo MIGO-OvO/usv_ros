@@ -45,6 +45,17 @@ import rospy
 from std_msgs.msg import String
 from std_srvs.srv import Trigger, TriggerResponse
 
+try:
+    from usv_ros.srv import ControlCommand, ControlCommandResponse
+except ImportError:
+    ControlCommand = object
+
+    class ControlCommandResponse(object):
+        def __init__(self, success=False, message="", result_json=""):
+            self.success = success
+            self.message = message
+            self.result_json = result_json
+
 # 添加 lib 目录到路径
 script_dir = os.path.dirname(os.path.abspath(__file__))
 lib_dir = os.path.join(script_dir, 'lib')
@@ -459,6 +470,7 @@ class PumpControlNode(object):
         self._current_step_spectro_timestamp = None
         self._lower_device_settings_file = self._resolve_lower_device_settings_file()
         self._lower_device_settings = self._load_lower_device_settings()
+        self.manual_mode_enabled = False
 
         # Publishers
         self.angles_pub = rospy.Publisher('/usv/pump_angles', String, queue_size=10)
@@ -467,6 +479,8 @@ class PumpControlNode(object):
         self.pid_complete_pub = rospy.Publisher('/usv/pump_pid_complete', String, queue_size=10)
         self.pid_error_pub = rospy.Publisher('/usv/pump_pid_error', String, queue_size=50)
         self.injection_status_pub = rospy.Publisher('/usv/injection_pump_status', String, queue_size=10, latch=True)
+        self.control_events_pub = rospy.Publisher('/usv/control_events', String, queue_size=20)
+        self.manual_status_pub = rospy.Publisher('/usv/manual_status', String, queue_size=10, latch=True)
         self.spectro_voltage_pub = rospy.Publisher('/usv/spectrometer_voltage', String, queue_size=20)
         self.spectro_status_pub = rospy.Publisher('/usv/spectrometer_status', String, queue_size=20, latch=True)
         self.spectro_raw_pub = rospy.Publisher('/usv/spectrometer_raw', String, queue_size=20)
@@ -491,10 +505,12 @@ class PumpControlNode(object):
         self.spectro_start_srv = rospy.Service('/usv/spectrometer_start', Trigger, self._spectro_start_callback)
         self.spectro_stop_srv = rospy.Service('/usv/spectrometer_stop', Trigger, self._spectro_stop_callback)
         self.i2c_map_apply_srv = rospy.Service('/usv/i2c_map_apply', Trigger, self._i2c_map_apply_callback)
+        self.control_command_srv = rospy.Service('/usv/control_command', ControlCommand, self._control_command_callback)
 
         rospy.loginfo("Pump Control Node initialized")
         rospy.loginfo("  Serial: %s @ %d", self.serial_port, self.baudrate)
         rospy.loginfo("  PID Mode: %s (precision: %.2f)", self.pid_mode, self.pid_precision)
+        self._publish_manual_status()
 
     def connect(self):
         """连接串口。"""
@@ -1370,6 +1386,232 @@ class PumpControlNode(object):
         msg.data = status
         self.spectro_status_pub.publish(msg)
 
+    def _automation_is_active(self):
+        return bool(
+            self.automation_engine.is_running()
+            or getattr(self.automation_engine, "is_paused", lambda: False)()
+        )
+
+    def _spectrometer_is_active(self):
+        return self.spectro_state in ("starting", "acquiring")
+
+    def _control_response(self, success, message, result=None):
+        return ControlCommandResponse(
+            success=bool(success),
+            message=str(message),
+            result_json=json.dumps(result or {}),
+        )
+
+    def _publish_control_event(self, command_id, source, action, state, message="", result=None, started_at=None):
+        event = {
+            "command_id": command_id,
+            "source": source,
+            "action": action,
+            "state": state,
+            "message": str(message or ""),
+            "timestamp": time.time(),
+        }
+        if started_at is not None:
+            event["elapsed_ms"] = int((time.time() - started_at) * 1000)
+        if result:
+            event["result"] = result
+        try:
+            msg = String()
+            msg.data = json.dumps(event, ensure_ascii=False)
+            self.control_events_pub.publish(msg)
+        except Exception as exc:
+            rospy.logwarn("Failed to publish control event: %s", str(exc))
+
+    def _manual_status_payload(self):
+        return {
+            "enabled": bool(self.manual_mode_enabled),
+            "automation_active": self._automation_is_active(),
+            "spectrometer_active": self._spectrometer_is_active(),
+        }
+
+    def _publish_manual_status(self):
+        try:
+            msg = String()
+            msg.data = json.dumps(self._manual_status_payload(), ensure_ascii=False)
+            self.manual_status_pub.publish(msg)
+        except Exception as exc:
+            rospy.logwarn("Failed to publish manual status: %s", str(exc))
+
+    def _reject_if_manual_mode(self, action_name):
+        if self.manual_mode_enabled:
+            message = "%s rejected: manual mode is enabled" % action_name
+            rospy.logwarn(message)
+            return TriggerResponse(success=False, message=message)
+        return None
+
+    def _set_manual_mode(self, enabled):
+        enabled = bool(enabled)
+        if enabled and self._automation_is_active():
+            return False, "Cannot enter manual mode while automation is active"
+        if enabled and self._spectrometer_is_active():
+            return False, "Cannot enter manual mode while spectrometer is acquiring"
+        self.manual_mode_enabled = enabled
+        self._publish_manual_status()
+        return True, "Manual mode enabled" if enabled else "Manual mode disabled"
+
+    def _build_manual_step(self, payload):
+        if isinstance(payload.get("step"), dict):
+            return payload["step"], None
+
+        axis = str(payload.get("axis", "")).strip().upper()
+        if axis not in MOTOR_NAMES:
+            return None, "Invalid manual axis: %s" % axis
+
+        direction = str(payload.get("direction", "F")).strip().upper()
+        if direction not in ("F", "B"):
+            return None, "Invalid manual direction: %s" % direction
+
+        try:
+            speed = max(0, min(100, float(payload.get("speed_rpm", payload.get("speed", 0)))))
+            angle = max(0.0, min(99999.0, float(payload.get("angle_deg", payload.get("angle", 0)))))
+        except (TypeError, ValueError):
+            return None, "Invalid manual speed or angle"
+
+        step = {
+            axis: {
+                "enable": "E",
+                "direction": direction,
+                "speed": "%g" % speed,
+                "angle": "%g" % angle,
+                "continuous": bool(payload.get("continuous", False)),
+            }
+        }
+        return step, None
+
+    def _control_command_callback(self, req):
+        command_id = str(getattr(req, "command_id", "") or "cmd-%d" % int(time.time() * 1000))
+        source = str(getattr(req, "source", "") or "unknown")
+        action = str(getattr(req, "action", "") or "").strip()
+        started_at = time.time()
+        try:
+            payload = json.loads(getattr(req, "payload_json", "") or "{}")
+            if not isinstance(payload, dict):
+                raise ValueError("payload_json must be an object")
+        except (TypeError, ValueError) as exc:
+            message = "Invalid control payload: %s" % str(exc)
+            self._publish_control_event(command_id, source, action, "failed", message, started_at=started_at)
+            return self._control_response(False, message)
+
+        self._publish_control_event(command_id, source, action, "queued")
+        self._publish_control_event(command_id, source, action, "running")
+
+        try:
+            success, message, result = self._execute_control_action(action, payload)
+        except Exception as exc:
+            rospy.logerr("Control command failed: %s", str(exc))
+            success, message, result = False, str(exc), {}
+
+        self._publish_control_event(
+            command_id,
+            source,
+            action,
+            "succeeded" if success else "failed",
+            message,
+            result,
+            started_at,
+        )
+        return self._control_response(success, message, result)
+
+    def _execute_control_action(self, action, payload):
+        if action == "manual_mode":
+            success, message = self._set_manual_mode(bool(payload.get("enabled", False)))
+            return success, message, self._manual_status_payload()
+
+        if action == "manual_step":
+            if not self.manual_mode_enabled:
+                return False, "Manual mode is not enabled", self._manual_status_payload()
+            if self._automation_is_active() or self._spectrometer_is_active():
+                return False, "Manual command rejected by active automation or spectrometer", self._manual_status_payload()
+            step, error = self._build_manual_step(payload)
+            if error:
+                return False, error, {}
+            command = self.command_generator.generate_command(step, mode="manual")
+            if not command:
+                return False, "Manual command did not generate a serial command", {"step": step}
+            success = self.send_command(command)
+            return success, "Manual pump command sent" if success else "Manual pump command send failed", {
+                "command": command.strip(),
+                "step": step,
+            }
+
+        if action == "manual_stop_all":
+            success = self.stop_all_pumps()
+            return success, "All pumps stopped" if success else "Stop all pumps failed", {}
+
+        if action == "injection_on":
+            speed = payload.get("speed")
+            if speed is not None:
+                success = self._send_injection_pump_command(speed=speed)
+            else:
+                response = self._injection_on_callback(None)
+                success = response.success
+            return success, "Injection pump on" if success else "Injection pump on failed", self._injection_status_result()
+
+        if action == "injection_off":
+            success = self._send_injection_pump_command(enabled=False)
+            return success, "Injection pump off" if success else "Injection pump off failed", self._injection_status_result()
+
+        if action == "injection_set_speed":
+            success = self._send_injection_pump_command(speed=payload.get("speed", 0))
+            return success, "Injection pump speed set" if success else "Injection pump speed set failed", self._injection_status_result()
+
+        if action == "injection_status":
+            return True, "Injection pump status", self._injection_status_result()
+
+        if action == "spectrometer_i2c_map":
+            mapping = payload.get("mapping", {})
+            if "angles" in mapping:
+                self.i2c_mapping["angles"] = mapping["angles"]
+            if "spectro_channel" in mapping:
+                self.i2c_mapping["spectro_channel"] = int(mapping["spectro_channel"])
+            success = self._apply_i2c_mapping()
+            return success, "I2C mapping applied" if success else "I2C mapping apply failed", {"mapping": self.i2c_mapping}
+
+        if action == "spectrometer_configure":
+            updated = dict(payload)
+            updated.pop("cmd", None)
+            self.spectro_config.update(updated)
+            self.spectro_reference_voltage = float(self.spectro_config.get('reference_voltage', self.spectro_reference_voltage))
+            self.spectro_baseline_voltage = float(self.spectro_config.get('baseline_voltage', self.spectro_baseline_voltage))
+            success = self._apply_spectro_config()
+            return success, "Spectrometer configured" if success else "Spectrometer config failed", {"spectrometer": self.spectro_config}
+
+        if action == "spectrometer_start":
+            if self.manual_mode_enabled:
+                return False, "Spectrometer start rejected: manual mode is enabled", self._manual_status_payload()
+            success, message = self._spectro_start()
+            return success, message, {}
+
+        if action == "spectrometer_stop":
+            success, message = self._spectro_stop()
+            return success, message, {}
+
+        if action == "spectrometer_baseline":
+            reference_voltage = payload.get("reference_voltage")
+            if reference_voltage is None and self.latest_spectro and self.latest_spectro.get("valid", False):
+                reference_voltage = self.latest_spectro.get("voltage")
+            success, message = self._set_spectro_reference_voltage(reference_voltage)
+            return success, message, {
+                "reference_voltage": self.spectro_reference_voltage,
+                "baseline_voltage": self.spectro_baseline_voltage,
+                "baseline_set": success,
+            }
+
+        return False, "Unknown control action: %s" % action, {}
+
+    def _injection_status_result(self):
+        return {
+            "enabled": self.inject_pump_enabled,
+            "speed": self.inject_pump_speed,
+            "last_response": self.inject_pump_last_response,
+            "last_error": self.inject_pump_last_error,
+        }
+
     def _cmd_callback(self, msg):
         """直接指令回调。"""
         cmd = msg.data.strip()
@@ -1462,6 +1704,9 @@ class PumpControlNode(object):
             rospy.logwarn("Unknown spectrometer command: %s", cmd)
 
     def _spectro_start_callback(self, req):
+        rejected = self._reject_if_manual_mode("Spectrometer start")
+        if rejected:
+            return rejected
         success, message = self._spectro_start()
         return TriggerResponse(success=success, message=message)
 
@@ -1522,6 +1767,9 @@ class PumpControlNode(object):
 
     def _auto_start_callback(self, req):
         """启动自动化服务回调。"""
+        rejected = self._reject_if_manual_mode("Automation start")
+        if rejected:
+            return rejected
         step_count = len(self.automation_engine.steps)
         if self.automation_engine.is_running():
             rospy.logwarn("Automation start rejected: already running")

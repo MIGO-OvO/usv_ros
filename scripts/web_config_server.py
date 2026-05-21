@@ -45,6 +45,10 @@ try:
     import rospy
     from std_msgs.msg import String
     from std_srvs.srv import Trigger
+    try:
+        from usv_ros.srv import ControlCommand
+    except ImportError:
+        ControlCommand = object
     ROS_AVAILABLE = True
 except ImportError:
     ROS_AVAILABLE = False
@@ -77,6 +81,9 @@ except ImportError:
         def __init__(self): self.data = ""
 
     class Trigger:
+        pass
+
+    class ControlCommand:
         pass
 
 # 确保脚本目录在路径中
@@ -535,6 +542,13 @@ class WebConfigServer(object):
             "last_response": "",
             "last_error": "",
         }
+        self.manual_status = {
+            "enabled": False,
+            "automation_active": False,
+            "spectrometer_active": False,
+        }
+        self.control_events = []
+        self.control_events_max = 100
         self.voltage_history = []  # List of {timestamp, voltage, absorbance, raw}
 
         # ROS 订阅 (仅在非独立模式)
@@ -546,6 +560,8 @@ class WebConfigServer(object):
             self.spectro_status_sub = rospy.Subscriber('/usv/spectrometer_status', String, self._spectro_status_cb)
             self.mission_sub = rospy.Subscriber('/usv/mission_status', String, self._mission_status_cb)
             self.pid_error_sub = rospy.Subscriber('/usv/pump_pid_error', String, self._pid_error_cb)
+            self.control_events_sub = rospy.Subscriber('/usv/control_events', String, self._control_event_cb)
+            self.manual_status_sub = rospy.Subscriber('/usv/manual_status', String, self._manual_status_cb)
             self.steps_pub = rospy.Publisher('/usv/automation_steps', String, queue_size=1)
             self.command_pub = rospy.Publisher('/usv/pump_command', String, queue_size=10)
             self.spectro_cmd_pub = rospy.Publisher('/usv/spectrometer_command', String, queue_size=10)
@@ -557,6 +573,8 @@ class WebConfigServer(object):
             self.spectro_status_sub = None
             self.mission_sub = None
             self.pid_error_sub = None
+            self.control_events_sub = None
+            self.manual_status_sub = None
             self.steps_pub = None
             self.command_pub = None
             self.spectro_cmd_pub = None
@@ -729,6 +747,30 @@ class WebConfigServer(object):
             except Exception:
                 pass
 
+    def _control_event_cb(self, msg):
+        try:
+            event = json.loads(msg.data)
+            self.control_events.append(event)
+            if len(self.control_events) > self.control_events_max:
+                self.control_events = self.control_events[-self.control_events_max:]
+            if self.socketio:
+                self.socketio.emit('control_event', event)
+        except Exception as e:
+            rospy.logerr("Error parsing control event: %s", str(e))
+
+    def _manual_status_cb(self, msg):
+        try:
+            data = json.loads(msg.data)
+            self.manual_status = {
+                "enabled": bool(data.get("enabled", False)),
+                "automation_active": bool(data.get("automation_active", False)),
+                "spectrometer_active": bool(data.get("spectrometer_active", False)),
+            }
+            if self.socketio:
+                self.socketio.emit('manual_status', self.manual_status)
+        except Exception as e:
+            rospy.logerr("Error parsing manual status: %s", str(e))
+
     def _add_log(self, message, level='info'):
         """添加日志并推送到 WebSocket"""
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -815,17 +857,37 @@ class WebConfigServer(object):
                 return folder
         return candidates[-1]
 
-    def _publish_spectrometer_command(self, payload):
-        """Publish a JSON command to pump_control_node's runtime spectrometer channel."""
-        if not getattr(self, 'spectro_cmd_pub', None):
-            return False, "spectrometer command publisher not initialized"
+    def _call_control_command(self, action, payload=None, source="web"):
+        payload = payload or {}
         try:
-            msg = String()
-            msg.data = json.dumps(payload)
-            self.spectro_cmd_pub.publish(msg)
-            return True, "published"
+            rospy.wait_for_service('/usv/control_command', timeout=2.0)
+            service = rospy.ServiceProxy('/usv/control_command', ControlCommand)
+            command_id = "%s-%d" % (action, int(time.time() * 1000))
+            resp = service(command_id, source, action, json.dumps(payload))
+            result = {}
+            try:
+                result = json.loads(getattr(resp, "result_json", "") or "{}")
+            except Exception:
+                result = {}
+            return bool(resp.success), str(resp.message), result
         except Exception as e:
-            return False, str(e)
+            return False, str(e), {}
+
+    def _publish_spectrometer_command(self, payload):
+        """Send a spectrometer runtime command through the synchronous control transaction service."""
+        action_map = {
+            "set_i2c_map": "spectrometer_i2c_map",
+            "configure": "spectrometer_configure",
+            "start": "spectrometer_start",
+            "stop": "spectrometer_stop",
+            "set_baseline": "spectrometer_baseline",
+        }
+        cmd = str((payload or {}).get("cmd", "")).strip().lower()
+        action = action_map.get(cmd)
+        if not action:
+            return False, "unsupported spectrometer command: %s" % cmd
+        ok, message, _ = self._call_control_command(action, payload)
+        return ok, message
 
 
     @staticmethod
@@ -1509,6 +1571,49 @@ class WebConfigServer(object):
             self.voltage_history = []
             return jsonify({"success": True, "message": "历史数据已清除"})
 
+        @self.app.route('/api/control/events', methods=['GET'])
+        def get_control_events():
+            limit = min(max(int(request.args.get('limit', 20)), 1), self.control_events_max)
+            return jsonify({"success": True, "data": self.control_events[-limit:]})
+
+        @self.app.route('/api/manual/status', methods=['GET'])
+        def get_manual_status():
+            return jsonify({
+                "success": True,
+                "data": self.manual_status,
+                "events": self.control_events[-20:],
+            })
+
+        @self.app.route('/api/manual/mode', methods=['POST'])
+        def set_manual_mode():
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "request body must be a JSON object"}), 400
+            if self.standalone:
+                self.manual_status["enabled"] = bool(data.get("enabled", False))
+                return jsonify({"success": True, "message": "standalone manual mode", "data": self.manual_status})
+            ok, message, result = self._call_control_command("manual_mode", {"enabled": bool(data.get("enabled", False))})
+            if result:
+                self.manual_status.update(result)
+            return jsonify({"success": ok, "message": message, "data": self.manual_status}), (200 if ok else 409)
+
+        @self.app.route('/api/manual/pump-step', methods=['POST'])
+        def manual_pump_step():
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "request body must be a JSON object"}), 400
+            if self.standalone:
+                return jsonify({"success": True, "message": "standalone manual pump step", "data": data})
+            ok, message, result = self._call_control_command("manual_step", data)
+            return jsonify({"success": ok, "message": message, "data": result}), (200 if ok else 409)
+
+        @self.app.route('/api/manual/stop-all', methods=['POST'])
+        def manual_stop_all():
+            if self.standalone:
+                return jsonify({"success": True, "message": "standalone stop all"})
+            ok, message, result = self._call_control_command("manual_stop_all", {})
+            return jsonify({"success": ok, "message": message, "data": result}), (200 if ok else 500)
+
         @self.app.route('/api/spectrometer/start', methods=['POST'])
         def start_spectrometer():
             if self.standalone:
@@ -1726,6 +1831,15 @@ class WebConfigServer(object):
                 return jsonify({"success": True, "data": self.injection_pump_status, "message": "模拟模式"})
 
             try:
+                ok, message, result = self._call_control_command("injection_status", {})
+                if ok:
+                    self.injection_pump_status.update({
+                        "enabled": bool(result.get("enabled", False)),
+                        "speed": int(result.get("speed", 0)),
+                        "last_response": result.get("last_response", ""),
+                        "last_error": result.get("last_error", ""),
+                    })
+                return jsonify({"success": ok, "data": self.injection_pump_status, "message": message})
                 service = rospy.ServiceProxy('/usv/injection_pump_get_status', Trigger)
                 resp = service()
                 if resp.success:
@@ -1762,6 +1876,10 @@ class WebConfigServer(object):
                 return jsonify({"success": True, "data": self.injection_pump_status, "message": "模拟模式已开启"})
 
             try:
+                ok, message, result = self._call_control_command("injection_on", {"speed": speed})
+                if result:
+                    self.injection_pump_status.update(result)
+                return jsonify({"success": ok, "data": self.injection_pump_status, "message": message}), (200 if ok else 400)
                 if speed > 0:
                     command = f'PUMP:SET:{speed}'
                     if not self.command_pub:
@@ -1789,6 +1907,10 @@ class WebConfigServer(object):
                 return jsonify({"success": True, "data": self.injection_pump_status, "message": "模拟模式已关闭"})
 
             try:
+                ok, message, result = self._call_control_command("injection_off", {})
+                if result:
+                    self.injection_pump_status.update(result)
+                return jsonify({"success": ok, "data": self.injection_pump_status, "message": message})
                 service = rospy.ServiceProxy('/usv/injection_pump_off', Trigger)
                 resp = service()
                 return jsonify({"success": resp.success, "data": self.injection_pump_status, "message": resp.message})
@@ -1809,6 +1931,11 @@ class WebConfigServer(object):
                 self.injection_pump_status["last_response"] = command
                 self.injection_pump_status["last_error"] = ""
                 return jsonify({"success": True, "data": self.injection_pump_status, "message": "模拟模式已设置"})
+
+            ok, message, result = self._call_control_command("injection_set_speed", {"speed": speed})
+            if result:
+                self.injection_pump_status.update(result)
+            return jsonify({"success": ok, "data": self.injection_pump_status, "message": message}), (200 if ok else 500)
 
             if self.command_pub:
                 msg = String()
@@ -2144,6 +2271,7 @@ class WebConfigServer(object):
                     "spectrometer_status": self.spectrometer_status,
                 })
                 self.socketio.emit('angles', self.current_angles)
+                self.socketio.emit('manual_status', self.manual_status)
 
             if self.standalone:
                 # 独立模式模拟数据变化 (测试用)

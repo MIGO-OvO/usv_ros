@@ -5,6 +5,7 @@ import { MobileNav } from '@/components/layout/MobileNav'
 import Monitor from '@/pages/Monitor'
 import Automation from '@/pages/Automation'
 import Data from '@/pages/Data'
+import Manual from '@/pages/Manual'
 import Settings from '@/pages/Settings'
 import { useAppStore } from '@/store'
 import { Toaster } from '@/components/ui/toaster'
@@ -29,6 +30,7 @@ function App() {
              <Routes>
                <Route path="/" element={<Monitor />} />
                <Route path="/automation" element={<Automation />} />
+               <Route path="/manual" element={<Manual />} />
                <Route path="/data" element={<Data />} />
                <Route path="/settings" element={<Settings />} />
              </Routes>
