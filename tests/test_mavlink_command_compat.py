@@ -276,16 +276,25 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
             ],
         )
 
-    def test_trigger_node_spectrometer_start_and_stop_publish_async_commands(self):
-        module = _load_script("mavlink_trigger_node_spectro_async_test", "scripts/mavlink_trigger_node.py")
+    def test_trigger_node_spectrometer_start_and_stop_call_pump_services(self):
+        module = _load_script("mavlink_trigger_node_spectro_services_test", "scripts/mavlink_trigger_node.py")
         node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        calls = []
         node.spectrometer_command_pub = RecordingPublisher()
+        node._call_spectrometer_service = lambda action: calls.append(action) or True
 
         self.assertTrue(node.handle_mavlink_command(31018, 0.0, 0.0))
         self.assertTrue(node.handle_mavlink_command(31019, 0.0, 0.0))
 
-        payloads = [json.loads(msg.data) for msg in node.spectrometer_command_pub.messages]
-        self.assertEqual(payloads, [{"cmd": "start"}, {"cmd": "stop"}])
+        self.assertEqual(calls, ["start", "stop"])
+        self.assertEqual(node.spectrometer_command_pub.messages, [])
+
+    def test_trigger_node_spectrometer_service_failure_rejects_command(self):
+        module = _load_script("mavlink_trigger_node_spectro_service_failure_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node._call_spectrometer_service = lambda action: False
+
+        self.assertFalse(node.handle_mavlink_command(31018, 0.0, 0.0))
 
     def test_manual_sample_start_rejection_does_not_publish_failed_mission_state(self):
         module = _load_script("mavlink_trigger_node_manual_reject_test", "scripts/mavlink_trigger_node.py")

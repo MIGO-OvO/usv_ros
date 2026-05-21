@@ -115,6 +115,7 @@ class MAVLinkTriggerNode(object):
         self.default_retry_count = int(rospy.get_param('~sampling_retry_count', 0))
         self.default_on_fail = str(rospy.get_param('~sampling_on_fail', 'HOLD')).strip().upper()
         self.auto_trigger_on_waypoint = bool(rospy.get_param('~auto_trigger_on_waypoint', False))
+        self.spectrometer_service_timeout = float(rospy.get_param('~spectrometer_service_timeout', 3.0))
 
         # 状态
         self.mavros_state = State()
@@ -735,11 +736,33 @@ class MAVLinkTriggerNode(object):
         elif cmd_id == CMD_SET_BASELINE:
             return self._set_spectrometer_baseline(param1)
         elif cmd_id == CMD_SPECTROMETER_START:
-            return self._publish_spectrometer_command('start')
+            return self._call_spectrometer_service('start')
         elif cmd_id == CMD_SPECTROMETER_STOP:
-            return self._publish_spectrometer_command('stop')
+            return self._call_spectrometer_service('stop')
         else:
             rospy.logwarn("Unknown command: %d", cmd_id)
+            return False
+
+    def _call_spectrometer_service(self, action):
+        service_map = {
+            'start': '/usv/spectrometer_start',
+            'stop': '/usv/spectrometer_stop',
+        }
+        service_name = service_map.get(action)
+        if not service_name:
+            return False
+
+        try:
+            rospy.wait_for_service(service_name, timeout=self.spectrometer_service_timeout)
+            service = rospy.ServiceProxy(service_name, Trigger)
+            resp = service()
+            if resp.success:
+                rospy.loginfo("Spectrometer %s: %s", action, resp.message)
+            else:
+                rospy.logwarn("Spectrometer %s rejected: %s", action, resp.message)
+            return bool(resp.success)
+        except Exception as e:
+            rospy.logerr("Spectrometer %s service error: %s", action, str(e))
             return False
 
     def _publish_spectrometer_command(self, command):
