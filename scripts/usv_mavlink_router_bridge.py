@@ -23,6 +23,7 @@ COMP_ID = 191   # MAV_COMP_ID_ONBOARD_COMPUTER, matches QGC USVPayloadPanel targ
 ROUTER_URL = "tcp:127.0.0.1:5760"
 WAIT_HEARTBEAT_TIMEOUT = 10.0
 MAX_PENDING_SENDS = 50
+RECONNECT_BACKOFF_SEC = 2.0
 
 # USV 自定义命令范围
 CMD_START_SAMPLING = 31010
@@ -63,6 +64,7 @@ class USVMavlinkRouterBridge(object):
         self._pid_mode = 0.0
         self._boot_time = time.time()
         self._last_heartbeat = 0.0
+        self._last_reconnect_attempt = 0.0
         self._diag_last_report = time.time()
         self._diag_pub = rospy.Publisher("/usv/bridge_diagnostics", String, queue_size=5)
         self._diag_tx_total = 0        # 总发送包数
@@ -89,6 +91,10 @@ class USVMavlinkRouterBridge(object):
         rospy.Subscriber("/usv/pump_pid_error", String, self._pid_error_cb)
         rospy.Subscriber("/mavros/state", State, self._mavros_state_cb, queue_size=5)
         rospy.loginfo("USV Router Bridge: sysid=%d compid=%d router=%s", self._sys_id, self._comp_id, self._router_url)
+        self._conn = None
+        self._connect_router(wait_heartbeat=True)
+
+    def _connect_router(self, wait_heartbeat=False):
         self._conn = mavutil.mavlink_connection(
             self._router_url,
             source_system=self._sys_id,
@@ -96,7 +102,9 @@ class USVMavlinkRouterBridge(object):
             autoreconnect=True,
             force_connected=True,
         )
-        self._wait_router_heartbeat()
+        if wait_heartbeat:
+            self._wait_router_heartbeat()
+        return True
 
     def _wait_router_heartbeat(self):
         hb = self._conn.wait_heartbeat(timeout=self._wait_heartbeat_timeout)
@@ -104,6 +112,47 @@ class USVMavlinkRouterBridge(object):
             rospy.logwarn("Router bridge: no FCU heartbeat within %.1fs, continue anyway", self._wait_heartbeat_timeout)
         else:
             rospy.loginfo("Router bridge: FCU heartbeat detected sys=%s comp=%s", self._conn.target_system, self._conn.target_component)
+
+    def _record_send_error(self):
+        with self._lock:
+            self._diag_pub_errors += 1
+
+    def _reconnect_router(self):
+        now = time.time()
+        if now - self._last_reconnect_attempt < RECONNECT_BACKOFF_SEC:
+            return False
+        self._last_reconnect_attempt = now
+        rospy.logwarn("Router bridge: reconnecting MAVLink router endpoint %s", self._router_url)
+        try:
+            old_conn = self._conn
+            if old_conn is not None and hasattr(old_conn, "close"):
+                try:
+                    old_conn.close()
+                except Exception:
+                    pass
+            return self._connect_router(wait_heartbeat=False)
+        except Exception as exc:
+            rospy.logwarn("Router bridge: reconnect failed: %s", str(exc))
+            return False
+
+    def _mav_send_with_retry(self, send_fn, label):
+        try:
+            send_fn()
+            return True
+        except Exception as exc:
+            self._record_send_error()
+            rospy.logwarn("Failed to send %s: %s", label, str(exc))
+
+        if not self._reconnect_router():
+            return False
+
+        try:
+            send_fn()
+            return True
+        except Exception as exc:
+            self._record_send_error()
+            rospy.logwarn("Failed to send %s after reconnect: %s", label, str(exc))
+            return False
 
     def _voltage_cb(self, msg):
         try:
@@ -246,46 +295,42 @@ class USVMavlinkRouterBridge(object):
             rospy.logwarn("Failed to queue COMMAND_ACK: %s", str(exc))
 
     def _send_statustext(self, text, severity):
-        try:
-            self._conn.mav.statustext_send(severity, text.encode('utf-8'))
+        if self._mav_send_with_retry(
+            lambda: self._conn.mav.statustext_send(severity, text.encode('utf-8')),
+            "STATUSTEXT",
+        ):
             with self._lock:
                 self._diag_tx_total += 1
-        except Exception as exc:
-            with self._lock:
-                self._diag_pub_errors += 1
-            rospy.logwarn("Failed to send STATUSTEXT: %s", str(exc))
 
     def _send_command_ack(self, command, result, target_sys, target_comp):
-        try:
-            self._conn.mav.command_ack_send(
+        sent = self._mav_send_with_retry(
+            lambda: self._conn.mav.command_ack_send(
                 int(command),
                 int(result),
                 0xFF,
                 0,
                 int(target_sys),
                 int(target_comp)
-            )
+            ),
+            "COMMAND_ACK",
+        )
+        if sent:
             with self._lock:
                 self._diag_tx_total += 1
             return True
-        except Exception as exc:
-            with self._lock:
-                self._diag_pub_errors += 1
-            rospy.logwarn("Failed to send COMMAND_ACK: %s", str(exc))
-            return False
+        return False
 
     def _send_usv_done(self, sample_id):
-        try:
-            t = int((time.time() - self._boot_time) * 1000) & 0xFFFFFFFF
-            self._conn.mav.named_value_float_send(t, b"USV_DONE\x00\x00", float(sample_id))
+        t = int((time.time() - self._boot_time) * 1000) & 0xFFFFFFFF
+        sent = self._mav_send_with_retry(
+            lambda: self._conn.mav.named_value_float_send(t, b"USV_DONE\x00\x00", float(sample_id)),
+            "USV_DONE",
+        )
+        if sent:
             with self._lock:
                 self._diag_tx_total += 1
                 self._diag_tx_named += 1
             rospy.loginfo("Sent USV_DONE id=%d to FCU", sample_id)
-        except Exception as exc:
-            with self._lock:
-                self._diag_pub_errors += 1
-            rospy.logwarn("Failed to send USV_DONE: %s", str(exc))
 
     def _receive_mavlink_messages(self):
         """接收 QGC 发来的 COMMAND_LONG，并兼容转发到旧内部总线。"""
@@ -409,44 +454,52 @@ class USVMavlinkRouterBridge(object):
             pass
 
     def _send_heartbeat(self):
-        try:
-            self._conn.mav.heartbeat_send(mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER, mavutil.mavlink.MAV_AUTOPILOT_INVALID, 0, 0, mavutil.mavlink.MAV_STATE_ACTIVE)
+        sent = self._mav_send_with_retry(
+            lambda: self._conn.mav.heartbeat_send(
+                mavutil.mavlink.MAV_TYPE_ONBOARD_CONTROLLER,
+                mavutil.mavlink.MAV_AUTOPILOT_INVALID,
+                0,
+                0,
+                mavutil.mavlink.MAV_STATE_ACTIVE,
+            ),
+            "HEARTBEAT",
+        )
+        if sent:
             with self._lock:
                 self._diag_tx_total += 1
                 self._diag_tx_heartbeat += 1
-        except Exception as exc:
-            with self._lock:
-                self._diag_pub_errors += 1
-            rospy.logwarn("Failed to send HEARTBEAT: %s", str(exc))
 
     def _send_payload(self, voltage, absorbance, angles, status, automation_step, automation_total, sample_count, pid_error, pid_mode, baseline_set, reference_voltage, baseline_voltage, spectrometer_valid):
         t = int((time.time() - self._boot_time) * 1000) & 0xFFFFFFFF
-        try:
-            self._conn.mav.named_value_float_send(t, b"USV_VOLT\x00\x00", voltage)
-            self._conn.mav.named_value_float_send(t, b"USV_ABS\x00\x00\x00", absorbance)
-            self._conn.mav.named_value_float_send(t, b"PUMP_X\x00\x00\x00\x00", angles["X"])
-            self._conn.mav.named_value_float_send(t, b"PUMP_Y\x00\x00\x00\x00", angles["Y"])
-            self._conn.mav.named_value_float_send(t, b"PUMP_Z\x00\x00\x00\x00", angles["Z"])
-            self._conn.mav.named_value_float_send(t, b"PUMP_A\x00\x00\x00\x00", angles["A"])
-            self._conn.mav.named_value_float_send(t, b"USV_STAT\x00\x00", float(status))
-            self._conn.mav.named_value_float_send(t, b"USV_PKT\x00\x00\x00", float(self._pkt_count))
-            self._conn.mav.named_value_float_send(t, b"USV_STEP\x00\x00", automation_step)
-            self._conn.mav.named_value_float_send(t, b"USV_STOT\x00\x00", automation_total)
-            self._conn.mav.named_value_float_send(t, b"USV_SCNT\x00\x00", sample_count)
-            self._conn.mav.named_value_float_send(t, b"USV_PERR\x00\x00", pid_error)
-            self._conn.mav.named_value_float_send(t, b"USV_PMOD\x00\x00", pid_mode)
-            self._conn.mav.named_value_float_send(t, b"USV_BSET\x00\x00", baseline_set)
-            self._conn.mav.named_value_float_send(t, b"USV_REF\x00\x00\x00", reference_voltage)
-            self._conn.mav.named_value_float_send(t, b"USV_BASE\x00\x00", baseline_voltage)
-            self._conn.mav.named_value_float_send(t, b"USV_VLD\x00\x00\x00", spectrometer_valid)
+        fields = (
+            (b"USV_VOLT\x00\x00", voltage),
+            (b"USV_ABS\x00\x00\x00", absorbance),
+            (b"PUMP_X\x00\x00\x00\x00", angles["X"]),
+            (b"PUMP_Y\x00\x00\x00\x00", angles["Y"]),
+            (b"PUMP_Z\x00\x00\x00\x00", angles["Z"]),
+            (b"PUMP_A\x00\x00\x00\x00", angles["A"]),
+            (b"USV_STAT\x00\x00", float(status)),
+            (b"USV_PKT\x00\x00\x00", float(self._pkt_count)),
+            (b"USV_STEP\x00\x00", automation_step),
+            (b"USV_STOT\x00\x00", automation_total),
+            (b"USV_SCNT\x00\x00", sample_count),
+            (b"USV_PERR\x00\x00", pid_error),
+            (b"USV_PMOD\x00\x00", pid_mode),
+            (b"USV_BSET\x00\x00", baseline_set),
+            (b"USV_REF\x00\x00\x00", reference_voltage),
+            (b"USV_BASE\x00\x00", baseline_voltage),
+            (b"USV_VLD\x00\x00\x00", spectrometer_valid),
+        )
+
+        def send_batch():
+            for name, value in fields:
+                self._conn.mav.named_value_float_send(t, name, value)
+
+        if self._mav_send_with_retry(send_batch, "payload telemetry"):
             self._pkt_count = (self._pkt_count + 1) % 65536
             with self._lock:
                 self._diag_tx_total += 17
                 self._diag_tx_named += 17
-        except Exception as exc:
-            with self._lock:
-                self._diag_pub_errors += 1
-            rospy.logwarn("Failed to send payload: %s", str(exc))
 
     def run(self):
         rate = rospy.Rate(TELEMETRY_RATE_HZ)
