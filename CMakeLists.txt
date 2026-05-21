@@ -8,6 +8,17 @@ find_package(catkin REQUIRED COMPONENTS
   std_srvs
   geometry_msgs
   mavros_msgs
+  message_generation
+)
+
+add_service_files(
+  FILES
+  ControlCommand.srv
+)
+
+generate_messages(
+  DEPENDENCIES
+  std_msgs
 )
 
 ###################################
@@ -20,6 +31,7 @@ catkin_package(
     std_srvs
     geometry_msgs
     mavros_msgs
+    message_runtime
 )
 
 #############

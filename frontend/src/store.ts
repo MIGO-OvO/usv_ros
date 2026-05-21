@@ -83,6 +83,23 @@ interface RadioStatus {
   txbuf: number
 }
 
+interface ManualStatus {
+  enabled: boolean
+  automation_active: boolean
+  spectrometer_active: boolean
+}
+
+interface ControlEvent {
+  command_id: string
+  source: string
+  action: string
+  state: string
+  message: string
+  timestamp: number
+  elapsed_ms?: number
+  result?: Record<string, unknown>
+}
+
 interface StatusPayload {
   pump_connected?: boolean
   automation_running?: boolean
@@ -153,6 +170,8 @@ interface AppState {
   mavrosState: MavrosState
   bridgeDiag: BridgeDiag | null
   radioStatus: RadioStatus | null
+  manualStatus: ManualStatus
+  controlEvents: ControlEvent[]
 
   connect: () => void
   disconnect: () => void
@@ -160,6 +179,16 @@ interface AppState {
   setInjectionPumpSpeed: (speed: number) => Promise<{ success: boolean; message: string }>
   turnInjectionPumpOn: (speed?: number) => Promise<{ success: boolean; message: string }>
   turnInjectionPumpOff: () => Promise<{ success: boolean; message: string }>
+  refreshManualStatus: () => Promise<void>
+  setManualMode: (enabled: boolean) => Promise<{ success: boolean; message: string }>
+  sendManualPumpStep: (payload: {
+    axis: string
+    direction: string
+    speed_rpm: number
+    angle_deg: number
+    continuous: boolean
+  }) => Promise<{ success: boolean; message: string }>
+  stopManualPumps: () => Promise<{ success: boolean; message: string }>
 }
 
 const DEFAULT_INJECTION_PUMP_STATUS: InjectionPumpStatus = {
@@ -167,6 +196,12 @@ const DEFAULT_INJECTION_PUMP_STATUS: InjectionPumpStatus = {
   speed: 0,
   last_response: '',
   last_error: '',
+}
+
+const DEFAULT_MANUAL_STATUS: ManualStatus = {
+  enabled: false,
+  automation_active: false,
+  spectrometer_active: false,
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
@@ -190,6 +225,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   mavrosState: { connected: false, armed: false, mode: '' },
   bridgeDiag: null,
   radioStatus: null,
+  manualStatus: DEFAULT_MANUAL_STATUS,
+  controlEvents: [],
 
   connect: () => {
     if (get().socket) return
@@ -307,6 +344,14 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({ radioStatus: data })
     })
 
+    socket.on('manual_status', (data: ManualStatus) => {
+      set({ manualStatus: { ...DEFAULT_MANUAL_STATUS, ...data } })
+    })
+
+    socket.on('control_event', (data: ControlEvent) => {
+      set((state) => ({ controlEvents: [...state.controlEvents.slice(-49), data] }))
+    })
+
     set({ socket })
   },
 
@@ -359,6 +404,46 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (json.success && json.data) {
       set({ injectionPump: { ...DEFAULT_INJECTION_PUMP_STATUS, ...json.data } })
     }
+    return { success: !!json.success, message: json.message || '' }
+  },
+
+  refreshManualStatus: async () => {
+    const res = await fetch('/api/manual/status')
+    const json = await res.json()
+    if (json.success && json.data) {
+      set({
+        manualStatus: { ...DEFAULT_MANUAL_STATUS, ...json.data },
+        controlEvents: Array.isArray(json.events) ? json.events : get().controlEvents,
+      })
+    }
+  },
+
+  setManualMode: async (enabled: boolean) => {
+    const res = await fetch('/api/manual/mode', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled }),
+    })
+    const json = await res.json()
+    if (json.data) {
+      set({ manualStatus: { ...DEFAULT_MANUAL_STATUS, ...json.data } })
+    }
+    return { success: !!json.success, message: json.message || '' }
+  },
+
+  sendManualPumpStep: async (payload) => {
+    const res = await fetch('/api/manual/pump-step', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    })
+    const json = await res.json()
+    return { success: !!json.success, message: json.message || '' }
+  },
+
+  stopManualPumps: async () => {
+    const res = await fetch('/api/manual/stop-all', { method: 'POST' })
+    const json = await res.json()
     return { success: !!json.success, message: json.message || '' }
   },
 }))

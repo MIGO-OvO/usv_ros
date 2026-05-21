@@ -179,10 +179,14 @@ class FakeConnection:
 class RecordingMav:
     def __init__(self):
         self.named_values = []
+        self.command_acks = []
 
     def named_value_float_send(self, timestamp, name, value):
         clean_name = name.decode("ascii").rstrip("\x00")
         self.named_values.append((clean_name, value))
+
+    def command_ack_send(self, command, result, progress, result_param2, target_sys, target_comp):
+        self.command_acks.append((command, result, progress, result_param2, target_sys, target_comp))
 
 
 class MavlinkCommandCompatibilityTests(unittest.TestCase):
@@ -215,6 +219,24 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
             bridge._cmd_rx_pub.messages[0].data,
             [31010.0, 1.5, 2.5, 1.0, 191.0, 255.0, 190.0],
         )
+
+    def test_router_bridge_sends_command_ack_immediately_on_ack_request(self):
+        module = _load_script("usv_mavlink_router_bridge_ack_fast_path_test", "scripts/usv_mavlink_router_bridge.py")
+        bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
+        bridge._lock = threading.Lock()
+        bridge._diag_tx_total = 0
+        bridge._diag_pub_errors = 0
+        bridge._pending_acks = []
+        mav = RecordingMav()
+        bridge._conn = types.SimpleNamespace(mav=mav)
+
+        msg = sys.modules["std_msgs.msg"].Float32MultiArray()
+        msg.data = [31018.0, 0.0, 255.0, 190.0]
+
+        bridge._cmd_ack_cb(msg)
+
+        self.assertEqual(mav.command_acks, [(31018, 0, 0xFF, 0, 255, 190)])
+        self.assertEqual(bridge._pending_acks, [])
 
     def test_trigger_node_accepts_forwarded_internal_command_bus(self):
         module = _load_script("mavlink_trigger_node_test", "scripts/mavlink_trigger_node.py")

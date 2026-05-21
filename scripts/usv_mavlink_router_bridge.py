@@ -238,13 +238,10 @@ class USVMavlinkRouterBridge(object):
     def _cmd_ack_cb(self, msg):
         try:
             command, result, target_sys, target_comp = msg.data
-            with self._lock:
-                self._pending_acks.append((
-                    int(command),
-                    int(result),
-                    int(target_sys),
-                    int(target_comp),
-                ))
+            ack = (int(command), int(result), int(target_sys), int(target_comp))
+            if not self._send_command_ack(*ack):
+                with self._lock:
+                    self._pending_acks.append(ack)
         except Exception as exc:
             rospy.logwarn("Failed to queue COMMAND_ACK: %s", str(exc))
 
@@ -270,10 +267,12 @@ class USVMavlinkRouterBridge(object):
             )
             with self._lock:
                 self._diag_tx_total += 1
+            return True
         except Exception as exc:
             with self._lock:
                 self._diag_pub_errors += 1
             rospy.logwarn("Failed to send COMMAND_ACK: %s", str(exc))
+            return False
 
     def _send_usv_done(self, sample_id):
         try:
