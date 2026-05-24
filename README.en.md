@@ -347,6 +347,14 @@ cd ~/usv_ws
 sudo HOTSPOT_IFACE=wlan1 ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
 ```
 
+By default, the installer writes and enables `usv-boot.service` only. It does not start the full ROS/hotspot chain during installation, which avoids install-time failures when field hardware or networking is not ready yet.
+To start and verify the service immediately after installation:
+
+```bash
+cd ~/usv_ws
+sudo USV_BOOT_START_NOW=true HOTSPOT_IFACE=wlan1 ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
+```
+
 If Web configuration is accessed through SSH, disable the autostart hotspot and keep only ROS/Web autostart:
 
 ```bash
@@ -363,7 +371,7 @@ ssh -N -L 5000:127.0.0.1:5000 jetson@<Jetson_IP>
 Open `http://127.0.0.1:5000` in the browser. If local port 5000 is already in use, use
 `-L 5050:127.0.0.1:5000` and open `http://127.0.0.1:5050`.
 
-Default boot sequence:
+Service startup sequence:
 
 1. Create or restore the hotspot by default; skip it when `USV_ENABLE_HOTSPOT=false`.
 2. Start `start_usv_all.sh` as the user that ran the installer.
@@ -379,10 +387,10 @@ sudo systemctl restart usv-boot.service
 sudo ./src/usv_ros/scripts/uninstall_boot_service.sh
 ```
 
-Temporarily relax strict self-checks during field debugging:
+Temporarily relax strict self-checks when starting the service immediately during field debugging:
 
 ```bash
-sudo USV_STRICT_SELF_CHECK=false ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
+sudo USV_BOOT_START_NOW=true USV_STRICT_SELF_CHECK=false ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
 ```
 
 ## Configuration Model

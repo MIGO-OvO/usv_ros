@@ -17,6 +17,7 @@ HOTSPOT_IP="${HOTSPOT_IP:-10.42.0.1}"
 HOTSPOT_ROUTE_METRIC="${HOTSPOT_ROUTE_METRIC:-900}"
 USV_BOOT_WAIT_SECONDS="${USV_BOOT_WAIT_SECONDS:-90}"
 USV_STRICT_SELF_CHECK="${USV_STRICT_SELF_CHECK:-true}"
+USV_BOOT_START_NOW="${USV_BOOT_START_NOW:-false}"
 
 log() {
     echo "[install-usv-boot] $*"
@@ -77,6 +78,32 @@ WantedBy=multi-user.target
 EOF
 }
 
+enable_service() {
+    systemctl daemon-reload
+    systemctl reset-failed "$SERVICE_NAME" >/dev/null 2>&1 || true
+    systemctl enable "$SERVICE_NAME"
+}
+
+start_service_if_requested() {
+    if [[ "$USV_BOOT_START_NOW" != "true" ]]; then
+        log "installed and enabled: $SERVICE_NAME"
+        log "service start now: skipped (set USV_BOOT_START_NOW=true to start immediately)"
+        return 0
+    fi
+
+    log "start now: $SERVICE_NAME"
+    if systemctl start "$SERVICE_NAME"; then
+        log "started: $SERVICE_NAME"
+        return 0
+    fi
+
+    log "ERROR: service start failed: $SERVICE_NAME"
+    log "status: sudo systemctl status $SERVICE_NAME"
+    log "logs: sudo journalctl -u $SERVICE_NAME -n 120 --no-pager"
+    log "boot check: $WS_DIR/.usv_run/logs/boot_check.log"
+    return 1
+}
+
 main() {
     require_root
 
@@ -103,10 +130,9 @@ main() {
     log "write $SERVICE_PATH"
     write_service
 
-    systemctl daemon-reload
-    systemctl enable --now "$SERVICE_NAME"
+    enable_service
+    start_service_if_requested
 
-    log "installed and started: $SERVICE_NAME"
     log "hotspot enabled: $USV_ENABLE_HOTSPOT"
     log "hotspot iface: $HOTSPOT_IFACE"
     log "hotspot route metric: $HOTSPOT_ROUTE_METRIC"

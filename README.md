@@ -385,6 +385,14 @@ cd ~/usv_ws
 sudo HOTSPOT_IFACE=wlan1 ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
 ```
 
+安装脚本默认只写入并启用 `usv-boot.service`，不会在安装阶段立即启动整套 ROS/热点链路，避免因现场硬件或网络尚未就绪导致安装报错。
+如需安装后立刻启动并验证服务：
+
+```bash
+cd ~/usv_ws
+sudo USV_BOOT_START_NOW=true HOTSPOT_IFACE=wlan1 ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
+```
+
 如果只通过 SSH 访问 Web 配置页，可以关闭自启热点，只保留 ROS/Web 自启：
 
 ```bash
@@ -401,7 +409,7 @@ ssh -N -L 5000:127.0.0.1:5000 jetson@<Jetson_IP>
 浏览器打开 `http://127.0.0.1:5000`。如果本机 5000 被占用，可改成 `-L 5050:127.0.0.1:5000`
 并访问 `http://127.0.0.1:5050`。
 
-默认启动顺序：
+服务启动顺序：
 
 1. 默认创建/恢复热点；`USV_ENABLE_HOTSPOT=false` 时跳过。
 2. 以安装脚本调用者作为运行用户启动 `start_usv_all.sh`。
@@ -417,10 +425,10 @@ sudo systemctl restart usv-boot.service
 sudo ./src/usv_ros/scripts/uninstall_boot_service.sh
 ```
 
-现场调试时可临时放宽严格自检：
+现场调试并立即启动服务时可临时放宽严格自检：
 
 ```bash
-sudo USV_STRICT_SELF_CHECK=false ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
+sudo USV_BOOT_START_NOW=true USV_STRICT_SELF_CHECK=false ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
 ```
 
 ## 配置模型

@@ -28,7 +28,11 @@ class BootServiceScriptTests(unittest.TestCase):
         self.assertIn("USV_HOTSPOT_PASSWORD=", text)
         self.assertIn("USV_ENABLE_HOTSPOT=", text)
         self.assertIn("HOTSPOT_ROUTE_METRIC=", text)
-        self.assertIn("systemctl enable --now", text)
+        self.assertIn('USV_BOOT_START_NOW="${USV_BOOT_START_NOW:-false}"', text)
+        self.assertIn('systemctl enable "$SERVICE_NAME"', text)
+        self.assertIn('systemctl reset-failed "$SERVICE_NAME"', text)
+        self.assertIn('systemctl start "$SERVICE_NAME"', text)
+        self.assertNotIn("systemctl enable --now", text)
 
     def test_boot_start_runs_hotspot_then_ros_then_self_check_log(self):
         text = self._read_script("usv_boot_start.sh")
