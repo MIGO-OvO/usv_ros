@@ -65,7 +65,8 @@ English version: `README.en.md`
 
 ```text
 QGroundControl / 定制 USV 面板
-  |  COMMAND_LONG 31010..31019
+  |  Plan: MAV_CMD_NAV_SCRIPT_TIME(param1=1)
+  |  Manual: COMMAND_LONG 31010..31019
   |  NAMED_VALUE_FLOAT 载荷字段
   v
 数传电台 -> Pixhawk 6C / 定制 ArduRover
@@ -111,6 +112,7 @@ ESP32 检测装置主控
 - 检测装置身份握手：`HELLO?` / `DET?` 必须返回 `DET_ID:USV_DETECTOR*`。
 - Web 端硬件设置热切换：保存串口参数后调用 `/usv/pump_reconnect` 重连泵控节点。
 - 航点采样配置 CRUD、任务配置导入导出、任务数据 JSON 记录和 CSV 下载。
+- Web 数据中心跟随 `sampling_started` 自动建档，跟随 `sampling_stopped` / `survey_stopped` 停止记录。
 - 开机自启脚本：热点、ROS 主系统、router 与自检统一由 `usv-boot.service` 管理。
 
 ## 目录结构
@@ -607,7 +609,7 @@ curl -X POST http://127.0.0.1:5000/api/hardware/apply \
 
 | 命令 | 含义 |
 |---:|---|
-| `31010` | 开始采样。`param2 > 0` 表示飞控原生采样触发，不切 HOLD |
+| `31010` | 手动开始采样，不作为航线 mission item |
 | `31011` | 停止采样 |
 | `31012` | 暂停采样 |
 | `31013` | 恢复采样 |
@@ -618,7 +620,13 @@ curl -X POST http://127.0.0.1:5000/api/hardware/apply \
 | `31018` | 启动分光检测器信号采集 |
 | `31019` | 停止分光检测器信号采集 |
 
-bridge 也兼容飞控以 `NAMED_VALUE_FLOAT` 发出的原生任务触发：
+航线定点采样使用飞控原生 `MAV_CMD_NAV_SCRIPT_TIME`：
+
+- `param1=1`：USV 定点采样。
+- `param2=1..255`：超时保护秒数，QGC 默认 255。
+- `param3..param6=0`：v1 保留。
+
+bridge 兼容飞控以 `NAMED_VALUE_FLOAT` 发出的原生任务触发：
 
 - `USV_SMPL=<sample_id>`：触发一次定点采样，完成后 bridge 发送 `USV_DONE=<sample_id>`。
 - `USV_SURV=1/0`：开启或停止走航采样。

@@ -322,6 +322,7 @@ class MAVLinkTriggerNode(object):
         else:
             self._set_waypoint_state(wp_seq, WaypointSamplingState.FAILED)
             self._set_mission_state(MissionState.FAILED, "{}:{}".format(wp_seq, reason))
+            self._publish_status("sampling_stopped")
             self._handle_failure_action(reason)
 
     def _pump_status_cb(self, msg):
@@ -408,6 +409,7 @@ class MAVLinkTriggerNode(object):
             self._handle_failure_action('automation_start_failed')
             return False
 
+        self._publish_status("sampling_started")
         return True
 
     def _stop_sampling_sequence(self):
@@ -826,6 +828,7 @@ class MAVLinkTriggerNode(object):
                 self._publish_status("manual_start_rejected")
             return False
 
+        self._publish_status("sampling_started")
         rospy.loginfo("Manual sampling started (no HOLD, no stable wait)")
         return True
 
@@ -852,6 +855,7 @@ class MAVLinkTriggerNode(object):
             self._set_mission_state(MissionState.FAILED, "fcu_sample_start_failed")
             return False
 
+        self._publish_status("sampling_started")
         rospy.loginfo("FCU-triggered sampling started (id=%d, no HOLD, no stable wait)", sample_id)
         return True
 
@@ -901,7 +905,16 @@ class MAVLinkTriggerNode(object):
                 with self.state_lock:
                     self.is_sampling = True
                     self._survey_sample_active = True
-                self._call_automation_service('start')
+                if self._call_automation_service('start'):
+                    self._publish_status("sampling_started")
+                else:
+                    with self.state_lock:
+                        self.is_sampling = False
+                        self._survey_sample_active = False
+                        self._survey_active = False
+                    self._set_mission_state(MissionState.FAILED, "survey_sample_start_failed")
+                    self._publish_status("survey_stopped")
+                    break
                 # 等待本次采样完成
                 while self.is_sampling and self._survey_active and not rospy.is_shutdown():
                     rospy.sleep(0.2)
