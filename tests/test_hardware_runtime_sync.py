@@ -67,6 +67,27 @@ class RecordingSocket:
         self.events.append((event, payload))
 
 
+class RecordingDataManager:
+    def __init__(self):
+        self.current_mission_file = None
+        self.started = []
+        self.stopped = 0
+        self.points = []
+
+    def start_mission(self, mission_name=""):
+        self.started.append(mission_name)
+        self.current_mission_file = "mission-test.json"
+        return self.current_mission_file
+
+    def stop_mission(self):
+        self.stopped += 1
+        self.current_mission_file = None
+
+    def add_data_point(self, voltage, absorbance=0.0):
+        if self.current_mission_file:
+            self.points.append((voltage, absorbance))
+
+
 def _install_fake_ros_modules():
     publishers = {}
 
@@ -231,6 +252,57 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(control_calls[-1]["action"], "spectrometer_stop")
         self.assertEqual(json.loads(control_calls[-1]["payload_json"]), {"cmd": "stop"})
         self.assertEqual(publishers["/usv/spectrometer_command"].messages, [])
+
+    def test_web_trigger_status_starts_and_stops_data_recording_once(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_trigger_status_recording_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            server.data_manager = RecordingDataManager()
+
+            server._trigger_status_cb(string_cls("sampling_started"))
+            server._trigger_status_cb(string_cls("sampling_started"))
+            server._trigger_status_cb(string_cls("sampling_stopped"))
+
+        self.assertEqual(len(server.data_manager.started), 1)
+        self.assertEqual(server.data_manager.stopped, 1)
+
+    def test_web_structured_automation_status_controls_voltage_recording(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_automation_status_recording_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            server.socketio = RecordingSocket()
+            server.data_manager = RecordingDataManager()
+            server.data_manager.start_mission("")
+
+            server._automation_status_cb(string_cls(json.dumps({"running": True})))
+            server._voltage_cb(string_cls(json.dumps({"voltage": 1.2, "absorbance": 0.3})))
+
+            server._automation_status_cb(string_cls(json.dumps({"running": False})))
+            server._voltage_cb(string_cls(json.dumps({"voltage": 2.4, "absorbance": 0.6})))
+
+        self.assertEqual(server.data_manager.points, [(1.2, 0.3)])
 
     def test_web_spectrometer_baseline_route_uses_current_valid_voltage(self):
         module, publishers, _ = _load_script(

@@ -292,6 +292,8 @@ rostopic echo /usv/trigger_status
 | 上行遥测 | `bridge_diagnostics` 定期输出，`pkt_count` / `tx_named_value` 持续增长 |
 | 下行指令 | QGC 点击按钮后，`/usv/mavlink_cmd_rx` 出现命令数组 |
 | 执行状态 | `/usv/trigger_status` 出现 `sampling_started` / `sampling_stopped` / `calibrate_started` |
+| 航线采样 | QGC Plan 使用 `MAV_CMD_NAV_SCRIPT_TIME(param1=1)`；执行时 bridge 收到 `USV_SMPL`，完成后发 `USV_DONE` |
+| 数据记录 | `sampling_started` 后 Web 数据中心出现任务记录；有效分光数据到达时数据点数量增长 |
 
 ### 5.5 热点访问
 
