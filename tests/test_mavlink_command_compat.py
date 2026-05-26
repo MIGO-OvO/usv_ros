@@ -369,6 +369,86 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         self.assertTrue(accepted)
         self.assertEqual([msg.data for msg in node.status_pub.messages], ["sampling_started"])
 
+    def test_manual_sample_uses_global_loop_count_not_waypoint_override(self):
+        module = _load_script("mavlink_trigger_node_manual_loop_count_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.is_sampling = False
+        node.current_waypoint = 3
+        node.default_retry_count = 0
+        node.default_on_fail = "HOLD"
+        node.hold_settle_time = 3.0
+        node.steps_pub = RecordingPublisher()
+        node.status_pub = RecordingPublisher()
+        node._load_config = lambda: {
+            "sampling_sequence": {"steps": [{"name": "sample"}], "loop_count": 5},
+            "pump_settings": {"pid_mode": True, "pid_precision": 0.1},
+            "waypoint_sampling": {"3": {"enabled": True, "loop_count": 1}},
+        }
+        node._get_default_config = lambda: {"sampling_sequence": {"steps": [], "loop_count": 1}}
+        node._set_mission_state = lambda state, context=None: None
+        node._call_automation_service = lambda name: True
+
+        accepted = node._do_manual_sample()
+
+        self.assertTrue(accepted)
+        payload = json.loads(node.steps_pub.messages[-1].data)
+        self.assertEqual(payload["loop_count"], 5)
+
+    def test_manual_sample_completion_returns_idle_without_auto_resume(self):
+        module = _load_script("mavlink_trigger_node_manual_completion_idle_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.state_lock = threading.Lock()
+        node.is_sampling = False
+        node.current_waypoint = 0
+        node.default_retry_count = 0
+        node.default_on_fail = "HOLD"
+        node.hold_settle_time = 3.0
+        node.steps_pub = RecordingPublisher()
+        states = []
+        statuses = []
+        resumed = []
+        node._load_config = lambda: {
+            "sampling_sequence": {"steps": [{"name": "sample"}], "loop_count": 2},
+            "pump_settings": {"pid_mode": True, "pid_precision": 0.1},
+            "waypoint_sampling": {},
+        }
+        node._get_default_config = lambda: {"sampling_sequence": {"steps": [], "loop_count": 1}}
+        node._set_mission_state = lambda state, context=None: states.append((state, context))
+        node._set_waypoint_state = lambda *args: None
+        node._publish_status = lambda status: statuses.append(status)
+        node._call_automation_service = lambda name: True
+        node._resume_auto_if_mission_exists = lambda: resumed.append(True)
+
+        accepted = node._do_manual_sample()
+        node._handle_completion(success=True, reason="finished")
+
+        self.assertTrue(accepted)
+        self.assertFalse(node.is_sampling)
+        self.assertEqual(states[-1], (module.MissionState.IDLE, "manual_finished"))
+        self.assertIn("sampling_stopped", statuses)
+        self.assertEqual(resumed, [])
+
+    def test_manual_stop_returns_idle_without_auto_resume(self):
+        module = _load_script("mavlink_trigger_node_manual_stop_idle_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.is_sampling = True
+        node.current_waypoint = 0
+        node.current_sampling_context = {"source": "manual"}
+        states = []
+        statuses = []
+        resumed = []
+        node._call_automation_service = lambda name: True
+        node._set_mission_state = lambda state, context=None: states.append((state, context))
+        node._publish_status = lambda status: statuses.append(status)
+        node._resume_auto_if_mission_exists = lambda: resumed.append(True)
+
+        node._stop_sampling_sequence()
+
+        self.assertFalse(node.is_sampling)
+        self.assertEqual(states[-1], (module.MissionState.IDLE, "manual_stopped"))
+        self.assertEqual(statuses, ["sampling_stopped"])
+        self.assertEqual(resumed, [])
+
     def test_fcu_sample_publishes_sampling_started_after_automation_start_accepts(self):
         module = _load_script("mavlink_trigger_node_fcu_started_test", "scripts/mavlink_trigger_node.py")
         node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
@@ -443,6 +523,58 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         self.assertEqual(bridge._automation_step, 2.0)
         self.assertEqual(bridge._automation_total, 5.0)
         self.assertEqual(bridge._pid_mode, 1.0)
+        self.assertEqual(bridge._status_code, module.USVMavlinkRouterBridge._MISSION_STATE_CODES["SAMPLING"])
+
+    def test_router_bridge_clears_sampling_status_when_web_started_automation_finishes(self):
+        module = _load_script("usv_mavlink_router_bridge_web_finish_test", "scripts/usv_mavlink_router_bridge.py")
+        bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
+        bridge._lock = threading.Lock()
+        bridge._automation_step = 1.0
+        bridge._automation_total = 1.0
+        bridge._pid_mode = 1.0
+        bridge._automation_running = True
+        bridge._last_mission_state = "SAMPLING"
+        bridge._status_code = module.USVMavlinkRouterBridge._MISSION_STATE_CODES["SAMPLING"]
+        bridge._fcu_sample_id = 0
+
+        msg = sys.modules["std_msgs.msg"].String()
+        msg.data = json.dumps({
+            "status": "finished",
+            "running": False,
+            "paused": False,
+            "automation_step": 1,
+            "automation_total": 1,
+            "pid_mode": "done",
+        })
+
+        bridge._automation_status_cb(msg)
+
+        self.assertEqual(bridge._status_code, module.USVMavlinkRouterBridge._MISSION_STATE_CODES["IDLE"])
+
+    def test_router_bridge_keeps_sampling_status_for_pending_fcu_done(self):
+        module = _load_script("usv_mavlink_router_bridge_fcu_done_guard_test", "scripts/usv_mavlink_router_bridge.py")
+        bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
+        bridge._lock = threading.Lock()
+        bridge._automation_step = 1.0
+        bridge._automation_total = 1.0
+        bridge._pid_mode = 1.0
+        bridge._automation_running = True
+        bridge._last_mission_state = "SAMPLING"
+        bridge._status_code = module.USVMavlinkRouterBridge._MISSION_STATE_CODES["SAMPLING"]
+        bridge._fcu_sample_id = 42
+
+        msg = sys.modules["std_msgs.msg"].String()
+        msg.data = json.dumps({
+            "status": "finished",
+            "running": False,
+            "paused": False,
+            "automation_step": 1,
+            "automation_total": 1,
+            "pid_mode": "done",
+        })
+
+        bridge._automation_status_cb(msg)
+
         self.assertEqual(bridge._status_code, module.USVMavlinkRouterBridge._MISSION_STATE_CODES["SAMPLING"])
 
     def test_router_bridge_sends_baseline_named_values_with_payload(self):
