@@ -212,6 +212,7 @@ class USVMavlinkRouterBridge(object):
         self._automation_total = float(data_dict.get("automation_total", 0.0) or 0.0)
         self._automation_running = bool(data_dict.get("running", False))
         self._automation_paused = bool(data_dict.get("paused", False))
+        status_text = str(data_dict.get("status", "") or "").lower()
 
         pid_mode_str = str(data_dict.get("pid_mode", "idle")).lower()
         if "running" in pid_mode_str or "paused" in pid_mode_str:
@@ -224,10 +225,25 @@ class USVMavlinkRouterBridge(object):
             self._pid_mode = 0.0
 
         last_state = getattr(self, "_last_mission_state", "IDLE")
-        if self._automation_running and last_state in ("IDLE", "HOLD_NO_MISSION"):
+        if "error" in status_text or "fail" in status_text:
+            self._status_code = self._MISSION_STATE_CODES["FAILED"]
+        elif self._automation_paused:
+            self._status_code = self._MISSION_STATE_CODES["PAUSED"]
+        elif self._automation_running and last_state in ("IDLE", "HOLD_NO_MISSION", "SAMPLING", "SAMPLING_DONE", "PAUSED"):
             self._status_code = self._MISSION_STATE_CODES["SAMPLING"]
-        elif not self._automation_running and last_state in ("IDLE", "HOLD_NO_MISSION"):
-            self._status_code = self._MISSION_STATE_CODES.get(last_state, 0)
+        elif not self._automation_running:
+            terminal_status = (
+                "finish" in status_text
+                or "done" in status_text
+                or "stop" in status_text
+                or status_text in ("idle", "")
+            )
+            sampling_state = last_state in ("IDLE", "HOLD_NO_MISSION", "SAMPLING", "SAMPLING_DONE", "PAUSED")
+            if terminal_status and sampling_state and getattr(self, "_fcu_sample_id", 0) <= 0:
+                self._last_mission_state = "IDLE"
+                self._status_code = self._MISSION_STATE_CODES["IDLE"]
+            elif last_state in ("IDLE", "HOLD_NO_MISSION"):
+                self._status_code = self._MISSION_STATE_CODES.get(last_state, 0)
 
     def _trigger_status_cb(self, msg):
         data = msg.data.lower()
