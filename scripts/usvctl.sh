@@ -34,6 +34,8 @@ Usage:
   usvoff
   usvrestart [roslaunch args...]
   usvstatus
+  usvhotspot on|off|status [ssid] [password]
+  usvaddr
   usvupdate
   usvbuild [catkin_make args...]
   usvdeploy [roslaunch args...]
@@ -43,6 +45,8 @@ Commands:
   stop       Stop usv_ros launch, mavlink-routerd, and roscore
   restart    Stop then start; extra args pass to roslaunch
   status     Print process, hotspot, ROS, MAVROS, and bridge status
+  hotspot    Start, stop, or inspect the USV Wi-Fi hotspot
+  addr       Print SSH and Web access commands without ROS diagnostics
   update     git pull --ff-only in the usv_ros repository
   build      Run catkin_make in the workspace root
   deploy     Stop, update, build, then start
@@ -84,6 +88,42 @@ restart_system() {
 
 status_system() {
     "$SCRIPT_DIR/status_usv_all.sh"
+}
+
+hotspot_system() {
+    local action="${1:-status}"
+    if [[ $# -gt 0 ]]; then
+        shift
+    fi
+
+    case "$action" in
+        on|start)
+            if [[ "$(id -u)" -eq 0 ]]; then
+                "$SCRIPT_DIR/setup_hotspot.sh" "$@"
+            else
+                sudo -E "$SCRIPT_DIR/setup_hotspot.sh" "$@"
+            fi
+            ;;
+        off|stop)
+            if [[ "$(id -u)" -eq 0 ]]; then
+                "$SCRIPT_DIR/stop_hotspot.sh"
+            else
+                sudo -E "$SCRIPT_DIR/stop_hotspot.sh"
+            fi
+            ;;
+        status)
+            "$SCRIPT_DIR/status_usv_all.sh" hotspot
+            ;;
+        *)
+            ctl_log "ERROR: unknown hotspot action: $action"
+            ctl_log "Usage: usvhotspot on|off|status [ssid] [password]"
+            exit 2
+            ;;
+    esac
+}
+
+addr_system() {
+    "$SCRIPT_DIR/status_usv_all.sh" addr
 }
 
 update_system() {
@@ -130,6 +170,12 @@ dispatch() {
         usvstatus)
             cmd="status"
             ;;
+        usvhotspot)
+            cmd="hotspot"
+            ;;
+        usvaddr)
+            cmd="addr"
+            ;;
         usvupdate)
             cmd="update"
             ;;
@@ -165,6 +211,12 @@ dispatch() {
             ;;
         status)
             status_system
+            ;;
+        hotspot|ap)
+            hotspot_system "$@"
+            ;;
+        addr|address)
+            addr_system
             ;;
         update)
             update_system

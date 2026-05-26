@@ -175,6 +175,10 @@ class MissionDataManager(object):
         self._save_current()
         return filename
 
+    def is_recording(self):
+        """是否正在记录任务数据。"""
+        return bool(self.current_mission_file)
+
     def stop_mission(self):
         """停止任务记录。"""
         if self.current_mission_file:
@@ -559,6 +563,8 @@ class WebConfigServer(object):
             self.voltage_sub = rospy.Subscriber('/usv/spectrometer_voltage', String, self._voltage_cb)
             self.spectro_status_sub = rospy.Subscriber('/usv/spectrometer_status', String, self._spectro_status_cb)
             self.mission_sub = rospy.Subscriber('/usv/mission_status', String, self._mission_status_cb)
+            self.trigger_status_sub = rospy.Subscriber('/usv/trigger_status', String, self._trigger_status_cb)
+            self.automation_status_sub = rospy.Subscriber('/usv/automation_status', String, self._automation_status_cb)
             self.pid_error_sub = rospy.Subscriber('/usv/pump_pid_error', String, self._pid_error_cb)
             self.control_events_sub = rospy.Subscriber('/usv/control_events', String, self._control_event_cb)
             self.manual_status_sub = rospy.Subscriber('/usv/manual_status', String, self._manual_status_cb)
@@ -572,6 +578,8 @@ class WebConfigServer(object):
             self.voltage_sub = None
             self.spectro_status_sub = None
             self.mission_sub = None
+            self.trigger_status_sub = None
+            self.automation_status_sub = None
             self.pid_error_sub = None
             self.control_events_sub = None
             self.manual_status_sub = None
@@ -620,6 +628,22 @@ class WebConfigServer(object):
         rospy.loginfo("Web Config Server initialized (%s)", mode_str)
         rospy.loginfo("  URL: http://%s:%d", self.host, self.port)
 
+    def _data_recording_active(self):
+        is_recording = getattr(self.data_manager, "is_recording", None)
+        if callable(is_recording):
+            return bool(is_recording())
+        return bool(getattr(self.data_manager, "current_mission_file", None))
+
+    def _start_data_recording_if_needed(self):
+        if self._data_recording_active():
+            return
+        mission_name = self.config_manager.get().get('mission', {}).get('name', '')
+        self.data_manager.start_mission(mission_name)
+
+    def _stop_data_recording_if_active(self):
+        if self._data_recording_active():
+            self.data_manager.stop_mission()
+
     def _status_cb(self, msg):
         """泵状态回调。"""
         status_raw = msg.data or ""
@@ -644,6 +668,34 @@ class WebConfigServer(object):
                 self.automation_running = False
         elif status == 'stopped':
             self.automation_running = False
+
+    def _automation_status_cb(self, msg):
+        """结构化自动化状态回调。"""
+        try:
+            data = json.loads(msg.data)
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+        if 'running' in data:
+            self.automation_running = bool(data.get('running', False))
+        if 'paused' in data and data.get('paused'):
+            self.automation_running = False
+
+    def _trigger_status_cb(self, msg):
+        """采样生命周期回调，用于 Web 数据中心自动建档。"""
+        status = (msg.data or '').lower()
+        if 'sampling_started' in status:
+            self.automation_running = True
+            self._start_data_recording_if_needed()
+        elif (
+            'sampling_stopped' in status
+            or 'survey_stopped' in status
+            or 'manual_start_rejected' in status
+            or 'start_failed' in status
+        ):
+            self.automation_running = False
+            self._stop_data_recording_if_active()
 
     def _injection_status_cb(self, msg):
         """进样泵状态回调。"""
@@ -2221,12 +2273,12 @@ class WebConfigServer(object):
                 if config_patch:
                     self.config_manager.update(config_patch)
                 self._publish_steps()
-                # 开始记录数据
-                self.data_manager.start_mission(self.config_manager.get().get('mission', {}).get('name', ''))
+                # 开始记录数据；若采样生命周期回调已建档则不重复创建。
+                self._start_data_recording_if_needed()
 
             # 如果是停止，停止记录
             if action == 'stop':
-                self.data_manager.stop_mission()
+                self._stop_data_recording_if_active()
 
             # 调用服务
             rospy.wait_for_service(service_name, timeout=2.0)

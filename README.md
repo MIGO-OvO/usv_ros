@@ -65,7 +65,8 @@ English version: `README.en.md`
 
 ```text
 QGroundControl / 定制 USV 面板
-  |  COMMAND_LONG 31010..31019
+  |  Plan: MAV_CMD_NAV_SCRIPT_TIME(param1=1)
+  |  Manual: COMMAND_LONG 31010..31019
   |  NAMED_VALUE_FLOAT 载荷字段
   v
 数传电台 -> Pixhawk 6C / 定制 ArduRover
@@ -111,6 +112,7 @@ ESP32 检测装置主控
 - 检测装置身份握手：`HELLO?` / `DET?` 必须返回 `DET_ID:USV_DETECTOR*`。
 - Web 端硬件设置热切换：保存串口参数后调用 `/usv/pump_reconnect` 重连泵控节点。
 - 航点采样配置 CRUD、任务配置导入导出、任务数据 JSON 记录和 CSV 下载。
+- Web 数据中心跟随 `sampling_started` 自动建档，跟随 `sampling_stopped` / `survey_stopped` 停止记录。
 - 开机自启脚本：热点、ROS 主系统、router 与自检统一由 `usv-boot.service` 管理。
 
 ## 目录结构
@@ -230,6 +232,8 @@ cd ~/usv_ws
 usvon       # 启动 roscore + mavlink-routerd + usv_ros
 usvoff      # 停止 usv_ros + mavlink-routerd + roscore
 usvstatus   # 查看进程、热点、ROS、MAVROS、bridge 状态
+usvhotspot  # 启停/查看备用 Wi-Fi 热点
+usvaddr     # 查看 SSH 与 Web 端口转发地址
 usvrestart  # 停止后重新启动，参数透传给 roslaunch
 usvupdate   # 只在 ~/usv_ws/src/usv_ros 执行 git pull --ff-only
 usvbuild    # 在 ~/usv_ws 执行 catkin_make，参数透传给 catkin_make
@@ -243,6 +247,8 @@ usvctl start
 usvctl stop
 usvctl restart web_port:=5050 pump_port:=/dev/ttyUSB1
 usvctl status
+usvctl hotspot status
+usvctl addr
 usvctl update
 usvctl build -j2
 usvctl deploy
@@ -347,12 +353,15 @@ curl http://127.0.0.1:5000/api/ui/debug
 
 ```bash
 cd ~/usv_ws
-sudo ./src/usv_ros/scripts/setup_hotspot.sh USV_Control 12345678
-sudo ./src/usv_ros/scripts/stop_hotspot.sh
+HOTSPOT_BAND=5g HOTSPOT_CHANNEL=149 usvhotspot on USV_Control 12345678
+usvhotspot status
+usvhotspot off
 ```
 
 默认热点连接名为 `USV_AP`，默认地址为 `10.42.0.1`。可通过 `HOTSPOT_IFACE`、`HOTSPOT_CONN_NAME`、
-`HOTSPOT_IP`、`HOTSPOT_ROUTE_METRIC` 覆盖。
+`HOTSPOT_IP`、`HOTSPOT_ROUTE_METRIC`、`HOTSPOT_BAND`、`HOTSPOT_CHANNEL` 覆盖。双频 USB 网卡默认使用
+`HOTSPOT_BAND=5g`、`HOTSPOT_CHANNEL=149`；若现场 5GHz AP 受地区码或驱动限制，可改用
+`HOTSPOT_BAND=2.4g HOTSPOT_CHANNEL=6`。
 
 推荐现场使用双网卡并行：USB Wi-Fi 作为热点网卡，板载 Wi-Fi、网线或手机 USB 共享作为外网上游。
 
@@ -361,7 +370,7 @@ nmcli dev status
 nmcli dev wifi connect "<外网SSID>" password "<外网密码>" ifname wlan0
 
 cd ~/usv_ws
-sudo HOTSPOT_IFACE=wlan1 ./src/usv_ros/scripts/setup_hotspot.sh USV_Control 12345678
+HOTSPOT_IFACE=wlan1 HOTSPOT_BAND=5g HOTSPOT_CHANNEL=149 usvhotspot on USV_Control 12345678
 ip route
 ./src/usv_ros/scripts/status_usv_all.sh
 ```
@@ -378,11 +387,17 @@ cd ~/usv_ws
 sudo ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
 ```
 
+开机自启默认不拉起热点，只启动 ROS/Web，方便 Nano 接入现有局域网后用 SSH/Web 隧道访问。查看当前可用地址：
+
+```bash
+usvaddr
+```
+
 双网卡并行安装推荐指定热点网卡：
 
 ```bash
 cd ~/usv_ws
-sudo HOTSPOT_IFACE=wlan1 ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
+sudo USV_ENABLE_HOTSPOT=true HOTSPOT_IFACE=wlan1 HOTSPOT_BAND=5g HOTSPOT_CHANNEL=149 ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
 ```
 
 安装脚本默认只写入并启用 `usv-boot.service`，不会在安装阶段立即启动整套 ROS/热点链路，避免因现场硬件或网络尚未就绪导致安装报错。
@@ -390,7 +405,7 @@ sudo HOTSPOT_IFACE=wlan1 ./src/usv_ros/scripts/install_boot_service.sh USV_Contr
 
 ```bash
 cd ~/usv_ws
-sudo USV_BOOT_START_NOW=true HOTSPOT_IFACE=wlan1 ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
+sudo USV_BOOT_START_NOW=true ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
 ```
 
 如果只通过 SSH 访问 Web 配置页，可以关闭自启热点，只保留 ROS/Web 自启：
@@ -411,7 +426,7 @@ ssh -N -L 5000:127.0.0.1:5000 jetson@<Jetson_IP>
 
 服务启动顺序：
 
-1. 默认创建/恢复热点；`USV_ENABLE_HOTSPOT=false` 时跳过。
+1. 默认跳过热点；`USV_ENABLE_HOTSPOT=true` 时创建/恢复热点。
 2. 以安装脚本调用者作为运行用户启动 `start_usv_all.sh`。
 3. 等待 Web、ROS 节点、MAVROS 和 bridge 诊断就绪；启用热点时额外等待热点就绪。
 4. 自检结果写入 `~/usv_ws/.usv_run/logs/boot_check.log`。
@@ -607,7 +622,7 @@ curl -X POST http://127.0.0.1:5000/api/hardware/apply \
 
 | 命令 | 含义 |
 |---:|---|
-| `31010` | 开始采样。`param2 > 0` 表示飞控原生采样触发，不切 HOLD |
+| `31010` | 手动开始采样，不作为航线 mission item |
 | `31011` | 停止采样 |
 | `31012` | 暂停采样 |
 | `31013` | 恢复采样 |
@@ -618,7 +633,13 @@ curl -X POST http://127.0.0.1:5000/api/hardware/apply \
 | `31018` | 启动分光检测器信号采集 |
 | `31019` | 停止分光检测器信号采集 |
 
-bridge 也兼容飞控以 `NAMED_VALUE_FLOAT` 发出的原生任务触发：
+航线定点采样使用飞控原生 `MAV_CMD_NAV_SCRIPT_TIME`：
+
+- `param1=1`：USV 定点采样。
+- `param2=1..255`：超时保护秒数，QGC 默认 255。
+- `param3..param6=0`：v1 保留。
+
+bridge 兼容飞控以 `NAMED_VALUE_FLOAT` 发出的原生任务触发：
 
 - `USV_SMPL=<sample_id>`：触发一次定点采样，完成后 bridge 发送 `USV_DONE=<sample_id>`。
 - `USV_SURV=1/0`：开启或停止走航采样。

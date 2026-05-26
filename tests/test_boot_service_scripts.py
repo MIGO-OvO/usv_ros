@@ -28,6 +28,8 @@ class BootServiceScriptTests(unittest.TestCase):
         self.assertIn("USV_HOTSPOT_PASSWORD=", text)
         self.assertIn("USV_ENABLE_HOTSPOT=", text)
         self.assertIn("HOTSPOT_ROUTE_METRIC=", text)
+        self.assertIn("HOTSPOT_BAND=", text)
+        self.assertIn("HOTSPOT_CHANNEL=", text)
         self.assertIn('USV_BOOT_START_NOW="${USV_BOOT_START_NOW:-false}"', text)
         self.assertIn('systemctl enable "$SERVICE_NAME"', text)
         self.assertIn('systemctl reset-failed "$SERVICE_NAME"', text)
@@ -54,7 +56,7 @@ class BootServiceScriptTests(unittest.TestCase):
     def test_boot_start_can_skip_hotspot_when_disabled(self):
         text = self._read_script("usv_boot_start.sh")
 
-        self.assertIn('USV_ENABLE_HOTSPOT="${USV_ENABLE_HOTSPOT:-true}"', text)
+        self.assertIn('USV_ENABLE_HOTSPOT="${USV_ENABLE_HOTSPOT:-false}"', text)
         self.assertIn("is_hotspot_enabled", text)
         self.assertIn("skip hotspot setup: disabled", text)
         self.assertIn("require_hotspot_self_check", text)
@@ -63,7 +65,7 @@ class BootServiceScriptTests(unittest.TestCase):
     def test_boot_stop_can_skip_hotspot_when_disabled(self):
         text = self._read_script("usv_boot_stop.sh")
 
-        self.assertIn('USV_ENABLE_HOTSPOT="${USV_ENABLE_HOTSPOT:-true}"', text)
+        self.assertIn('USV_ENABLE_HOTSPOT="${USV_ENABLE_HOTSPOT:-false}"', text)
         self.assertIn("is_hotspot_enabled", text)
         self.assertIn("skip hotspot stop: disabled", text)
 
@@ -76,6 +78,16 @@ class BootServiceScriptTests(unittest.TestCase):
         self.assertIn("ipv4.route-metric", text)
         self.assertIn("ipv6.route-metric", text)
 
+    def test_setup_hotspot_prefers_5ghz_with_fixed_channel(self):
+        text = self._read_script("setup_hotspot.sh")
+
+        self.assertIn('HOTSPOT_BAND="${HOTSPOT_BAND:-5g}"', text)
+        self.assertIn("HOTSPOT_CHANNEL=", text)
+        self.assertIn("NM_HOTSPOT_BAND", text)
+        self.assertIn('802-11-wireless.band "$NM_HOTSPOT_BAND"', text)
+        self.assertIn('802-11-wireless.channel "$HOTSPOT_CHANNEL"', text)
+        self.assertIn("HOTSPOT_BAND=2.4g HOTSPOT_CHANNEL=6", text)
+
     def test_status_reports_external_internet_path(self):
         text = self._read_script("status_usv_all.sh")
 
@@ -84,6 +96,15 @@ class BootServiceScriptTests(unittest.TestCase):
         self.assertIn("getent hosts github.com", text)
         self.assertIn("https://github.com/", text)
         self.assertIn("internet:", text)
+
+    def test_status_can_print_quick_access_addresses(self):
+        text = self._read_script("status_usv_all.sh")
+
+        self.assertIn("print_access_addresses", text)
+        self.assertIn("web_tunnel:", text)
+        self.assertIn("ssh:", text)
+        self.assertIn("hotspot_web:", text)
+        self.assertIn('case "${1:-full}" in', text)
 
     def test_boot_stop_stops_ros_before_hotspot(self):
         text = self._read_script("usv_boot_stop.sh")

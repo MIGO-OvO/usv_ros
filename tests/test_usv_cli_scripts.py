@@ -28,6 +28,8 @@ class UsvCliScriptTests(unittest.TestCase):
             "usvoff",
             "usvrestart",
             "usvstatus",
+            "usvhotspot",
+            "usvaddr",
             "usvupdate",
             "usvbuild",
             "usvdeploy",
@@ -47,6 +49,20 @@ class UsvCliScriptTests(unittest.TestCase):
         self.assertIn('"$SCRIPT_DIR/stop_usv_all.sh"', text)
         self.assertIn('"$SCRIPT_DIR/restart_usv_all.sh" "$@"', text)
         self.assertIn('"$SCRIPT_DIR/status_usv_all.sh"', text)
+
+    def test_usvctl_dispatches_hotspot_and_address_helpers(self):
+        text = self._read_script("usvctl.sh")
+
+        self.assertIn("hotspot_system()", text)
+        self.assertIn("addr_system()", text)
+        self.assertIn('sudo -E "$SCRIPT_DIR/setup_hotspot.sh" "$@"', text)
+        self.assertIn('sudo -E "$SCRIPT_DIR/stop_hotspot.sh"', text)
+        self.assertIn('"$SCRIPT_DIR/status_usv_all.sh" hotspot', text)
+        self.assertIn('"$SCRIPT_DIR/status_usv_all.sh" addr', text)
+        self.assertIn("usvhotspot)", text)
+        self.assertIn("usvaddr)", text)
+        self.assertIn("hotspot|ap)", text)
+        self.assertIn("addr|address)", text)
 
     def test_update_uses_ros_package_git_pull_only(self):
         text = self._read_script("usvctl.sh")

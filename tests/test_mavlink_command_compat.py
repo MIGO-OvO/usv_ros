@@ -351,6 +351,72 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         self.assertNotIn((module.MissionState.FAILED, "manual_start_failed"), states)
         self.assertEqual(states[-1], (module.MissionState.IDLE, "manual_start_rejected"))
 
+    def test_manual_sample_publishes_sampling_started_after_automation_start_accepts(self):
+        module = _load_script("mavlink_trigger_node_manual_started_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.is_sampling = False
+        node.current_waypoint = 0
+        node.steps_pub = RecordingPublisher()
+        node.status_pub = RecordingPublisher()
+        node._load_config = lambda: {"steps": []}
+        node._get_default_config = lambda: {"steps": []}
+        node._build_steps_payload = lambda config, waypoint: {"steps": []}
+        node._set_mission_state = lambda state, context=None: None
+        node._call_automation_service = lambda name: True
+
+        accepted = node._do_manual_sample()
+
+        self.assertTrue(accepted)
+        self.assertEqual([msg.data for msg in node.status_pub.messages], ["sampling_started"])
+
+    def test_fcu_sample_publishes_sampling_started_after_automation_start_accepts(self):
+        module = _load_script("mavlink_trigger_node_fcu_started_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.is_sampling = False
+        node.current_waypoint = 4
+        node.steps_pub = RecordingPublisher()
+        node.status_pub = RecordingPublisher()
+        node._load_config = lambda: {"steps": []}
+        node._get_default_config = lambda: {"steps": []}
+        node._build_steps_payload = lambda config, waypoint: {"steps": []}
+        node._set_mission_state = lambda state, context=None: None
+        node._call_automation_service = lambda name: True
+
+        accepted = node._do_fcu_sample(42)
+
+        self.assertTrue(accepted)
+        self.assertEqual([msg.data for msg in node.status_pub.messages], ["sampling_started"])
+
+    def test_nav_sampling_sequence_publishes_sampling_started_after_automation_start_accepts(self):
+        module = _load_script("mavlink_trigger_node_nav_started_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.is_sampling = False
+        node.current_waypoint = 7
+        node.default_on_fail = "HOLD"
+        node.current_sampling_context = None
+        node.steps_pub = RecordingPublisher()
+        node.status_pub = RecordingPublisher()
+        node._load_config = lambda: {"steps": []}
+        node._get_default_config = lambda: {"steps": []}
+        node._get_waypoint_sampling_config = lambda config, waypoint: {
+            "enabled": True,
+            "retry_count": 0,
+            "on_fail": "HOLD",
+            "hold_before_sampling_s": 0,
+        }
+        node._build_steps_payload = lambda config, waypoint: {"steps": []}
+        node._set_waypoint_state = lambda state, context=None: None
+        node._set_mission_state = lambda state, context=None: None
+        node.set_mode = lambda mode: True
+        node._wait_until_stable = lambda timeout: (True, "stable")
+        node._call_automation_service = lambda name: True
+        node._handle_failure_action = lambda reason: None
+
+        accepted = node._start_sampling_sequence(7)
+
+        self.assertTrue(accepted)
+        self.assertEqual([msg.data for msg in node.status_pub.messages], ["sampling_started"])
+
     def test_router_bridge_updates_automation_named_values_from_structured_status(self):
         module = _load_script("usv_mavlink_router_bridge_automation_test", "scripts/usv_mavlink_router_bridge.py")
         bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
@@ -415,6 +481,13 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         self.assertEqual(len(mav.named_values), 17)
         self.assertEqual(bridge._diag_tx_named, 17)
 
+    def test_rover_nav_script_time_is_the_only_mission_sampling_trigger(self):
+        workspace_root = REPO_ROOT.parents[1]
+        mode_auto = (workspace_root / "ardupilot-usv" / "Rover" / "mode_auto.cpp").read_text(encoding="utf-8")
+
+        self.assertNotIn("case 31010:", mode_auto)
+        self.assertIn("nav_scripting.command == 1", mode_auto)
+        self.assertIn('gcs().send_named_float("USV_SMPL"', mode_auto)
     def test_router_bridge_reconnects_and_keeps_payload_alive_after_socket_write_failure(self):
         module = _load_script("usv_mavlink_router_bridge_reconnect_payload_test", "scripts/usv_mavlink_router_bridge.py")
         bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
@@ -522,6 +595,28 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         self.assertIn((module.MissionState.SURVEYING, "5.0"), states)
         self.assertIn("survey_sample_done", statuses)
         self.assertEqual(resumed, [])
+
+    def test_sampling_failure_publishes_sampling_stopped_for_bridge_completion(self):
+        module = _load_script("mavlink_trigger_node_failure_stopped_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.state_lock = threading.Lock()
+        node.is_sampling = True
+        node._survey_sample_active = False
+        node.current_waypoint = 9
+        states = []
+        statuses = []
+        failures = []
+        node._set_waypoint_state = lambda *args: None
+        node._set_mission_state = lambda state, context=None: states.append((state, context))
+        node._publish_status = lambda status: statuses.append(status)
+        node._handle_failure_action = lambda reason: failures.append(reason)
+
+        node._handle_completion(success=False, reason="automation_timeout")
+
+        self.assertFalse(node.is_sampling)
+        self.assertIn("sampling_stopped", statuses)
+        self.assertIn((module.MissionState.FAILED, "9:automation_timeout"), states)
+        self.assertEqual(failures, ["automation_timeout"])
 
     def test_trigger_retry_passes_decremented_retry_count_to_next_attempt(self):
         module = _load_script("mavlink_trigger_node_retry_test", "scripts/mavlink_trigger_node.py")

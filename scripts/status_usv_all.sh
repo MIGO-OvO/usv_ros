@@ -16,7 +16,10 @@ ROUTER_LOG_FILE="$LOG_DIR/mavlink_router.log"
 HOTSPOT_IFACE="${HOTSPOT_IFACE:-wlan0}"
 HOTSPOT_CONN_NAME="${HOTSPOT_CONN_NAME:-USV_AP}"
 HOTSPOT_IP="${HOTSPOT_IP:-10.42.0.1}"
+HOTSPOT_BAND="${HOTSPOT_BAND:-5g}"
+HOTSPOT_CHANNEL="${HOTSPOT_CHANNEL:-149}"
 WEB_PORT="${WEB_PORT:-5000}"
+USV_SSH_USER="${USV_SSH_USER:-jetson}"
 
 print_status() {
     local name="$1"
@@ -38,11 +41,55 @@ print_status() {
     echo "$name: STOPPED"
 }
 
+hotspot_band_label() {
+    case "$1" in
+        a)
+            echo "5g"
+            ;;
+        bg)
+            echo "2.4g"
+            ;;
+        "")
+            echo "unknown"
+            ;;
+        *)
+            echo "$1"
+            ;;
+    esac
+}
+
+get_default_iface() {
+    if ! command -v ip >/dev/null 2>&1; then
+        return 0
+    fi
+
+    ip route show default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}' | head -n 1
+}
+
+get_iface_ipv4() {
+    local iface="$1"
+    if [[ -z "$iface" ]] || ! command -v ip >/dev/null 2>&1; then
+        return 0
+    fi
+
+    ip -o -4 addr show dev "$iface" scope global 2>/dev/null | awk '{split($4, a, "/"); print a[1]; exit}'
+}
+
+get_first_management_candidate() {
+    if ! command -v ip >/dev/null 2>&1; then
+        return 0
+    fi
+
+    ip -o -4 addr show scope global 2>/dev/null | awk -v hotspot="$HOTSPOT_IFACE" '$2!="lo" && $2!=hotspot {split($4, a, "/"); print $2 " " a[1]; exit}'
+}
+
 print_hotspot_status() {
     local iface_state="missing"
     local ip_state="missing"
     local conn_state="unknown"
     local port_state="closed"
+    local hotspot_band="$HOTSPOT_BAND"
+    local hotspot_channel="$HOTSPOT_CHANNEL"
 
     if command -v ip >/dev/null 2>&1 && ip link show "$HOTSPOT_IFACE" >/dev/null 2>&1; then
         iface_state="present"
@@ -54,6 +101,15 @@ print_hotspot_status() {
     if command -v nmcli >/dev/null 2>&1; then
         if nmcli -t -f NAME con show 2>/dev/null | grep -Fxq "$HOTSPOT_CONN_NAME"; then
             conn_state="configured"
+            local nm_band nm_channel
+            nm_band="$(nmcli -g 802-11-wireless.band con show "$HOTSPOT_CONN_NAME" 2>/dev/null || true)"
+            nm_channel="$(nmcli -g 802-11-wireless.channel con show "$HOTSPOT_CONN_NAME" 2>/dev/null || true)"
+            if [[ -n "$nm_band" ]]; then
+                hotspot_band="$(hotspot_band_label "$nm_band")"
+            fi
+            if [[ -n "$nm_channel" && "$nm_channel" != "0" ]]; then
+                hotspot_channel="$nm_channel"
+            fi
         else
             conn_state="missing"
         fi
@@ -69,7 +125,7 @@ print_hotspot_status() {
         port_state="listening"
     fi
 
-    echo "hotspot: iface=$HOTSPOT_IFACE state=$iface_state conn=$conn_state ip=$ip_state web_port=$port_state"
+    echo "hotspot: iface=$HOTSPOT_IFACE state=$iface_state conn=$conn_state ip=$ip_state band=$hotspot_band channel=$hotspot_channel web_port=$port_state"
     echo "  target_ip=$HOTSPOT_IP"
 
     if [[ "$iface_state" == "present" && "$ip_state" == "assigned" && "$conn_state" == "active" && "$port_state" == "listening" ]]; then
@@ -82,6 +138,46 @@ print_hotspot_status() {
         [[ "$port_state" == "listening" ]] || issues+=("web-port-not-listening")
         echo "  issues=${issues[*]}"
     fi
+}
+
+print_access_addresses() {
+    local default_iface
+    local management_iface=""
+    local lan_ip=""
+    local candidate=""
+    local hotspot_web="unavailable"
+
+    default_iface="$(get_default_iface)"
+    if [[ -n "$default_iface" && "$default_iface" != "$HOTSPOT_IFACE" ]]; then
+        management_iface="$default_iface"
+        lan_ip="$(get_iface_ipv4 "$management_iface")"
+    fi
+
+    if [[ -z "$lan_ip" ]]; then
+        candidate="$(get_first_management_candidate)"
+        if [[ -n "$candidate" ]]; then
+            management_iface="${candidate%% *}"
+            lan_ip="${candidate#* }"
+        fi
+    fi
+
+    if command -v ip >/dev/null 2>&1 && ip -4 addr show "$HOTSPOT_IFACE" 2>/dev/null | grep -Fq "$HOTSPOT_IP/"; then
+        hotspot_web="http://$HOTSPOT_IP:$WEB_PORT"
+    fi
+
+    echo "USV Access Addresses"
+    if [[ -n "$lan_ip" ]]; then
+        echo "lan_ip: $lan_ip iface=$management_iface"
+        echo "ssh: ssh $USV_SSH_USER@$lan_ip"
+        echo "web_tunnel: ssh -N -L $WEB_PORT:127.0.0.1:$WEB_PORT $USV_SSH_USER@$lan_ip"
+    else
+        echo "lan_ip: unavailable"
+        echo "ssh: unavailable (no non-hotspot IPv4 address found)"
+        echo "web_tunnel: unavailable (no non-hotspot IPv4 address found)"
+    fi
+    echo "web_local: http://127.0.0.1:$WEB_PORT"
+    echo "hotspot_web: $hotspot_web"
+    echo "hostname_hint: ssh $USV_SSH_USER@$(hostname).local"
 }
 
 print_internet_status() {
@@ -141,13 +237,20 @@ print_internet_status() {
     fi
 }
 
-echo "USV Runtime Status"
-echo "run_dir=$RUN_DIR"
-print_status "roscore" "$MASTER_PID_FILE" "$MASTER_LOG_FILE"
-print_status "mavlink_router" "$ROUTER_PID_FILE" "$ROUTER_LOG_FILE"
-print_status "usv_system" "$LAUNCH_PID_FILE" "$LAUNCH_LOG_FILE"
-print_hotspot_status
-print_internet_status
+print_full_status() {
+    echo "USV Runtime Status"
+    echo "run_dir=$RUN_DIR"
+    print_status "roscore" "$MASTER_PID_FILE" "$MASTER_LOG_FILE"
+    print_status "mavlink_router" "$ROUTER_PID_FILE" "$ROUTER_LOG_FILE"
+    print_status "usv_system" "$LAUNCH_PID_FILE" "$LAUNCH_LOG_FILE"
+    print_hotspot_status
+    print_internet_status
+
+    # 关闭 errexit 以防止 ROS 检查失败中断脚本
+    set +e
+    print_ros_nodes
+    set -e
+}
 
 # ── ROS 节点级健康检查 ──────────────────────────────────────────────
 # 仅在 roscore 运行时执行；使用 timeout 避免 hang；失败不中断脚本
@@ -281,7 +384,19 @@ else:
     fi
 }
 
-# 关闭 errexit 以防止 ROS 检查失败中断脚本
-set +e
-print_ros_nodes
-set -e
+case "${1:-full}" in
+    full|status)
+        print_full_status
+        ;;
+    hotspot|ap)
+        print_hotspot_status
+        ;;
+    addr|address)
+        print_access_addresses
+        ;;
+    *)
+        echo "ERROR: unknown status view: $1" >&2
+        echo "Usage: status_usv_all.sh [full|hotspot|addr]" >&2
+        exit 2
+        ;;
+esac
