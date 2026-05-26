@@ -189,6 +189,18 @@ class RecordingMav:
         self.command_acks.append((command, result, progress, result_param2, target_sys, target_comp))
 
 
+class FailingOnceNamedValueMav(RecordingMav):
+    def __init__(self):
+        super().__init__()
+        self.fail_next_named_value = True
+
+    def named_value_float_send(self, timestamp, name, value):
+        if self.fail_next_named_value:
+            self.fail_next_named_value = False
+            raise OSError("router socket closed")
+        super().named_value_float_send(timestamp, name, value)
+
+
 class MavlinkCommandCompatibilityTests(unittest.TestCase):
     def test_trigger_node_constructs_without_auto_trigger_attr_crash(self):
         module = _load_script("mavlink_trigger_node_construct_test", "scripts/mavlink_trigger_node.py")
@@ -476,6 +488,47 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         self.assertNotIn("case 31010:", mode_auto)
         self.assertIn("nav_scripting.command == 1", mode_auto)
         self.assertIn('gcs().send_named_float("USV_SMPL"', mode_auto)
+    def test_router_bridge_reconnects_and_keeps_payload_alive_after_socket_write_failure(self):
+        module = _load_script("usv_mavlink_router_bridge_reconnect_payload_test", "scripts/usv_mavlink_router_bridge.py")
+        bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
+        bridge._boot_time = 0
+        bridge._pkt_count = 10
+        bridge._diag_tx_total = 0
+        bridge._diag_tx_named = 0
+        bridge._diag_pub_errors = 0
+        bridge._lock = threading.Lock()
+        first_mav = FailingOnceNamedValueMav()
+        recovered_mav = RecordingMav()
+        bridge._conn = types.SimpleNamespace(mav=first_mav)
+        reconnects = []
+
+        def reconnect_router():
+            reconnects.append(True)
+            bridge._conn = types.SimpleNamespace(mav=recovered_mav)
+            return True
+
+        bridge._reconnect_router = reconnect_router
+
+        bridge._send_payload(
+            voltage=1.23,
+            absorbance=0.12,
+            angles={"X": 1.0, "Y": 2.0, "Z": 3.0, "A": 4.0},
+            status=14,
+            automation_step=2,
+            automation_total=5,
+            sample_count=7,
+            pid_error=0.01,
+            pid_mode=1,
+            baseline_set=1.0,
+            reference_voltage=1.23,
+            baseline_voltage=0.0,
+            spectrometer_valid=1.0,
+        )
+
+        self.assertEqual(reconnects, [True])
+        self.assertEqual(len(recovered_mav.named_values), 17)
+        self.assertEqual(recovered_mav.named_values[0][0], "USV_VOLT")
+        self.assertEqual(bridge._diag_tx_named, 17)
 
     def test_router_bridge_caches_spectrometer_valid_from_voltage_payload(self):
         module = _load_script("usv_mavlink_router_bridge_valid_payload_test", "scripts/usv_mavlink_router_bridge.py")
