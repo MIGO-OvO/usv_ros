@@ -66,6 +66,22 @@ get_default_iface() {
     ip route show default 2>/dev/null | awk '{for (i=1; i<=NF; i++) if ($i=="dev") {print $(i+1); exit}}' | head -n 1
 }
 
+is_management_iface() {
+    local iface="$1"
+
+    case "$iface" in
+        ""|lo)
+            return 1
+            ;;
+        l4tbr*|docker*|br-*|virbr*|veth*)
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
+}
+
 get_iface_ipv4() {
     local iface="$1"
     if [[ -z "$iface" ]] || ! command -v ip >/dev/null 2>&1; then
@@ -80,7 +96,22 @@ get_first_management_candidate() {
         return 0
     fi
 
-    ip -o -4 addr show scope global 2>/dev/null | awk -v hotspot="$HOTSPOT_IFACE" '$2!="lo" && $2!=hotspot {split($4, a, "/"); print $2 " " a[1]; exit}'
+    local line iface cidr ip_addr
+    while read -r line; do
+        iface="$(echo "$line" | awk '{print $2}')"
+        cidr="$(echo "$line" | awk '{print $4}')"
+        if ! is_management_iface "$iface"; then
+            continue
+        fi
+        ip_addr="${cidr%%/*}"
+        if [[ "$ip_addr" == "$HOTSPOT_IP" ]]; then
+            continue
+        fi
+        if [[ -n "$ip_addr" ]]; then
+            echo "$iface $ip_addr"
+            return 0
+        fi
+    done < <(ip -o -4 addr show scope global 2>/dev/null)
 }
 
 print_hotspot_status() {
@@ -148,9 +179,13 @@ print_access_addresses() {
     local hotspot_web="unavailable"
 
     default_iface="$(get_default_iface)"
-    if [[ -n "$default_iface" && "$default_iface" != "$HOTSPOT_IFACE" ]]; then
+    if is_management_iface "$default_iface"; then
         management_iface="$default_iface"
         lan_ip="$(get_iface_ipv4 "$management_iface")"
+        if [[ "$lan_ip" == "$HOTSPOT_IP" ]]; then
+            management_iface=""
+            lan_ip=""
+        fi
     fi
 
     if [[ -z "$lan_ip" ]]; then
