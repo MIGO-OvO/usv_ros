@@ -21,9 +21,29 @@ INTERFACE="${HOTSPOT_IFACE:-wlan0}"
 CON_NAME="${HOTSPOT_CONN_NAME:-USV_AP}"
 HOTSPOT_IP="${HOTSPOT_IP:-10.42.0.1}"
 HOTSPOT_ROUTE_METRIC="${HOTSPOT_ROUTE_METRIC:-900}"
+HOTSPOT_BAND="${HOTSPOT_BAND:-5g}"
 WS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 RUN_DIR="$WS_DIR/.usv_run"
 PREV_WIFI_FILE="$RUN_DIR/previous_wifi_connection"
+
+case "${HOTSPOT_BAND,,}" in
+    5g|5ghz|a)
+        NM_HOTSPOT_BAND="a"
+        HOTSPOT_BAND_LABEL="5g"
+        DEFAULT_HOTSPOT_CHANNEL="149"
+        ;;
+    2.4g|2g|24g|2.4ghz|bg|b/g|g)
+        NM_HOTSPOT_BAND="bg"
+        HOTSPOT_BAND_LABEL="2.4g"
+        DEFAULT_HOTSPOT_CHANNEL="6"
+        ;;
+    *)
+        echo "错误: HOTSPOT_BAND 只支持 5g 或 2.4g，当前为: $HOTSPOT_BAND"
+        exit 1
+        ;;
+esac
+
+HOTSPOT_CHANNEL="${HOTSPOT_CHANNEL:-$DEFAULT_HOTSPOT_CHANNEL}"
 
 mkdir -p "$RUN_DIR"
 
@@ -34,6 +54,8 @@ echo "SSID: $SSID"
 echo "Password: $PASSWORD"
 echo "Security: WPA-PSK"
 echo "Interface: $INTERFACE"
+echo "Band: $HOTSPOT_BAND_LABEL"
+echo "Channel: $HOTSPOT_CHANNEL"
 echo "Route metric: $HOTSPOT_ROUTE_METRIC"
 echo ""
 
@@ -76,7 +98,8 @@ echo "创建热点连接..."
 nmcli connection add type wifi ifname "$INTERFACE" con-name "$CON_NAME" ssid "$SSID" >/dev/null
 nmcli connection modify "$CON_NAME" \
     802-11-wireless.mode ap \
-    802-11-wireless.band bg \
+    802-11-wireless.band "$NM_HOTSPOT_BAND" \
+    802-11-wireless.channel "$HOTSPOT_CHANNEL" \
     ipv4.method shared \
     ipv4.never-default yes \
     ipv4.route-metric "$HOTSPOT_ROUTE_METRIC" \
@@ -96,6 +119,8 @@ if nmcli connection up "$CON_NAME" >/dev/null 2>&1; then
     echo "SSID: $SSID"
     echo "Password: $PASSWORD"
     echo "Security: WPA-PSK"
+    echo "Band: $HOTSPOT_BAND_LABEL"
+    echo "Channel: $HOTSPOT_CHANNEL"
     echo "热点 IP: $HOTSPOT_IP"
     echo ""
     echo "当前 $INTERFACE 状态:"
@@ -105,7 +130,7 @@ if nmcli connection up "$CON_NAME" >/dev/null 2>&1; then
     echo "  - 通过热点: http://$HOTSPOT_IP:5000"
     echo ""
     echo "连接详情:"
-    nmcli -f GENERAL.NAME,GENERAL.DEVICES,802-11-wireless.ssid,802-11-wireless.mode,802-11-wireless-security.key-mgmt con show "$CON_NAME"
+    nmcli -f GENERAL.NAME,GENERAL.DEVICES,802-11-wireless.ssid,802-11-wireless.mode,802-11-wireless.band,802-11-wireless.channel,802-11-wireless-security.key-mgmt con show "$CON_NAME"
     echo ""
 else
     echo "热点创建失败!"
@@ -119,6 +144,11 @@ else
     echo "  nmcli dev status"
     echo "  nmcli -p connection show '$CON_NAME'"
     echo "  nmcli dev wifi list ifname $INTERFACE"
+    if [ "$NM_HOTSPOT_BAND" = "a" ]; then
+        echo ""
+        echo "5GHz AP 可能受地区码、驱动或网卡限制。可显式改用 2.4GHz 固定信道重试:"
+        echo "  sudo HOTSPOT_BAND=2.4g HOTSPOT_CHANNEL=6 HOTSPOT_IFACE=$INTERFACE ./src/usv_ros/scripts/setup_hotspot.sh $SSID $PASSWORD"
+    fi
     exit 1
 fi
 

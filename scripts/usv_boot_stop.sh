@@ -7,7 +7,7 @@ source "$SCRIPT_DIR/common_env.sh"
 
 SERVICE_NAME="${SERVICE_NAME:-usv-boot.service}"
 USV_RUN_USER="${USV_RUN_USER:-${SUDO_USER:-$(id -un)}}"
-USV_ENABLE_HOTSPOT="${USV_ENABLE_HOTSPOT:-true}"
+USV_ENABLE_HOTSPOT="${USV_ENABLE_HOTSPOT:-false}"
 BOOT_CHECK_LOG_FILE="${BOOT_CHECK_LOG_FILE:-$LOG_DIR/boot_check.log}"
 
 prepare_boot_log() {

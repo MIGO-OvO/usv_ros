@@ -17,7 +17,7 @@ resolve_script_dir() {
 SCRIPT_DIR="$(resolve_script_dir)"
 USVCTL_SCRIPT="$SCRIPT_DIR/usvctl.sh"
 TARGET_DIR="${USV_COMMAND_DIR:-$HOME/.local/bin}"
-COMMANDS=(usvctl usvon usvoff usvrestart usvstatus usvupdate usvbuild usvdeploy)
+COMMANDS=(usvctl usvon usvoff usvrestart usvstatus usvhotspot usvaddr usvupdate usvbuild usvdeploy)
 
 log() {
     echo "[install-usv-commands] $*"
