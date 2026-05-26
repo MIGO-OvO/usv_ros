@@ -265,6 +265,21 @@ class MAVLinkTriggerNode(object):
             'on_fail': waypoint_cfg['on_fail'],
         }
 
+    def _build_manual_steps_payload(self, config):
+        """Build a manual sampling payload from global Web sampling_sequence only."""
+        config = config or {}
+        sampling_sequence = dict(config.get('sampling_sequence', {}) or {})
+        try:
+            loop_count = int(sampling_sequence.get('loop_count', 1))
+        except (TypeError, ValueError):
+            loop_count = 1
+        return {
+            'steps': sampling_sequence.get('steps', []),
+            'loop_count': max(0, loop_count),
+            'pid_mode': config.get('pump_settings', {}).get('pid_mode', True),
+            'pid_precision': config.get('pump_settings', {}).get('pid_precision', 0.1),
+        }
+
     def _wait_until_stable(self, settle_time):
         """轻量稳定判定：速度/角速度持续低于阈值。"""
         self._set_mission_state(MissionState.WAITING_STABLE, str(self.current_waypoint))
@@ -302,11 +317,18 @@ class MAVLinkTriggerNode(object):
             was_survey_sample = getattr(self, "_survey_sample_active", False)
             if was_survey_sample:
                 self._survey_sample_active = False
+            sampling_context = dict(getattr(self, "current_sampling_context", {}) or {})
+            is_manual_sample = sampling_context.get("source") == "manual"
             self.is_sampling = False
         rospy.loginfo("Handling sampling completion: success=%s reason=%s", success, reason)
         wp_seq = self.current_waypoint
         if success:
             self._set_waypoint_state(wp_seq, WaypointSamplingState.DONE)
+            if is_manual_sample:
+                self.current_sampling_context = None
+                self._set_mission_state(MissionState.IDLE, "manual_finished")
+                self._publish_status("sampling_stopped")
+                return
             if was_survey_sample:
                 if getattr(self, "_survey_active", False):
                     self._set_mission_state(MissionState.SURVEYING, "{:.1f}".format(getattr(self, "_survey_interval", 5.0)))
@@ -373,6 +395,7 @@ class MAVLinkTriggerNode(object):
             'waypoint_seq': waypoint_seq,
             'retry_count': waypoint_cfg['retry_count'],
             'on_fail': waypoint_cfg['on_fail'],
+            'source': 'waypoint',
         }
         self._set_waypoint_state(waypoint_seq, WaypointSamplingState.HOLDING)
         self._set_mission_state(MissionState.HOLDING, str(waypoint_seq))
@@ -415,8 +438,14 @@ class MAVLinkTriggerNode(object):
     def _stop_sampling_sequence(self):
         """停止采样序列。"""
         rospy.loginfo("Stopping sampling sequence...")
+        sampling_context = dict(getattr(self, "current_sampling_context", {}) or {})
         self._call_automation_service('stop')
         self.is_sampling = False
+        if sampling_context.get("source") == "manual":
+            self.current_sampling_context = None
+            self._set_mission_state(MissionState.IDLE, "manual_stopped")
+            self._publish_status("sampling_stopped")
+            return
         self._set_mission_state(MissionState.HOLD_NO_MISSION, str(self.current_waypoint))
         self._publish_status("sampling_stopped")
         rospy.sleep(1.0)
@@ -813,7 +842,7 @@ class MAVLinkTriggerNode(object):
             return False
 
         config = self._load_config() or self._get_default_config()
-        steps_data = self._build_steps_payload(config, self.current_waypoint)
+        steps_data = self._build_manual_steps_payload(config)
 
         msg = String()
         msg.data = json.dumps(steps_data)
@@ -821,8 +850,13 @@ class MAVLinkTriggerNode(object):
 
         self._set_mission_state(MissionState.SAMPLING, str(self.current_waypoint))
         self.is_sampling = True
+        self.current_sampling_context = {
+            'waypoint_seq': int(self.current_waypoint),
+            'source': 'manual',
+        }
         if not self._call_automation_service('start'):
             self.is_sampling = False
+            self.current_sampling_context = None
             self._set_mission_state(MissionState.IDLE, "manual_start_rejected")
             if getattr(self, 'status_pub', None) is not None:
                 self._publish_status("manual_start_rejected")
@@ -850,8 +884,14 @@ class MAVLinkTriggerNode(object):
 
         self._set_mission_state(MissionState.SAMPLING, str(self.current_waypoint))
         self.is_sampling = True
+        self.current_sampling_context = {
+            'waypoint_seq': int(self.current_waypoint),
+            'source': 'fcu',
+            'sample_id': int(sample_id),
+        }
         if not self._call_automation_service('start'):
             self.is_sampling = False
+            self.current_sampling_context = None
             self._set_mission_state(MissionState.FAILED, "fcu_sample_start_failed")
             return False
 
