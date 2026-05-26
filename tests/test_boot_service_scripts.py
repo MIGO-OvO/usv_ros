@@ -1,4 +1,7 @@
 import unittest
+import subprocess
+import stat
+import tempfile
 from pathlib import Path
 
 
@@ -7,6 +10,14 @@ SCRIPTS_DIR = REPO_ROOT / "scripts"
 
 
 class BootServiceScriptTests(unittest.TestCase):
+    def _bash_path(self, path):
+        resolved = Path(path).resolve()
+        if resolved.drive:
+            drive = resolved.drive.rstrip(":").lower()
+            rest = str(resolved)[3:].replace("\\", "/")
+            return f"/mnt/{drive}/{rest}"
+        return resolved.as_posix()
+
     def _read_script(self, name):
         path = SCRIPTS_DIR / name
         self.assertTrue(path.exists(), f"missing script: {path}")
@@ -101,10 +112,60 @@ class BootServiceScriptTests(unittest.TestCase):
         text = self._read_script("status_usv_all.sh")
 
         self.assertIn("print_access_addresses", text)
+        self.assertIn("is_management_iface", text)
+        self.assertIn("l4tbr*", text)
+        self.assertIn("docker*", text)
         self.assertIn("web_tunnel:", text)
         self.assertIn("ssh:", text)
         self.assertIn("hotspot_web:", text)
         self.assertIn('case "${1:-full}" in', text)
+
+    def test_addr_skips_jetson_usb_and_docker_bridge_addresses(self):
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:
+            fake_ip = Path(tmp) / "ip"
+            fake_ip.write_bytes(
+                b"""#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == "route show default" ]]; then
+    echo "default via 192.168.55.100 dev l4tbr0 proto static metric 100"
+    exit 0
+fi
+if [[ "$*" == "-o -4 addr show dev l4tbr0 scope global" ]]; then
+    echo "9: l4tbr0    inet 192.168.55.1/24 brd 192.168.55.255 scope global l4tbr0"
+    exit 0
+fi
+if [[ "$*" == "-o -4 addr show dev wlan0 scope global" ]]; then
+    echo "3: wlan0    inet 10.33.44.167/24 brd 10.33.44.255 scope global wlan0"
+    exit 0
+fi
+if [[ "$*" == "-o -4 addr show scope global" ]]; then
+    echo "9: l4tbr0    inet 192.168.55.1/24 brd 192.168.55.255 scope global l4tbr0"
+    echo "5: docker0    inet 172.17.0.1/16 brd 172.17.255.255 scope global docker0"
+    echo "3: wlan0    inet 10.33.44.167/24 brd 10.33.44.255 scope global wlan0"
+    exit 0
+fi
+if [[ "$*" == "-4 addr show wlan0" ]]; then
+    exit 1
+fi
+exit 1
+"""
+            )
+            fake_ip.chmod(fake_ip.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            command = "cd '{}' && export PATH='{}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' && bash scripts/status_usv_all.sh addr".format(
+                self._bash_path(REPO_ROOT),
+                self._bash_path(tmp),
+            )
+            result = subprocess.run(
+                ["bash", "-lc", command],
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+
+        self.assertIn("lan_ip: 10.33.44.167 iface=wlan0", result.stdout)
+        self.assertIn("ssh: ssh jetson@10.33.44.167", result.stdout)
+        self.assertNotIn("ssh jetson@192.168.55.1", result.stdout)
 
     def test_boot_stop_stops_ros_before_hotspot(self):
         text = self._read_script("usv_boot_stop.sh")
