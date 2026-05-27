@@ -551,6 +551,33 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(bridge._status_code, module.USVMavlinkRouterBridge._MISSION_STATE_CODES["IDLE"])
 
+    def test_router_bridge_treats_finished_status_as_terminal_even_if_running_flag_is_stale(self):
+        module = _load_script("usv_mavlink_router_bridge_stale_running_finish_test", "scripts/usv_mavlink_router_bridge.py")
+        bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
+        bridge._lock = threading.Lock()
+        bridge._automation_step = 1.0
+        bridge._automation_total = 1.0
+        bridge._pid_mode = 1.0
+        bridge._automation_running = True
+        bridge._last_mission_state = "SAMPLING"
+        bridge._status_code = module.USVMavlinkRouterBridge._MISSION_STATE_CODES["SAMPLING"]
+        bridge._fcu_sample_id = 0
+
+        msg = sys.modules["std_msgs.msg"].String()
+        msg.data = json.dumps({
+            "status": "finished",
+            "running": True,
+            "paused": False,
+            "automation_step": 1,
+            "automation_total": 1,
+            "pid_mode": "done",
+        })
+
+        bridge._automation_status_cb(msg)
+
+        self.assertFalse(bridge._automation_running)
+        self.assertEqual(bridge._status_code, module.USVMavlinkRouterBridge._MISSION_STATE_CODES["IDLE"])
+
     def test_router_bridge_keeps_sampling_status_for_pending_fcu_done(self):
         module = _load_script("usv_mavlink_router_bridge_fcu_done_guard_test", "scripts/usv_mavlink_router_bridge.py")
         bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)

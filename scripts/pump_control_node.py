@@ -1900,6 +1900,17 @@ class PumpControlNode(object):
 
         status_text = str(status or "idle")
         status_lower = status_text.lower()
+        terminal_status = (
+            "finish" in status_lower
+            or "done" in status_lower
+            or "stop" in status_lower
+            or "error" in status_lower
+            or "fail" in status_lower
+            or status_lower == "idle"
+        )
+        if terminal_status:
+            running = False
+            paused = False
         if total_steps > 0 and (running or paused):
             automation_step = min(current_step + 1, total_steps)
         elif total_steps > 0 and ("finish" in status_lower or "done" in status_lower):

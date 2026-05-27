@@ -479,6 +479,9 @@ class AutomationEngine(object):
         except Exception:
             pass
 
+        self._running.clear()
+        self._paused.clear()
+
         if self._failed and self._last_error:
             self._update_status("failed")
         else:
