@@ -25,6 +25,8 @@ Python: 3.8
 from __future__ import print_function
 
 import json
+import copy
+import math
 import os
 import sys
 import threading
@@ -99,6 +101,132 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "sampling_config.json")
 CALIBRATION_FILE = os.path.join(CONFIG_DIR, "calibration.json")
 DATA_DIR = os.path.expanduser("~/usv_ws/data/missions")
 
+AMAP_PLUGINS = ["AMap.Scale", "AMap.ToolBar", "AMap.HeatMap"]
+MAX_LIVE_TRACK_POINTS = 1000
+DEFAULT_SURFACE_SIZE = 50
+MAX_SURFACE_SIZE = 80
+
+
+def _to_float_or_none(value):
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _out_of_china(lat, lng):
+    return lng < 72.004 or lng > 137.8347 or lat < 0.8293 or lat > 55.8271
+
+
+def _transform_lat(x, y):
+    ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * math.sqrt(abs(x))
+    ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
+    ret += (20.0 * math.sin(y * math.pi) + 40.0 * math.sin(y / 3.0 * math.pi)) * 2.0 / 3.0
+    ret += (160.0 * math.sin(y / 12.0 * math.pi) + 320 * math.sin(y * math.pi / 30.0)) * 2.0 / 3.0
+    return ret
+
+
+def _transform_lng(x, y):
+    ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * math.sqrt(abs(x))
+    ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
+    ret += (20.0 * math.sin(x * math.pi) + 40.0 * math.sin(x / 3.0 * math.pi)) * 2.0 / 3.0
+    ret += (150.0 * math.sin(x / 12.0 * math.pi) + 300.0 * math.sin(x / 30.0 * math.pi)) * 2.0 / 3.0
+    return ret
+
+
+def wgs84_to_gcj02(lat, lng):
+    """Convert WGS84 coordinates to GCJ-02 for AMap display."""
+    lat = _to_float_or_none(lat)
+    lng = _to_float_or_none(lng)
+    if lat is None or lng is None:
+        return None
+    if _out_of_china(lat, lng):
+        return {"lat": lat, "lng": lng}
+    a = 6378245.0
+    ee = 0.00669342162296594323
+    d_lat = _transform_lat(lng - 105.0, lat - 35.0)
+    d_lng = _transform_lng(lng - 105.0, lat - 35.0)
+    rad_lat = lat / 180.0 * math.pi
+    magic = math.sin(rad_lat)
+    magic = 1 - ee * magic * magic
+    sqrt_magic = math.sqrt(magic)
+    d_lat = (d_lat * 180.0) / ((a * (1 - ee)) / (magic * sqrt_magic) * math.pi)
+    d_lng = (d_lng * 180.0) / (a / sqrt_magic * math.cos(rad_lat) * math.pi)
+    return {"lat": lat + d_lat, "lng": lng + d_lng}
+
+
+def make_position_snapshot(lat, lng, alt=None, timestamp=None):
+    lat = _to_float_or_none(lat)
+    lng = _to_float_or_none(lng)
+    if lat is None or lng is None:
+        return None
+    gcj = wgs84_to_gcj02(lat, lng)
+    alt_value = _to_float_or_none(alt)
+    position = {
+        "timestamp": timestamp or datetime.now().isoformat(),
+        "wgs84": {"lat": lat, "lng": lng, "alt": alt_value},
+        "gcj02": {"lat": gcj["lat"], "lng": gcj["lng"], "alt": alt_value},
+    }
+    return position
+
+
+def normalize_pollution_metric_config(config):
+    raw = config if isinstance(config, dict) else {}
+    enabled = bool(raw.get("enabled", False))
+    slope = _to_float_or_none(raw.get("slope", 1.0))
+    intercept = _to_float_or_none(raw.get("intercept", 0.0))
+    if slope is None:
+        slope = 1.0
+    if intercept is None:
+        intercept = 0.0
+    unit = str(raw.get("unit", "mg/L") or "mg/L").strip()[:32] or "mg/L"
+    display_name = str(raw.get("display_name", "浓度") or "浓度").strip()[:64] or "浓度"
+    return {
+        "enabled": enabled,
+        "slope": slope,
+        "intercept": intercept,
+        "unit": unit,
+        "display_name": display_name,
+    }
+
+
+def resolve_pollution_metric(voltage, absorbance, metric_config=None):
+    absorbance_value = _to_float_or_none(absorbance)
+    voltage_value = _to_float_or_none(voltage)
+    cfg = normalize_pollution_metric_config(metric_config or {})
+    concentration = None
+    metric_used = "absorbance"
+    if cfg["enabled"] and absorbance_value is not None:
+        concentration = cfg["slope"] * absorbance_value + cfg["intercept"]
+        if math.isfinite(concentration):
+            metric_used = "concentration"
+        else:
+            concentration = None
+    return {
+        "voltage": voltage_value,
+        "absorbance": absorbance_value,
+        "concentration": concentration,
+        "concentration_unit": cfg["unit"],
+        "concentration_display_name": cfg["display_name"],
+        "metric_used": metric_used,
+    }
+
+
+def _extract_metric_value(point, metric):
+    metric = (metric or "auto").strip().lower()
+    if metric == "auto":
+        metric = point.get("metric_used") or ("concentration" if point.get("concentration") is not None else "absorbance")
+    if metric == "concentration":
+        value = point.get("concentration")
+        if value is None:
+            value = point.get("absorbance")
+    elif metric == "voltage":
+        value = point.get("voltage")
+    else:
+        value = point.get("absorbance")
+    return _to_float_or_none(value)
+
 class CalibrationManager(object):
     """零点校准管理器"""
     def __init__(self, file_path=CALIBRATION_FILE):
@@ -170,6 +298,8 @@ class MissionDataManager(object):
             "name": mission_name or f"Mission {timestamp}",
             "start_time": datetime.now().isoformat(),
             "end_time": None,
+            "track_points": [],
+            "route_waypoints": [],
             "data_points": []
         }
         self._save_current()
@@ -187,14 +317,67 @@ class MissionDataManager(object):
             self.current_mission_file = None
             self.current_mission_data = []
 
-    def add_data_point(self, voltage, absorbance=0.0):
-        """添加数据点（含电压和吸光度）。"""
+    def set_route_waypoints(self, waypoints):
+        """缓存当前任务航线航点。"""
+        if self.current_mission_file and isinstance(self.current_mission_data, dict):
+            self.current_mission_data["route_waypoints"] = list(waypoints or [])
+            self._save_current()
+
+    def add_track_point(self, position):
+        """添加轨迹点。"""
+        if self.current_mission_file and isinstance(self.current_mission_data, dict) and position:
+            points = self.current_mission_data.setdefault("track_points", [])
+            points.append(position)
+            if len(points) > MAX_LIVE_TRACK_POINTS:
+                self.current_mission_data["track_points"] = points[-MAX_LIVE_TRACK_POINTS:]
+            if len(points) % 10 == 0:
+                self._save_current()
+
+    def add_data_point(
+        self,
+        voltage,
+        absorbance=0.0,
+        position=None,
+        waypoint_seq=None,
+        step_index=None,
+        loop_index=None,
+        sample_id=None,
+        spectrometer_raw=None,
+        pollution_metric=None,
+    ):
+        """添加数据点（含电压、吸光度、地理位置和污染指标）。"""
         if self.current_mission_file:
+            metric = resolve_pollution_metric(voltage, absorbance, pollution_metric)
             point = {
                 "timestamp": datetime.now().isoformat(),
-                "voltage": voltage,
-                "absorbance": absorbance
+                "voltage": metric["voltage"],
+                "absorbance": metric["absorbance"],
+                "concentration": metric["concentration"],
+                "concentration_unit": metric["concentration_unit"],
+                "concentration_display_name": metric["concentration_display_name"],
+                "metric_used": metric["metric_used"],
             }
+            if position:
+                point.update(position)
+            if waypoint_seq is not None:
+                try:
+                    point["waypoint_seq"] = int(waypoint_seq)
+                except (TypeError, ValueError):
+                    point["waypoint_seq"] = waypoint_seq
+            if step_index is not None:
+                try:
+                    point["step_index"] = int(step_index)
+                except (TypeError, ValueError):
+                    point["step_index"] = step_index
+            if loop_index is not None:
+                try:
+                    point["loop_index"] = int(loop_index)
+                except (TypeError, ValueError):
+                    point["loop_index"] = loop_index
+            if sample_id is not None:
+                point["sample_id"] = sample_id
+            if spectrometer_raw is not None:
+                point["raw"] = spectrometer_raw
             self.current_mission_data["data_points"].append(point)
             # 每 10 个点保存一次，防止数据丢失
             if len(self.current_mission_data["data_points"]) % 10 == 0:
@@ -226,7 +409,9 @@ class MissionDataManager(object):
                             "name": data.get("name", f),
                             "start_time": data.get("start_time"),
                             "end_time": data.get("end_time"),
-                            "point_count": len(data.get("data_points", []))
+                            "point_count": len(data.get("data_points", [])),
+                            "track_count": len(data.get("track_points", [])),
+                            "route_count": len(data.get("route_waypoints", [])),
                         })
                 except Exception:
                     continue
@@ -235,6 +420,12 @@ class MissionDataManager(object):
 
     def get_mission(self, mission_id):
         """获取指定任务详情。"""
+        if (
+            self.current_mission_file
+            and isinstance(self.current_mission_data, dict)
+            and str(self.current_mission_data.get("mission_id")) == str(mission_id)
+        ):
+            return self.current_mission_data
         filename = f"mission_{mission_id}.json"
         path = os.path.join(self.data_dir, filename)
         if os.path.exists(path):
@@ -308,6 +499,13 @@ DEFAULT_CONFIG = {
     "detection_settings": {
         "duration": 5.0,
         "sample_rate": 100
+    },
+    "pollution_metric": {
+        "enabled": False,
+        "slope": 1.0,
+        "intercept": 0.0,
+        "unit": "mg/L",
+        "display_name": "浓度"
     },
     "hardware": {
         "pump_serial_port": "/dev/ttyUSB0",
@@ -398,9 +596,13 @@ class ConfigManager(object):
             }
         return normalized
 
+    @staticmethod
+    def _normalize_pollution_metric(data):
+        return normalize_pollution_metric_config(data)
+
     def __init__(self, config_file=CONFIG_FILE):
         self.config_file = config_file
-        self.config = DEFAULT_CONFIG.copy()
+        self.config = copy.deepcopy(DEFAULT_CONFIG)
         self._ensure_dir()
 
     def _ensure_dir(self):
@@ -430,6 +632,9 @@ class ConfigManager(object):
             self.config['waypoint_sampling'] = self._normalize_waypoint_sampling(
                 self.config.get('waypoint_sampling', {})
             )
+            self.config['pollution_metric'] = self._normalize_pollution_metric(
+                self.config.get('pollution_metric', {})
+            )
             self.config['updated_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
@@ -454,6 +659,9 @@ class ConfigManager(object):
         self.config['waypoint_sampling'] = self._normalize_waypoint_sampling(
             self.config.get('waypoint_sampling', {})
         )
+        self.config['pollution_metric'] = self._normalize_pollution_metric(
+            self.config.get('pollution_metric', {})
+        )
 
     def _migrate_legacy_hardware_defaults(self):
         """Migrate old defaults that had spectro on ch2 to correct ch0."""
@@ -470,12 +678,15 @@ class ConfigManager(object):
 
     def reset(self):
         """重置为默认配置。"""
-        self.config = DEFAULT_CONFIG.copy()
+        self.config = copy.deepcopy(DEFAULT_CONFIG)
         self.config['sampling_sequence'] = self._normalize_sampling_sequence(
             self.config.get('sampling_sequence', {})
         )
         self.config['waypoint_sampling'] = self._normalize_waypoint_sampling(
             self.config.get('waypoint_sampling', {})
+        )
+        self.config['pollution_metric'] = self._normalize_pollution_metric(
+            self.config.get('pollution_metric', {})
         )
         return self.save()
 
@@ -487,6 +698,9 @@ class ConfigManager(object):
         )
         config['waypoint_sampling'] = self._normalize_waypoint_sampling(
             config.get('waypoint_sampling', {})
+        )
+        config['pollution_metric'] = self._normalize_pollution_metric(
+            config.get('pollution_metric', {})
         )
         return config
 
@@ -551,6 +765,12 @@ class WebConfigServer(object):
             "automation_active": False,
             "spectrometer_active": False,
         }
+        self.current_position = None
+        self.live_track_points = []
+        self.route_waypoints = []
+        self.current_waypoint_seq = None
+        self.latest_automation_status = {}
+        self.data_recording_source = None
         self.control_events = []
         self.control_events_max = 100
         self.voltage_history = []  # List of {timestamp, voltage, absorbance, raw}
@@ -568,6 +788,18 @@ class WebConfigServer(object):
             self.pid_error_sub = rospy.Subscriber('/usv/pump_pid_error', String, self._pid_error_cb)
             self.control_events_sub = rospy.Subscriber('/usv/control_events', String, self._control_event_cb)
             self.manual_status_sub = rospy.Subscriber('/usv/manual_status', String, self._manual_status_cb)
+            try:
+                from sensor_msgs.msg import NavSatFix
+                self.gps_sub = rospy.Subscriber('/mavros/global_position/global', NavSatFix, self._gps_cb)
+            except Exception:
+                self.gps_sub = None
+                rospy.logwarn("sensor_msgs not available, GPS map tracking disabled")
+            try:
+                from mavros_msgs.msg import WaypointList
+                self.waypoints_sub = rospy.Subscriber('/mavros/mission/waypoints', WaypointList, self._waypoints_cb)
+            except Exception:
+                self.waypoints_sub = None
+                rospy.logwarn("mavros_msgs WaypointList not available, route map tracking disabled")
             self.steps_pub = rospy.Publisher('/usv/automation_steps', String, queue_size=1)
             self.command_pub = rospy.Publisher('/usv/pump_command', String, queue_size=10)
             self.spectro_cmd_pub = rospy.Publisher('/usv/spectrometer_command', String, queue_size=10)
@@ -583,6 +815,8 @@ class WebConfigServer(object):
             self.pid_error_sub = None
             self.control_events_sub = None
             self.manual_status_sub = None
+            self.gps_sub = None
+            self.waypoints_sub = None
             self.steps_pub = None
             self.command_pub = None
             self.spectro_cmd_pub = None
@@ -634,15 +868,23 @@ class WebConfigServer(object):
             return bool(is_recording())
         return bool(getattr(self.data_manager, "current_mission_file", None))
 
-    def _start_data_recording_if_needed(self):
+    def _start_data_recording_if_needed(self, source="unknown"):
         if self._data_recording_active():
+            if not self.data_recording_source:
+                self.data_recording_source = source
             return
         mission_name = self.config_manager.get().get('mission', {}).get('name', '')
         self.data_manager.start_mission(mission_name)
+        self.data_recording_source = source
+        if self.route_waypoints:
+            self.data_manager.set_route_waypoints(self.route_waypoints)
+        if self.current_position:
+            self.data_manager.add_track_point(self.current_position)
 
     def _stop_data_recording_if_active(self):
         if self._data_recording_active():
             self.data_manager.stop_mission()
+        self.data_recording_source = None
 
     def _status_cb(self, msg):
         """泵状态回调。"""
@@ -677,17 +919,30 @@ class WebConfigServer(object):
             return
         if not isinstance(data, dict):
             return
+        self.latest_automation_status = data
         if 'running' in data:
             self.automation_running = bool(data.get('running', False))
         if 'paused' in data and data.get('paused'):
             self.automation_running = False
+        status_text = str(data.get("status", "") or "").lower()
+        terminal_status = (
+            "finish" in status_text
+            or "done" in status_text
+            or "stop" in status_text
+            or "error" in status_text
+            or "fail" in status_text
+        )
+        if terminal_status:
+            self.automation_running = False
+            if self.data_recording_source == "web":
+                self._stop_data_recording_if_active()
 
     def _trigger_status_cb(self, msg):
         """采样生命周期回调，用于 Web 数据中心自动建档。"""
         status = (msg.data or '').lower()
         if 'sampling_started' in status:
             self.automation_running = True
-            self._start_data_recording_if_needed()
+            self._start_data_recording_if_needed(source="trigger")
         elif (
             'sampling_stopped' in status
             or 'survey_stopped' in status
@@ -759,7 +1014,22 @@ class WebConfigServer(object):
         self.latest_spectrometer_payload = data
 
         if self.automation_running:
-            self.data_manager.add_data_point(self.current_voltage, self.current_absorbance)
+            automation = self.latest_automation_status if isinstance(self.latest_automation_status, dict) else {}
+            try:
+                self.data_manager.add_data_point(
+                    self.current_voltage,
+                    self.current_absorbance,
+                    position=self.current_position,
+                    waypoint_seq=self.current_waypoint_seq,
+                    step_index=automation.get("step_index", automation.get("current_step")),
+                    loop_index=automation.get("loop_index", automation.get("current_loop")),
+                    sample_id=automation.get("sample_id"),
+                    spectrometer_raw=data,
+                    pollution_metric=self._current_metric_config(),
+                )
+            except TypeError:
+                # Test doubles and older integrations may still expose the legacy two-argument API.
+                self.data_manager.add_data_point(self.current_voltage, self.current_absorbance)
             self.voltage_history.append({
                 "timestamp": datetime.now().isoformat(),
                 "voltage": self.current_voltage,
@@ -788,6 +1058,9 @@ class WebConfigServer(object):
     def _mission_status_cb(self, msg):
         """任务状态回调"""
         self.mission_status = msg.data
+        waypoint_seq = self._parse_status_waypoint(msg.data)
+        if waypoint_seq is not None:
+            self.current_waypoint_seq = waypoint_seq
 
     def _pid_error_cb(self, msg):
         """PID 误差回调"""
@@ -822,6 +1095,213 @@ class WebConfigServer(object):
                 self.socketio.emit('manual_status', self.manual_status)
         except Exception as e:
             rospy.logerr("Error parsing manual status: %s", str(e))
+
+    def _gps_cb(self, msg):
+        """GPS 回调：缓存 WGS84 船位，并生成高德展示用 GCJ-02 坐标。"""
+        position = make_position_snapshot(
+            getattr(msg, "latitude", None),
+            getattr(msg, "longitude", None),
+            getattr(msg, "altitude", None),
+        )
+        if not position:
+            return
+        self.current_position = position
+        self.live_track_points.append(position)
+        if len(self.live_track_points) > MAX_LIVE_TRACK_POINTS:
+            self.live_track_points = self.live_track_points[-MAX_LIVE_TRACK_POINTS:]
+        if self._data_recording_active():
+            self.data_manager.add_track_point(position)
+        if self.socketio:
+            self.socketio.emit("map_position", position)
+
+    def _waypoints_cb(self, msg):
+        """MAVROS 航点列表回调：缓存航线，用于地图叠加。"""
+        waypoints = []
+        for seq, wp in enumerate(getattr(msg, "waypoints", []) or []):
+            lat = getattr(wp, "x_lat", None)
+            lng = getattr(wp, "y_long", None)
+            alt = getattr(wp, "z_alt", None)
+            position = make_position_snapshot(lat, lng, alt)
+            if not position:
+                continue
+            waypoints.append({
+                "seq": seq,
+                "command": getattr(wp, "command", None),
+                "frame": getattr(wp, "frame", None),
+                "is_current": bool(getattr(wp, "is_current", False)),
+                "autocontinue": bool(getattr(wp, "autocontinue", False)),
+                **position,
+            })
+        self.route_waypoints = waypoints
+        if self._data_recording_active():
+            self.data_manager.set_route_waypoints(waypoints)
+        if self.socketio:
+            self.socketio.emit("map_route", waypoints)
+
+    @staticmethod
+    def _parse_status_waypoint(status):
+        parts = str(status or "").split(":")
+        if len(parts) < 2:
+            return None
+        try:
+            return int(parts[1])
+        except (TypeError, ValueError):
+            return None
+
+    def _current_metric_config(self):
+        return self.config_manager.get().get("pollution_metric", {})
+
+    def _current_live_samples(self):
+        data = getattr(self.data_manager, "current_mission_data", {})
+        if isinstance(data, dict):
+            return list(data.get("data_points", []) or [])
+        return []
+
+    @staticmethod
+    def _point_display_coord(point):
+        coord = point.get("gcj02") if isinstance(point, dict) else None
+        if not isinstance(coord, dict):
+            return None
+        lat = _to_float_or_none(coord.get("lat"))
+        lng = _to_float_or_none(coord.get("lng"))
+        if lat is None or lng is None:
+            return None
+        return lng, lat
+
+    def _build_mission_geojson(self, mission_data, metric="auto"):
+        features = []
+        data = mission_data or {}
+        route_coords = []
+        for wp in data.get("route_waypoints", []) or []:
+            coord = self._point_display_coord(wp)
+            if not coord:
+                continue
+            route_coords.append([coord[0], coord[1]])
+            features.append({
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [coord[0], coord[1]]},
+                "properties": {
+                    "layer": "waypoint",
+                    "seq": wp.get("seq"),
+                },
+            })
+        if len(route_coords) >= 2:
+            features.insert(0, {
+                "type": "Feature",
+                "geometry": {"type": "LineString", "coordinates": route_coords},
+                "properties": {"layer": "route"},
+            })
+
+        track_coords = []
+        for point in data.get("track_points", []) or []:
+            coord = self._point_display_coord(point)
+            if coord:
+                track_coords.append([coord[0], coord[1]])
+        if len(track_coords) >= 2:
+            features.append({
+                "type": "Feature",
+                "geometry": {"type": "LineString", "coordinates": track_coords},
+                "properties": {"layer": "track"},
+            })
+
+        for point in data.get("data_points", []) or []:
+            coord = self._point_display_coord(point)
+            value = _extract_metric_value(point, metric)
+            if not coord or value is None:
+                continue
+            features.append({
+                "type": "Feature",
+                "geometry": {"type": "Point", "coordinates": [coord[0], coord[1]]},
+                "properties": {
+                    "layer": "sample",
+                    "timestamp": point.get("timestamp"),
+                    "value": value,
+                    "metric": metric if metric != "auto" else point.get("metric_used", "absorbance"),
+                    "voltage": point.get("voltage"),
+                    "absorbance": point.get("absorbance"),
+                    "concentration": point.get("concentration"),
+                    "concentration_unit": point.get("concentration_unit"),
+                    "waypoint_seq": point.get("waypoint_seq"),
+                    "step_index": point.get("step_index"),
+                    "loop_index": point.get("loop_index"),
+                },
+            })
+        return {
+            "type": "FeatureCollection",
+            "features": features,
+            "properties": {
+                "mission_id": data.get("mission_id"),
+                "name": data.get("name"),
+            },
+        }
+
+    def _build_idw_surface(self, mission_data, metric="auto", size=DEFAULT_SURFACE_SIZE, power=2.0):
+        valid_points = []
+        for point in (mission_data or {}).get("data_points", []) or []:
+            coord = self._point_display_coord(point)
+            value = _extract_metric_value(point, metric)
+            if coord and value is not None:
+                valid_points.append({"lng": coord[0], "lat": coord[1], "value": value})
+        if len(valid_points) < 3:
+            return {
+                "valid": False,
+                "reason": "至少需要 3 个带 GPS 的有效采样点才能生成 IDW 插值面",
+                "metric": metric,
+                "grid": [],
+                "bounds": None,
+            }
+
+        try:
+            size = int(size)
+        except (TypeError, ValueError):
+            size = DEFAULT_SURFACE_SIZE
+        size = max(3, min(MAX_SURFACE_SIZE, size))
+        try:
+            power = float(power)
+        except (TypeError, ValueError):
+            power = 2.0
+        power = max(0.5, min(5.0, power))
+
+        lngs = [p["lng"] for p in valid_points]
+        lats = [p["lat"] for p in valid_points]
+        values = [p["value"] for p in valid_points]
+        min_lng, max_lng = min(lngs), max(lngs)
+        min_lat, max_lat = min(lats), max(lats)
+        lng_span = max(max_lng - min_lng, 0.00001)
+        lat_span = max(max_lat - min_lat, 0.00001)
+        grid = []
+        for yi in range(size):
+            lat = min_lat + lat_span * yi / float(size - 1)
+            for xi in range(size):
+                lng = min_lng + lng_span * xi / float(size - 1)
+                exact = None
+                weighted_sum = 0.0
+                weight_total = 0.0
+                for p in valid_points:
+                    distance = math.hypot((lng - p["lng"]) * 111320.0, (lat - p["lat"]) * 110540.0)
+                    if distance < 0.001:
+                        exact = p["value"]
+                        break
+                    weight = 1.0 / math.pow(distance, power)
+                    weighted_sum += weight * p["value"]
+                    weight_total += weight
+                value = exact if exact is not None else weighted_sum / weight_total
+                grid.append({"lng": lng, "lat": lat, "value": value})
+        return {
+            "valid": True,
+            "reason": "",
+            "metric": metric,
+            "grid": grid,
+            "bounds": {
+                "southwest": {"lng": min_lng, "lat": min_lat},
+                "northeast": {"lng": max_lng, "lat": max_lat},
+            },
+            "min": min(values),
+            "max": max(values),
+            "point_count": len(valid_points),
+            "size": size,
+            "power": power,
+        }
 
     def _add_log(self, message, level='info'):
         """添加日志并推送到 WebSocket"""
@@ -1179,6 +1659,21 @@ class WebConfigServer(object):
                 abort(404)
             return send_from_directory(assets_dir, filename)
 
+        @self.app.route('/<path:spa_path>')
+        def spa_fallback(spa_path):
+            """Serve the React app for BrowserRouter routes such as /map."""
+            if (
+                spa_path.startswith('api/')
+                or spa_path.startswith('socket.io')
+                or spa_path.startswith('assets/')
+                or spa_path.startswith('static/')
+            ):
+                abort(404)
+            ui_mode = get_ui_mode()
+            if ui_mode != 'static' and os.path.isfile(dist_index):
+                return send_from_directory(dist_folder, 'index.html')
+            return send_from_directory(static_folder, 'index.html')
+
         @self.app.route('/api/config', methods=['GET'])
         def get_config():
             return jsonify(self.config_manager.get())
@@ -1198,6 +1693,38 @@ class WebConfigServer(object):
             self.config_manager.reset()
             self._add_log("配置已重置", "warning")
             return jsonify({"success": True, "message": "已重置为默认配置"})
+
+        @self.app.route('/api/map/config', methods=['GET'])
+        def get_map_config():
+            key = os.environ.get("AMAP_WEB_KEY", "").strip()
+            security_js_code = os.environ.get("AMAP_SECURITY_JS_CODE", "").strip()
+            enabled = bool(key and security_js_code)
+            return jsonify({
+                "success": True,
+                "data": {
+                    "enabled": enabled,
+                    "provider": "amap",
+                    "key": key if enabled else "",
+                    "securityJsCode": security_js_code if enabled else "",
+                    "version": "2.0",
+                    "plugins": list(AMAP_PLUGINS),
+                },
+            })
+
+        @self.app.route('/api/map/live', methods=['GET'])
+        def get_live_map():
+            return jsonify({
+                "success": True,
+                "data": {
+                    "position": self.current_position,
+                    "track_points": self.live_track_points[-MAX_LIVE_TRACK_POINTS:],
+                    "route_waypoints": self.route_waypoints,
+                    "data_points": self._current_live_samples(),
+                    "metric_config": self._current_metric_config(),
+                    "mission_status": self.mission_status,
+                    "automation_running": self.automation_running,
+                },
+            })
 
         # 任务控制 API
         @self.app.route('/api/mission/start', methods=['POST'])
@@ -1773,6 +2300,30 @@ class WebConfigServer(object):
                 return jsonify({"success": True, "data": data})
             return jsonify({"success": False, "message": "任务不存在"}), 404
 
+        @self.app.route('/api/data/mission/<mission_id>/geojson', methods=['GET'])
+        def get_mission_geojson(mission_id):
+            data = self.data_manager.get_mission(mission_id)
+            if not data:
+                return jsonify({"success": False, "message": "任务不存在"}), 404
+            metric = request.args.get("metric", "auto")
+            return jsonify({
+                "success": True,
+                "data": self._build_mission_geojson(data, metric),
+            })
+
+        @self.app.route('/api/data/mission/<mission_id>/surface', methods=['GET'])
+        def get_mission_surface(mission_id):
+            data = self.data_manager.get_mission(mission_id)
+            if not data:
+                return jsonify({"success": False, "message": "任务不存在"}), 404
+            metric = request.args.get("metric", "auto")
+            size = request.args.get("size", DEFAULT_SURFACE_SIZE)
+            power = request.args.get("power", 2.0)
+            return jsonify({
+                "success": True,
+                "data": self._build_idw_surface(data, metric, size=size, power=power),
+            })
+
         @self.app.route('/api/data/mission/<mission_id>', methods=['DELETE'])
         def delete_mission_data(mission_id):
             if self.data_manager.delete_mission(mission_id):
@@ -1788,9 +2339,39 @@ class WebConfigServer(object):
             import io, csv
             output = io.StringIO()
             writer = csv.writer(output)
-            writer.writerow(["timestamp", "voltage", "absorbance"])
+            writer.writerow([
+                "timestamp",
+                "voltage",
+                "absorbance",
+                "concentration",
+                "concentration_unit",
+                "metric_used",
+                "wgs84_lat",
+                "wgs84_lng",
+                "gcj02_lat",
+                "gcj02_lng",
+                "waypoint_seq",
+                "step_index",
+                "loop_index",
+            ])
             for pt in data.get("data_points", []):
-                writer.writerow([pt.get("timestamp", ""), pt.get("voltage", ""), pt.get("absorbance", "")])
+                wgs84 = pt.get("wgs84", {}) if isinstance(pt.get("wgs84"), dict) else {}
+                gcj02 = pt.get("gcj02", {}) if isinstance(pt.get("gcj02"), dict) else {}
+                writer.writerow([
+                    pt.get("timestamp", ""),
+                    pt.get("voltage", ""),
+                    pt.get("absorbance", ""),
+                    pt.get("concentration", ""),
+                    pt.get("concentration_unit", ""),
+                    pt.get("metric_used", ""),
+                    wgs84.get("lat", ""),
+                    wgs84.get("lng", ""),
+                    gcj02.get("lat", ""),
+                    gcj02.get("lng", ""),
+                    pt.get("waypoint_seq", ""),
+                    pt.get("step_index", ""),
+                    pt.get("loop_index", ""),
+                ])
             return Response(
                 output.getvalue(),
                 mimetype="text/csv",
@@ -2257,6 +2838,7 @@ class WebConfigServer(object):
             self._add_log(msg, "warning")
             return jsonify({"success": False, "message": msg}), 400
 
+        started_recording = False
         try:
             request_data = request.get_json(silent=True) or {}
 
@@ -2274,7 +2856,8 @@ class WebConfigServer(object):
                     self.config_manager.update(config_patch)
                 self._publish_steps()
                 # 开始记录数据；若采样生命周期回调已建档则不重复创建。
-                self._start_data_recording_if_needed()
+                self._start_data_recording_if_needed(source="web")
+                started_recording = True
 
             # 如果是停止，停止记录
             if action == 'stop':
@@ -2284,11 +2867,15 @@ class WebConfigServer(object):
             rospy.wait_for_service(service_name, timeout=2.0)
             service = rospy.ServiceProxy(service_name, Trigger)
             resp = service()
+            if action == 'start' and started_recording and not resp.success:
+                self._stop_data_recording_if_active()
 
             self._add_log(f"任务 {action}: {resp.message}", "success" if resp.success else "error")
             return jsonify({"success": resp.success, "message": resp.message})
 
         except Exception as e:
+            if action == 'start' and started_recording:
+                self._stop_data_recording_if_active()
             msg = f"服务调用失败: {str(e)}"
             self._add_log(msg, "error")
             return jsonify({"success": False, "message": msg})

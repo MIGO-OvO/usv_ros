@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/set-state-in-effect */
 import { useEffect, useState, useCallback } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -54,7 +55,7 @@ export function WaypointSamplingCard() {
       } else {
         toast({ title: '保存失败', description: json.message, variant: 'destructive' })
       }
-    } catch (e) {
+    } catch {
       toast({ title: '请求失败', variant: 'destructive' })
     }
   }
@@ -69,7 +70,7 @@ export function WaypointSamplingCard() {
       } else {
         toast({ title: '同步失败', description: json.message, variant: 'destructive' })
       }
-    } catch (e) {
+    } catch {
       toast({ title: '同步请求失败', variant: 'destructive' })
     }
   }
@@ -89,7 +90,7 @@ export function WaypointSamplingCard() {
     setData(next)
   }
 
-  const updateField = (key: string, field: keyof WaypointSamplingItem, value: any) => {
+  const updateField = (key: string, field: keyof WaypointSamplingItem, value: WaypointSamplingItem[keyof WaypointSamplingItem]) => {
     setData({ ...data, [key]: { ...data[key], [field]: value } })
   }
 

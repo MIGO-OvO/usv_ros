@@ -36,6 +36,14 @@ interface HardwareConfig {
   i2c_mapping: Record<'X' | 'Y' | 'Z' | 'A', number>
 }
 
+interface PollutionMetricConfig {
+  enabled: boolean
+  slope: number
+  intercept: number
+  unit: string
+  display_name: string
+}
+
 const DEFAULT_HW: HardwareConfig = {
   pump_serial_port: '/dev/ttyUSB0',
   pump_baudrate: 115200,
@@ -54,6 +62,14 @@ const DEFAULT_HW: HardwareConfig = {
   i2c_mapping: { X: 2, Y: 3, Z: 6, A: 7 },
 }
 
+const DEFAULT_POLLUTION_METRIC: PollutionMetricConfig = {
+  enabled: false,
+  slope: 1.0,
+  intercept: 0.0,
+  unit: 'mg/L',
+  display_name: '浓度',
+}
+
 export default function Settings() {
   const pumpAngles = useAppStore((state) => state.pumpAngles)
   const rawAngles = useAppStore((state) => state.rawAngles)
@@ -63,12 +79,14 @@ export default function Settings() {
   })
 
   const [hw, setHw] = useState<HardwareConfig>({ ...DEFAULT_HW })
+  const [pollutionMetric, setPollutionMetric] = useState<PollutionMetricConfig>({ ...DEFAULT_POLLUTION_METRIC })
   const [serialPorts, setSerialPorts] = useState<SerialPort[]>([])
   const [hwLoading, setHwLoading] = useState(false)
   const [hwMsg, setHwMsg] = useState('')
 
   useEffect(() => {
     fetchConfig()
+    fetchPollutionConfig()
     fetchHardwareConfig()
   }, [])
 
@@ -103,7 +121,7 @@ export default function Settings() {
       })
       const data = await res.json()
       setHwMsg(data.message)
-    } catch (e: any) { setHwMsg(e.message) }
+    } catch (e: unknown) { setHwMsg(e instanceof Error ? e.message : String(e)) }
   }
 
   const saveAndApplyHardware = async () => {
@@ -121,7 +139,7 @@ export default function Settings() {
       if (data.results?.i2c_mapping) msgs.push('映射: ' + data.results.i2c_mapping.message)
       setHwMsg(msgs.filter(Boolean).join(' | '))
       if (data.data) setHw({ ...DEFAULT_HW, ...data.data, i2c_mapping: { ...DEFAULT_HW.i2c_mapping, ...(data.data.i2c_mapping || {}) } })
-    } catch (e: any) { setHwMsg(e.message) }
+    } catch (e: unknown) { setHwMsg(e instanceof Error ? e.message : String(e)) }
     setHwLoading(false)
   }
 
@@ -135,7 +153,7 @@ export default function Settings() {
       const data = await res.json()
       setHwMsg(data.message || '已保存')
       if (data.data) setHw({ ...DEFAULT_HW, ...data.data, i2c_mapping: { ...DEFAULT_HW.i2c_mapping, ...(data.data.i2c_mapping || {}) } })
-    } catch (e: any) { setHwMsg(e.message) }
+    } catch (e: unknown) { setHwMsg(e instanceof Error ? e.message : String(e)) }
   }
 
   const fetchConfig = async () => {
@@ -147,6 +165,16 @@ export default function Settings() {
         }
     } catch (e) {
         console.error(e)
+    }
+  }
+
+  const fetchPollutionConfig = async () => {
+    try {
+      const res = await fetch('/api/config')
+      const data = await res.json()
+      setPollutionMetric({ ...DEFAULT_POLLUTION_METRIC, ...(data.pollution_metric || {}) })
+    } catch (e) {
+      console.error(e)
     }
   }
 
@@ -162,6 +190,22 @@ export default function Settings() {
           console.error(e)
           toast({ title: 'PID 参数更新失败', variant: 'destructive' })
       }
+  }
+
+  const savePollutionMetric = async () => {
+    try {
+      const res = await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ pollution_metric: pollutionMetric }),
+      })
+      const data = await res.json()
+      if (!data.success) throw new Error(data.message || '保存失败')
+      toast({ title: '污染指标已更新', variant: 'success' })
+    } catch (e) {
+      console.error(e)
+      toast({ title: '污染指标保存失败', variant: 'destructive' })
+    }
   }
 
   const setZero = async (axis?: string) => {
@@ -239,6 +283,49 @@ export default function Settings() {
                 <div className="flex gap-2 pt-4">
                     <Button className="flex-1" onClick={saveConfig}><Save className="w-4 h-4 mr-2" /> 保存参数</Button>
                     <Button variant="outline" onClick={fetchConfig}><RefreshCw className="w-4 h-4" /></Button>
+                </div>
+            </CardContent>
+        </Card>
+
+        <Card>
+            <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                    <Activity className="w-5 h-5 text-emerald-500" />
+                    污染指标
+                </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+                <label className="flex items-center justify-between gap-3 text-sm">
+                    <span>
+                      <span className="font-medium block">启用浓度工作曲线</span>
+                      <span className="text-xs text-muted-foreground">未启用时地图自动使用吸光度。</span>
+                    </span>
+                    <Switch checked={pollutionMetric.enabled} onCheckedChange={v => setPollutionMetric(p => ({ ...p, enabled: v }))} />
+                </label>
+                <div className="grid grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                        <Label>斜率 slope</Label>
+                        <Input type="number" step="0.0001" value={pollutionMetric.slope} onChange={e => setPollutionMetric(p => ({ ...p, slope: parseFloat(e.target.value) || 0 }))} />
+                    </div>
+                    <div className="space-y-2">
+                        <Label>截距 intercept</Label>
+                        <Input type="number" step="0.0001" value={pollutionMetric.intercept} onChange={e => setPollutionMetric(p => ({ ...p, intercept: parseFloat(e.target.value) || 0 }))} />
+                    </div>
+                    <div className="space-y-2">
+                        <Label>显示名称</Label>
+                        <Input value={pollutionMetric.display_name} onChange={e => setPollutionMetric(p => ({ ...p, display_name: e.target.value }))} />
+                    </div>
+                    <div className="space-y-2">
+                        <Label>单位</Label>
+                        <Input value={pollutionMetric.unit} onChange={e => setPollutionMetric(p => ({ ...p, unit: e.target.value }))} />
+                    </div>
+                </div>
+                <div className="rounded-md bg-muted/50 p-3 text-xs text-muted-foreground">
+                  当前公式：{pollutionMetric.display_name || '浓度'} = {pollutionMetric.slope || 0} × 吸光度 + {pollutionMetric.intercept || 0}
+                </div>
+                <div className="flex gap-2">
+                    <Button className="flex-1" onClick={savePollutionMetric}><Save className="w-4 h-4 mr-2" /> 保存指标</Button>
+                    <Button variant="outline" onClick={fetchPollutionConfig}><RefreshCw className="w-4 h-4" /></Button>
                 </div>
             </CardContent>
         </Card>

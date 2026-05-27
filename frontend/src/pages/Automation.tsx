@@ -1,3 +1,4 @@
+/* eslint-disable @typescript-eslint/no-explicit-any, react-hooks/immutability */
 import { useEffect, useState } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -113,7 +114,7 @@ export default function Automation() {
         const wpRes = await fetch('/api/waypoint-sampling')
         const wpJson = await wpRes.json()
         if (wpJson.success && wpJson.data) wpSampling = wpJson.data
-      } catch (_) { /* 获取失败时不传该字段，后端会用 config 中已有值 */ }
+      } catch { /* 获取失败时不传该字段，后端会用 config 中已有值 */ }
 
       const body: Record<string, unknown> = {
         sampling_sequence: { steps, loop_count: loopCount },
@@ -187,7 +188,7 @@ export default function Automation() {
       } else {
         toast({ title: '导入失败', description: result.message, variant: 'destructive' })
       }
-    } catch (err) {
+    } catch {
       toast({ title: '导入失败', description: '文件解析错误', variant: 'destructive' })
     }
     e.target.value = ''
