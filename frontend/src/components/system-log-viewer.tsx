@@ -115,7 +115,7 @@ export function SystemLogViewer() {
         </div>
       </CardHeader>
       <CardContent>
-        <ScrollArea className="h-80 rounded-md border bg-muted/30" ref={scrollRef as any}>
+        <ScrollArea className="h-80 rounded-md border bg-muted/30" ref={scrollRef}>
           <div className="p-3 font-mono text-xs leading-relaxed whitespace-pre-wrap">
             {lines.length === 0 ? (
               <span className="text-muted-foreground">暂无日志内容</span>

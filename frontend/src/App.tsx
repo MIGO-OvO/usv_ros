@@ -7,6 +7,8 @@ import Automation from '@/pages/Automation'
 import Data from '@/pages/Data'
 import Manual from '@/pages/Manual'
 import Settings from '@/pages/Settings'
+import MapPage from '@/pages/Map'
+import Lab from '@/pages/Lab'
 import { useAppStore } from '@/store'
 import { Toaster } from '@/components/ui/toaster'
 import { ConfirmProvider } from '@/hooks/use-confirm'
@@ -32,6 +34,8 @@ function App() {
                <Route path="/automation" element={<Automation />} />
                <Route path="/manual" element={<Manual />} />
                <Route path="/data" element={<Data />} />
+               <Route path="/map" element={<MapPage />} />
+               <Route path="/lab" element={<Lab />} />
                <Route path="/settings" element={<Settings />} />
              </Routes>
           </main>

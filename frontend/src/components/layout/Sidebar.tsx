@@ -1,5 +1,5 @@
 import { Link, useLocation } from "react-router-dom"
-import { Activity, Database, LayoutDashboard, PlayCircle, Settings, SlidersHorizontal } from "lucide-react"
+import { Activity, Database, FlaskConical, LayoutDashboard, MapPinned, PlayCircle, Settings, SlidersHorizontal } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { useAppStore } from "@/store"
 import { ModeToggle } from "@/components/mode-toggle"
@@ -9,6 +9,8 @@ const navItems = [
   { name: "自动化", href: "/automation", icon: PlayCircle },
   { name: "手动控制", href: "/manual", icon: SlidersHorizontal },
   { name: "数据中心", href: "/data", icon: Database },
+  { name: "污染地图", href: "/map", icon: MapPinned },
+  { name: "实验室测试", href: "/lab", icon: FlaskConical },
   { name: "设置", href: "/settings", icon: Settings },
 ]
 

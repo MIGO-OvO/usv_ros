@@ -1,7 +1,9 @@
 import importlib.util
 import json
+import os
 import sys
 import tempfile
+import time
 import types
 import unittest
 from pathlib import Path
@@ -304,6 +306,387 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
 
         self.assertEqual(server.data_manager.points, [(1.2, 0.3)])
 
+    def test_web_direct_automation_terminal_status_stops_only_web_owned_recording(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_automation_terminal_recording_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+
+            web_manager = RecordingDataManager()
+            server.data_manager = web_manager
+            server._start_data_recording_if_needed(source="web")
+            server._automation_status_cb(string_cls(json.dumps({
+                "status": "finished",
+                "running": False,
+                "paused": False,
+            })))
+
+            trigger_manager = RecordingDataManager()
+            server.data_manager = trigger_manager
+            server._start_data_recording_if_needed(source="trigger")
+            server._automation_status_cb(string_cls(json.dumps({
+                "status": "finished",
+                "running": False,
+                "paused": False,
+            })))
+
+        self.assertEqual(web_manager.stopped, 1)
+        self.assertEqual(trigger_manager.stopped, 0)
+        self.assertFalse(server.automation_running)
+
+    def test_automation_engine_finished_callback_reports_not_running(self):
+        module = _load_script(
+            "automation_engine_finished_status_test",
+            "scripts/lib/automation_engine.py",
+        )[0]
+
+        class DummyCommandGenerator:
+            def reset_for_auto_mode(self):
+                pass
+
+            def generate_pid_stop_command(self):
+                return "PID:STOP"
+
+            def generate_stop_command(self):
+                return "STOP"
+
+            def generate_command(self, step, mode="auto"):
+                return ""
+
+        engine = module.AutomationEngine(DummyCommandGenerator(), lambda command: True)
+        engine.set_steps([{"interval": 0}])
+        engine.set_loop_count(1)
+        finished_running = []
+
+        def on_status(status):
+            if status == "finished":
+                finished_running.append(engine.is_running())
+
+        engine.on_status_update = on_status
+        self.assertTrue(engine.start())
+        deadline = time.time() + 2.0
+        while engine._thread and engine._thread.is_alive() and time.time() < deadline:
+            time.sleep(0.01)
+
+        self.assertFalse(engine._thread.is_alive())
+        self.assertEqual(finished_running, [False])
+
+    def test_lab_simulator_integrates_straight_turn_stop_and_reset(self):
+        module = _load_script(
+            "lab_sim_node_integrator_test",
+            "scripts/lab_sim_node.py",
+        )[0]
+
+        sim = module.LabSimulator({
+            "start_lat": 30.0,
+            "start_lng": 120.0,
+            "heading_deg": 0.0,
+            "max_speed_mps": 1.0,
+            "wheel_base_m": 0.5,
+        })
+
+        sim.set_virtual_propulsion(1.0, 1.0)
+        straight = sim.step(2.0)
+        sim.set_virtual_propulsion(-0.5, 0.5)
+        turning = sim.step(1.0)
+        sim.set_virtual_propulsion(0.0, 0.0)
+        stopped = sim.step(1.0)
+        sim.reset()
+        reset = sim.snapshot()
+
+        self.assertGreater(straight["lat"], 30.0)
+        self.assertAlmostEqual(straight["lng"], 120.0, places=5)
+        self.assertGreater(turning["heading_deg"], straight["heading_deg"])
+        self.assertEqual(stopped["speed_mps"], 0.0)
+        self.assertEqual(reset["track_count"], 1)
+        self.assertEqual(reset["virtual_propulsion"]["left"], 0.0)
+        self.assertFalse(reset["virtual_propulsion"]["real_output_enabled"])
+
+    def test_web_map_config_reads_amap_environment_without_persisting_credentials(self):
+        module, _, _ = _load_script(
+            "web_config_server_map_config_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            with unittest.mock.patch.dict(os.environ, {
+                "AMAP_WEB_KEY": "test-web-key",
+                "AMAP_SECURITY_JS_CODE": "test-security-code",
+            }, clear=False):
+                server = module.WebConfigServer(standalone=True)
+                client = server.app.test_client()
+                response = client.get("/api/map/config")
+
+            payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["success"])
+        self.assertTrue(payload["data"]["enabled"])
+        self.assertEqual(payload["data"]["key"], "test-web-key")
+        self.assertEqual(payload["data"]["securityJsCode"], "test-security-code")
+        self.assertIn("AMap.HeatMap", payload["data"]["plugins"])
+        self.assertFalse(Path(config_file).exists())
+
+    def test_web_static_dist_serves_spa_map_route(self):
+        module, _, _ = _load_script(
+            "web_config_server_spa_map_route_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=True)
+            client = server.app.test_client()
+
+            response = client.get("/map")
+            missing_api = client.get("/api/not-a-real-route")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertIn(b'<div id="root">', response.data)
+        self.assertEqual(missing_api.status_code, 404)
+
+    def test_web_records_geo_sample_with_concentration_when_work_curve_enabled(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_geo_sample_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            server.data_manager = module.MissionDataManager(str(Path(tmpdir) / "missions"))
+            server.config_manager.update({
+                "pollution_metric": {
+                    "enabled": True,
+                    "slope": 2.0,
+                    "intercept": 0.1,
+                    "unit": "mg/L",
+                    "display_name": "COD",
+                }
+            })
+
+            server._start_data_recording_if_needed()
+            server._gps_cb(types.SimpleNamespace(latitude=30.0, longitude=120.0, altitude=4.5))
+            server._mission_status_cb(string_cls("SAMPLING:4"))
+            server._automation_status_cb(string_cls(json.dumps({
+                "running": True,
+                "step_index": 2,
+                "loop_index": 1,
+            })))
+            server._voltage_cb(string_cls(json.dumps({
+                "voltage": 1.2,
+                "absorbance": 0.3,
+                "valid": True,
+                "raw_code": 1234,
+            })))
+
+            point = server.data_manager.current_mission_data["data_points"][-1]
+
+        self.assertEqual(point["waypoint_seq"], 4)
+        self.assertEqual(point["step_index"], 2)
+        self.assertEqual(point["loop_index"], 1)
+        self.assertEqual(point["metric_used"], "concentration")
+        self.assertAlmostEqual(point["concentration"], 0.7)
+        self.assertEqual(point["concentration_unit"], "mg/L")
+        self.assertEqual(point["wgs84"]["lat"], 30.0)
+        self.assertEqual(point["wgs84"]["lng"], 120.0)
+        self.assertIn("gcj02", point)
+
+    def test_web_geojson_excludes_samples_without_gps_and_surface_reports_empty(self):
+        module, _, _ = _load_script(
+            "web_config_server_geojson_empty_surface_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=True)
+            server.data_manager = module.MissionDataManager(str(Path(tmpdir) / "missions"))
+            mission_id = server.data_manager.start_mission("geojson")
+            mission_id = server.data_manager.current_mission_data["mission_id"]
+            server.data_manager.add_data_point(1.0, 0.2, position={
+                "wgs84": {"lat": 30.0, "lng": 120.0, "alt": 1.0},
+                "gcj02": {"lat": 29.9975, "lng": 120.0046, "alt": 1.0},
+            })
+            server.data_manager.add_data_point(2.0, 0.4)
+            client = server.app.test_client()
+
+            geojson_resp = client.get(f"/api/data/mission/{mission_id}/geojson?metric=absorbance")
+            surface_resp = client.get(f"/api/data/mission/{mission_id}/surface?metric=absorbance")
+
+        geojson = geojson_resp.get_json()
+        surface = surface_resp.get_json()
+        sample_features = [
+            f for f in geojson["data"]["features"]
+            if f["properties"].get("layer") == "sample"
+        ]
+
+        self.assertEqual(geojson_resp.status_code, 200)
+        self.assertEqual(len(sample_features), 1)
+        self.assertEqual(sample_features[0]["properties"]["value"], 0.2)
+        self.assertEqual(surface_resp.status_code, 200)
+        self.assertFalse(surface["data"]["valid"])
+        self.assertIn("3", surface["data"]["reason"])
+
+    def test_web_idw_surface_uses_valid_metric_points(self):
+        module, _, _ = _load_script(
+            "web_config_server_idw_surface_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=True)
+            server.data_manager = module.MissionDataManager(str(Path(tmpdir) / "missions"))
+            server.data_manager.start_mission("surface")
+            mission_id = server.data_manager.current_mission_data["mission_id"]
+            for lat, lng, absorbance in [
+                (30.000, 120.000, 0.1),
+                (30.001, 120.000, 0.3),
+                (30.000, 120.001, 0.5),
+            ]:
+                server.data_manager.add_data_point(1.0, absorbance, position={
+                    "wgs84": {"lat": lat, "lng": lng, "alt": 0.0},
+                    "gcj02": {"lat": lat, "lng": lng, "alt": 0.0},
+                })
+            client = server.app.test_client()
+
+            response = client.get(f"/api/data/mission/{mission_id}/surface?metric=absorbance&size=4")
+
+        payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["data"]["valid"])
+        self.assertEqual(len(payload["data"]["grid"]), 16)
+        self.assertAlmostEqual(payload["data"]["min"], 0.1)
+        self.assertAlmostEqual(payload["data"]["max"], 0.5)
+
+    def test_web_lab_config_api_and_sim_status_feed_live_map(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_lab_api_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=True)
+            client = server.app.test_client()
+
+            save_resp = client.post("/api/lab/config", json={
+                "enabled": True,
+                "bypass_pid_wait": True,
+                "position_source": "lab_sim",
+                "sim": {"start_lat": 30.0, "start_lng": 120.0, "max_speed_mps": 1.2},
+            })
+            get_resp = client.get("/api/lab/config")
+            start_resp = client.post("/api/lab/start")
+            server._lab_sim_status_cb(string_cls(json.dumps({
+                "running": True,
+                "lat": 30.0,
+                "lng": 120.0,
+                "heading_deg": 90.0,
+                "speed_mps": 0.5,
+                "virtual_propulsion": {"left": 0.5, "right": 0.5, "real_output_enabled": False},
+            })))
+            live_resp = client.get("/api/map/live")
+            stop_resp = client.post("/api/lab/stop")
+
+        self.assertEqual(save_resp.status_code, 200)
+        self.assertTrue(get_resp.get_json()["data"]["enabled"])
+        self.assertTrue(start_resp.get_json()["success"])
+        live = live_resp.get_json()["data"]
+        self.assertEqual(live["position"]["position_source"], "lab_sim")
+        self.assertTrue(live["position"]["lab_mode"])
+        self.assertEqual(live["lab_status"]["virtual_propulsion"]["left"], 0.5)
+        self.assertTrue(stop_resp.get_json()["success"])
+
+    def test_mission_data_marks_lab_samples_and_geojson_excludes_by_default(self):
+        module, _, _ = _load_script(
+            "web_config_server_lab_data_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = module.MissionDataManager(str(Path(tmpdir) / "missions"))
+            manager.start_mission("lab")
+            mission_id = manager.current_mission_data["mission_id"]
+            lab_position = module.make_position_snapshot(
+                30.0,
+                120.0,
+                source="lab_sim",
+                lab_mode=True,
+            )
+            manager.add_data_point(1.0, 0.2, position=lab_position)
+            manager.stop_mission()
+
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=True)
+            server.data_manager = manager
+            client = server.app.test_client()
+
+            raw_resp = client.get(f"/api/data/mission/{mission_id}")
+            geojson_resp = client.get(f"/api/data/mission/{mission_id}/geojson?metric=absorbance")
+            include_resp = client.get(f"/api/data/mission/{mission_id}/geojson?metric=absorbance&include_lab=true")
+
+        point = raw_resp.get_json()["data"]["data_points"][0]
+        self.assertTrue(point["lab_mode"])
+        self.assertEqual(point["position_source"], "lab_sim")
+        self.assertEqual(len(geojson_resp.get_json()["data"]["features"]), 0)
+        self.assertEqual(len(include_resp.get_json()["data"]["features"]), 1)
+
     def test_web_spectrometer_baseline_route_uses_current_valid_voltage(self):
         module, publishers, _ = _load_script(
             "web_config_server_spectrometer_baseline_route_test",
@@ -438,6 +821,30 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertIn("manual", auto_response.message.lower())
         self.assertIn("manual", spectro_response.message.lower())
 
+    def test_pump_node_lab_steps_disable_pid_wait_but_keep_real_serial_failures(self):
+        module, _, string_cls = _load_script(
+            "pump_control_node_lab_steps_test",
+            "scripts/pump_control_node.py",
+        )
+        node = module.PumpControlNode()
+        payload = {
+            "steps": [{
+                "name": "lab",
+                "X": {"enable": "E", "direction": "F", "speed": "5", "angle": "90"},
+                "interval": 0,
+            }],
+            "loop_count": 1,
+            "pid_mode": True,
+            "lab_mode": True,
+            "lab_options": {"bypass_pid_wait": True},
+        }
+
+        node._steps_callback(string_cls(json.dumps(payload)))
+
+        self.assertTrue(node.lab_mode_enabled)
+        self.assertFalse(node.pid_mode)
+        self.assertFalse(node.automation_engine._pid_mode_enabled)
+
     def test_web_manual_routes_use_control_transaction_service(self):
         module, _, _ = _load_script(
             "web_config_server_manual_routes_test",
@@ -560,6 +967,35 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertIn("/api/spectrometer/start", monitor_text)
         self.assertIn("/api/spectrometer/stop", monitor_text)
         self.assertIn("/api/spectrometer/baseline", monitor_text)
+
+    def test_frontend_declares_amap_page_and_loader_dependency(self):
+        app_text = (REPO_ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+        sidebar_text = (REPO_ROOT / "frontend" / "src" / "components" / "layout" / "Sidebar.tsx").read_text(encoding="utf-8")
+        mobile_nav_text = (REPO_ROOT / "frontend" / "src" / "components" / "layout" / "MobileNav.tsx").read_text(encoding="utf-8")
+        package_text = (REPO_ROOT / "frontend" / "package.json").read_text(encoding="utf-8")
+        map_page = REPO_ROOT / "frontend" / "src" / "pages" / "Map.tsx"
+
+        self.assertIn('path="/map"', app_text)
+        self.assertIn('href: "/map"', sidebar_text)
+        self.assertIn('href: "/map"', mobile_nav_text)
+        self.assertTrue(map_page.exists())
+        self.assertIn("@amap/amap-jsapi-loader", package_text)
+        self.assertIn("/api/map/config", map_page.read_text(encoding="utf-8"))
+        self.assertIn("AMap.HeatMap", map_page.read_text(encoding="utf-8"))
+
+    def test_frontend_declares_lab_page_and_navigation_entry(self):
+        app_text = (REPO_ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+        sidebar_text = (REPO_ROOT / "frontend" / "src" / "components" / "layout" / "Sidebar.tsx").read_text(encoding="utf-8")
+        mobile_nav_text = (REPO_ROOT / "frontend" / "src" / "components" / "layout" / "MobileNav.tsx").read_text(encoding="utf-8")
+        lab_page = REPO_ROOT / "frontend" / "src" / "pages" / "Lab.tsx"
+
+        self.assertIn('path="/lab"', app_text)
+        self.assertIn('href: "/lab"', sidebar_text)
+        self.assertIn('href: "/lab"', mobile_nav_text)
+        self.assertTrue(lab_page.exists())
+        lab_text = lab_page.read_text(encoding="utf-8")
+        self.assertIn("/api/lab/config", lab_text)
+        self.assertIn("/api/lab/start", lab_text)
 
     def test_web_apply_publishes_i2c_ads_and_start_commands(self):
         module, publishers, _ = _load_script(

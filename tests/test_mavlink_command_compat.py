@@ -1,5 +1,6 @@
 import importlib.util
 import json
+import os
 import sys
 import threading
 import types
@@ -8,6 +9,22 @@ from pathlib import Path
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def _workspace_root():
+    candidates = []
+    env_root = os.environ.get("USV_WORKSPACE_ROOT")
+    if env_root:
+        candidates.append(Path(env_root))
+    candidates.extend([
+        REPO_ROOT.parents[1],
+        REPO_ROOT.parent,
+        Path("D:/usv_ws"),
+    ])
+    for candidate in candidates:
+        if (candidate / "ardupilot-usv" / "Rover" / "mode_auto.cpp").exists():
+            return candidate
+    return REPO_ROOT.parents[1]
 
 
 class RecordingPublisher:
@@ -394,6 +411,35 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         payload = json.loads(node.steps_pub.messages[-1].data)
         self.assertEqual(payload["loop_count"], 5)
 
+    def test_manual_sample_lab_mode_disables_pid_wait_and_marks_position_source(self):
+        module = _load_script("mavlink_trigger_node_manual_lab_mode_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.is_sampling = False
+        node.current_waypoint = 0
+        node.steps_pub = RecordingPublisher()
+        node.status_pub = RecordingPublisher()
+        node._load_config = lambda: {
+            "sampling_sequence": {"steps": [{"name": "lab sample"}], "loop_count": 1},
+            "pump_settings": {"pid_mode": True, "pid_precision": 0.1},
+            "lab_mode": {
+                "enabled": True,
+                "bypass_pid_wait": True,
+                "position_source": "lab_sim",
+            },
+        }
+        node._get_default_config = lambda: {"sampling_sequence": {"steps": [], "loop_count": 1}}
+        node._set_mission_state = lambda state, context=None: None
+        node._call_automation_service = lambda name: True
+
+        accepted = node._do_manual_sample()
+
+        self.assertTrue(accepted)
+        payload = json.loads(node.steps_pub.messages[-1].data)
+        self.assertFalse(payload["pid_mode"])
+        self.assertTrue(payload["lab_mode"])
+        self.assertEqual(payload["position_source"], "lab_sim")
+        self.assertTrue(payload["lab_options"]["bypass_pid_wait"])
+
     def test_manual_sample_completion_returns_idle_without_auto_resume(self):
         module = _load_script("mavlink_trigger_node_manual_completion_idle_test", "scripts/mavlink_trigger_node.py")
         node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
@@ -551,6 +597,33 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(bridge._status_code, module.USVMavlinkRouterBridge._MISSION_STATE_CODES["IDLE"])
 
+    def test_router_bridge_treats_finished_status_as_terminal_even_if_running_flag_is_stale(self):
+        module = _load_script("usv_mavlink_router_bridge_stale_running_finish_test", "scripts/usv_mavlink_router_bridge.py")
+        bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
+        bridge._lock = threading.Lock()
+        bridge._automation_step = 1.0
+        bridge._automation_total = 1.0
+        bridge._pid_mode = 1.0
+        bridge._automation_running = True
+        bridge._last_mission_state = "SAMPLING"
+        bridge._status_code = module.USVMavlinkRouterBridge._MISSION_STATE_CODES["SAMPLING"]
+        bridge._fcu_sample_id = 0
+
+        msg = sys.modules["std_msgs.msg"].String()
+        msg.data = json.dumps({
+            "status": "finished",
+            "running": True,
+            "paused": False,
+            "automation_step": 1,
+            "automation_total": 1,
+            "pid_mode": "done",
+        })
+
+        bridge._automation_status_cb(msg)
+
+        self.assertFalse(bridge._automation_running)
+        self.assertEqual(bridge._status_code, module.USVMavlinkRouterBridge._MISSION_STATE_CODES["IDLE"])
+
     def test_router_bridge_keeps_sampling_status_for_pending_fcu_done(self):
         module = _load_script("usv_mavlink_router_bridge_fcu_done_guard_test", "scripts/usv_mavlink_router_bridge.py")
         bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
@@ -614,7 +687,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         self.assertEqual(bridge._diag_tx_named, 17)
 
     def test_rover_nav_script_time_is_the_only_mission_sampling_trigger(self):
-        workspace_root = REPO_ROOT.parents[1]
+        workspace_root = _workspace_root()
         mode_auto = (workspace_root / "ardupilot-usv" / "Rover" / "mode_auto.cpp").read_text(encoding="utf-8")
 
         self.assertNotIn("case 31010:", mode_auto)
