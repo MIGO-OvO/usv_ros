@@ -1684,6 +1684,15 @@ class WebConfigServer(object):
         # 使用 threading 模式以兼容 ROS
         self.socketio = SocketIO(self.app, cors_allowed_origins="*", async_mode='threading')
 
+        @self.app.after_request
+        def prevent_stale_frontend_cache(response):
+            path = request.path or "/"
+            if not (path.startswith("/api/") or path.startswith("/socket.io")):
+                response.headers["Cache-Control"] = "no-store, no-cache, max-age=0, must-revalidate"
+                response.headers["Pragma"] = "no-cache"
+                response.headers["Expires"] = "0"
+            return response
+
         def json_object():
             data = request.get_json(silent=True)
             return data if isinstance(data, dict) else None
@@ -1827,8 +1836,19 @@ class WebConfigServer(object):
             ):
                 abort(404)
             ui_mode = get_ui_mode()
+            if ui_mode != 'static':
+                dist_file = os.path.join(dist_folder, spa_path)
+                if os.path.isfile(dist_file):
+                    return send_from_directory(dist_folder, spa_path)
+                if os.path.splitext(spa_path)[1]:
+                    abort(404)
             if ui_mode != 'static' and os.path.isfile(dist_index):
                 return send_from_directory(dist_folder, 'index.html')
+            static_file = os.path.join(static_folder, spa_path)
+            if os.path.isfile(static_file):
+                return send_from_directory(static_folder, spa_path)
+            if os.path.splitext(spa_path)[1]:
+                abort(404)
             return send_from_directory(static_folder, 'index.html')
 
         @self.app.route('/api/config', methods=['GET'])
