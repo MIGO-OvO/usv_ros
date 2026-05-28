@@ -357,7 +357,7 @@ export default function MapPage() {
       mapRef.current?.addControl(new AMap.Scale())
       mapRef.current?.addControl(new AMap.ToolBar({ position: { right: '16px', top: '16px' } }))
       setMapError('')
-    }).catch((err) => {
+    }).catch((err: unknown) => {
       console.error(err)
       setMapError('高德地图加载失败')
     }).finally(() => setLoadingMap(false))

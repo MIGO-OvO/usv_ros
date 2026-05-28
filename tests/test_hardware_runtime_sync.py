@@ -462,10 +462,21 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             client = server.app.test_client()
 
             response = client.get("/map")
+            lab_response = client.get("/lab")
+            logo_response = client.get("/usv-logo.svg")
+            missing_asset = client.get("/not-a-real-file.js")
             missing_api = client.get("/api/not-a-real-route")
 
         self.assertEqual(response.status_code, 200)
         self.assertIn(b'<div id="root">', response.data)
+        self.assertIn("no-store", response.headers.get("Cache-Control", ""))
+        self.assertEqual(lab_response.status_code, 200)
+        self.assertIn(b'<div id="root">', lab_response.data)
+        self.assertEqual(logo_response.status_code, 200)
+        self.assertIn("image/svg+xml", logo_response.headers.get("Content-Type", ""))
+        self.assertIn("no-store", logo_response.headers.get("Cache-Control", ""))
+        self.assertNotIn(b'<div id="root">', logo_response.data)
+        self.assertEqual(missing_asset.status_code, 404)
         self.assertEqual(missing_api.status_code, 404)
 
     def test_web_records_geo_sample_with_concentration_when_work_curve_enabled(self):
