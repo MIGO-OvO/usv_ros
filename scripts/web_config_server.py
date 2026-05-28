@@ -156,7 +156,7 @@ def wgs84_to_gcj02(lat, lng):
     return {"lat": lat + d_lat, "lng": lng + d_lng}
 
 
-def make_position_snapshot(lat, lng, alt=None, timestamp=None):
+def make_position_snapshot(lat, lng, alt=None, timestamp=None, source="real", lab_mode=False):
     lat = _to_float_or_none(lat)
     lng = _to_float_or_none(lng)
     if lat is None or lng is None:
@@ -167,8 +167,55 @@ def make_position_snapshot(lat, lng, alt=None, timestamp=None):
         "timestamp": timestamp or datetime.now().isoformat(),
         "wgs84": {"lat": lat, "lng": lng, "alt": alt_value},
         "gcj02": {"lat": gcj["lat"], "lng": gcj["lng"], "alt": alt_value},
+        "position_source": str(source or "real"),
+        "lab_mode": bool(lab_mode),
     }
     return position
+
+
+def normalize_lab_config(config):
+    raw = config if isinstance(config, dict) else {}
+    sim_raw = raw.get("sim", {}) if isinstance(raw.get("sim", {}), dict) else {}
+
+    def to_bool(name, default=False):
+        value = raw.get(name, default)
+        if isinstance(value, str):
+            return value.strip().lower() in ("1", "true", "yes", "on")
+        return bool(value)
+
+    def sim_float(name, default, min_value=None, max_value=None):
+        value = _to_float_or_none(sim_raw.get(name, default))
+        if value is None:
+            value = default
+        if min_value is not None:
+            value = max(min_value, value)
+        if max_value is not None:
+            value = min(max_value, value)
+        return value
+
+    position_source = str(raw.get("position_source", "lab_sim") or "lab_sim").strip().lower()
+    if position_source not in ("lab_sim", "real", "none"):
+        position_source = "lab_sim"
+    profile = str(raw.get("profile", "semi_hardware") or "semi_hardware").strip().lower()
+    if profile not in ("semi_hardware", "software_only"):
+        profile = "semi_hardware"
+
+    return {
+        "enabled": to_bool("enabled", False),
+        "profile": profile,
+        "position_source": position_source,
+        "allow_no_gps": to_bool("allow_no_gps", True),
+        "bypass_pid_wait": to_bool("bypass_pid_wait", True),
+        "real_propulsion_enabled": to_bool("real_propulsion_enabled", False),
+        "include_lab_data_by_default": to_bool("include_lab_data_by_default", False),
+        "sim": {
+            "start_lat": sim_float("start_lat", 30.0, -90.0, 90.0),
+            "start_lng": sim_float("start_lng", 120.0, -180.0, 180.0),
+            "heading_deg": sim_float("heading_deg", 0.0, 0.0, 360.0),
+            "max_speed_mps": sim_float("max_speed_mps", 1.0, 0.0, 20.0),
+            "wheel_base_m": sim_float("wheel_base_m", 0.6, 0.05, 10.0),
+        },
+    }
 
 
 def normalize_pollution_metric_config(config):
@@ -344,6 +391,8 @@ class MissionDataManager(object):
         sample_id=None,
         spectrometer_raw=None,
         pollution_metric=None,
+        position_source=None,
+        lab_mode=False,
     ):
         """添加数据点（含电压、吸光度、地理位置和污染指标）。"""
         if self.current_mission_file:
@@ -359,6 +408,10 @@ class MissionDataManager(object):
             }
             if position:
                 point.update(position)
+            if "position_source" not in point:
+                point["position_source"] = str(position_source or ("real" if position else "none"))
+            if "lab_mode" not in point:
+                point["lab_mode"] = bool(lab_mode)
             if waypoint_seq is not None:
                 try:
                     point["waypoint_seq"] = int(waypoint_seq)
@@ -523,6 +576,22 @@ DEFAULT_CONFIG = {
         "reference_voltage": 0.0,
         "baseline_voltage": 0.0,
         "i2c_mapping": {"X": 2, "Y": 3, "Z": 6, "A": 7}
+    },
+    "lab_mode": {
+        "enabled": False,
+        "profile": "semi_hardware",
+        "position_source": "lab_sim",
+        "allow_no_gps": True,
+        "bypass_pid_wait": True,
+        "real_propulsion_enabled": False,
+        "include_lab_data_by_default": False,
+        "sim": {
+            "start_lat": 30.0,
+            "start_lng": 120.0,
+            "heading_deg": 0.0,
+            "max_speed_mps": 1.0,
+            "wheel_base_m": 0.6
+        }
     }
 }
 
@@ -600,6 +669,10 @@ class ConfigManager(object):
     def _normalize_pollution_metric(data):
         return normalize_pollution_metric_config(data)
 
+    @staticmethod
+    def _normalize_lab_mode(data):
+        return normalize_lab_config(data)
+
     def __init__(self, config_file=CONFIG_FILE):
         self.config_file = config_file
         self.config = copy.deepcopy(DEFAULT_CONFIG)
@@ -635,6 +708,9 @@ class ConfigManager(object):
             self.config['pollution_metric'] = self._normalize_pollution_metric(
                 self.config.get('pollution_metric', {})
             )
+            self.config['lab_mode'] = self._normalize_lab_mode(
+                self.config.get('lab_mode', {})
+            )
             self.config['updated_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
@@ -662,6 +738,9 @@ class ConfigManager(object):
         self.config['pollution_metric'] = self._normalize_pollution_metric(
             self.config.get('pollution_metric', {})
         )
+        self.config['lab_mode'] = self._normalize_lab_mode(
+            self.config.get('lab_mode', {})
+        )
 
     def _migrate_legacy_hardware_defaults(self):
         """Migrate old defaults that had spectro on ch2 to correct ch0."""
@@ -688,6 +767,9 @@ class ConfigManager(object):
         self.config['pollution_metric'] = self._normalize_pollution_metric(
             self.config.get('pollution_metric', {})
         )
+        self.config['lab_mode'] = self._normalize_lab_mode(
+            self.config.get('lab_mode', {})
+        )
         return self.save()
 
     def get(self):
@@ -701,6 +783,9 @@ class ConfigManager(object):
         )
         config['pollution_metric'] = self._normalize_pollution_metric(
             config.get('pollution_metric', {})
+        )
+        config['lab_mode'] = self._normalize_lab_mode(
+            config.get('lab_mode', {})
         )
         return config
 
@@ -770,6 +855,14 @@ class WebConfigServer(object):
         self.route_waypoints = []
         self.current_waypoint_seq = None
         self.latest_automation_status = {}
+        self.lab_status = {
+            "enabled": False,
+            "running": False,
+            "position_source": "lab_sim",
+            "speed_mps": 0.0,
+            "heading_deg": 0.0,
+            "virtual_propulsion": {"left": 0.0, "right": 0.0, "real_output_enabled": False},
+        }
         self.data_recording_source = None
         self.control_events = []
         self.control_events_max = 100
@@ -788,6 +881,7 @@ class WebConfigServer(object):
             self.pid_error_sub = rospy.Subscriber('/usv/pump_pid_error', String, self._pid_error_cb)
             self.control_events_sub = rospy.Subscriber('/usv/control_events', String, self._control_event_cb)
             self.manual_status_sub = rospy.Subscriber('/usv/manual_status', String, self._manual_status_cb)
+            self.lab_sim_status_sub = rospy.Subscriber('/usv/lab_sim/status', String, self._lab_sim_status_cb)
             try:
                 from sensor_msgs.msg import NavSatFix
                 self.gps_sub = rospy.Subscriber('/mavros/global_position/global', NavSatFix, self._gps_cb)
@@ -803,6 +897,7 @@ class WebConfigServer(object):
             self.steps_pub = rospy.Publisher('/usv/automation_steps', String, queue_size=1)
             self.command_pub = rospy.Publisher('/usv/pump_command', String, queue_size=10)
             self.spectro_cmd_pub = rospy.Publisher('/usv/spectrometer_command', String, queue_size=10)
+            self.lab_sim_command_pub = rospy.Publisher('/usv/lab_sim/command', String, queue_size=5)
         else:
             self.status_sub = None
             self.angles_sub = None
@@ -815,11 +910,13 @@ class WebConfigServer(object):
             self.pid_error_sub = None
             self.control_events_sub = None
             self.manual_status_sub = None
+            self.lab_sim_status_sub = None
             self.gps_sub = None
             self.waypoints_sub = None
             self.steps_pub = None
             self.command_pub = None
             self.spectro_cmd_pub = None
+            self.lab_sim_command_pub = None
 
         # Flask & SocketIO
         self.app = None
@@ -1096,12 +1193,64 @@ class WebConfigServer(object):
         except Exception as e:
             rospy.logerr("Error parsing manual status: %s", str(e))
 
+    def _current_lab_config(self):
+        return normalize_lab_config(self.config_manager.get().get("lab_mode", {}))
+
+    def _lab_sim_status_cb(self, msg):
+        """Handle simulated lab navigation state and feed the map/data path."""
+        try:
+            data = json.loads(msg.data)
+        except Exception:
+            return
+        if not isinstance(data, dict):
+            return
+
+        virtual_propulsion = data.get("virtual_propulsion", {})
+        if not isinstance(virtual_propulsion, dict):
+            virtual_propulsion = {}
+        self.lab_status = {
+            "enabled": True,
+            "running": bool(data.get("running", False)),
+            "position_source": "lab_sim",
+            "speed_mps": float(data.get("speed_mps", 0.0) or 0.0),
+            "heading_deg": float(data.get("heading_deg", 0.0) or 0.0),
+            "virtual_propulsion": {
+                "left": float(virtual_propulsion.get("left", 0.0) or 0.0),
+                "right": float(virtual_propulsion.get("right", 0.0) or 0.0),
+                "real_output_enabled": bool(virtual_propulsion.get("real_output_enabled", False)),
+            },
+        }
+        position = make_position_snapshot(
+            data.get("lat"),
+            data.get("lng"),
+            data.get("alt"),
+            timestamp=data.get("timestamp"),
+            source="lab_sim",
+            lab_mode=True,
+        )
+        if position:
+            position["speed_mps"] = self.lab_status["speed_mps"]
+            position["heading_deg"] = self.lab_status["heading_deg"]
+            position["virtual_propulsion"] = dict(self.lab_status["virtual_propulsion"])
+            self.current_position = position
+            self.live_track_points.append(position)
+            if len(self.live_track_points) > MAX_LIVE_TRACK_POINTS:
+                self.live_track_points = self.live_track_points[-MAX_LIVE_TRACK_POINTS:]
+            if self._data_recording_active():
+                self.data_manager.add_track_point(position)
+            if self.socketio:
+                self.socketio.emit("map_position", position)
+        if self.socketio:
+            self.socketio.emit("lab_status", self.lab_status)
+
     def _gps_cb(self, msg):
         """GPS 回调：缓存 WGS84 船位，并生成高德展示用 GCJ-02 坐标。"""
         position = make_position_snapshot(
             getattr(msg, "latitude", None),
             getattr(msg, "longitude", None),
             getattr(msg, "altitude", None),
+            source="real",
+            lab_mode=False,
         )
         if not position:
             return
@@ -1168,7 +1317,7 @@ class WebConfigServer(object):
             return None
         return lng, lat
 
-    def _build_mission_geojson(self, mission_data, metric="auto"):
+    def _build_mission_geojson(self, mission_data, metric="auto", include_lab=False):
         features = []
         data = mission_data or {}
         route_coords = []
@@ -1194,6 +1343,8 @@ class WebConfigServer(object):
 
         track_coords = []
         for point in data.get("track_points", []) or []:
+            if point.get("lab_mode") and not include_lab:
+                continue
             coord = self._point_display_coord(point)
             if coord:
                 track_coords.append([coord[0], coord[1]])
@@ -1205,6 +1356,8 @@ class WebConfigServer(object):
             })
 
         for point in data.get("data_points", []) or []:
+            if point.get("lab_mode") and not include_lab:
+                continue
             coord = self._point_display_coord(point)
             value = _extract_metric_value(point, metric)
             if not coord or value is None:
@@ -1224,6 +1377,8 @@ class WebConfigServer(object):
                     "waypoint_seq": point.get("waypoint_seq"),
                     "step_index": point.get("step_index"),
                     "loop_index": point.get("loop_index"),
+                    "position_source": point.get("position_source", "none"),
+                    "lab_mode": bool(point.get("lab_mode", False)),
                 },
             })
         return {
@@ -1235,9 +1390,11 @@ class WebConfigServer(object):
             },
         }
 
-    def _build_idw_surface(self, mission_data, metric="auto", size=DEFAULT_SURFACE_SIZE, power=2.0):
+    def _build_idw_surface(self, mission_data, metric="auto", size=DEFAULT_SURFACE_SIZE, power=2.0, include_lab=False):
         valid_points = []
         for point in (mission_data or {}).get("data_points", []) or []:
+            if point.get("lab_mode") and not include_lab:
+                continue
             coord = self._point_display_coord(point)
             value = _extract_metric_value(point, metric)
             if coord and value is not None:
@@ -1723,6 +1880,69 @@ class WebConfigServer(object):
                     "metric_config": self._current_metric_config(),
                     "mission_status": self.mission_status,
                     "automation_running": self.automation_running,
+                    "lab_config": self._current_lab_config(),
+                    "lab_status": self.lab_status,
+                },
+            })
+
+        @self.app.route('/api/lab/config', methods=['GET'])
+        def get_lab_config():
+            return jsonify({
+                "success": True,
+                "data": self._current_lab_config(),
+                "status": self.lab_status,
+            })
+
+        @self.app.route('/api/lab/config', methods=['POST'])
+        def save_lab_config():
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "request body must be a JSON object"}), 400
+            normalized = normalize_lab_config(data)
+            if self.config_manager.update({"lab_mode": normalized}):
+                if self.lab_sim_command_pub:
+                    msg = String()
+                    msg.data = json.dumps({"cmd": "config", "config": normalized}, ensure_ascii=False)
+                    self.lab_sim_command_pub.publish(msg)
+                return jsonify({"success": True, "message": "lab config saved", "data": normalized})
+            return jsonify({"success": False, "message": "save failed"}), 500
+
+        @self.app.route('/api/lab/start', methods=['POST'])
+        def start_lab_sim():
+            lab_config = self._current_lab_config()
+            if not lab_config.get("enabled", False):
+                lab_config["enabled"] = True
+                self.config_manager.update({"lab_mode": lab_config})
+            if self.lab_sim_command_pub:
+                msg = String()
+                msg.data = json.dumps({"cmd": "start", "config": lab_config}, ensure_ascii=False)
+                self.lab_sim_command_pub.publish(msg)
+            self.lab_status.update({
+                "enabled": True,
+                "running": True,
+                "position_source": lab_config.get("position_source", "lab_sim"),
+            })
+            return jsonify({"success": True, "message": "lab simulation started", "data": self.lab_status})
+
+        @self.app.route('/api/lab/stop', methods=['POST'])
+        def stop_lab_sim():
+            if self.lab_sim_command_pub:
+                msg = String()
+                msg.data = json.dumps({"cmd": "stop"}, ensure_ascii=False)
+                self.lab_sim_command_pub.publish(msg)
+            self.lab_status["running"] = False
+            self.lab_status["virtual_propulsion"] = {"left": 0.0, "right": 0.0, "real_output_enabled": False}
+            return jsonify({"success": True, "message": "lab simulation stopped", "data": self.lab_status})
+
+        @self.app.route('/api/lab/status', methods=['GET'])
+        def get_lab_status():
+            return jsonify({
+                "success": True,
+                "data": {
+                    "config": self._current_lab_config(),
+                    "status": self.lab_status,
+                    "position": self.current_position,
+                    "track_points": self.live_track_points[-MAX_LIVE_TRACK_POINTS:],
                 },
             })
 
@@ -2306,9 +2526,10 @@ class WebConfigServer(object):
             if not data:
                 return jsonify({"success": False, "message": "任务不存在"}), 404
             metric = request.args.get("metric", "auto")
+            include_lab = str(request.args.get("include_lab", "")).strip().lower() in ("1", "true", "yes", "on")
             return jsonify({
                 "success": True,
-                "data": self._build_mission_geojson(data, metric),
+                "data": self._build_mission_geojson(data, metric, include_lab=include_lab),
             })
 
         @self.app.route('/api/data/mission/<mission_id>/surface', methods=['GET'])
@@ -2319,9 +2540,10 @@ class WebConfigServer(object):
             metric = request.args.get("metric", "auto")
             size = request.args.get("size", DEFAULT_SURFACE_SIZE)
             power = request.args.get("power", 2.0)
+            include_lab = str(request.args.get("include_lab", "")).strip().lower() in ("1", "true", "yes", "on")
             return jsonify({
                 "success": True,
-                "data": self._build_idw_surface(data, metric, size=size, power=power),
+                "data": self._build_idw_surface(data, metric, size=size, power=power, include_lab=include_lab),
             })
 
         @self.app.route('/api/data/mission/<mission_id>', methods=['DELETE'])
@@ -2350,6 +2572,8 @@ class WebConfigServer(object):
                 "wgs84_lng",
                 "gcj02_lat",
                 "gcj02_lng",
+                "position_source",
+                "lab_mode",
                 "waypoint_seq",
                 "step_index",
                 "loop_index",
@@ -2368,6 +2592,8 @@ class WebConfigServer(object):
                     wgs84.get("lng", ""),
                     gcj02.get("lat", ""),
                     gcj02.get("lng", ""),
+                    pt.get("position_source", ""),
+                    pt.get("lab_mode", False),
                     pt.get("waypoint_seq", ""),
                     pt.get("step_index", ""),
                     pt.get("loop_index", ""),
@@ -2886,12 +3112,23 @@ class WebConfigServer(object):
             return
 
         config = self.config_manager.get()
+        lab_config = normalize_lab_config(config.get('lab_mode', {}))
+        pid_mode = config.get('pump_settings', {}).get('pid_mode', True)
+        if lab_config.get("enabled") and lab_config.get("bypass_pid_wait"):
+            pid_mode = False
         steps_data = {
             "steps": config.get('sampling_sequence', {}).get('steps', []),
             "loop_count": config.get('sampling_sequence', {}).get('loop_count', 1),
-            "pid_mode": config.get('pump_settings', {}).get('pid_mode', True),
+            "pid_mode": pid_mode,
             "pid_precision": config.get('pump_settings', {}).get('pid_precision', 0.1),
             "waypoint_sampling": config.get('waypoint_sampling', {}),
+            "lab_mode": bool(lab_config.get("enabled", False)),
+            "position_source": lab_config.get("position_source", "lab_sim") if lab_config.get("enabled") else "real",
+            "lab_options": {
+                "bypass_pid_wait": bool(lab_config.get("bypass_pid_wait", False)),
+                "allow_no_gps": bool(lab_config.get("allow_no_gps", True)),
+                "real_propulsion_enabled": bool(lab_config.get("real_propulsion_enabled", False)),
+            },
         }
         msg = String()
         msg.data = json.dumps(steps_data)

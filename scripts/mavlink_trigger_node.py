@@ -269,6 +269,12 @@ class MAVLinkTriggerNode(object):
         """Build a manual sampling payload from global Web sampling_sequence only."""
         config = config or {}
         sampling_sequence = dict(config.get('sampling_sequence', {}) or {})
+        lab_cfg = config.get('lab_mode', {}) if isinstance(config.get('lab_mode', {}), dict) else {}
+        lab_enabled = bool(lab_cfg.get('enabled', False))
+        lab_bypass_pid = bool(lab_cfg.get('bypass_pid_wait', True))
+        pid_mode = config.get('pump_settings', {}).get('pid_mode', True)
+        if lab_enabled and lab_bypass_pid:
+            pid_mode = False
         try:
             loop_count = int(sampling_sequence.get('loop_count', 1))
         except (TypeError, ValueError):
@@ -276,8 +282,15 @@ class MAVLinkTriggerNode(object):
         return {
             'steps': sampling_sequence.get('steps', []),
             'loop_count': max(0, loop_count),
-            'pid_mode': config.get('pump_settings', {}).get('pid_mode', True),
+            'pid_mode': pid_mode,
             'pid_precision': config.get('pump_settings', {}).get('pid_precision', 0.1),
+            'lab_mode': lab_enabled,
+            'position_source': str(lab_cfg.get('position_source', 'lab_sim' if lab_enabled else 'real') or 'real'),
+            'lab_options': {
+                'bypass_pid_wait': lab_bypass_pid,
+                'allow_no_gps': bool(lab_cfg.get('allow_no_gps', True)),
+                'real_propulsion_enabled': bool(lab_cfg.get('real_propulsion_enabled', False)),
+            },
         }
 
     def _wait_until_stable(self, settle_time):

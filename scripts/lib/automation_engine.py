@@ -230,7 +230,9 @@ class AutomationEngine(object):
             "total_steps": len(self.steps),
             "current_loop": self._current_loop,
             "total_loops": self.loop_count,
-            "pending_motors": list(self._pending_pid_motors)
+            "pending_motors": list(self._pending_pid_motors),
+            "failed": bool(self._failed),
+            "last_error": self._last_error,
         }
 
     def _run_loop(self):

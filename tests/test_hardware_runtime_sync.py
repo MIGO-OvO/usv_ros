@@ -381,6 +381,37 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertFalse(engine._thread.is_alive())
         self.assertEqual(finished_running, [False])
 
+    def test_lab_simulator_integrates_straight_turn_stop_and_reset(self):
+        module = _load_script(
+            "lab_sim_node_integrator_test",
+            "scripts/lab_sim_node.py",
+        )[0]
+
+        sim = module.LabSimulator({
+            "start_lat": 30.0,
+            "start_lng": 120.0,
+            "heading_deg": 0.0,
+            "max_speed_mps": 1.0,
+            "wheel_base_m": 0.5,
+        })
+
+        sim.set_virtual_propulsion(1.0, 1.0)
+        straight = sim.step(2.0)
+        sim.set_virtual_propulsion(-0.5, 0.5)
+        turning = sim.step(1.0)
+        sim.set_virtual_propulsion(0.0, 0.0)
+        stopped = sim.step(1.0)
+        sim.reset()
+        reset = sim.snapshot()
+
+        self.assertGreater(straight["lat"], 30.0)
+        self.assertAlmostEqual(straight["lng"], 120.0, places=5)
+        self.assertGreater(turning["heading_deg"], straight["heading_deg"])
+        self.assertEqual(stopped["speed_mps"], 0.0)
+        self.assertEqual(reset["track_count"], 1)
+        self.assertEqual(reset["virtual_propulsion"]["left"], 0.0)
+        self.assertFalse(reset["virtual_propulsion"]["real_output_enabled"])
+
     def test_web_map_config_reads_amap_environment_without_persisting_credentials(self):
         module, _, _ = _load_script(
             "web_config_server_map_config_test",
@@ -571,6 +602,91 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertAlmostEqual(payload["data"]["min"], 0.1)
         self.assertAlmostEqual(payload["data"]["max"], 0.5)
 
+    def test_web_lab_config_api_and_sim_status_feed_live_map(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_lab_api_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=True)
+            client = server.app.test_client()
+
+            save_resp = client.post("/api/lab/config", json={
+                "enabled": True,
+                "bypass_pid_wait": True,
+                "position_source": "lab_sim",
+                "sim": {"start_lat": 30.0, "start_lng": 120.0, "max_speed_mps": 1.2},
+            })
+            get_resp = client.get("/api/lab/config")
+            start_resp = client.post("/api/lab/start")
+            server._lab_sim_status_cb(string_cls(json.dumps({
+                "running": True,
+                "lat": 30.0,
+                "lng": 120.0,
+                "heading_deg": 90.0,
+                "speed_mps": 0.5,
+                "virtual_propulsion": {"left": 0.5, "right": 0.5, "real_output_enabled": False},
+            })))
+            live_resp = client.get("/api/map/live")
+            stop_resp = client.post("/api/lab/stop")
+
+        self.assertEqual(save_resp.status_code, 200)
+        self.assertTrue(get_resp.get_json()["data"]["enabled"])
+        self.assertTrue(start_resp.get_json()["success"])
+        live = live_resp.get_json()["data"]
+        self.assertEqual(live["position"]["position_source"], "lab_sim")
+        self.assertTrue(live["position"]["lab_mode"])
+        self.assertEqual(live["lab_status"]["virtual_propulsion"]["left"], 0.5)
+        self.assertTrue(stop_resp.get_json()["success"])
+
+    def test_mission_data_marks_lab_samples_and_geojson_excludes_by_default(self):
+        module, _, _ = _load_script(
+            "web_config_server_lab_data_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = module.MissionDataManager(str(Path(tmpdir) / "missions"))
+            manager.start_mission("lab")
+            mission_id = manager.current_mission_data["mission_id"]
+            lab_position = module.make_position_snapshot(
+                30.0,
+                120.0,
+                source="lab_sim",
+                lab_mode=True,
+            )
+            manager.add_data_point(1.0, 0.2, position=lab_position)
+            manager.stop_mission()
+
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=True)
+            server.data_manager = manager
+            client = server.app.test_client()
+
+            raw_resp = client.get(f"/api/data/mission/{mission_id}")
+            geojson_resp = client.get(f"/api/data/mission/{mission_id}/geojson?metric=absorbance")
+            include_resp = client.get(f"/api/data/mission/{mission_id}/geojson?metric=absorbance&include_lab=true")
+
+        point = raw_resp.get_json()["data"]["data_points"][0]
+        self.assertTrue(point["lab_mode"])
+        self.assertEqual(point["position_source"], "lab_sim")
+        self.assertEqual(len(geojson_resp.get_json()["data"]["features"]), 0)
+        self.assertEqual(len(include_resp.get_json()["data"]["features"]), 1)
+
     def test_web_spectrometer_baseline_route_uses_current_valid_voltage(self):
         module, publishers, _ = _load_script(
             "web_config_server_spectrometer_baseline_route_test",
@@ -704,6 +820,30 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertFalse(spectro_response.success)
         self.assertIn("manual", auto_response.message.lower())
         self.assertIn("manual", spectro_response.message.lower())
+
+    def test_pump_node_lab_steps_disable_pid_wait_but_keep_real_serial_failures(self):
+        module, _, string_cls = _load_script(
+            "pump_control_node_lab_steps_test",
+            "scripts/pump_control_node.py",
+        )
+        node = module.PumpControlNode()
+        payload = {
+            "steps": [{
+                "name": "lab",
+                "X": {"enable": "E", "direction": "F", "speed": "5", "angle": "90"},
+                "interval": 0,
+            }],
+            "loop_count": 1,
+            "pid_mode": True,
+            "lab_mode": True,
+            "lab_options": {"bypass_pid_wait": True},
+        }
+
+        node._steps_callback(string_cls(json.dumps(payload)))
+
+        self.assertTrue(node.lab_mode_enabled)
+        self.assertFalse(node.pid_mode)
+        self.assertFalse(node.automation_engine._pid_mode_enabled)
 
     def test_web_manual_routes_use_control_transaction_service(self):
         module, _, _ = _load_script(
@@ -842,6 +982,20 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertIn("@amap/amap-jsapi-loader", package_text)
         self.assertIn("/api/map/config", map_page.read_text(encoding="utf-8"))
         self.assertIn("AMap.HeatMap", map_page.read_text(encoding="utf-8"))
+
+    def test_frontend_declares_lab_page_and_navigation_entry(self):
+        app_text = (REPO_ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
+        sidebar_text = (REPO_ROOT / "frontend" / "src" / "components" / "layout" / "Sidebar.tsx").read_text(encoding="utf-8")
+        mobile_nav_text = (REPO_ROOT / "frontend" / "src" / "components" / "layout" / "MobileNav.tsx").read_text(encoding="utf-8")
+        lab_page = REPO_ROOT / "frontend" / "src" / "pages" / "Lab.tsx"
+
+        self.assertIn('path="/lab"', app_text)
+        self.assertIn('href: "/lab"', sidebar_text)
+        self.assertIn('href: "/lab"', mobile_nav_text)
+        self.assertTrue(lab_page.exists())
+        lab_text = lab_page.read_text(encoding="utf-8")
+        self.assertIn("/api/lab/config", lab_text)
+        self.assertIn("/api/lab/start", lab_text)
 
     def test_web_apply_publishes_i2c_ads_and_start_commands(self):
         module, publishers, _ = _load_script(

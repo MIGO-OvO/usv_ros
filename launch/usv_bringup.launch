@@ -56,6 +56,7 @@
     <arg name="enable_web" default="true" />
     <arg name="enable_mavlink_trigger" default="true" />
     <arg name="enable_mavlink_bridge" default="true" />
+    <arg name="enable_lab_sim" default="true" />
 
     <!-- ==================== Load Parameters ==================== -->
     <rosparam file="$(find usv_ros)/config/usv_params.yaml" command="load" />
@@ -90,6 +91,10 @@
         <param name="port" value="$(arg web_port)" />
         <param name="web_ui" value="$(arg web_ui)" />
     </node>
+
+    <!-- ==================== Laboratory Simulation ==================== -->
+    <node name="lab_sim_node" pkg="usv_ros" type="lab_sim_node.py"
+          output="screen" if="$(arg enable_lab_sim)" />
 
     <!-- ==================== MAVLink Telemetry Bridge ==================== -->
     <node name="usv_mavlink_bridge" pkg="usv_ros" type="usv_mavlink_router_bridge.py"

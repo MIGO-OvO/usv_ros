@@ -445,6 +445,9 @@ class PumpControlNode(object):
 
         # 自动化诊断上下文
         self._current_auto_step = None
+        self.lab_mode_enabled = False
+        self.lab_options = {}
+        self.last_automation_failure = {}
 
         # 当前角度状态
         self.current_angles = {m: 0.0 for m in MOTOR_NAMES}
@@ -1729,6 +1732,16 @@ class PumpControlNode(object):
             loop_count = data.get("loop_count", 1)
             pid_mode = bool(data.get("pid_mode", self.pid_mode))
             pid_precision = float(data.get("pid_precision", self.pid_precision))
+            lab_options = data.get("lab_options", {}) if isinstance(data.get("lab_options", {}), dict) else {}
+            self.lab_mode_enabled = bool(data.get("lab_mode", False))
+            self.lab_options = {
+                "bypass_pid_wait": bool(lab_options.get("bypass_pid_wait", True)),
+                "allow_no_gps": bool(lab_options.get("allow_no_gps", True)),
+                "real_propulsion_enabled": bool(lab_options.get("real_propulsion_enabled", False)),
+            }
+            self.last_automation_failure = {}
+            if self.lab_mode_enabled and self.lab_options["bypass_pid_wait"]:
+                pid_mode = False
 
             self.pid_mode = pid_mode
             self.pid_precision = pid_precision
@@ -1849,11 +1862,19 @@ class PumpControlNode(object):
 
     def _on_automation_error(self, error):
         """自动化错误回调。"""
+        engine_status = self.automation_engine.get_status()
+        self.last_automation_failure = {
+            "reason": str(error),
+            "step": self._current_auto_step,
+            "pending_motors": sorted(engine_status.get("pending_motors", [])),
+            "spectrometer_state": self.spectro_state,
+            "lab_mode": bool(self.lab_mode_enabled),
+        }
         if "PID 等待超时" in error and self._current_auto_step:
             step = self._current_auto_step
             step_name = step.get("name", "未命名步骤")
             diag_parts = []
-            for motor in sorted(self.automation_engine.get_status().get("pending_motors", [])):
+            for motor in sorted(engine_status.get("pending_motors", [])):
                 target = self.pid_target_angles.get(motor)
                 current = self.current_angles.get(motor)
                 if target is None:
@@ -1868,7 +1889,7 @@ class PumpControlNode(object):
                 )
             rospy.logerr("[Automation] PID 超时详情: step=%s loop=%s pending=%s",
                          step_name,
-                         self.automation_engine.get_status().get("current_loop"),
+                         engine_status.get("current_loop"),
                          ", ".join(diag_parts) if diag_parts else "none")
         rospy.logerr("[Automation] 错误: %s", error)
         self._publish_status("error: " + error)
@@ -1938,6 +1959,12 @@ class PumpControlNode(object):
             "current_loop": int(engine_status.get("current_loop", 0) or 0),
             "total_loops": int(engine_status.get("total_loops", 0) or 0),
             "pid_mode": pid_mode,
+            "lab_mode": bool(self.lab_mode_enabled),
+            "lab_options": dict(self.lab_options),
+            "pending_motors": list(engine_status.get("pending_motors", [])),
+            "last_error": engine_status.get("last_error") or self.last_automation_failure.get("reason", ""),
+            "failure": dict(self.last_automation_failure),
+            "spectrometer_state": self.spectro_state,
         }
         msg = String()
         msg.data = json.dumps(payload, ensure_ascii=False)
