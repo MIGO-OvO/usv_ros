@@ -94,6 +94,7 @@ if SCRIPT_DIR not in sys.path:
     sys.path.append(SCRIPT_DIR)
 
 from preset_manager import PresetManager
+import map_tile_cache as mtc
 
 # 配置文件路径
 CONFIG_DIR = os.path.expanduser("~/usv_ws/config")
@@ -101,7 +102,6 @@ CONFIG_FILE = os.path.join(CONFIG_DIR, "sampling_config.json")
 CALIBRATION_FILE = os.path.join(CONFIG_DIR, "calibration.json")
 DATA_DIR = os.path.expanduser("~/usv_ws/data/missions")
 
-AMAP_PLUGINS = ["AMap.Scale", "AMap.ToolBar", "AMap.HeatMap"]
 MAX_LIVE_TRACK_POINTS = 1000
 DEFAULT_SURFACE_SIZE = 50
 MAX_SURFACE_SIZE = 80
@@ -824,6 +824,7 @@ class WebConfigServer(object):
         self.preset_manager = PresetManager()
         self.data_manager = MissionDataManager()
         self.calibration_manager = CalibrationManager()
+        self.tile_cache = mtc.MapTileCache(logger=rospy.logwarn)
 
         # 日志缓冲
         self.log_buffer = []
@@ -1299,6 +1300,50 @@ class WebConfigServer(object):
 
     def _current_metric_config(self):
         return self.config_manager.get().get("pollution_metric", {})
+
+    def _resolve_prewarm_bbox(self, client_bbox):
+        """预热范围: 优先航点包络(gcj02), 无航点回退到前端传入的当前视野。
+
+        返回 (min_lng, min_lat, max_lng, max_lat) 或 None。
+        """
+        lngs, lats = [], []
+        for wp in (self.route_waypoints or []):
+            coord = wp.get("gcj02") if isinstance(wp, dict) else None
+            if isinstance(coord, dict):
+                lng, lat = coord.get("lng"), coord.get("lat")
+                if isinstance(lng, (int, float)) and isinstance(lat, (int, float)):
+                    lngs.append(float(lng))
+                    lats.append(float(lat))
+        if lngs and lats:
+            pad = 0.003  # 约 300m 余量, 覆盖航线两侧岸线
+            return (min(lngs) - pad, min(lats) - pad,
+                    max(lngs) + pad, max(lats) + pad)
+        # 回退: 前端当前视野 bbox
+        if isinstance(client_bbox, dict):
+            try:
+                return (float(client_bbox["min_lng"]), float(client_bbox["min_lat"]),
+                        float(client_bbox["max_lng"]), float(client_bbox["max_lat"]))
+            except (KeyError, TypeError, ValueError):
+                return None
+        return None
+
+    def _emit_prewarm_progress(self, status):
+        if self.socketio:
+            self.socketio.emit("map_prewarm_progress", status)
+
+    @staticmethod
+    def _probe_online():
+        """探测能否到达高德瓦片端点, 用于在线/离线状态显示。"""
+        try:
+            req = mtc.Request(
+                "https://webst01.is.autonavi.com/appmaptile?style=6&x=0&y=0&z=1",
+                headers={"User-Agent": "USV-OfflineMap/1.0"})
+            resp = mtc.urlopen(req, timeout=2.5)
+            resp.read(64)
+            return True
+        except Exception:
+            return False
+
 
     def _current_live_samples(self):
         data = getattr(self.data_manager, "current_mission_data", {})
@@ -1873,20 +1918,76 @@ class WebConfigServer(object):
 
         @self.app.route('/api/map/config', methods=['GET'])
         def get_map_config():
-            key = os.environ.get("AMAP_WEB_KEY", "").strip()
-            security_js_code = os.environ.get("AMAP_SECURITY_JS_CODE", "").strip()
-            enabled = bool(key and security_js_code)
+            """下发离线地图配置: 瓦片代理走本地, 无需高德 Key。"""
             return jsonify({
                 "success": True,
                 "data": {
-                    "enabled": enabled,
-                    "provider": "amap",
-                    "key": key if enabled else "",
-                    "securityJsCode": security_js_code if enabled else "",
-                    "version": "2.0",
-                    "plugins": list(AMAP_PLUGINS),
+                    "enabled": True,
+                    "provider": "leaflet-amap-raster",
+                    "tile_url": "/api/map/tile/{style}/{z}/{x}/{y}.png",
+                    "styles": list(mtc.VALID_STYLES),
+                    "default_style": "satellite",
+                    "min_zoom": mtc.ZOOM_HARD_MIN,
+                    "max_zoom": mtc.ZOOM_HARD_MAX,
+                    "default_center": {"lng": 114.305, "lat": 30.593},
+                    "default_zoom": 15,
+                    "prewarm_zoom": {
+                        "min": mtc.DEFAULT_ZOOM_MIN,
+                        "max": mtc.DEFAULT_ZOOM_MAX,
+                    },
                 },
             })
+
+        @self.app.route('/api/map/tile/<style>/<int:z>/<int:x>/<int:y>.png', methods=['GET'])
+        def get_map_tile(style, z, x, y):
+            """瓦片代理: 缓存优先, 在线回源落盘, 离线未命中返占位瓦片。"""
+            data, hit = self.tile_cache.get_tile(style, z, x, y)
+            resp = Response(data, mimetype='image/png')
+            resp.headers['Cache-Control'] = 'public, max-age=31536000'
+            resp.headers['X-Tile-Source'] = hit
+            return resp
+
+        @self.app.route('/api/map/cache/stats', methods=['GET'])
+        def get_map_cache_stats():
+            return jsonify({
+                "success": True,
+                "data": {
+                    "cache": self.tile_cache.stats(),
+                    "prewarm": self.tile_cache.prewarm_status(),
+                },
+            })
+
+        @self.app.route('/api/map/cache/prewarm', methods=['POST'])
+        def start_map_prewarm():
+            data = json_object() or {}
+            bbox = self._resolve_prewarm_bbox(data.get("bbox"))
+            if not bbox:
+                return jsonify({"success": False,
+                                "message": "无可用范围(无航点且未提供视野)"}), 400
+            ok, info = self.tile_cache.start_prewarm(
+                bbox,
+                data.get("zoom_min", mtc.DEFAULT_ZOOM_MIN),
+                data.get("zoom_max", mtc.DEFAULT_ZOOM_MAX),
+                data.get("styles") or list(mtc.VALID_STYLES),
+                progress_cb=self._emit_prewarm_progress,
+            )
+            status = 200 if ok else 409
+            return jsonify({"success": ok, "message": info.get("message"),
+                            "data": info}), status
+
+        @self.app.route('/api/map/cache/prewarm/stop', methods=['POST'])
+        def stop_map_prewarm():
+            return jsonify({"success": True, "data": self.tile_cache.stop_prewarm()})
+
+        @self.app.route('/api/map/cache/clear', methods=['POST'])
+        def clear_map_cache():
+            ok, message = self.tile_cache.clear()
+            return jsonify({"success": ok, "message": message,
+                            "data": self.tile_cache.stats()})
+
+        @self.app.route('/api/map/ping', methods=['GET'])
+        def map_ping():
+            return jsonify({"success": True, "online": self._probe_online()})
 
         @self.app.route('/api/map/live', methods=['GET'])
         def get_live_map():

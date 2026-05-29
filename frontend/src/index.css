@@ -81,3 +81,21 @@
 ::-webkit-scrollbar-thumb {
   @apply bg-muted-foreground/20 rounded-full hover:bg-muted-foreground/40 transition-colors;
 }
+
+/* Leaflet 航点标签 */
+.usv-waypoint-icon span {
+  display: inline-block;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-weight: 600;
+  color: #fff;
+  background: #2563eb;
+  border-radius: 9999px;
+  white-space: nowrap;
+  transform: translate(-50%, -130%);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
+}
+.leaflet-container {
+  background: #1a1a1a;
+  font: inherit;
+}

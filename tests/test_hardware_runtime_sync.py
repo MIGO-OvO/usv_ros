@@ -412,7 +412,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(reset["virtual_propulsion"]["left"], 0.0)
         self.assertFalse(reset["virtual_propulsion"]["real_output_enabled"])
 
-    def test_web_map_config_reads_amap_environment_without_persisting_credentials(self):
+    def test_web_map_config_serves_offline_tile_proxy_without_amap_key(self):
         module, _, _ = _load_script(
             "web_config_server_map_config_test",
             "scripts/web_config_server.py",
@@ -420,29 +420,28 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmpdir:
             config_file = str(Path(tmpdir) / "sampling_config.json")
+            cache_dir = str(Path(tmpdir) / "map_cache")
 
             class TempConfigManager(module.ConfigManager):
                 def __init__(self, _config_file=config_file):
                     super().__init__(_config_file)
 
             module.ConfigManager = TempConfigManager
-            with unittest.mock.patch.dict(os.environ, {
-                "AMAP_WEB_KEY": "test-web-key",
-                "AMAP_SECURITY_JS_CODE": "test-security-code",
-            }, clear=False):
-                server = module.WebConfigServer(standalone=True)
-                client = server.app.test_client()
-                response = client.get("/api/map/config")
-
+            module.mtc.CACHE_DIR = cache_dir
+            server = module.WebConfigServer(standalone=True)
+            server.tile_cache = module.mtc.MapTileCache(cache_dir=cache_dir)
+            client = server.app.test_client()
+            response = client.get("/api/map/config")
             payload = response.get_json()
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(payload["success"])
         self.assertTrue(payload["data"]["enabled"])
-        self.assertEqual(payload["data"]["key"], "test-web-key")
-        self.assertEqual(payload["data"]["securityJsCode"], "test-security-code")
-        self.assertIn("AMap.HeatMap", payload["data"]["plugins"])
-        self.assertFalse(Path(config_file).exists())
+        self.assertEqual(payload["data"]["provider"], "leaflet-amap-raster")
+        self.assertIn("{style}", payload["data"]["tile_url"])
+        self.assertIn("satellite", payload["data"]["styles"])
+        self.assertNotIn("key", payload["data"])
+        self.assertNotIn("securityJsCode", payload["data"])
 
     def test_web_static_dist_serves_spa_map_route(self):
         module, _, _ = _load_script(
@@ -979,7 +978,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertIn("/api/spectrometer/stop", monitor_text)
         self.assertIn("/api/spectrometer/baseline", monitor_text)
 
-    def test_frontend_declares_amap_page_and_loader_dependency(self):
+    def test_frontend_declares_map_page_and_leaflet_dependency(self):
         app_text = (REPO_ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
         sidebar_text = (REPO_ROOT / "frontend" / "src" / "components" / "layout" / "Sidebar.tsx").read_text(encoding="utf-8")
         mobile_nav_text = (REPO_ROOT / "frontend" / "src" / "components" / "layout" / "MobileNav.tsx").read_text(encoding="utf-8")
@@ -990,9 +989,12 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertIn('href: "/map"', sidebar_text)
         self.assertIn('href: "/map"', mobile_nav_text)
         self.assertTrue(map_page.exists())
-        self.assertIn("@amap/amap-jsapi-loader", package_text)
-        self.assertIn("/api/map/config", map_page.read_text(encoding="utf-8"))
-        self.assertIn("AMap.HeatMap", map_page.read_text(encoding="utf-8"))
+        self.assertIn('"leaflet"', package_text)
+        self.assertIn("leaflet.heat", package_text)
+        self.assertNotIn("@amap/amap-jsapi-loader", package_text)
+        map_text = map_page.read_text(encoding="utf-8")
+        self.assertIn("/api/map/config", map_text)
+        self.assertIn("/api/map/cache/prewarm", map_text)
 
     def test_frontend_declares_lab_page_and_navigation_entry(self):
         app_text = (REPO_ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
