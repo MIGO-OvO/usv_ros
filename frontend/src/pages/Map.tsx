@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import 'leaflet.heat'
-import { Activity, AlertTriangle, Database, Download, Layers, Loader2, MapPinned, Navigation, RefreshCw, Route, Trash2, Wifi, WifiOff, X } from 'lucide-react'
+import { Activity, AlertTriangle, Database, Download, Layers, Loader2, MapPinned, Navigation, RefreshCw, Route, Trash2, Upload, Wifi, WifiOff, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { cn } from '@/lib/utils'
@@ -157,6 +157,9 @@ export default function MapPage() {
   const [prewarm, setPrewarm] = useState<PrewarmStatus | null>(null)
   const [cacheStats, setCacheStats] = useState<CacheStats | null>(null)
   const [cacheMsg, setCacheMsg] = useState('')
+  const [offlineMode, setOfflineMode] = useState(false)
+  const [importing, setImporting] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement | null>(null)
 
   const activeSamples = useMemo(
     () => geojson?.features.filter((f) => f.properties?.layer === 'sample') || [],
@@ -177,11 +180,48 @@ export default function MapPage() {
       if (json.success) {
         setCacheStats(json.data.cache)
         setPrewarm(json.data.prewarm)
+        if (typeof json.data.offline_mode === 'boolean') setOfflineMode(json.data.offline_mode)
       }
     } catch {
       /* 离线时忽略 */
     }
   }, [])
+
+  const toggleOffline = useCallback(async (enabled: boolean) => {
+    setOfflineMode(enabled)
+    try {
+      const res = await fetch('/api/map/offline-mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled }),
+      })
+      const json = await res.json()
+      setCacheMsg(json.message || '')
+    } catch {
+      setCacheMsg('离线模式切换失败')
+    }
+  }, [])
+
+  const importPack = useCallback(async (file: File) => {
+    setImporting(true)
+    setCacheMsg('')
+    try {
+      const form = new FormData()
+      form.append('pack', file)
+      const res = await fetch('/api/map/cache/import', { method: 'POST', body: form })
+      const json = await res.json()
+      if (json.success) {
+        setCacheMsg(`导入完成: 新增 ${json.data.added} 张, 跳过 ${json.data.skipped} 张`)
+        loadCacheStats()
+      } else {
+        setCacheMsg(json.message || '导入失败')
+      }
+    } catch {
+      setCacheMsg('导入请求失败')
+    } finally {
+      setImporting(false)
+    }
+  }, [loadCacheStats])
 
   const probeOnline = useCallback(async () => {
     try {
@@ -527,6 +567,15 @@ export default function MapPage() {
                 <span className="text-muted-foreground">已缓存瓦片</span>
                 <span className="font-medium">{cacheStats ? `${cacheStats.tiles} 张 · ${(cacheStats.bytes / 1048576).toFixed(1)} MB` : '—'}</span>
               </div>
+              <label className="flex items-center justify-between">
+                <span className="text-muted-foreground">离线模式</span>
+                <input
+                  type="checkbox"
+                  className="h-4 w-8 cursor-pointer accent-primary"
+                  checked={offlineMode}
+                  onChange={(e) => toggleOffline(e.target.checked)}
+                />
+              </label>
               {prewarm?.running ? (
                 <div className="space-y-2">
                   <div className="h-2 w-full rounded-full bg-muted overflow-hidden">
@@ -542,8 +591,24 @@ export default function MapPage() {
                 </div>
               ) : (
                 <div className="space-y-2">
-                  <Button size="sm" className="w-full" onClick={startPrewarm} disabled={!online}>
+                  <Button size="sm" className="w-full" onClick={startPrewarm} disabled={!online || offlineMode}>
                     <Download className="w-4 h-4 mr-1" />预热当前作业区
+                  </Button>
+                  <input
+                    ref={fileInputRef}
+                    type="file"
+                    accept=".tar"
+                    className="hidden"
+                    onChange={(e) => {
+                      const file = e.target.files?.[0]
+                      if (file) importPack(file)
+                      e.target.value = ''
+                    }}
+                  />
+                  <Button variant="outline" size="sm" className="w-full" disabled={importing}
+                    onClick={() => fileInputRef.current?.click()}>
+                    {importing ? <Loader2 className="w-4 h-4 mr-1 animate-spin" /> : <Upload className="w-4 h-4 mr-1" />}
+                    导入离线包
                   </Button>
                   <Button variant="outline" size="sm" className="w-full" onClick={clearCache}>
                     <Trash2 className="w-4 h-4 mr-1" />清空缓存
@@ -556,7 +621,7 @@ export default function MapPage() {
                 </div>
               )}
               {cacheMsg && <div className="rounded-md bg-muted p-2 text-xs">{cacheMsg}</div>}
-              <p className="text-xs text-muted-foreground">联网时预热当前视野范围, 现场离线即可加载已缓存区域。</p>
+              <p className="text-xs text-muted-foreground">联网时预热当前视野; 无网络时可导入离线包(由联网设备 map_pack_export 导出), 并开启离线模式避免弱网卡顿。</p>
             </CardContent>
           </Card>
         </aside>

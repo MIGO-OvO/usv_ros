@@ -29,6 +29,7 @@ import copy
 import math
 import os
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime
@@ -1954,6 +1955,7 @@ class WebConfigServer(object):
                 "data": {
                     "cache": self.tile_cache.stats(),
                     "prewarm": self.tile_cache.prewarm_status(),
+                    "offline_mode": self.tile_cache.offline_mode,
                 },
             })
 
@@ -1984,6 +1986,42 @@ class WebConfigServer(object):
             ok, message = self.tile_cache.clear()
             return jsonify({"success": ok, "message": message,
                             "data": self.tile_cache.stats()})
+
+        @self.app.route('/api/map/offline-mode', methods=['GET'])
+        def get_offline_mode():
+            return jsonify({"success": True, "data": {"offline_mode": self.tile_cache.offline_mode}})
+
+        @self.app.route('/api/map/offline-mode', methods=['POST'])
+        def set_offline_mode():
+            data = json_object() or {}
+            enabled = self.tile_cache.set_offline_mode(bool(data.get("enabled", False)))
+            self._add_log("离线地图模式: %s" % ("开启" if enabled else "关闭"))
+            return jsonify({"success": True, "data": {"offline_mode": enabled},
+                            "message": "离线模式已%s" % ("开启" if enabled else "关闭")})
+
+        @self.app.route('/api/map/cache/import', methods=['POST'])
+        def import_map_pack():
+            """上传离线瓦片包(tar), 校验后合并进缓存。multipart 字段名: pack。"""
+            upload = request.files.get("pack") if request.files else None
+            if upload is None or not upload.filename:
+                return jsonify({"success": False, "message": "未提供瓦片包文件(字段 pack)"}), 400
+            tmp_fd, tmp_path = tempfile.mkstemp(suffix=".tar", prefix="usv_mapimport_")
+            try:
+                os.close(tmp_fd)
+                upload.save(tmp_path)
+                ok, summary = mtc.import_pack(
+                    tmp_path, cache_dir=self.tile_cache.cache_dir, logger=rospy.logwarn)
+                if ok:
+                    self._add_log("离线地图包导入: 新增 %d 张, 跳过 %d 张" % (
+                        summary.get("added", 0), summary.get("skipped", 0)), "success")
+                status = 200 if ok else 400
+                return jsonify({"success": ok, "message": summary.get("message"),
+                                "data": summary}), status
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except OSError:
+                    pass
 
         @self.app.route('/api/map/ping', methods=['GET'])
         def map_ping():
