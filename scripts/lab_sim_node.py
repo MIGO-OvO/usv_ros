@@ -34,6 +34,24 @@ def _clamp(value, low, high):
     return max(low, min(high, value))
 
 
+def _local_offset_m(lat0, lng0, lat1, lng1):
+    """两经纬度点间的 (north_m, east_m) 平面近似偏移。"""
+    north = (lat1 - lat0) * 110540.0
+    cos_lat = max(0.01, math.cos(math.radians(lat0)))
+    east = (lng1 - lng0) * 111320.0 * cos_lat
+    return north, east
+
+
+def _distance_m(lat0, lng0, lat1, lng1):
+    north, east = _local_offset_m(lat0, lng0, lat1, lng1)
+    return math.hypot(north, east)
+
+
+def _wrap180(deg):
+    """把角度归一化到 [-180, 180)。"""
+    return (deg + 180.0) % 360.0 - 180.0
+
+
 class LabSimulator(object):
     """Pure differential-drive state integrator used by the ROS lab sim node."""
 
@@ -47,6 +65,8 @@ class LabSimulator(object):
         self.max_speed_mps = max(0.0, _float_value(config.get("max_speed_mps", 1.0), 1.0))
         self.wheel_base_m = max(0.05, _float_value(config.get("wheel_base_m", 0.6), 0.6))
         self.real_propulsion_enabled = bool(config.get("real_propulsion_enabled", False))
+        # 到点判定半径(米): 船位距航点小于该值视为到达
+        self.arrival_radius_m = max(0.5, _float_value(config.get("arrival_radius_m", 3.0), 3.0))
         self.reset()
 
     def reset(self):
@@ -57,6 +77,10 @@ class LabSimulator(object):
         self.left_output = 0.0
         self.right_output = 0.0
         self.running = False
+        # 航线制导状态: 航点列表与当前目标索引
+        self.waypoints = []
+        self.target_idx = 0
+        self.mission_active = False
         self.track = [self._track_point()]
         return self.snapshot()
 
@@ -70,11 +94,69 @@ class LabSimulator(object):
         return self.snapshot()
 
     def set_virtual_propulsion(self, left, right):
+        # 手动推进会接管, 退出航线制导
+        self.mission_active = False
         self.left_output = _clamp(_float_value(left, 0.0), -1.0, 1.0)
         self.right_output = _clamp(_float_value(right, 0.0), -1.0, 1.0)
 
+    def set_mission(self, waypoints):
+        """载入虚拟航线并进入自动制导。waypoints: [{lat,lng,seq?}, ...]。"""
+        cleaned = []
+        for i, wp in enumerate(waypoints or []):
+            lat = _float_value((wp or {}).get("lat"), None) if isinstance(wp, dict) else None
+            lng = _float_value((wp or {}).get("lng"), None) if isinstance(wp, dict) else None
+            if lat is None or lng is None:
+                continue
+            seq = (wp.get("seq") if isinstance(wp, dict) else None)
+            cleaned.append({"lat": lat, "lng": lng,
+                            "seq": int(seq) if seq is not None else len(cleaned)})
+        self.waypoints = cleaned
+        self.target_idx = 0
+        self._arrivals = []
+        self.mission_active = len(cleaned) > 0
+        if self.mission_active:
+            self.running = True
+        return self.snapshot()
+
+    def drain_arrivals(self):
+        """取出并清空待发布的到达事件 (seq 列表)。"""
+        pending = list(getattr(self, "_arrivals", []))
+        self._arrivals = []
+        return pending
+
+    def _steer_toward_target(self):
+        """差速制导: 朝当前目标航点转向并前进; 到点则推进索引并记录到达。"""
+        if not self.waypoints or self.target_idx >= len(self.waypoints):
+            self.mission_active = False
+            self.left_output = self.right_output = 0.0
+            return
+        target = self.waypoints[self.target_idx]
+        dist = _distance_m(self.lat, self.lng, target["lat"], target["lng"])
+        if dist <= self.arrival_radius_m:
+            if not hasattr(self, "_arrivals"):
+                self._arrivals = []
+            self._arrivals.append({"seq": target["seq"], "lat": self.lat, "lng": self.lng})
+            self.target_idx += 1
+            if self.target_idx >= len(self.waypoints):
+                # 航线完成: 停在终点
+                self.mission_active = False
+                self.left_output = self.right_output = 0.0
+                self.speed_mps = 0.0
+                return
+            target = self.waypoints[self.target_idx]
+        north, east = _local_offset_m(self.lat, self.lng, target["lat"], target["lng"])
+        bearing = math.degrees(math.atan2(east, north)) % 360.0
+        error = _wrap180(bearing - self.heading_deg)
+        turn = _clamp(error / 45.0, -1.0, 1.0)        # 45 度误差即满舵
+        forward = _clamp(1.0 - abs(error) / 90.0, 0.15, 1.0)  # 偏差大时降速保留转向
+        self.left_output = _clamp(forward - turn, -1.0, 1.0)
+        self.right_output = _clamp(forward + turn, -1.0, 1.0)
+
     def step(self, dt):
         dt = max(0.0, _float_value(dt, 0.0))
+        # 航线制导: 自动设定 left/right 输出, 朝目标航点行进并记录到达
+        if self.mission_active:
+            self._steer_toward_target()
         linear = self.max_speed_mps * (self.left_output + self.right_output) / 2.0
         yaw_rate = self.max_speed_mps * (self.right_output - self.left_output) / self.wheel_base_m
         if not self.running:
@@ -105,6 +187,9 @@ class LabSimulator(object):
         }
 
     def snapshot(self):
+        target_seq = None
+        if self.mission_active and self.target_idx < len(self.waypoints):
+            target_seq = self.waypoints[self.target_idx]["seq"]
         return {
             "timestamp": datetime.now().isoformat(),
             "running": bool(self.running),
@@ -113,6 +198,12 @@ class LabSimulator(object):
             "heading_deg": self.heading_deg,
             "speed_mps": self.speed_mps,
             "track_count": len(self.track),
+            "mission": {
+                "active": bool(self.mission_active),
+                "total": len(self.waypoints),
+                "target_seq": target_seq,
+                "reached_count": self.target_idx,
+            },
             "virtual_propulsion": {
                 "left": self.left_output,
                 "right": self.right_output,
@@ -132,12 +223,15 @@ class LabSimNode(object):
             "heading_deg": rospy.get_param("~heading_deg", 0.0),
             "max_speed_mps": rospy.get_param("~max_speed_mps", 1.0),
             "wheel_base_m": rospy.get_param("~wheel_base_m", 0.6),
+            "arrival_radius_m": rospy.get_param("~arrival_radius_m", 3.0),
             "real_propulsion_enabled": rospy.get_param("~real_propulsion_enabled", False),
         }
         self.sim = LabSimulator(config)
         self._lock = threading.Lock()
         self._last_step = time.time()
         self._status_pub = rospy.Publisher("/usv/lab_sim/status", String, queue_size=10, latch=True)
+        # C2: 虚拟航点到达事件 (独立话题, 不污染 /mavros/mission/reached)
+        self._reached_pub = rospy.Publisher("/usv/lab_sim/waypoint_reached", String, queue_size=10)
         rospy.Subscriber("/usv/lab_sim/command", String, self._command_cb, queue_size=10)
 
     def _command_cb(self, msg):
@@ -161,7 +255,15 @@ class LabSimNode(object):
                     sim_cfg = dict(cfg["sim"])
                     sim_cfg["real_propulsion_enabled"] = bool(cfg.get("real_propulsion_enabled", False))
                     self.sim.configure(sim_cfg)
-                self.sim.start()
+                # start 可携带航线, 携带则进入自动制导, 否则仅置 running
+                waypoints = data.get("waypoints")
+                if isinstance(waypoints, list) and waypoints:
+                    self.sim.set_mission(waypoints)
+                else:
+                    self.sim.start()
+            elif cmd == "mission":
+                # 载入/更新虚拟航线并进入自动制导
+                self.sim.set_mission(data.get("waypoints", []))
             elif cmd == "stop":
                 self.sim.stop()
             elif cmd == "reset":
@@ -169,7 +271,20 @@ class LabSimNode(object):
             elif cmd == "propulsion":
                 self.sim.set_virtual_propulsion(data.get("left", 0.0), data.get("right", 0.0))
                 self.sim.start()
+            arrivals = self.sim.drain_arrivals()
+        self._publish_arrivals(arrivals)
         self._publish_status()
+
+    def _publish_arrivals(self, arrivals):
+        for item in arrivals or []:
+            payload = {
+                "seq": int(item.get("seq", 0)),
+                "lat": item.get("lat"),
+                "lng": item.get("lng"),
+                "source": "lab_sim",
+                "timestamp": datetime.now().isoformat(),
+            }
+            self._reached_pub.publish(String(json.dumps(payload, ensure_ascii=False)))
 
     def _publish_status(self):
         self._status_pub.publish(String(json.dumps(self.sim.snapshot(), ensure_ascii=False)))
@@ -181,7 +296,9 @@ class LabSimNode(object):
             with self._lock:
                 self.sim.step(now - self._last_step)
                 self._last_step = now
+                arrivals = self.sim.drain_arrivals()
                 self._publish_status()
+            self._publish_arrivals(arrivals)
             rate.sleep()
 
 

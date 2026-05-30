@@ -31,6 +31,7 @@ from __future__ import print_function
 import json
 import math
 import os
+import random
 import struct
 import threading
 import time
@@ -145,11 +146,15 @@ class MAVLinkTriggerNode(object):
         self.steps_pub = rospy.Publisher('/usv/automation_steps', String, queue_size=1)
         self.pump_command_pub = rospy.Publisher('/usv/pump_command', String, queue_size=10)
         self.spectrometer_command_pub = rospy.Publisher('/usv/spectrometer_command', String, queue_size=10)
+        # 实验模拟数据源: 伪造分光电压注入真实通路, 与真实设备数据格式一致
+        self.spectrometer_voltage_pub = rospy.Publisher('/usv/spectrometer_voltage', String, queue_size=10)
         self.cmd_ack_pub = rospy.Publisher('/usv/mavlink_cmd_ack', Float32MultiArray, queue_size=10)
 
         # Subscribers
         self.state_sub = rospy.Subscriber('/mavros/state', State, self._state_cb)
         self.waypoint_sub = rospy.Subscriber('/mavros/mission/reached', WaypointReached, self._waypoint_cb)
+        # C2: 实验模式下虚拟船到点事件 (独立话题, 仅 lab_mode 生效)
+        self.lab_reached_sub = rospy.Subscriber('/usv/lab_sim/waypoint_reached', String, self._lab_waypoint_cb, queue_size=10)
         self.pump_status_sub = rospy.Subscriber('/usv/pump_status', String, self._pump_status_cb)
         self.spectrometer_voltage_sub = rospy.Subscriber('/usv/spectrometer_voltage', String, self._spectrometer_voltage_cb)
         self.velocity_sub = rospy.Subscriber('/mavros/local_position/velocity_local', TwistStamped, self._velocity_cb, queue_size=10)
@@ -322,6 +327,107 @@ class MAVLinkTriggerNode(object):
         rospy.loginfo("Waypoint %d reached", msg.wp_seq)
         self._set_mission_state(MissionState.WAYPOINT_REACHED, str(msg.wp_seq))
         self._publish_status("waypoint_reached:{}".format(msg.wp_seq))
+
+    def _lab_config(self):
+        """读取实验模式配置 (lab_mode 段)。"""
+        cfg = self._load_config() or self._get_default_config()
+        lab = cfg.get('lab_mode', {})
+        return lab if isinstance(lab, dict) else {}
+
+    def _lab_waypoint_cb(self, msg):
+        """C2: 虚拟船到达回调。仅 lab_mode 启用时驱动采样状态机。
+
+        真实任务由飞控原生 mission 触发采样; 实验模式无飞控, 由本回调主动启动。
+        实验采样跳过 set_mode/稳定等待 (无飞控), 数据源按配置走真实设备或模拟生成。
+        """
+        lab = self._lab_config()
+        if not lab.get('enabled', False):
+            return
+        try:
+            data = json.loads(msg.data)
+            seq = int(data.get('seq', 0))
+        except (ValueError, TypeError):
+            return
+        lat = data.get('lat')
+        lng = data.get('lng')
+        rospy.loginfo("Lab virtual waypoint %d reached", seq)
+        self.current_waypoint = seq
+        self._set_mission_state(MissionState.WAYPOINT_REACHED, str(seq))
+        self._publish_status("waypoint_reached:{}".format(seq))
+        # 后台执行实验采样, 避免阻塞回调
+        threading.Thread(
+            target=self._run_lab_sampling,
+            args=(seq, lat, lng, lab), daemon=True).start()
+
+    @staticmethod
+    def _simulated_voltage(lat, lng, lab):
+        """按"距污染源越近浓度越高"模型生成模拟分光电压。
+
+        污染源: 模式 center 取航线中心(由 web 写入 lab_mode.mission.center),
+                模式 manual 取 lab_mode.pollution.source。半径外趋近基线。
+        返回 (voltage, absorbance)。voltage 越低代表吸光度越高(浓度越高)。
+        """
+        pollution = lab.get('pollution', {}) if isinstance(lab.get('pollution'), dict) else {}
+        src = None
+        if str(pollution.get('mode', 'center')) == 'manual':
+            s = pollution.get('source', {})
+            if isinstance(s, dict) and s.get('lat') is not None and s.get('lng') is not None:
+                src = (float(s['lat']), float(s['lng']))
+        if src is None:
+            center = (lab.get('mission', {}) or {}).get('center', {})
+            if isinstance(center, dict) and center.get('lat') is not None:
+                src = (float(center['lat']), float(center['lng']))
+        ref_v = float(pollution.get('reference_voltage', 3.0) or 3.0)
+        radius = max(1.0, float(pollution.get('radius_m', 150.0) or 150.0))
+        strength = min(1.0, max(0.0, float(pollution.get('strength', 0.8) or 0.8)))
+        ratio = 0.0
+        if src is not None and lat is not None and lng is not None:
+            north = (float(lat) - src[0]) * 110540.0
+            cos_lat = max(0.01, math.cos(math.radians(float(lat))))
+            east = (float(lng) - src[1]) * 111320.0 * cos_lat
+            dist = math.hypot(north, east)
+            ratio = strength * math.exp(-(dist * dist) / (2.0 * radius * radius))
+        ratio = min(0.95, max(0.0, ratio + random.uniform(-0.03, 0.03)))
+        voltage = max(0.05, ref_v * (1.0 - ratio))
+        absorbance = max(0.0, math.log10(ref_v / max(voltage, 1e-6)))
+        return round(voltage, 4), round(absorbance, 4)
+
+    def _run_lab_sampling(self, seq, lat, lng, lab):
+        """实验模式采样: 真实数据源走 automation 服务; 模拟数据源伪造电压注入。"""
+        if self.is_sampling:
+            rospy.logwarn("Lab sampling already in progress, skip wp %d", seq)
+            return
+        data_source = str(lab.get('data_source', 'simulated')).strip().lower()
+        self._set_mission_state(MissionState.SAMPLING, str(seq))
+        self._publish_status("sampling_started")
+        if data_source == 'real':
+            # 真实采样设备: 复用泵/光谱仪自动化流程
+            self.is_sampling = True
+            self.current_sampling_context = {'waypoint_seq': seq, 'source': 'lab_real'}
+            config = self._load_config() or self._get_default_config()
+            steps_data = self._build_manual_steps_payload(config)
+            steps_data['waypoint_seq'] = seq
+            self.steps_pub.publish(String(json.dumps(steps_data)))
+            if not self._call_automation_service('start'):
+                self.is_sampling = False
+                self._set_mission_state(MissionState.FAILED, "%d:lab_real_start_failed" % seq)
+                self._publish_status("sampling_stopped")
+            return
+        # 模拟数据源: 生成电压并发布到真实通路, 由 web 落入 data_points
+        voltage, absorbance = self._simulated_voltage(lat, lng, lab)
+        payload = {
+            "voltage": voltage,
+            "absorbance": absorbance,
+            "status": "ok",
+            "waypoint_seq": seq,
+            "lab_mode": True,
+            "simulated": True,
+            "timestamp": time.time(),
+        }
+        self.spectrometer_voltage_pub.publish(String(json.dumps(payload)))
+        rospy.loginfo("Lab simulated sample wp %d: V=%.3f A=%.3f", seq, voltage, absorbance)
+        self._set_mission_state(MissionState.SAMPLING_DONE, str(seq))
+        self._publish_status("sampling_stopped")
 
     def _handle_completion(self, success=True, reason='finished'):
         with self.state_lock:

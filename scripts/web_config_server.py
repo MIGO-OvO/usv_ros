@@ -200,11 +200,15 @@ def normalize_lab_config(config):
     profile = str(raw.get("profile", "semi_hardware") or "semi_hardware").strip().lower()
     if profile not in ("semi_hardware", "software_only"):
         profile = "semi_hardware"
+    data_source = str(raw.get("data_source", "simulated") or "simulated").strip().lower()
+    if data_source not in ("simulated", "real"):
+        data_source = "simulated"
 
     return {
         "enabled": to_bool("enabled", False),
         "profile": profile,
         "position_source": position_source,
+        "data_source": data_source,
         "allow_no_gps": to_bool("allow_no_gps", True),
         "bypass_pid_wait": to_bool("bypass_pid_wait", True),
         "real_propulsion_enabled": to_bool("real_propulsion_enabled", False),
@@ -215,7 +219,62 @@ def normalize_lab_config(config):
             "heading_deg": sim_float("heading_deg", 0.0, 0.0, 360.0),
             "max_speed_mps": sim_float("max_speed_mps", 1.0, 0.0, 20.0),
             "wheel_base_m": sim_float("wheel_base_m", 0.6, 0.05, 10.0),
+            "arrival_radius_m": sim_float("arrival_radius_m", 3.0, 0.5, 100.0),
         },
+        "mission": normalize_lab_mission(raw.get("mission")),
+        "pollution": normalize_lab_pollution(raw.get("pollution")),
+    }
+
+
+def _coord_or_none(raw):
+    """解析 {lat,lng} 坐标, 非法返回 None。"""
+    if not isinstance(raw, dict):
+        return None
+    lat = _to_float_or_none(raw.get("lat"))
+    lng = _to_float_or_none(raw.get("lng"))
+    if lat is None or lng is None:
+        return None
+    return {"lat": lat, "lng": lng}
+
+
+def normalize_lab_mission(config):
+    """规范实验虚拟航线: waypoints 列表 + 自动计算的 center(航线包络中心)。"""
+    raw = config if isinstance(config, dict) else {}
+    waypoints = []
+    for i, wp in enumerate(raw.get("waypoints", []) or []):
+        coord = _coord_or_none(wp)
+        if coord is None:
+            continue
+        coord["seq"] = i
+        waypoints.append(coord)
+    center = _coord_or_none(raw.get("center"))
+    if center is None and waypoints:
+        center = {
+            "lat": sum(w["lat"] for w in waypoints) / len(waypoints),
+            "lng": sum(w["lng"] for w in waypoints) / len(waypoints),
+        }
+    return {"waypoints": waypoints, "center": center}
+
+
+def normalize_lab_pollution(config):
+    """规范模拟污染源: 模式 center(航线中心)/manual(手动放置) + 强度/半径。"""
+    raw = config if isinstance(config, dict) else {}
+    mode = str(raw.get("mode", "center") or "center").strip().lower()
+    if mode not in ("center", "manual"):
+        mode = "center"
+
+    def fnum(name, default, lo, hi):
+        v = _to_float_or_none(raw.get(name, default))
+        if v is None:
+            v = default
+        return max(lo, min(hi, v))
+
+    return {
+        "mode": mode,
+        "source": _coord_or_none(raw.get("source")),
+        "strength": fnum("strength", 0.8, 0.0, 1.0),
+        "radius_m": fnum("radius_m", 150.0, 1.0, 100000.0),
+        "reference_voltage": fnum("reference_voltage", 3.0, 0.1, 10.0),
     }
 
 
@@ -582,6 +641,7 @@ DEFAULT_CONFIG = {
         "enabled": False,
         "profile": "semi_hardware",
         "position_source": "lab_sim",
+        "data_source": "simulated",
         "allow_no_gps": True,
         "bypass_pid_wait": True,
         "real_propulsion_enabled": False,
@@ -591,7 +651,16 @@ DEFAULT_CONFIG = {
             "start_lng": 120.0,
             "heading_deg": 0.0,
             "max_speed_mps": 1.0,
-            "wheel_base_m": 0.6
+            "wheel_base_m": 0.6,
+            "arrival_radius_m": 3.0
+        },
+        "mission": {"waypoints": [], "center": None},
+        "pollution": {
+            "mode": "center",
+            "source": None,
+            "strength": 0.8,
+            "radius_m": 150.0,
+            "reference_voltage": 3.0
         }
     }
 }
@@ -1198,6 +1267,15 @@ class WebConfigServer(object):
     def _current_lab_config(self):
         return normalize_lab_config(self.config_manager.get().get("lab_mode", {}))
 
+    def _push_lab_mission(self, lab_config):
+        """把实验虚拟航线下发给 lab_sim 节点 (mission 指令)。"""
+        if not self.lab_sim_command_pub:
+            return
+        waypoints = (lab_config.get("mission", {}) or {}).get("waypoints", [])
+        msg = String()
+        msg.data = json.dumps({"cmd": "mission", "waypoints": waypoints}, ensure_ascii=False)
+        self.lab_sim_command_pub.publish(msg)
+
     def _lab_sim_status_cb(self, msg):
         """Handle simulated lab navigation state and feed the map/data path."""
         try:
@@ -1246,7 +1324,14 @@ class WebConfigServer(object):
             self.socketio.emit("lab_status", self.lab_status)
 
     def _gps_cb(self, msg):
-        """GPS 回调：缓存 WGS84 船位，并生成高德展示用 GCJ-02 坐标。"""
+        """GPS 回调：缓存 WGS84 船位，并生成高德展示用 GCJ-02 坐标。
+
+        实验模式 (position_source=lab_sim) 下忽略真实 GPS, 由 lab_sim 独占船位,
+        避免真实 GPS 与虚拟船位同时写入导致地图船位跳变。
+        """
+        lab = self._current_lab_config()
+        if lab.get("enabled") and lab.get("position_source", "lab_sim") == "lab_sim":
+            return
         position = make_position_snapshot(
             getattr(msg, "latitude", None),
             getattr(msg, "longitude", None),
@@ -2073,8 +2158,12 @@ class WebConfigServer(object):
                 lab_config["enabled"] = True
                 self.config_manager.update({"lab_mode": lab_config})
             if self.lab_sim_command_pub:
+                waypoints = (lab_config.get("mission", {}) or {}).get("waypoints", [])
+                payload = {"cmd": "start", "config": lab_config}
+                if waypoints:
+                    payload["waypoints"] = waypoints
                 msg = String()
-                msg.data = json.dumps({"cmd": "start", "config": lab_config}, ensure_ascii=False)
+                msg.data = json.dumps(payload, ensure_ascii=False)
                 self.lab_sim_command_pub.publish(msg)
             self.lab_status.update({
                 "enabled": True,
@@ -2104,6 +2193,42 @@ class WebConfigServer(object):
                     "track_points": self.live_track_points[-MAX_LIVE_TRACK_POINTS:],
                 },
             })
+
+        @self.app.route('/api/lab/mission', methods=['POST'])
+        def save_lab_mission():
+            """保存实验虚拟航线 (Web 绘制)。整体覆盖 lab_mode.mission。"""
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
+            lab = self._current_lab_config()
+            lab["mission"] = normalize_lab_mission(data)
+            if self.config_manager.update({"lab_mode": lab}):
+                self._push_lab_mission(lab)
+                return jsonify({"success": True, "message": "实验航线已保存",
+                                "data": lab["mission"]})
+            return jsonify({"success": False, "message": "保存失败"}), 500
+
+        @self.app.route('/api/lab/mission/import-qgc', methods=['POST'])
+        def import_lab_mission_from_qgc():
+            """从飞控当前缓存航点 (route_waypoints) 导入为实验虚拟航线。"""
+            waypoints = []
+            for wp in (self.route_waypoints or []):
+                coord = wp.get("gcj02") if isinstance(wp, dict) else None
+                src = wp if isinstance(wp, dict) else {}
+                lat = src.get("lat")
+                lng = src.get("lng")
+                if lat is None or lng is None:
+                    continue
+                waypoints.append({"lat": lat, "lng": lng})
+            if not waypoints:
+                return jsonify({"success": False, "message": "无可导入航点 (飞控未上传 mission)"}), 400
+            lab = self._current_lab_config()
+            lab["mission"] = normalize_lab_mission({"waypoints": waypoints})
+            if self.config_manager.update({"lab_mode": lab}):
+                self._push_lab_mission(lab)
+                return jsonify({"success": True, "message": "已从 QGC 导入 %d 个航点" % len(waypoints),
+                                "data": lab["mission"]})
+            return jsonify({"success": False, "message": "保存失败"}), 500
 
         # 任务控制 API
         @self.app.route('/api/mission/start', methods=['POST'])
