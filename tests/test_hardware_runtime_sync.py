@@ -6,6 +6,7 @@ import tempfile
 import time
 import types
 import unittest
+import unittest.mock
 from pathlib import Path
 
 
@@ -432,6 +433,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             server.tile_cache = module.mtc.MapTileCache(cache_dir=cache_dir)
             client = server.app.test_client()
             response = client.get("/api/map/config")
+            placeholder = client.get("/api/map/tile/not-a-style/3/0/0.png")
             payload = response.get_json()
 
         self.assertEqual(response.status_code, 200)
@@ -439,9 +441,12 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertTrue(payload["data"]["enabled"])
         self.assertEqual(payload["data"]["provider"], "leaflet-amap-raster")
         self.assertIn("{style}", payload["data"]["tile_url"])
+        self.assertIn("v=2", payload["data"]["tile_url"])
         self.assertIn("satellite", payload["data"]["styles"])
         self.assertNotIn("key", payload["data"])
         self.assertNotIn("securityJsCode", payload["data"])
+        self.assertEqual(placeholder.headers.get("X-Tile-Source"), "placeholder")
+        self.assertIn("no-store", placeholder.headers.get("Cache-Control", ""))
 
     def test_web_static_dist_serves_spa_map_route(self):
         module, _, _ = _load_script(
@@ -656,6 +661,35 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertTrue(live["position"]["lab_mode"])
         self.assertEqual(live["lab_status"]["virtual_propulsion"]["left"], 0.5)
         self.assertTrue(stop_resp.get_json()["success"])
+
+    def test_web_lab_import_qgc_reads_nested_gcj02_route_waypoints(self):
+        module, _, _ = _load_script(
+            "web_config_server_lab_import_qgc_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=True)
+            server.route_waypoints = [
+                {"seq": 0, "gcj02": {"lat": 30.0, "lng": 120.0}},
+                {"seq": 1, "gcj02": {"lat": 30.001, "lng": 120.002}},
+            ]
+            client = server.app.test_client()
+
+            response = client.post("/api/lab/mission/import-qgc")
+            config_resp = client.get("/api/lab/config")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.get_json()["success"])
+        self.assertEqual(len(response.get_json()["data"]["waypoints"]), 2)
+        self.assertEqual(len(config_resp.get_json()["data"]["mission"]["waypoints"]), 2)
 
     def test_mission_data_marks_lab_samples_and_geojson_excludes_by_default(self):
         module, _, _ = _load_script(
@@ -1009,6 +1043,9 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         lab_text = lab_page.read_text(encoding="utf-8")
         self.assertIn("/api/lab/config", lab_text)
         self.assertIn("/api/lab/start", lab_text)
+        self.assertIn("/api/lab/mission", lab_text)
+        self.assertIn("persistMission", lab_text)
+        self.assertIn("drawModeRef.current && !pendingRef.current", lab_text)
 
     def test_web_apply_publishes_i2c_ads_and_start_commands(self):
         module, publishers, _ = _load_script(

@@ -2010,7 +2010,10 @@ class WebConfigServer(object):
                 "data": {
                     "enabled": True,
                     "provider": "leaflet-amap-raster",
-                    "tile_url": "/api/map/tile/{style}/{z}/{x}/{y}.png",
+                    # v2 deliberately busts browser caches created before placeholder
+                    # tiles used no-store headers. The style segment keeps satellite
+                    # and annotation caches separated on disk and in the browser.
+                    "tile_url": "/api/map/tile/{style}/{z}/{x}/{y}.png?v=2",
                     "styles": list(mtc.VALID_STYLES),
                     "default_style": "satellite",
                     "min_zoom": mtc.ZOOM_HARD_MIN,
@@ -2029,8 +2032,14 @@ class WebConfigServer(object):
             """瓦片代理: 缓存优先, 在线回源落盘, 离线未命中返占位瓦片。"""
             data, hit = self.tile_cache.get_tile(style, z, x, y)
             resp = Response(data, mimetype='image/png')
-            resp.headers['Cache-Control'] = 'public, max-age=31536000'
+            if hit == "placeholder":
+                resp.headers['Cache-Control'] = 'no-store, no-cache, max-age=0, must-revalidate'
+                resp.headers['Pragma'] = 'no-cache'
+                resp.headers['Expires'] = '0'
+            else:
+                resp.headers['Cache-Control'] = 'public, max-age=31536000, immutable'
             resp.headers['X-Tile-Source'] = hit
+            resp.headers['X-Tile-Style'] = style
             return resp
 
         @self.app.route('/api/map/cache/stats', methods=['GET'])
@@ -2214,7 +2223,7 @@ class WebConfigServer(object):
             waypoints = []
             for wp in (self.route_waypoints or []):
                 coord = wp.get("gcj02") if isinstance(wp, dict) else None
-                src = wp if isinstance(wp, dict) else {}
+                src = coord if isinstance(coord, dict) else (wp if isinstance(wp, dict) else {})
                 lat = src.get("lat")
                 lng = src.get("lng")
                 if lat is None or lng is None:
