@@ -430,12 +430,6 @@ export default function MapPage() {
         minZoom: mapConfig.min_zoom,
         maxZoom: mapConfig.max_zoom,
       }).addTo(map)
-      if (mapConfig.styles.includes('annotation')) {
-        L.tileLayer(tileTpl.replace('{style}', 'annotation'), {
-          minZoom: mapConfig.min_zoom,
-          maxZoom: mapConfig.max_zoom,
-        }).addTo(map)
-      }
       overlaysRef.current = L.layerGroup().addTo(map)
       heatRef.current = (L as unknown as { heatLayer: (pts: Array<[number, number, number]>, opts: Record<string, unknown>) => HeatLayer }).heatLayer([], {
         radius: 30,

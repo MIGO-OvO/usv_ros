@@ -98,13 +98,53 @@ export default function Lab() {
   const boatRef = useRef<L.Marker | null>(null)
   const configRef = useRef(config)
   const drawModeRef = useRef(drawMode)
+  const pendingRef = useRef(pending)
   configRef.current = config
   drawModeRef.current = drawMode
+  pendingRef.current = pending
+
+  const persistMission = async (mission: LabMission) => {
+    try {
+      const res = await fetch('/api/lab/mission', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(mission),
+      })
+      const json = await res.json()
+      if (json.success && json.data) {
+        setConfig((c) => ({ ...c, mission: json.data }))
+        return true
+      }
+      setMessage(json.message || '实验航线保存失败')
+    } catch {
+      setMessage('实验航线保存失败')
+    }
+    return false
+  }
+
+  const persistConfig = async (nextConfig: LabConfig) => {
+    try {
+      const res = await fetch('/api/lab/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(nextConfig),
+      })
+      const json = await res.json()
+      if (json.success && json.data) {
+        setConfig(json.data)
+        return true
+      }
+      setMessage(json.message || '配置保存失败')
+    } catch {
+      setMessage('配置保存失败')
+    }
+    return false
+  }
 
   const refresh = async () => {
     const res = await fetch('/api/lab/status')
     const json = await res.json()
-    if (json.data?.config) setConfig(json.data.config)
+    if (json.data?.config && !drawModeRef.current && !pendingRef.current) setConfig(json.data.config)
     if (json.data?.status) setStatus({ ...fallbackStatus, ...json.data.status })
     if (json.data?.position?.gcj02 && boatRef.current) {
       boatRef.current.setLatLng([json.data.position.gcj02.lat, json.data.position.gcj02.lng])
@@ -132,17 +172,36 @@ export default function Lab() {
       map.on('click', (e: L.LeafletMouseEvent) => {
         const mode = drawModeRef.current
         if (mode === 'waypoint') {
-          setConfig((c) => {
-            const waypoints = [...c.mission.waypoints, { lat: e.latlng.lat, lng: e.latlng.lng, seq: c.mission.waypoints.length }]
-            return { ...c, mission: { ...c.mission, waypoints } }
-          })
+          const current = configRef.current
+          const waypoints = [
+            ...current.mission.waypoints,
+            { lat: e.latlng.lat, lng: e.latlng.lng, seq: current.mission.waypoints.length },
+          ]
+          const nextMission = { waypoints, center: null }
+          setConfig((c) => ({ ...c, mission: nextMission }))
+          persistMission(nextMission).catch(() => {})
         } else if (mode === 'source') {
-          setConfig((c) => ({ ...c, pollution: { ...c.pollution, mode: 'manual', source: { lat: e.latlng.lat, lng: e.latlng.lng } } }))
+          const nextConfig = {
+            ...configRef.current,
+            pollution: {
+              ...configRef.current.pollution,
+              mode: 'manual' as const,
+              source: { lat: e.latlng.lat, lng: e.latlng.lng },
+            },
+          }
+          setConfig(nextConfig)
+          persistConfig(nextConfig).catch(() => {})
         }
       })
       mapRef.current = map
     }).catch(() => {})
-    return () => { cancelled = true }
+    return () => {
+      cancelled = true
+      mapRef.current?.remove()
+      mapRef.current = null
+      layerRef.current = null
+      boatRef.current = null
+    }
   }, [])
 
   // 重绘航线/航点/污染源
@@ -195,8 +254,11 @@ export default function Lab() {
     if (json.data) setConfig(json.data)
   }
 
-  const clearWaypoints = () =>
-    setConfig((c) => ({ ...c, mission: { waypoints: [], center: null } }))
+  const clearWaypoints = async () => {
+    const nextMission = { waypoints: [], center: null }
+    setConfig((c) => ({ ...c, mission: nextMission }))
+    await persistMission(nextMission)
+  }
 
   const importQgc = async () => {
     const res = await fetch('/api/lab/mission/import-qgc', { method: 'POST' })
