@@ -562,6 +562,7 @@ REST API 和 Socket.IO 实时事件。
 | `GET /api/data/missions` | 历史任务文件列表 |
 | `GET /api/data/mission/<id>` | 历史任务 JSON |
 | `GET /api/data/mission/<id>/csv` | 历史任务 CSV 下载 |
+| `GET/POST/DELETE /api/lab/route` | 实验模式地图航点读取、保存、清空 |
 | `GET /api/logs/files`、`GET /api/logs/<filename>` | 系统日志查看 |
 | `GET /api/hardware/config`、`POST /api/hardware/config` | 硬件连接配置 |
 | `GET /api/hardware/serial-ports` | 枚举串口 |

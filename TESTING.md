@@ -239,9 +239,14 @@ curl http://127.0.0.1:5000/api/hardware/serial-ports
 curl -X POST http://127.0.0.1:5000/api/hardware/apply \
   -H "Content-Type: application/json" \
   -d '{"pump_serial_port":"/dev/ttyUSB0","pump_baudrate":115200,"pump_timeout":1.0}'
+
+curl -X POST http://127.0.0.1:5000/api/lab/route \
+  -H "Content-Type: application/json" \
+  -d '{"route_waypoints":[{"gcj02":{"lat":30.0,"lng":120.0}},{"gcj02":{"lat":30.001,"lng":120.002}}]}'
+curl http://127.0.0.1:5000/api/map/live
 ```
 
-通过判据：接口返回成功；`usv_system.log` 出现泵控重连日志；进程不退出。
+通过判据：接口返回成功；`usv_system.log` 出现泵控重连日志；实验模式航点会出现在 `/api/map/live.route_waypoints`；进程不退出。
 
 <a id="spectrometer-flow"></a>
 

@@ -103,6 +103,7 @@ DATA_DIR = os.path.expanduser("~/usv_ws/data/missions")
 
 AMAP_PLUGINS = ["AMap.Scale", "AMap.ToolBar", "AMap.HeatMap"]
 MAX_LIVE_TRACK_POINTS = 1000
+MAX_LAB_ROUTE_WAYPOINTS = 200
 DEFAULT_SURFACE_SIZE = 50
 MAX_SURFACE_SIZE = 80
 
@@ -173,6 +174,47 @@ def make_position_snapshot(lat, lng, alt=None, timestamp=None, source="real", la
     return position
 
 
+def normalize_lab_route_waypoints(points):
+    """Normalize map-clicked lab route points.
+
+    The browser receives AMap click coordinates in GCJ-02. For lab routes these
+    are display/simulation points, so we preserve the GCJ-02 coordinate directly
+    and mirror it into wgs84 to keep the existing route shape consumers simple.
+    """
+    if not isinstance(points, list):
+        return []
+    normalized = []
+    for raw in points[:MAX_LAB_ROUTE_WAYPOINTS]:
+        if not isinstance(raw, dict):
+            continue
+        coord = raw.get("gcj02") if isinstance(raw.get("gcj02"), dict) else raw
+        lat = _to_float_or_none(coord.get("lat") if isinstance(coord, dict) else None)
+        lng = _to_float_or_none(coord.get("lng") if isinstance(coord, dict) else None)
+        if lat is None or lng is None or lat < -90.0 or lat > 90.0 or lng < -180.0 or lng > 180.0:
+            continue
+        alt = _to_float_or_none(coord.get("alt") if isinstance(coord, dict) else raw.get("alt"))
+        try:
+            seq = int(raw.get("seq", len(normalized)))
+        except (TypeError, ValueError):
+            seq = len(normalized)
+        waypoint = {
+            "seq": seq,
+            "timestamp": raw.get("timestamp") or datetime.now().isoformat(),
+            "position_source": "lab_route",
+            "lab_mode": True,
+            "wgs84": {"lat": lat, "lng": lng, "alt": alt},
+            "gcj02": {"lat": lat, "lng": lng, "alt": alt},
+            "command": raw.get("command"),
+            "frame": raw.get("frame"),
+            "is_current": bool(raw.get("is_current", False)),
+            "autocontinue": bool(raw.get("autocontinue", True)),
+        }
+        normalized.append(waypoint)
+    for idx, waypoint in enumerate(normalized):
+        waypoint["seq"] = idx
+    return normalized
+
+
 def normalize_lab_config(config):
     raw = config if isinstance(config, dict) else {}
     sim_raw = raw.get("sim", {}) if isinstance(raw.get("sim", {}), dict) else {}
@@ -208,6 +250,7 @@ def normalize_lab_config(config):
         "bypass_pid_wait": to_bool("bypass_pid_wait", True),
         "real_propulsion_enabled": to_bool("real_propulsion_enabled", False),
         "include_lab_data_by_default": to_bool("include_lab_data_by_default", False),
+        "route_waypoints": normalize_lab_route_waypoints(raw.get("route_waypoints", [])),
         "sim": {
             "start_lat": sim_float("start_lat", 30.0, -90.0, 90.0),
             "start_lng": sim_float("start_lng", 120.0, -180.0, 180.0),
@@ -585,6 +628,7 @@ DEFAULT_CONFIG = {
         "bypass_pid_wait": True,
         "real_propulsion_enabled": False,
         "include_lab_data_by_default": False,
+        "route_waypoints": [],
         "sim": {
             "start_lat": 30.0,
             "start_lng": 120.0,
@@ -853,6 +897,7 @@ class WebConfigServer(object):
         self.current_position = None
         self.live_track_points = []
         self.route_waypoints = []
+        self.lab_route_waypoints = list(self._current_lab_config().get("route_waypoints", []))
         self.current_waypoint_seq = None
         self.latest_automation_status = {}
         self.lab_status = {
@@ -965,6 +1010,25 @@ class WebConfigServer(object):
             return bool(is_recording())
         return bool(getattr(self.data_manager, "current_mission_file", None))
 
+    def _active_route_waypoints(self):
+        lab_config = self._current_lab_config()
+        if lab_config.get("enabled", False):
+            return list(self.lab_route_waypoints or lab_config.get("route_waypoints", []))
+        return list(self.route_waypoints or [])
+
+    def _set_lab_route_waypoints(self, waypoints):
+        normalized = normalize_lab_route_waypoints(waypoints)
+        self.lab_route_waypoints = normalized
+        lab_config = self._current_lab_config()
+        lab_config["route_waypoints"] = normalized
+        if self.config_manager.update({"lab_mode": lab_config}):
+            if self._data_recording_active() and lab_config.get("enabled", False):
+                self.data_manager.set_route_waypoints(normalized)
+            if self.socketio and lab_config.get("enabled", False):
+                self.socketio.emit("map_route", normalized)
+            return True, normalized
+        return False, normalized
+
     def _start_data_recording_if_needed(self, source="unknown"):
         if self._data_recording_active():
             if not self.data_recording_source:
@@ -973,8 +1037,9 @@ class WebConfigServer(object):
         mission_name = self.config_manager.get().get('mission', {}).get('name', '')
         self.data_manager.start_mission(mission_name)
         self.data_recording_source = source
-        if self.route_waypoints:
-            self.data_manager.set_route_waypoints(self.route_waypoints)
+        route = self._active_route_waypoints()
+        if route:
+            self.data_manager.set_route_waypoints(route)
         if self.current_position:
             self.data_manager.add_track_point(self.current_position)
 
@@ -1895,7 +1960,7 @@ class WebConfigServer(object):
                 "data": {
                     "position": self.current_position,
                     "track_points": self.live_track_points[-MAX_LIVE_TRACK_POINTS:],
-                    "route_waypoints": self.route_waypoints,
+                    "route_waypoints": self._active_route_waypoints(),
                     "data_points": self._current_live_samples(),
                     "metric_config": self._current_metric_config(),
                     "mission_status": self.mission_status,
@@ -1918,7 +1983,11 @@ class WebConfigServer(object):
             data = json_object()
             if data is None:
                 return jsonify({"success": False, "message": "request body must be a JSON object"}), 400
+            if "route_waypoints" not in data:
+                data = dict(data)
+                data["route_waypoints"] = self.lab_route_waypoints
             normalized = normalize_lab_config(data)
+            self.lab_route_waypoints = list(normalized.get("route_waypoints", []))
             if self.config_manager.update({"lab_mode": normalized}):
                 if self.lab_sim_command_pub:
                     msg = String()
@@ -1927,12 +1996,37 @@ class WebConfigServer(object):
                 return jsonify({"success": True, "message": "lab config saved", "data": normalized})
             return jsonify({"success": False, "message": "save failed"}), 500
 
+        @self.app.route('/api/lab/route', methods=['GET'])
+        def get_lab_route():
+            return jsonify({"success": True, "data": self.lab_route_waypoints})
+
+        @self.app.route('/api/lab/route', methods=['POST'])
+        def save_lab_route():
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "request body must be a JSON object"}), 400
+            route = data.get("route_waypoints", data.get("waypoints", []))
+            if not isinstance(route, list):
+                return jsonify({"success": False, "message": "route_waypoints must be a list"}), 400
+            ok, normalized = self._set_lab_route_waypoints(route)
+            if ok:
+                return jsonify({"success": True, "message": "lab route saved", "data": normalized})
+            return jsonify({"success": False, "message": "save failed", "data": normalized}), 500
+
+        @self.app.route('/api/lab/route', methods=['DELETE'])
+        def clear_lab_route():
+            ok, normalized = self._set_lab_route_waypoints([])
+            if ok:
+                return jsonify({"success": True, "message": "lab route cleared", "data": normalized})
+            return jsonify({"success": False, "message": "save failed", "data": normalized}), 500
+
         @self.app.route('/api/lab/start', methods=['POST'])
         def start_lab_sim():
             lab_config = self._current_lab_config()
             if not lab_config.get("enabled", False):
                 lab_config["enabled"] = True
                 self.config_manager.update({"lab_mode": lab_config})
+            self.lab_route_waypoints = list(lab_config.get("route_waypoints", []))
             if self.lab_sim_command_pub:
                 msg = String()
                 msg.data = json.dumps({"cmd": "start", "config": lab_config}, ensure_ascii=False)

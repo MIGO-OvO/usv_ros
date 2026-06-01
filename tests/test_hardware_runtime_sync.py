@@ -6,6 +6,7 @@ import tempfile
 import time
 import types
 import unittest
+import unittest.mock
 from pathlib import Path
 
 
@@ -658,6 +659,42 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(live["lab_status"]["virtual_propulsion"]["left"], 0.5)
         self.assertTrue(stop_resp.get_json()["success"])
 
+    def test_web_lab_route_api_persists_and_feeds_live_map(self):
+        module, _, _ = _load_script(
+            "web_config_server_lab_route_api_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=True)
+            client = server.app.test_client()
+
+            client.post("/api/lab/config", json={"enabled": True})
+            save_resp = client.post("/api/lab/route", json={
+                "route_waypoints": [
+                    {"seq": 0, "gcj02": {"lat": 30.0, "lng": 120.0}},
+                    {"seq": 1, "lat": 30.001, "lng": 120.002},
+                ],
+            })
+            route_resp = client.get("/api/lab/route")
+            live_resp = client.get("/api/map/live")
+            config_resp = client.get("/api/lab/config")
+
+        self.assertEqual(save_resp.status_code, 200)
+        self.assertTrue(save_resp.get_json()["success"])
+        self.assertEqual(len(route_resp.get_json()["data"]), 2)
+        live = live_resp.get_json()["data"]
+        self.assertEqual(len(live["route_waypoints"]), 2)
+        self.assertEqual(live["route_waypoints"][0]["position_source"], "lab_route")
+        self.assertEqual(len(config_resp.get_json()["data"]["route_waypoints"]), 2)
+
     def test_mission_data_marks_lab_samples_and_geojson_excludes_by_default(self):
         module, _, _ = _load_script(
             "web_config_server_lab_data_test",
@@ -993,6 +1030,14 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertIn("@amap/amap-jsapi-loader", package_text)
         self.assertIn("/api/map/config", map_page.read_text(encoding="utf-8"))
         self.assertIn("AMap.HeatMap", map_page.read_text(encoding="utf-8"))
+
+    def test_frontend_map_persists_lab_waypoints_and_cleans_amap_instance(self):
+        map_text = (REPO_ROOT / "frontend" / "src" / "pages" / "Map.tsx").read_text(encoding="utf-8")
+
+        self.assertIn("/api/lab/route", map_text)
+        self.assertIn("map.on?.('click'", map_text)
+        self.assertIn("destroy", map_text)
+        self.assertIn("mapLoadSeqRef", map_text)
 
     def test_frontend_declares_lab_page_and_navigation_entry(self):
         app_text = (REPO_ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")

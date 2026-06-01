@@ -1,7 +1,7 @@
 /* eslint-disable react-hooks/set-state-in-effect */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import AMapLoader from '@amap/amap-jsapi-loader'
-import { Activity, AlertTriangle, Database, Layers, Loader2, MapPinned, Navigation, RefreshCw, Route } from 'lucide-react'
+import { Activity, AlertTriangle, Database, Layers, Loader2, MapPinned, Navigation, RefreshCw, Route, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { cn } from '@/lib/utils'
@@ -81,6 +81,14 @@ interface LiveSample extends GeoPoint {
 
 interface LiveRouteWaypoint extends GeoPoint {
   seq?: number
+  position_source?: string
+  lab_mode?: boolean
+}
+
+interface LabConfig {
+  enabled?: boolean
+  position_source?: string
+  route_waypoints?: LiveRouteWaypoint[]
 }
 
 interface LivePayload {
@@ -88,6 +96,16 @@ interface LivePayload {
   track_points?: GeoPoint[]
   route_waypoints?: LiveRouteWaypoint[]
   data_points?: LiveSample[]
+  lab_config?: LabConfig
+}
+
+type MapClickEvent = {
+  lnglat?: {
+    getLng?: () => number
+    getLat?: () => number
+    lng?: number
+    lat?: number
+  }
 }
 
 type Overlay = {
@@ -103,6 +121,9 @@ type MapInstance = {
   remove: (overlay: Overlay) => void
   setFitView: (overlays: Overlay[], immediately?: boolean, padding?: [number, number, number, number]) => void
   addControl: (control: Overlay) => void
+  destroy?: () => void
+  on?: (event: string, handler: (event: MapClickEvent) => void) => void
+  off?: (event: string, handler: (event: MapClickEvent) => void) => void
 }
 
 type AMapApi = {
@@ -152,16 +173,22 @@ export default function MapPage() {
   const amapRef = useRef<AMapApi | null>(null)
   const overlaysRef = useRef<Overlay[]>([])
   const heatmapRef = useRef<HeatMapOverlay | null>(null)
+  const mapLoadSeqRef = useRef(0)
+  const liveRouteRef = useRef<LiveRouteWaypoint[]>([])
+  const labEnabledRef = useRef(false)
   const [mode, setMode] = useState<MapMode>('live')
   const [metric, setMetric] = useState<MetricMode>('auto')
   const [mapConfig, setMapConfig] = useState<AMapConfig | null>(null)
   const [mapError, setMapError] = useState('')
   const [loadingMap, setLoadingMap] = useState(false)
+  const [mapReady, setMapReady] = useState(0)
   const [missions, setMissions] = useState<MissionMeta[]>([])
   const [selectedMission, setSelectedMission] = useState('')
   const [geojson, setGeojson] = useState<GeoJsonPayload | null>(null)
   const [surface, setSurface] = useState<SurfacePayload | null>(null)
   const [statusText, setStatusText] = useState('等待地图数据')
+  const [labModeEnabled, setLabModeEnabled] = useState(false)
+  const [routeCount, setRouteCount] = useState(0)
 
   const activeSamples = useMemo(
     () => geojson?.features.filter((f) => f.properties?.layer === 'sample') || [],
@@ -283,6 +310,11 @@ export default function MapPage() {
     const json = await res.json()
     const live = (json.data || {}) as LivePayload
     const features: GeoFeature[] = []
+    const liveRoute = live.route_waypoints || []
+    liveRouteRef.current = liveRoute
+    labEnabledRef.current = Boolean(live.lab_config?.enabled)
+    setLabModeEnabled(Boolean(live.lab_config?.enabled))
+    setRouteCount(liveRoute.length)
     const trackPoints = live.track_points || []
     if (trackPoints.length > 1) {
       const coordinates: [number, number][] = trackPoints.map((p) => [p.gcj02.lng, p.gcj02.lat])
@@ -295,7 +327,15 @@ export default function MapPage() {
         properties: { layer: 'track' },
       })
     }
-    live.route_waypoints?.forEach((wp) => {
+    if (liveRoute.length > 1) {
+      const routeCoordinates: [number, number][] = liveRoute.map((wp) => [wp.gcj02.lng, wp.gcj02.lat])
+      features.push({
+        type: 'Feature',
+        geometry: { type: 'LineString', coordinates: routeCoordinates },
+        properties: { layer: 'route' },
+      })
+    }
+    liveRoute.forEach((wp) => {
       features.push({
         type: 'Feature',
         geometry: { type: 'Point', coordinates: [wp.gcj02.lng, wp.gcj02.lat] },
@@ -318,8 +358,54 @@ export default function MapPage() {
     })
     setGeojson({ type: 'FeatureCollection', features })
     setSurface(null)
-    setStatusText(live.position ? `实时船位 ${live.position.gcj02.lat.toFixed(6)}, ${live.position.gcj02.lng.toFixed(6)}` : '等待 GPS 船位')
+    setStatusText(
+      live.position
+        ? `实时船位 ${live.position.gcj02.lat.toFixed(6)}, ${live.position.gcj02.lng.toFixed(6)}`
+        : live.lab_config?.enabled
+          ? `实验模式航点 ${liveRoute.length} 个`
+          : '等待 GPS 船位',
+    )
   }, [metric])
+
+  const clearLabRoute = useCallback(async () => {
+    const res = await fetch('/api/lab/route', { method: 'DELETE' })
+    const json = await res.json()
+    if (!json.success) {
+      setStatusText(json.message || '实验航线清空失败')
+      return
+    }
+    liveRouteRef.current = []
+    await loadLive()
+  }, [loadLive])
+
+  const handleMapClick = useCallback(async (event: MapClickEvent) => {
+    if (mode !== 'live' || !labEnabledRef.current) return
+    const raw = event.lnglat
+    const lng = typeof raw?.getLng === 'function' ? raw.getLng() : numeric(raw?.lng)
+    const lat = typeof raw?.getLat === 'function' ? raw.getLat() : numeric(raw?.lat)
+    if (!Number.isFinite(Number(lat)) || !Number.isFinite(Number(lng))) return
+    const route = [
+      ...liveRouteRef.current,
+      {
+        seq: liveRouteRef.current.length,
+        position_source: 'lab_route',
+        lab_mode: true,
+        gcj02: { lat: Number(lat), lng: Number(lng) },
+      },
+    ]
+    const res = await fetch('/api/lab/route', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ route_waypoints: route }),
+    })
+    const json = await res.json()
+    if (!json.success) {
+      setStatusText(json.message || '实验航点保存失败')
+      return
+    }
+    liveRouteRef.current = json.data || route
+    await loadLive()
+  }, [loadLive, mode])
 
   const loadHistory = useCallback(async () => {
     if (!selectedMission) return
@@ -340,7 +426,10 @@ export default function MapPage() {
   }, [loadConfig, loadMissions])
 
   useEffect(() => {
-    if (!mapConfig?.enabled || !containerRef.current || mapRef.current) return
+    if (!mapConfig?.enabled || !containerRef.current) return
+    const loadSeq = mapLoadSeqRef.current + 1
+    mapLoadSeqRef.current = loadSeq
+    let cancelled = false
     setLoadingMap(true)
     window._AMapSecurityConfig = { securityJsCode: mapConfig.securityJsCode }
     AMapLoader.load({
@@ -348,20 +437,44 @@ export default function MapPage() {
       version: mapConfig.version || '2.0',
       plugins: mapConfig.plugins?.length ? mapConfig.plugins : ['AMap.Scale', 'AMap.ToolBar', 'AMap.HeatMap'],
     }).then((AMap: AMapApi) => {
+      if (cancelled || loadSeq !== mapLoadSeqRef.current || !containerRef.current) return
+      mapRef.current?.destroy?.()
       amapRef.current = AMap
       mapRef.current = new AMap.Map(containerRef.current, {
         zoom: 15,
         viewMode: '2D',
         resizeEnable: true,
+        mapStyle: 'amap://styles/normal',
+        features: ['bg', 'road', 'building', 'point'],
       })
       mapRef.current?.addControl(new AMap.Scale())
       mapRef.current?.addControl(new AMap.ToolBar({ position: { right: '16px', top: '16px' } }))
+      setMapReady((value) => value + 1)
       setMapError('')
     }).catch((err: unknown) => {
+      if (cancelled || loadSeq !== mapLoadSeqRef.current) return
       console.error(err)
       setMapError('高德地图加载失败')
-    }).finally(() => setLoadingMap(false))
+    }).finally(() => {
+      if (!cancelled && loadSeq === mapLoadSeqRef.current) setLoadingMap(false)
+    })
+    return () => {
+      cancelled = true
+      if (loadSeq !== mapLoadSeqRef.current) return
+      overlaysRef.current = []
+      heatmapRef.current = null
+      mapRef.current?.destroy?.()
+      mapRef.current = null
+      amapRef.current = null
+    }
   }, [mapConfig])
+
+  useEffect(() => {
+    const map = mapRef.current
+    if (!map?.on) return
+    map.on?.('click', handleMapClick)
+    return () => map.off?.('click', handleMapClick)
+  }, [handleMapClick, mapReady])
 
   useEffect(() => {
     if (mode === 'live') {
@@ -440,11 +553,18 @@ export default function MapPage() {
             </CardHeader>
             <CardContent className="space-y-3 text-sm">
               <div className="flex justify-between"><span className="text-muted-foreground">采样点</span><span className="font-medium">{activeSamples.length}</span></div>
+              <div className="flex justify-between"><span className="text-muted-foreground">航点</span><span className="font-medium">{routeCount}</span></div>
               <div className="flex justify-between"><span className="text-muted-foreground">指标</span><span className="font-medium">{metricLabels[metric]}</span></div>
               <div className="flex justify-between"><span className="text-muted-foreground">IDW</span><span className="font-medium">{surface?.valid ? `${surface.grid.length} 格` : '未生成'}</span></div>
               <div className="grid grid-cols-5 gap-1 pt-1">
                 {sampleColors.map((color) => <div key={color} className="h-2 rounded-full" style={{ background: color }} />)}
               </div>
+              {mode === 'live' && labModeEnabled && (
+                <Button variant="outline" size="sm" className="w-full" onClick={clearLabRoute} disabled={routeCount === 0}>
+                  <Trash2 className="w-4 h-4 mr-1" />
+                  清空实验航点
+                </Button>
+              )}
               {surface && !surface.valid && <div className="rounded-md bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300">{surface.reason}</div>}
             </CardContent>
           </Card>
