@@ -30,7 +30,9 @@ run_as_usv_user() {
     local env_args=(
         "WEB_PORT=${WEB_PORT:-5000}"
         "USV_ENABLE_HOTSPOT=$USV_ENABLE_HOTSPOT"
-        "HOTSPOT_IFACE=${HOTSPOT_IFACE:-wlan0}"
+        "INTERNET_IFACE=${INTERNET_IFACE:-wlan0}"
+        "INTERNET_BAND=${INTERNET_BAND:-2.4g}"
+        "HOTSPOT_IFACE=${HOTSPOT_IFACE:-wlan1}"
         "HOTSPOT_IP=${HOTSPOT_IP:-10.42.0.1}"
         "HOTSPOT_CONN_NAME=${HOTSPOT_CONN_NAME:-USV_AP}"
     )

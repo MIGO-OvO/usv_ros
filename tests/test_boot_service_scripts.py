@@ -38,6 +38,11 @@ class BootServiceScriptTests(unittest.TestCase):
         self.assertIn("USV_HOTSPOT_SSID=", text)
         self.assertIn("USV_HOTSPOT_PASSWORD=", text)
         self.assertIn("USV_ENABLE_HOTSPOT=", text)
+        self.assertIn('INTERNET_IFACE="${INTERNET_IFACE:-wlan0}"', text)
+        self.assertIn('INTERNET_BAND="${INTERNET_BAND:-2.4g}"', text)
+        self.assertIn('HOTSPOT_IFACE="${HOTSPOT_IFACE:-wlan1}"', text)
+        self.assertIn("INTERNET_IFACE=", text)
+        self.assertIn("INTERNET_BAND=", text)
         self.assertIn("HOTSPOT_ROUTE_METRIC=", text)
         self.assertIn("HOTSPOT_BAND=", text)
         self.assertIn("HOTSPOT_CHANNEL=", text)
@@ -92,18 +97,38 @@ class BootServiceScriptTests(unittest.TestCase):
     def test_setup_hotspot_prefers_5ghz_with_fixed_channel(self):
         text = self._read_script("setup_hotspot.sh")
 
+        self.assertIn('INTERFACE="${HOTSPOT_IFACE:-wlan1}"', text)
+        self.assertIn('INTERNET_IFACE="${INTERNET_IFACE:-wlan0}"', text)
+        self.assertIn('INTERNET_BAND="${INTERNET_BAND:-2.4g}"', text)
         self.assertIn('HOTSPOT_BAND="${HOTSPOT_BAND:-5g}"', text)
         self.assertIn("HOTSPOT_CHANNEL=", text)
         self.assertIn("NM_HOTSPOT_BAND", text)
         self.assertIn('802-11-wireless.band "$NM_HOTSPOT_BAND"', text)
         self.assertIn('802-11-wireless.channel "$HOTSPOT_CHANNEL"', text)
+        self.assertIn("configure_internet_wifi_band", text)
+        self.assertIn("INTERNET_WIFI_RECONNECT", text)
+        self.assertIn("HOTSPOT_ALLOW_INTERNET_IFACE", text)
+        self.assertIn("default-route-uses-hotspot-interface", text)
         self.assertIn("HOTSPOT_BAND=2.4g HOTSPOT_CHANNEL=6", text)
+
+    def test_boot_start_assigns_internet_wifi_to_24ghz(self):
+        text = self._read_script("usv_boot_start.sh")
+
+        self.assertIn('INTERNET_IFACE="${INTERNET_IFACE:-wlan0}"', text)
+        self.assertIn('INTERNET_BAND="${INTERNET_BAND:-2.4g}"', text)
+        self.assertIn("configure_internet_wifi_band", text)
+        self.assertIn("normalize_nm_wifi_band", text)
+        self.assertIn('802-11-wireless.band "$nm_band"', text)
+        self.assertIn("INTERNET_WIFI_RECONNECT", text)
 
     def test_status_reports_external_internet_path(self):
         text = self._read_script("status_usv_all.sh")
 
         self.assertIn("print_internet_status", text)
         self.assertIn("ip route show default", text)
+        self.assertIn("get_wifi_iface_band", text)
+        self.assertIn("target_band=$INTERNET_BAND", text)
+        self.assertIn("internet-band-not-2.4g", text)
         self.assertIn("getent hosts github.com", text)
         self.assertIn("https://github.com/", text)
         self.assertIn("internet:", text)
@@ -166,6 +191,85 @@ exit 1
         self.assertIn("lan_ip: 10.33.44.167 iface=wlan0", result.stdout)
         self.assertIn("ssh: ssh jetson@10.33.44.167", result.stdout)
         self.assertNotIn("ssh jetson@192.168.55.1", result.stdout)
+
+    def test_status_flags_internet_wifi_band_mismatch(self):
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:
+            fake_ip = Path(tmp) / "ip"
+            fake_ip.write_bytes(
+                b"""#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == "route show default" ]]; then
+    echo "default via 10.33.44.1 dev wlan0 proto dhcp metric 600"
+    exit 0
+fi
+if [[ "$*" == "link show wlan1" ]]; then
+    exit 0
+fi
+if [[ "$*" == "-4 addr show wlan1" ]]; then
+    exit 1
+fi
+exit 1
+"""
+            )
+            fake_iw = Path(tmp) / "iw"
+            fake_iw.write_bytes(
+                b"""#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == "dev wlan0 link" ]]; then
+    echo "Connected to 00:11:22:33:44:55 (on wlan0)"
+    echo "freq: 5180"
+    exit 0
+fi
+exit 1
+"""
+            )
+            fake_nmcli = Path(tmp) / "nmcli"
+            fake_nmcli.write_bytes(
+                b"""#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == "-t -f NAME con show" ]]; then
+    exit 0
+fi
+if [[ "$*" == "-t -f NAME con show --active" ]]; then
+    echo "HomeWiFi"
+    exit 0
+fi
+exit 0
+"""
+            )
+            fake_getent = Path(tmp) / "getent"
+            fake_getent.write_bytes(
+                b"""#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$*" == "hosts github.com" ]]; then
+    echo "140.82.113.4 github.com"
+    exit 0
+fi
+exit 1
+"""
+            )
+            fake_curl = Path(tmp) / "curl"
+            fake_curl.write_bytes(b"#!/usr/bin/env bash\nexit 0\n")
+
+            for fake_cmd in (fake_ip, fake_iw, fake_nmcli, fake_getent, fake_curl):
+                fake_cmd.chmod(fake_cmd.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+            command = "cd '{}' && export PATH='{}:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin' && INTERNET_IFACE=wlan0 INTERNET_BAND=2.4g HOTSPOT_IFACE=wlan1 bash scripts/status_usv_all.sh full".format(
+                self._bash_path(REPO_ROOT),
+                self._bash_path(tmp),
+            )
+            result = subprocess.run(
+                ["bash", "-lc", command],
+                text=True,
+                encoding="utf-8",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=True,
+            )
+
+        self.assertIn("internet: route=present iface=wlan0 source=external band=5g", result.stdout)
+        self.assertIn("target_iface=wlan0 target_band=2.4g", result.stdout)
+        self.assertIn("issue=internet-band-not-2.4g", result.stdout)
 
     def test_boot_stop_stops_ros_before_hotspot(self):
         text = self._read_script("usv_boot_stop.sh")

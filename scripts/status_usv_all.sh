@@ -13,7 +13,9 @@ ROUTER_PID_FILE="$RUN_DIR/mavlink_router.pid"
 MASTER_LOG_FILE="$LOG_DIR/roscore.log"
 LAUNCH_LOG_FILE="$LOG_DIR/usv_system.log"
 ROUTER_LOG_FILE="$LOG_DIR/mavlink_router.log"
-HOTSPOT_IFACE="${HOTSPOT_IFACE:-wlan0}"
+INTERNET_IFACE="${INTERNET_IFACE:-wlan0}"
+INTERNET_BAND="${INTERNET_BAND:-2.4g}"
+HOTSPOT_IFACE="${HOTSPOT_IFACE:-wlan1}"
 HOTSPOT_CONN_NAME="${HOTSPOT_CONN_NAME:-USV_AP}"
 HOTSPOT_IP="${HOTSPOT_IP:-10.42.0.1}"
 HOTSPOT_BAND="${HOTSPOT_BAND:-5g}"
@@ -56,6 +58,61 @@ hotspot_band_label() {
             echo "$1"
             ;;
     esac
+}
+
+freq_to_wifi_band_label() {
+    local freq="$1"
+
+    if [[ ! "$freq" =~ ^[0-9]+$ ]]; then
+        echo "unknown"
+        return
+    fi
+
+    if (( freq >= 2400 && freq < 2500 )); then
+        echo "2.4g"
+    elif (( freq >= 4900 && freq < 5900 )); then
+        echo "5g"
+    else
+        echo "unknown"
+    fi
+}
+
+get_active_wifi_connection_for_iface() {
+    local iface="$1"
+    nmcli -t -f NAME,DEVICE,TYPE con show --active 2>/dev/null | awk -F: -v iface="$iface" '$2==iface && $3=="802-11-wireless" {print $1; exit}'
+}
+
+get_wifi_iface_band() {
+    local iface="$1"
+    local active_conn=""
+    local nm_band=""
+    local freq=""
+
+    if [[ -z "$iface" || "$iface" == "none" || "$iface" == "unknown" ]]; then
+        echo "unknown"
+        return
+    fi
+
+    if command -v iw >/dev/null 2>&1; then
+        freq="$(iw dev "$iface" link 2>/dev/null | awk '/freq:/ {print $2; exit}')"
+        if [[ -n "$freq" ]]; then
+            freq_to_wifi_band_label "$freq"
+            return
+        fi
+    fi
+
+    if command -v nmcli >/dev/null 2>&1; then
+        active_conn="$(get_active_wifi_connection_for_iface "$iface")"
+        if [[ -n "$active_conn" ]]; then
+            nm_band="$(nmcli -g 802-11-wireless.band con show "$active_conn" 2>/dev/null || true)"
+            if [[ -n "$nm_band" ]]; then
+                hotspot_band_label "$nm_band"
+                return
+            fi
+        fi
+    fi
+
+    echo "unknown"
 }
 
 get_default_iface() {
@@ -219,6 +276,7 @@ print_internet_status() {
     local route_state="missing"
     local default_iface="none"
     local route_source="none"
+    local internet_band="unknown"
     local dns_state="unknown"
     local github_state="unknown"
     local default_route=""
@@ -239,6 +297,10 @@ print_internet_status() {
         fi
     else
         route_state="ip-missing"
+    fi
+
+    if [[ "$route_state" == "present" ]]; then
+        internet_band="$(get_wifi_iface_band "$default_iface")"
     fi
 
     if command -v getent >/dev/null 2>&1; then
@@ -263,12 +325,18 @@ print_internet_status() {
         github_state="curl-missing"
     fi
 
-    echo "internet: route=$route_state iface=$default_iface source=$route_source dns=$dns_state github=$github_state"
+    echo "internet: route=$route_state iface=$default_iface source=$route_source band=$internet_band target_iface=$INTERNET_IFACE target_band=$INTERNET_BAND dns=$dns_state github=$github_state"
 
     if [[ "$route_source" == "hotspot" ]]; then
         echo "  issue=default-route-uses-hotspot-interface"
     elif [[ "$route_state" != "present" ]]; then
         echo "  issue=default-route-missing"
+    elif [[ "$default_iface" == "$INTERNET_IFACE" && "$internet_band" != "unknown" && "$internet_band" != "$INTERNET_BAND" ]]; then
+        if [[ "$INTERNET_BAND" == "2.4g" ]]; then
+            echo "  issue=internet-band-not-2.4g"
+        else
+            echo "  issue=internet-band-not-target"
+        fi
     fi
 }
 

@@ -48,7 +48,7 @@ pip3 install pyserial flask flask-cors flask-socketio eventlet
 | Pixhawk TELEM2 | Jetson `/dev/ttyTHS1:921600` | 飞控参数 + 物理接线 |
 | MAVROS | `/mavros/state connected: True` | `rostopic echo -n 1 /mavros/state` |
 | Web UI | `static/dist/index.html` 或 `static/index.html` | `curl http://127.0.0.1:5000/api/ui/debug` |
-| Wi-Fi AP | `wlan0` 支持 AP 模式 | `nmcli dev wifi list ifname wlan0` |
+| Wi-Fi AP | `wlan1` 支持 AP 模式和 5 GHz | `nmcli dev wifi list ifname wlan1` |
 
 <a id="boot-autostart"></a>
 
@@ -65,15 +65,16 @@ catkin_make
 sudo ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
 ```
 
-推荐现场双网卡并行：`wlan1` 专门创建 `USV_Control` 热点，`wlan0`、`eth0` 或 `usb0`
-保留外网上游，用于 `git pull`、`apt update`。
+推荐现场双网卡并行：`wlan0` 作为 2.4 GHz 外网 Wi-Fi，`wlan1` 专门创建 5 GHz `USV_Control`
+热点；也可以用 `eth0` 或 `usb0` 保留外网上游，用于 `git pull`、`apt update`。
 
 ```bash
 nmcli dev status
 nmcli dev wifi connect "<外网SSID>" password "<外网密码>" ifname wlan0
+nmcli connection modify "<外网SSID>" 802-11-wireless.band bg
 
 cd ~/usv_ws
-sudo HOTSPOT_IFACE=wlan1 ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
+sudo USV_ENABLE_HOTSPOT=true INTERNET_IFACE=wlan0 INTERNET_BAND=2.4g HOTSPOT_IFACE=wlan1 HOTSPOT_BAND=5g HOTSPOT_CHANNEL=149 ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
 ```
 
 仅使用 SSH 访问 Web 配置页时，关闭自启热点：
@@ -95,11 +96,17 @@ ssh -N -L 5000:127.0.0.1:5000 jetson@<Jetson_IP>
 | 第 1 参数 | `USV_Control` | 热点 SSID |
 | 第 2 参数 | `12345678` | WPA-PSK 密码，至少 8 位 |
 | 第 3 参数 | `SUDO_USER` | ROS 运行用户，默认安装脚本调用者 |
-| `USV_ENABLE_HOTSPOT` | `true` | 是否在自启服务中创建/停止热点；设为 `false` 时只启动 ROS/Web |
-| `HOTSPOT_IFACE` | `wlan0` | 热点无线网卡 |
+| `USV_ENABLE_HOTSPOT` | `false` | 是否在自启服务中创建/停止热点；设为 `true` 时启动 5 GHz 热点 |
+| `INTERNET_IFACE` | `wlan0` | 外网 Wi-Fi 网卡 |
+| `INTERNET_BAND` | `2.4g` | 外网 Wi-Fi 目标频段；会写入活动 NetworkManager profile |
+| `INTERNET_WIFI_RECONNECT` | `false` | 是否立即重连外网 Wi-Fi 以应用频段；默认避免断开 SSH |
+| `HOTSPOT_IFACE` | `wlan1` | 热点无线网卡 |
 | `HOTSPOT_CONN_NAME` | `USV_AP` | NetworkManager 连接名 |
 | `HOTSPOT_IP` | `10.42.0.1` | 热点网关 IP |
 | `HOTSPOT_ROUTE_METRIC` | `900` | 热点连接 route metric；同时设置 never-default，避免抢默认路由 |
+| `HOTSPOT_BAND` | `5g` | 热点频段 |
+| `HOTSPOT_CHANNEL` | `149` | 热点信道 |
+| `HOTSPOT_ALLOW_INTERNET_IFACE` | `false` | 是否允许热点复用当前默认路由网卡；双网卡部署保持默认 |
 | `WEB_PORT` | `5000` | Web 服务端口 |
 | `USV_BOOT_WAIT_SECONDS` | `90` | 热点/Web 等待超时 |
 | `USV_STRICT_SELF_CHECK` | `true` | 严格自检，要求 ROS 节点和 MAVROS 均正常 |
@@ -136,8 +143,8 @@ tail -n 120 .usv_run/logs/boot_check.log
 |---|---|
 | systemd | `enabled` + `active` |
 | 自检日志 | `boot start complete` |
-| 热点 | 启用热点时 `hotspot: ... conn=active ... ip=assigned ... web_port=listening`；禁用热点时 `boot_check.log` 出现 `skip hotspot setup: disabled` |
-| 外网 | `internet: ... source=external ... dns=ok github=reachable`，且默认路由不走热点网卡 |
+| 热点 | 启用热点时 `hotspot: ... iface=wlan1 ... conn=active ... ip=assigned ... band=5g channel=149 ... web_port=listening`；禁用热点时 `boot_check.log` 出现 `skip hotspot setup: disabled` |
+| 外网 | `internet: ... iface=wlan0 source=external band=2.4g target_band=2.4g ... dns=ok github=reachable`，且默认路由不走热点网卡 |
 | ROS 进程 | `roscore: RUNNING`、`mavlink_router: RUNNING`、`usv_system: RUNNING` |
 | ROS 节点 | 严格模式下 `ros_nodes: ALL_OK` |
 | MAVROS | 严格模式下 `mavros_link: CONNECTED` |
@@ -169,7 +176,7 @@ sudo ./src/usv_ros/scripts/uninstall_boot_service.sh
 | 现象 | 首看 | 常见原因 |
 |---|---|---|
 | `usv-boot.service failed` | `sudo journalctl -u usv-boot.service -n 120 --no-pager` | 缺 `mavlink-routerd`、`nmcli`、ROS 未构建 |
-| 热点无 IP | `.usv_run/logs/boot_check.log` + `nmcli dev status` | 网卡不支持 AP、`wlan0` 名称不对、旧连接冲突 |
+| 热点无 IP | `.usv_run/logs/boot_check.log` + `nmcli dev status` | 网卡不支持 AP、`wlan1` 名称不对、旧连接冲突 |
 | Web 端口未监听 | `tail -f .usv_run/logs/usv_system.log` | Flask 依赖缺失、5000 端口被占、节点启动失败 |
 | `ros_nodes` 非 `ALL_OK` | `rosnode list` + `usv_system.log` | Python 依赖、launch 参数、节点初始化失败 |
 | `mavros_link: DISCONNECTED` | `mavlink_router.log` + `/mavros/state` | 飞控未上电、TELEM2 接线/参数错误、router 未连串口 |
@@ -187,9 +194,9 @@ sudo ./src/usv_ros/scripts/uninstall_boot_service.sh
 | 停止 ROS 主系统 | `./src/usv_ros/scripts/stop_usv_all.sh` | 停 `roslaunch`、router、roscore |
 | 重启 ROS 主系统 | `./src/usv_ros/scripts/restart_usv_all.sh` | 停止后重新启动 |
 | 状态总览 | `./src/usv_ros/scripts/status_usv_all.sh` | 进程、热点、外网默认路由、ROS 节点、MAVROS、bridge |
-| 创建热点 | `sudo ./src/usv_ros/scripts/setup_hotspot.sh USV_Control 12345678` | NetworkManager 连接 `USV_AP` |
+| 创建热点 | `sudo INTERNET_IFACE=wlan0 INTERNET_BAND=2.4g HOTSPOT_IFACE=wlan1 HOTSPOT_BAND=5g HOTSPOT_CHANNEL=149 ./src/usv_ros/scripts/setup_hotspot.sh USV_Control 12345678` | NetworkManager 连接 `USV_AP` |
 | 关闭热点 | `sudo ./src/usv_ros/scripts/stop_hotspot.sh` | 尝试回连原 Wi-Fi |
-| 安装上电自启 | `sudo ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678` | 创建并启动 `usv-boot.service` |
+| 安装上电自启 | `sudo ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678` | 创建并启用 `usv-boot.service`，默认不立即启动 |
 | 安装无热点自启 | `sudo USV_ENABLE_HOTSPOT=false ./src/usv_ros/scripts/install_boot_service.sh` | 只启动 ROS/Web，适合 SSH 端口转发 |
 | 卸载上电自启 | `sudo ./src/usv_ros/scripts/uninstall_boot_service.sh` | 停止并删除 unit |
 
@@ -298,15 +305,15 @@ rostopic echo /usv/trigger_status
 ### 5.5 热点访问
 
 ```bash
-sudo ./src/usv_ros/scripts/setup_hotspot.sh USV_Control 12345678
+sudo INTERNET_IFACE=wlan0 INTERNET_BAND=2.4g HOTSPOT_IFACE=wlan1 HOTSPOT_BAND=5g HOTSPOT_CHANNEL=149 ./src/usv_ros/scripts/setup_hotspot.sh USV_Control 12345678
 nmcli -f GENERAL.NAME,802-11-wireless.ssid,802-11-wireless-security.key-mgmt con show USV_AP
 ip route show default
 ./src/usv_ros/scripts/status_usv_all.sh
 ```
 
 通过判据：客户端能连接 `USV_Control`；访问 `http://10.42.0.1:5000`；状态显示
-`conn=active ip=assigned web_port=listening`；双网卡场景下 `internet` 行显示 `source=external`，
-默认路由走 `wlan0`、`eth0` 或 `usb0`，不走热点网卡。
+`iface=wlan1 conn=active ip=assigned band=5g channel=149 web_port=listening`；双网卡场景下
+`internet` 行显示 `iface=wlan0 source=external band=2.4g target_band=2.4g`，默认路由不走热点网卡。
 
 <a id="field-e2e"></a>
 
