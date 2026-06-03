@@ -356,14 +356,15 @@ curl http://127.0.0.1:5000/api/ui/debug
 
 ```bash
 cd ~/usv_ws
-HOTSPOT_BAND=5g HOTSPOT_CHANNEL=149 usvhotspot on USV_Control 12345678
+HOTSPOT_IFACE=wlan1 HOTSPOT_BAND=5g HOTSPOT_CHANNEL=149 usvhotspot on USV_Control 12345678
 usvhotspot status
 usvhotspot off
 ```
 
 默认热点连接名为 `USV_AP`，默认地址为 `10.42.0.1`。可通过 `HOTSPOT_IFACE`、`HOTSPOT_CONN_NAME`、
-`HOTSPOT_IP`、`HOTSPOT_ROUTE_METRIC`、`HOTSPOT_BAND`、`HOTSPOT_CHANNEL` 覆盖。双频 USB 网卡默认使用
-`HOTSPOT_BAND=5g`、`HOTSPOT_CHANNEL=149`；若现场 5GHz AP 受地区码或驱动限制，可改用
+`HOTSPOT_IP`、`HOTSPOT_ROUTE_METRIC`、`HOTSPOT_BAND`、`HOTSPOT_CHANNEL` 覆盖。默认双网卡角色为
+`INTERNET_IFACE=wlan0`、`INTERNET_BAND=2.4g`、`HOTSPOT_IFACE=wlan1`、`HOTSPOT_BAND=5g`、
+`HOTSPOT_CHANNEL=149`；若现场 5GHz AP 受地区码或驱动限制，可改用
 `HOTSPOT_BAND=2.4g HOTSPOT_CHANNEL=6`。
 
 推荐现场使用双网卡并行：USB Wi-Fi 作为热点网卡，板载 Wi-Fi、网线或手机 USB 共享作为外网上游。
@@ -371,15 +372,19 @@ usvhotspot off
 ```bash
 nmcli dev status
 nmcli dev wifi connect "<外网SSID>" password "<外网密码>" ifname wlan0
+nmcli connection modify "<外网SSID>" 802-11-wireless.band bg
 
 cd ~/usv_ws
-HOTSPOT_IFACE=wlan1 HOTSPOT_BAND=5g HOTSPOT_CHANNEL=149 usvhotspot on USV_Control 12345678
+INTERNET_IFACE=wlan0 INTERNET_BAND=2.4g HOTSPOT_IFACE=wlan1 HOTSPOT_BAND=5g HOTSPOT_CHANNEL=149 usvhotspot on USV_Control 12345678
 ip route
 ./src/usv_ros/scripts/status_usv_all.sh
 ```
 
 热点连接会设置 `ipv4.never-default=yes`、`ipv6.never-default=yes` 和较高 route metric，避免 `USV_AP`
-抢默认路由。`status_usv_all.sh` 会输出 `internet: ... source=external ...`，用于确认默认路由仍走外网接口。
+抢默认路由。`setup_hotspot.sh` 默认拒绝把当前默认路由接口切为热点，除非显式设置
+`HOTSPOT_ALLOW_INTERNET_IFACE=true`。热点脚本会把 `INTERNET_IFACE` 上的活动 Wi-Fi profile 设为
+`INTERNET_BAND=2.4g`；默认不主动重连，避免断开当前 SSH。`status_usv_all.sh` 会输出
+`internet: ... source=external ... band=2.4g target_band=2.4g ...`，用于确认默认路由仍走外网接口且频段正确。
 
 ### 开机自启
 
@@ -400,8 +405,11 @@ usvaddr
 
 ```bash
 cd ~/usv_ws
-sudo USV_ENABLE_HOTSPOT=true HOTSPOT_IFACE=wlan1 HOTSPOT_BAND=5g HOTSPOT_CHANNEL=149 ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
+sudo USV_ENABLE_HOTSPOT=true INTERNET_IFACE=wlan0 INTERNET_BAND=2.4g HOTSPOT_IFACE=wlan1 HOTSPOT_BAND=5g HOTSPOT_CHANNEL=149 ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
 ```
+
+安装脚本也会把活动外网 Wi-Fi 连接的 NetworkManager profile 设为 2.4 GHz；默认不主动重连，避免断开当前 SSH。
+如需安装后立即切到 2.4 GHz，可加 `INTERNET_WIFI_RECONNECT=true`。
 
 安装脚本默认只写入并启用 `usv-boot.service`，不会在安装阶段立即启动整套 ROS/热点链路，避免因现场硬件或网络尚未就绪导致安装报错。
 如需安装后立刻启动并验证服务：

@@ -307,12 +307,15 @@ Create a WPA-PSK hotspot manually:
 
 ```bash
 cd ~/usv_ws
-sudo ./src/usv_ros/scripts/setup_hotspot.sh USV_Control 12345678
-sudo ./src/usv_ros/scripts/stop_hotspot.sh
+HOTSPOT_IFACE=wlan1 HOTSPOT_BAND=5g HOTSPOT_CHANNEL=149 usvhotspot on USV_Control 12345678
+usvhotspot status
+usvhotspot off
 ```
 
 The default connection name is `USV_AP`, and the default address is `10.42.0.1`. Override with
-`HOTSPOT_IFACE`, `HOTSPOT_CONN_NAME`, `HOTSPOT_IP`, and `HOTSPOT_ROUTE_METRIC` when needed.
+`HOTSPOT_IFACE`, `HOTSPOT_CONN_NAME`, `HOTSPOT_IP`, `HOTSPOT_ROUTE_METRIC`, `HOTSPOT_BAND`, and
+`HOTSPOT_CHANNEL` when needed. The default two-adapter policy is `INTERNET_IFACE=wlan0`,
+`INTERNET_BAND=2.4g`, `HOTSPOT_IFACE=wlan1`, `HOTSPOT_BAND=5g`, and `HOTSPOT_CHANNEL=149`.
 
 Recommended field networking uses two adapters in parallel: a USB Wi-Fi adapter for the USV hotspot, and
 onboard Wi-Fi, Ethernet, or USB tethering for upstream internet access.
@@ -320,16 +323,20 @@ onboard Wi-Fi, Ethernet, or USB tethering for upstream internet access.
 ```bash
 nmcli dev status
 nmcli dev wifi connect "<internet-ssid>" password "<internet-password>" ifname wlan0
+nmcli connection modify "<internet-ssid>" 802-11-wireless.band bg
 
 cd ~/usv_ws
-sudo HOTSPOT_IFACE=wlan1 ./src/usv_ros/scripts/setup_hotspot.sh USV_Control 12345678
+INTERNET_IFACE=wlan0 INTERNET_BAND=2.4g HOTSPOT_IFACE=wlan1 HOTSPOT_BAND=5g HOTSPOT_CHANNEL=149 usvhotspot on USV_Control 12345678
 ip route
 ./src/usv_ros/scripts/status_usv_all.sh
 ```
 
 The hotspot connection sets `ipv4.never-default=yes`, `ipv6.never-default=yes`, and a high route metric so
 `USV_AP` does not take the default route. `status_usv_all.sh` reports `internet: ... source=external ...`
-when the default route still uses the upstream interface.
+and `band=2.4g target_band=2.4g` when the default route still uses the upstream interface on the target band.
+`setup_hotspot.sh` refuses to convert the current default-route interface into the hotspot unless
+`HOTSPOT_ALLOW_INTERNET_IFACE=true` is set explicitly. It also sets the active `INTERNET_IFACE` Wi-Fi
+profile to `INTERNET_BAND=2.4g` without reconnecting by default.
 
 ### Boot Autostart
 
@@ -344,15 +351,18 @@ For the recommended two-adapter setup, pin the hotspot to the USB Wi-Fi interfac
 
 ```bash
 cd ~/usv_ws
-sudo HOTSPOT_IFACE=wlan1 ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
+sudo USV_ENABLE_HOTSPOT=true INTERNET_IFACE=wlan0 INTERNET_BAND=2.4g HOTSPOT_IFACE=wlan1 HOTSPOT_BAND=5g HOTSPOT_CHANNEL=149 ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
 ```
+
+The boot script also sets the active upstream Wi-Fi NetworkManager profile to 2.4 GHz. It does not reconnect by
+default to avoid dropping an active SSH session; add `INTERNET_WIFI_RECONNECT=true` when immediate reassociation is required.
 
 By default, the installer writes and enables `usv-boot.service` only. It does not start the full ROS/hotspot chain during installation, which avoids install-time failures when field hardware or networking is not ready yet.
 To start and verify the service immediately after installation:
 
 ```bash
 cd ~/usv_ws
-sudo USV_BOOT_START_NOW=true HOTSPOT_IFACE=wlan1 ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
+sudo USV_BOOT_START_NOW=true INTERNET_IFACE=wlan0 INTERNET_BAND=2.4g HOTSPOT_IFACE=wlan1 HOTSPOT_BAND=5g HOTSPOT_CHANNEL=149 ./src/usv_ros/scripts/install_boot_service.sh USV_Control 12345678
 ```
 
 If Web configuration is accessed through SSH, disable the autostart hotspot and keep only ROS/Web autostart:

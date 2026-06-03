@@ -10,10 +10,14 @@ USV_RUN_USER="${USV_RUN_USER:-${SUDO_USER:-$(id -un)}}"
 USV_HOTSPOT_SSID="${USV_HOTSPOT_SSID:-USV_Control}"
 USV_HOTSPOT_PASSWORD="${USV_HOTSPOT_PASSWORD:-12345678}"
 USV_ENABLE_HOTSPOT="${USV_ENABLE_HOTSPOT:-false}"
-HOTSPOT_IFACE="${HOTSPOT_IFACE:-wlan0}"
+INTERNET_IFACE="${INTERNET_IFACE:-wlan0}"
+INTERNET_BAND="${INTERNET_BAND:-2.4g}"
+INTERNET_WIFI_RECONNECT="${INTERNET_WIFI_RECONNECT:-false}"
+HOTSPOT_IFACE="${HOTSPOT_IFACE:-wlan1}"
 HOTSPOT_IP="${HOTSPOT_IP:-10.42.0.1}"
 HOTSPOT_BAND="${HOTSPOT_BAND:-5g}"
 HOTSPOT_CHANNEL="${HOTSPOT_CHANNEL:-149}"
+HOTSPOT_ALLOW_INTERNET_IFACE="${HOTSPOT_ALLOW_INTERNET_IFACE:-false}"
 WEB_PORT="${WEB_PORT:-5000}"
 USV_BOOT_WAIT_SECONDS="${USV_BOOT_WAIT_SECONDS:-90}"
 USV_STRICT_SELF_CHECK="${USV_STRICT_SELF_CHECK:-true}"
@@ -56,11 +60,15 @@ run_as_usv_user() {
     local env_args=(
         "WEB_PORT=$WEB_PORT"
         "USV_ENABLE_HOTSPOT=$USV_ENABLE_HOTSPOT"
+        "INTERNET_IFACE=$INTERNET_IFACE"
+        "INTERNET_BAND=$INTERNET_BAND"
+        "INTERNET_WIFI_RECONNECT=$INTERNET_WIFI_RECONNECT"
         "HOTSPOT_IFACE=$HOTSPOT_IFACE"
         "HOTSPOT_IP=$HOTSPOT_IP"
         "HOTSPOT_CONN_NAME=${HOTSPOT_CONN_NAME:-USV_AP}"
         "HOTSPOT_BAND=$HOTSPOT_BAND"
         "HOTSPOT_CHANNEL=$HOTSPOT_CHANNEL"
+        "HOTSPOT_ALLOW_INTERNET_IFACE=$HOTSPOT_ALLOW_INTERNET_IFACE"
         "MAVLINK_ROUTERD_BIN=${MAVLINK_ROUTERD_BIN:-mavlink-routerd}"
         "FCU_UART_DEVICE=${FCU_UART_DEVICE:-/dev/ttyTHS1}"
         "FCU_UART_BAUD=${FCU_UART_BAUD:-921600}"
@@ -73,6 +81,61 @@ run_as_usv_user() {
         runuser -u "$USV_RUN_USER" -- env "${env_args[@]}" "$@"
     else
         env "${env_args[@]}" "$@"
+    fi
+}
+
+normalize_nm_wifi_band() {
+    case "${1,,}" in
+        2.4g|2g|24g|2.4ghz|bg|b/g|g)
+            echo "bg"
+            ;;
+        5g|5ghz|a)
+            echo "a"
+            ;;
+        *)
+            log_boot "ERROR: unsupported INTERNET_BAND: $1"
+            return 1
+            ;;
+    esac
+}
+
+get_active_wifi_connection_for_iface() {
+    local iface="$1"
+    nmcli -t -f NAME,DEVICE,TYPE con show --active 2>/dev/null | awk -F: -v iface="$iface" '$2==iface && $3=="802-11-wireless" {print $1; exit}'
+}
+
+configure_internet_wifi_band() {
+    local nm_band active_conn
+
+    if [[ -z "$INTERNET_IFACE" ]]; then
+        log_boot "skip internet wifi band: INTERNET_IFACE empty"
+        return 0
+    fi
+    if ! command -v nmcli >/dev/null 2>&1; then
+        log_boot "skip internet wifi band: nmcli missing"
+        return 0
+    fi
+    if command -v ip >/dev/null 2>&1 && ! ip link show "$INTERNET_IFACE" >/dev/null 2>&1; then
+        log_boot "skip internet wifi band: iface missing ($INTERNET_IFACE)"
+        return 0
+    fi
+
+    nm_band="$(normalize_nm_wifi_band "$INTERNET_BAND")"
+    active_conn="$(get_active_wifi_connection_for_iface "$INTERNET_IFACE")"
+    if [[ -z "$active_conn" ]]; then
+        log_boot "skip internet wifi band: no active wifi connection on $INTERNET_IFACE"
+        return 0
+    fi
+
+    nmcli connection modify "$active_conn" 802-11-wireless.band "$nm_band"
+    log_boot "internet wifi profile band set: iface=$INTERNET_IFACE conn=$active_conn band=$INTERNET_BAND"
+
+    if [[ "$INTERNET_WIFI_RECONNECT" == "true" ]]; then
+        log_boot "internet wifi reconnect: conn=$active_conn"
+        nmcli connection down "$active_conn" >/dev/null 2>&1 || true
+        nmcli connection up "$active_conn" >/dev/null
+    else
+        log_boot "internet wifi reconnect skipped: set INTERNET_WIFI_RECONNECT=true to apply immediately"
     fi
 }
 
@@ -166,7 +229,7 @@ main() {
     trap cleanup_on_error ERR
 
     log_boot "boot start"
-    log_boot "run_user=$USV_RUN_USER ssid=$USV_HOTSPOT_SSID hotspot=$USV_ENABLE_HOTSPOT band=$HOTSPOT_BAND channel=$HOTSPOT_CHANNEL strict=$USV_STRICT_SELF_CHECK"
+    log_boot "run_user=$USV_RUN_USER ssid=$USV_HOTSPOT_SSID hotspot=$USV_ENABLE_HOTSPOT internet_iface=$INTERNET_IFACE internet_band=$INTERNET_BAND hotspot_iface=$HOTSPOT_IFACE band=$HOTSPOT_BAND channel=$HOTSPOT_CHANNEL strict=$USV_STRICT_SELF_CHECK"
 
     require_root
     if is_hotspot_enabled; then
@@ -175,6 +238,8 @@ main() {
     fi
     require_command runuser
     require_command mavlink-routerd
+
+    configure_internet_wifi_band
 
     if is_hotspot_enabled; then
         HOTSPOT_ATTEMPTED="true"
