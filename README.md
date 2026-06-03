@@ -56,6 +56,7 @@ English version: `README.en.md`
 | `/mavros` | `mavros/launch/apm.launch` | 飞控状态、任务、模式切换服务 |
 | `/pump_control_node` | `scripts/pump_control_node.py` | 串口握手、泵控、自动化、进样泵、ADS 分光采集 |
 | `/web_config_server` | `scripts/web_config_server.py` | Web 页面、REST API、Socket.IO、配置与数据记录 |
+| `/system_health_node` | `scripts/system_health_node.py` | Jetson、ROS 节点与 ESP32 主控健康聚合 |
 | `/usv_mavlink_bridge` | `scripts/usv_mavlink_router_bridge.py` | router TCP 端点上的 MAVLink 遥测、命令、ACK 桥接 |
 | `/mavlink_trigger_node` | `scripts/mavlink_trigger_node.py` | 采样命令解释、任务阶段状态机、航点采样控制 |
 
@@ -107,8 +108,9 @@ ESP32 检测装置主控
 已实现的核心能力包括：
 
 - `mavlink-routerd` 串口复用：MAVROS 与自定义 bridge 分离。
-- 17 个 QGC 载荷遥测字段：`USV_VOLT`、`USV_ABS`、`PUMP_X/Y/Z/A`、`USV_STAT`、`USV_PKT`、
+- 22 个 QGC 载荷遥测字段：`USV_VOLT`、`USV_ABS`、`PUMP_X/Y/Z/A`、`USV_STAT`、`USV_PKT`、
   `USV_STEP`、`USV_STOT`、`USV_SCNT`、`USV_PERR`、`USV_PMOD`、`USV_BSET`、`USV_REF`、`USV_BASE`、`USV_VLD`。
+  其中 5 个系统健康字段为 `USV_JTMP`、`USV_ETMP`、`USV_JCPU`、`USV_JMEM`、`USV_EHEAP`。
 - 检测装置身份握手：`HELLO?` / `DET?` 必须返回 `DET_ID:USV_DETECTOR*`。
 - Web 端硬件设置热切换：保存串口参数后调用 `/usv/pump_reconnect` 重连泵控节点。
 - 航点采样配置 CRUD、任务配置导入导出、任务数据 JSON 记录和 CSV 下载。
@@ -133,6 +135,7 @@ usv_ros/
 │   └── usv_bringup.launch           # 主启动入口
 ├── scripts/
 │   ├── pump_control_node.py         # 检测装置串口、泵控、自动化、ADS 数据
+│   ├── system_health_node.py        # Jetson/ROS/ESP32 健康聚合
 │   ├── web_config_server.py         # Flask/Socket.IO Web 网关
 │   ├── mavlink_trigger_node.py      # MAVLink 指令与采样状态机
 │   ├── usv_mavlink_router_bridge.py # mavlink-router TCP 桥
@@ -474,7 +477,7 @@ sudo USV_BOOT_START_NOW=true USV_STRICT_SELF_CHECK=false ./src/usv_ros/scripts/i
 | MAVROS | `enable_mavros`、`mavros_fcu_url`、`mavros_gcs_url`、`mavros_tgt_system`、`mavros_tgt_component`、`mavros_fcu_protocol`、`mavros_respawn` |
 | 采样状态机 | `mavros_timeout`、`hold_settle_time`、`stable_check_timeout`、`stable_speed_threshold`、`stable_yaw_rate_threshold`、`sampling_retry_count`、`sampling_on_fail` |
 | MAVLink bridge | `mavlink_source_system`、`mavlink_source_component`、`mavlink_router_url` |
-| 节点开关 | `enable_pump`、`enable_web`、`enable_mavlink_trigger`、`enable_mavlink_bridge` |
+| 节点开关 | `enable_pump`、`enable_web`、`enable_system_health`、`enable_mavlink_trigger`、`enable_mavlink_bridge` |
 
 示例：
 
@@ -503,6 +506,8 @@ roslaunch usv_ros usv_bringup.launch \
 | `/usv/pump_pid_error` | `std_msgs/String` | pub | PID 误差 JSON |
 | `/usv/injection_pump_status` | `std_msgs/String` | pub | 进样泵状态 JSON |
 | `/usv/spectrometer_voltage` | `std_msgs/String` | pub | 分光数据 JSON，包含 `voltage`、`absorbance` 等 |
+| `/usv/detector_health` | `std_msgs/String` | pub | ESP32 主控健康 JSON，包含温度、heap、任务栈水位 |
+| `/usv/system_health` | `std_msgs/String` | pub | Jetson、ROS 节点和 ESP32 聚合健康 JSON |
 | `/usv/spectrometer_status` | `std_msgs/String` | pub | ADS 配置、采集中、错误等状态 |
 | `/usv/spectrometer_raw` | `std_msgs/String` | pub | 原始分光包 |
 | `/usv/spectrometer_absorbance` | `std_msgs/String` | pub | 吸光度数据 |
@@ -568,6 +573,7 @@ REST API 和 Socket.IO 实时事件。
 | `POST /api/hardware/test-pump-port` | 打开串口并执行检测装置握手 |
 | `POST /api/hardware/apply` | 保存硬件配置并重连泵控节点 |
 | `GET /api/diagnostics/link|history|events|export` | 链路诊断 |
+| `GET /api/diagnostics/system` | 系统健康最新快照和最近历史 |
 
 ### Socket.IO 事件
 
@@ -584,6 +590,7 @@ log
 mavros_state
 bridge_diagnostics
 radio_status
+system_health
 ```
 
 ### 快速 API 验证
@@ -592,6 +599,7 @@ radio_status
 curl http://127.0.0.1:5000/api/ui/debug
 curl http://127.0.0.1:5000/api/config
 curl http://127.0.0.1:5000/api/hardware/serial-ports
+curl http://127.0.0.1:5000/api/diagnostics/system
 curl -X POST http://127.0.0.1:5000/api/injection-pump/on
 curl -X POST http://127.0.0.1:5000/api/injection-pump/off
 ```
@@ -649,7 +657,7 @@ bridge 兼容飞控以 `NAMED_VALUE_FLOAT` 发出的原生任务触发：
 bridge 发送：
 
 - `HEARTBEAT`：1 Hz。
-- `NAMED_VALUE_FLOAT`：2 Hz，每轮 17 个字段。
+- `NAMED_VALUE_FLOAT`：2 Hz，每轮 22 个字段。
 
 | 字段 | 说明 |
 |---|---|
@@ -667,6 +675,11 @@ bridge 发送：
 | `USV_REF` | baseline 参考电压 |
 | `USV_BASE` | baseline 电压 |
 | `USV_VLD` | 分光检测器当前采样是否有效，0/1 |
+| `USV_JTMP` | Jetson CPU/SoC 温度，单位 °C；未知为 `-1` |
+| `USV_ETMP` | ESP32 内部温度，单位 °C；未知为 `-1` |
+| `USV_JCPU` | Jetson CPU 使用率，单位 `%`；未知为 `-1` |
+| `USV_JMEM` | Jetson 内存使用率，单位 `%`；未知为 `-1` |
+| `USV_EHEAP` | ESP32 可用 heap 百分比，单位 `%`；未知为 `-1` |
 
 诊断：
 
@@ -711,6 +724,7 @@ Web 的 `POST /api/hardware/test-pump-port` 使用同一握手逻辑，不能只
 | `0x55 0xAA` | PID 数据 |
 | `0x55 0xBB` | PID 测试结果 |
 | `0x55 0xDD` | 分光数据：时间戳、通道、状态、raw code、电压 |
+| `0x55 0xEE` | ESP32 健康数据：温度、heap、任务数、任务栈水位 |
 
 ## 数据与日志
 
@@ -753,6 +767,7 @@ curl http://127.0.0.1:5000/api/data/mission/<mission_id>/csv > mission.csv
 cd ~/usv_ws/src/usv_ros
 python3 -m py_compile \
   scripts/pump_control_node.py \
+  scripts/system_health_node.py \
   scripts/web_config_server.py \
   scripts/mavlink_trigger_node.py \
   scripts/usv_mavlink_router_bridge.py \
@@ -779,16 +794,19 @@ cd ~/usv_ws
 rosnode list
 rostopic echo -n 1 /mavros/state
 rostopic echo -n 1 /usv/bridge_diagnostics
+rostopic echo -n 1 /usv/system_health
 curl http://127.0.0.1:5000/api/ui/debug
+curl http://127.0.0.1:5000/api/diagnostics/system
 ```
 
 通过判据：
 
 - `status_usv_all.sh` 显示 `roscore`、`mavlink_router`、`usv_system` 运行。
 - `ros_nodes` 至少包含 `/pump_control_node`、`/web_config_server`、`/mavlink_trigger_node`、
-  `/usv_mavlink_bridge`、`/mavros`。
+  `/system_health_node`、`/usv_mavlink_bridge`、`/mavros`。
 - `/mavros/state` 中 `connected: True`。
 - `/usv/bridge_diagnostics` 的 `tx_named_value`、`pkt_count` 持续增长。
+- `/usv/system_health` 包含 `jetson`、`detector`、`ros_nodes` 和 `health`。
 - Web 控制台可访问，`/api/ui/debug` 返回 `dist_index_exists=true` 或明确回退到静态页面。
 
 更多现场测试流程见 [TESTING.md](TESTING.md)。
@@ -802,6 +820,7 @@ curl http://127.0.0.1:5000/api/ui/debug
 | 泵控节点启动失败 | 串口路径、权限、ESP32 供电、`DET_ID:USV_DETECTOR` 握手 |
 | Web 串口测试失败 | `POST /api/hardware/test-pump-port` 返回的 `identity` / 错误信息 |
 | 分光无数据 | `/usv/spectrometer_status`、`ADSSTART`、I2C 映射、检测装置固件状态 |
+| 系统健康无数据 | `/usv/system_health`、`/usv/detector_health`、`/api/diagnostics/system` |
 | MAVROS 断开 | 飞控串口线序、`SERIAL2_PROTOCOL=2`、`SERIAL2_BAUD=921`、`mavlink_router.log` |
 | QGC 指令不到 ROS | `/usv/mavlink_cmd_rx`、router TCP 端点、QGC target sys/comp |
 | QGC 面板无遥测 | `/usv/bridge_diagnostics` 的 `tx_named_value`、定制 ArduPilot/QGC 是否匹配 |
@@ -815,7 +834,7 @@ curl http://127.0.0.1:5000/api/ui/debug
 - Commit message 使用 `Feat:`、`Fix:`、`Refactor:`、`Docs:` 前缀。
 - Windows 上通常只做代码编辑和逻辑验证；Jetson、Pixhawk、ESP32 的真实运行验证需要现场硬件。
 - 更新 Web API、ROS topic/service 或 MAVLink 字段后，同步更新本 README、[TESTING.md](TESTING.md) 和工作空间
-  `docs/current/INTERFACE.md`。
+  `docs/current/40_interfaces.md`。
 
 ## License
 

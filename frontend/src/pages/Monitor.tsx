@@ -7,6 +7,7 @@ import { Activity, Zap, Play, Square, Anchor, Navigation, Pause, AlertTriangle, 
 import { cn } from '@/lib/utils'
 import { InjectionPumpCard } from '@/components/injection-pump-card'
 import { LinkDiagnosticsCard } from '@/components/link-diagnostics-card'
+import { SystemHealthCard } from '@/components/system-health-card'
 
 const MISSION_STATUS_MAP: Record<string, { label: string; color: string; icon: typeof Play }> = {
   IDLE:             { label: '空闲',       color: 'text-muted-foreground', icon: Square },
@@ -336,6 +337,7 @@ export default function Monitor() {
 
         <div className="xl:col-span-1 space-y-6">
           <InjectionPumpCard />
+          <SystemHealthCard />
           <LinkDiagnosticsCard />
         </div>
       </div>

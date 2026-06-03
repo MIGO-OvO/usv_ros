@@ -57,6 +57,7 @@
     <arg name="enable_mavlink_trigger" default="true" />
     <arg name="enable_mavlink_bridge" default="true" />
     <arg name="enable_lab_sim" default="true" />
+    <arg name="enable_system_health" default="true" />
 
     <!-- ==================== Load Parameters ==================== -->
     <rosparam file="$(find usv_ros)/config/usv_params.yaml" command="load" />
@@ -95,6 +96,10 @@
     <!-- ==================== Laboratory Simulation ==================== -->
     <node name="lab_sim_node" pkg="usv_ros" type="lab_sim_node.py"
           output="screen" if="$(arg enable_lab_sim)" />
+
+    <!-- ==================== System Health Monitor ==================== -->
+    <node name="system_health_node" pkg="usv_ros" type="system_health_node.py"
+          output="screen" if="$(arg enable_system_health)" />
 
     <!-- ==================== MAVLink Telemetry Bridge ==================== -->
     <node name="usv_mavlink_bridge" pkg="usv_ros" type="usv_mavlink_router_bridge.py"

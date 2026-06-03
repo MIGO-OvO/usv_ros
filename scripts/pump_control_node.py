@@ -71,10 +71,12 @@ HEADER2_ANGLE = 0xCC
 HEADER2_PID = 0xAA
 HEADER2_TEST = 0xBB
 HEADER2_SPECTRO = 0xDD
+HEADER2_HEALTH = 0xEE
 PACKET_SIZE_ANGLE = 20
 PACKET_SIZE_PID = 29
 PACKET_SIZE_TEST = 18
 PACKET_SIZE_SPECTRO = 18
+PACKET_SIZE_HEALTH = 37
 TAIL = 0x0A
 
 DETECTOR_HANDSHAKE_CMD = "HELLO?\r\n"
@@ -184,15 +186,17 @@ class PumpSerialReader(object):
         self.on_pid_data_received = None  # func(dict) - PID 数据 [0xAA]
         self.on_test_result_received = None  # func(dict) - 测试结果 [0xBB]
         self.on_spectro_received = None  # func(dict) - 分光数据 [0xDD]
+        self.on_health_received = None   # func(dict) - 系统健康数据 [0xEE]
         self.on_text_received = None    # func(str) - 文本响应
         self.on_error = None            # func(Exception) - 读取异常
 
-    def start(self, on_angle=None, on_pid=None, on_test=None, on_spectro=None, on_text=None, on_error=None):
+    def start(self, on_angle=None, on_pid=None, on_test=None, on_spectro=None, on_health=None, on_text=None, on_error=None):
         """启动后台读取线程。"""
         self.on_angle_received = on_angle
         self.on_pid_data_received = on_pid
         self.on_test_result_received = on_test
         self.on_spectro_received = on_spectro
+        self.on_health_received = on_health
         self.on_text_received = on_text
         self.on_error = on_error
         self.running = True
@@ -267,6 +271,8 @@ class PumpSerialReader(object):
                 return (i, HEADER2_TEST, PACKET_SIZE_TEST)
             elif h2 == HEADER2_SPECTRO:
                 return (i, HEADER2_SPECTRO, PACKET_SIZE_SPECTRO)
+            elif h2 == HEADER2_HEALTH:
+                return (i, HEADER2_HEALTH, PACKET_SIZE_HEALTH)
         return None
 
     def _validate_packet(self, data, packet_type, packet_size):
@@ -298,6 +304,11 @@ class PumpSerialReader(object):
             for i in range(1, 16):
                 checksum ^= data[i]
             return checksum == data[16]
+        elif packet_type == HEADER2_HEALTH:
+            checksum = 0
+            for i in range(1, PACKET_SIZE_HEALTH - 2):
+                checksum ^= data[i]
+            return checksum == data[PACKET_SIZE_HEALTH - 2]
 
         return False
 
@@ -312,6 +323,8 @@ class PumpSerialReader(object):
                 self._parse_test_packet(data)
             elif packet_type == HEADER2_SPECTRO:
                 self._parse_spectro_packet(data)
+            elif packet_type == HEADER2_HEALTH:
+                self._parse_health_packet(data)
         except Exception as e:
             rospy.logwarn("Packet parse error: %s", str(e))
 
@@ -380,6 +393,44 @@ class PumpSerialReader(object):
         }
         if self.on_spectro_received:
             self.on_spectro_received(packet)
+
+    def _parse_health_packet(self, data):
+        """解析系统健康数据包 [0x55][0xEE]。"""
+        (
+            version,
+            flags,
+            timestamp_ms,
+            uptime_s,
+            temp_c_x10,
+            cpu_freq_mhz,
+            heap_free,
+            heap_min_free,
+            heap_total,
+            task_count,
+            loop_stack_hwm,
+            comms_stack_hwm,
+            sensors_stack_hwm,
+        ) = struct.unpack("<BBIIhHIIIBHHH", data[2:35])
+        packet = {
+            "version": int(version),
+            "flags": int(flags),
+            "timestamp_ms": int(timestamp_ms),
+            "uptime_s": int(uptime_s),
+            "temperature_c": round(float(temp_c_x10) / 10.0, 1),
+            "cpu_freq_mhz": int(cpu_freq_mhz),
+            "heap_free": int(heap_free),
+            "heap_min_free": int(heap_min_free),
+            "heap_total": int(heap_total),
+            "heap_percent_free": round((float(heap_free) / float(heap_total)) * 100.0, 1) if heap_total else None,
+            "task_count": int(task_count),
+            "task_stack_hwm": {
+                "loop": int(loop_stack_hwm),
+                "comms": int(comms_stack_hwm),
+                "sensors": int(sensors_stack_hwm),
+            },
+        }
+        if self.on_health_received:
+            self.on_health_received(packet)
 
     def _process_text(self, data):
         """处理文本数据。"""
@@ -474,6 +525,7 @@ class PumpControlNode(object):
         self._lower_device_settings_file = self._resolve_lower_device_settings_file()
         self._lower_device_settings = self._load_lower_device_settings()
         self.manual_mode_enabled = False
+        self.latest_detector_health = {}
 
         # Publishers
         self.angles_pub = rospy.Publisher('/usv/pump_angles', String, queue_size=10)
@@ -488,6 +540,7 @@ class PumpControlNode(object):
         self.spectro_status_pub = rospy.Publisher('/usv/spectrometer_status', String, queue_size=20, latch=True)
         self.spectro_raw_pub = rospy.Publisher('/usv/spectrometer_raw', String, queue_size=20)
         self.spectro_absorbance_pub = rospy.Publisher('/usv/spectrometer_absorbance', String, queue_size=20)
+        self.detector_health_pub = rospy.Publisher('/usv/detector_health', String, queue_size=5)
 
         # Subscribers
         self.cmd_sub = rospy.Subscriber('/usv/pump_command', String, self._cmd_callback)
@@ -544,6 +597,7 @@ class PumpControlNode(object):
                 on_pid=self._on_pid_data_received,
                 on_test=self._on_test_result_received,
                 on_spectro=self._on_spectro_received,
+                on_health=self._on_health_received,
                 on_text=self._on_text_received,
                 on_error=self._on_serial_reader_error
             )
@@ -1355,6 +1409,15 @@ class PumpControlNode(object):
             'baseline_set': self._spectro_reference_ready(),
         })
         self.spectro_absorbance_pub.publish(absorbance_msg)
+
+    def _on_health_received(self, data):
+        """检测装置健康数据回调。"""
+        payload = dict(data)
+        payload["received_at"] = time.time()
+        self.latest_detector_health = payload
+        msg = String()
+        msg.data = json.dumps(payload, ensure_ascii=False)
+        self.detector_health_pub.publish(msg)
 
     def _spectro_reference_ready(self):
         return (self.spectro_reference_voltage - self.spectro_baseline_voltage) > 1e-6
