@@ -1,6 +1,6 @@
 # USV ROS 系统测试与现场排障手册
 
-Updated: 2026-05-15
+Updated: 2026-06-03
 
 关键词：Jetson Nano、ROS Noetic、systemd、开机自启、热点、MAVROS、mavlink-routerd、QGC、泵控、分光计、航点采样。
 
@@ -14,6 +14,7 @@ Updated: 2026-05-15
 | Web/硬件配置 | [5.1 Web 配置](#web-config) | `/api/ui/debug` 和硬件接口正常返回 |
 | 分光计/泵控 | [5.2](#spectrometer-flow) / [5.3](#pump-automation) | topic/service 有响应，日志无节点退出 |
 | QGC 指令/遥测 | [5.4 MAVLink 路由](#mavlink-router-bridge) | `mavlink_cmd_rx` 有下行，`bridge_diagnostics` 计数增长 |
+| 系统健康 | [5.5 系统健康监测](#system-health-flow) | Web、ROS、MAVLink 健康字段同步更新 |
 | 现场闭环 | [6. 现场全链路](#field-e2e) | QGC 指令、飞控链路、载荷执行、遥测回传均连通 |
 | 故障排查 | [7. 故障索引](#troubleshooting-index) | 按现象映射到日志、命令、责任模块 |
 
@@ -210,10 +211,11 @@ sudo ./src/usv_ros/scripts/uninstall_boot_service.sh
 | roscore 日志 | `tail -f ~/usv_ws/.usv_run/logs/roscore.log` | master 无异常退出 |
 | router 日志 | `tail -f ~/usv_ws/.usv_run/logs/mavlink_router.log` | 串口/5760/TCP 无错误 |
 | roslaunch 日志 | `tail -f ~/usv_ws/.usv_run/logs/usv_system.log` | 节点无 traceback |
-| ROS 节点 | `rosnode list` | `/pump_control_node`、`/web_config_server`、`/mavlink_trigger_node`、`/usv_mavlink_bridge`、`/mavros` |
+| ROS 节点 | `rosnode list` | `/pump_control_node`、`/web_config_server`、`/system_health_node`、`/mavlink_trigger_node`、`/usv_mavlink_bridge`、`/mavros` |
 | 单节点存活 | `rosnode ping /pump_control_node -c 1` | ping 成功 |
 | MAVROS | `rostopic echo -n 1 /mavros/state` | `connected: True` |
 | bridge 诊断 | `rostopic echo /usv/bridge_diagnostics` | `pkt_count`、`tx_named_value` 增长 |
+| 系统健康 | `rostopic echo -n 1 /usv/system_health` | Jetson、detector、ROS 节点字段存在 |
 | QGC 下行 | `rostopic echo /usv/mavlink_cmd_rx` | 点击 QGC 后出现 `Float32MultiArray` |
 | Web | `curl http://127.0.0.1:5000/api/ui/debug` | 返回 UI debug JSON |
 | 热点 | `nmcli con show --active` | `USV_AP` active |
@@ -289,13 +291,33 @@ rostopic echo /usv/trigger_status
 
 | 方向 | 判据 |
 |---|---|
-| 上行遥测 | `bridge_diagnostics` 定期输出，`pkt_count` / `tx_named_value` 持续增长 |
+| 上行遥测 | `bridge_diagnostics` 定期输出，`pkt_count` / `tx_named_value` 持续增长，QGC 可见 22 个字段 |
 | 下行指令 | QGC 点击按钮后，`/usv/mavlink_cmd_rx` 出现命令数组 |
 | 执行状态 | `/usv/trigger_status` 出现 `sampling_started` / `sampling_stopped` / `calibrate_started` |
 | 航线采样 | QGC Plan 使用 `MAV_CMD_NAV_SCRIPT_TIME(param1=1)`；执行时 bridge 收到 `USV_SMPL`，完成后发 `USV_DONE` |
 | 数据记录 | `sampling_started` 后 Web 数据中心出现任务记录；有效分光数据到达时数据点数量增长 |
 
-### 5.5 热点访问
+<a id="system-health-flow"></a>
+
+### 5.5 系统健康监测
+
+```bash
+rostopic echo -n 1 /usv/detector_health
+rostopic echo -n 1 /usv/system_health
+curl http://127.0.0.1:5000/api/diagnostics/system
+rostopic echo /usv/bridge_diagnostics
+```
+
+通过判据：
+
+| 项 | 判据 |
+|---|---|
+| ESP32 健康帧 | `/usv/detector_health` 包含 `temperature_c`、`heap_percent_free`、`task_stack_hwm` |
+| 聚合健康 | `/usv/system_health` 包含 `jetson`、`detector`、`ros_nodes`、`health` |
+| Web 展示 | 监控页系统健康卡片刷新，REST API 返回 `latest` 和 `history` |
+| MAVLink 健康字段 | QGC Fact 显示 `USV_JTMP`、`USV_ETMP`、`USV_JCPU`、`USV_JMEM`、`USV_EHEAP` |
+
+### 5.6 热点访问
 
 ```bash
 sudo ./src/usv_ros/scripts/setup_hotspot.sh USV_Control 12345678

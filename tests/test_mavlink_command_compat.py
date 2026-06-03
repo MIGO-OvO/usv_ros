@@ -683,8 +683,13 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         self.assertIn("USV_REF", names)
         self.assertIn("USV_BASE", names)
         self.assertIn("USV_VLD", names)
-        self.assertEqual(len(mav.named_values), 17)
-        self.assertEqual(bridge._diag_tx_named, 17)
+        self.assertIn("USV_JTMP", names)
+        self.assertIn("USV_ETMP", names)
+        self.assertIn("USV_JCPU", names)
+        self.assertIn("USV_JMEM", names)
+        self.assertIn("USV_EHEAP", names)
+        self.assertEqual(len(mav.named_values), 22)
+        self.assertEqual(bridge._diag_tx_named, 22)
 
     def test_rover_nav_script_time_is_the_only_mission_sampling_trigger(self):
         workspace_root = _workspace_root()
@@ -731,9 +736,9 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         )
 
         self.assertEqual(reconnects, [True])
-        self.assertEqual(len(recovered_mav.named_values), 17)
+        self.assertEqual(len(recovered_mav.named_values), 22)
         self.assertEqual(recovered_mav.named_values[0][0], "USV_VOLT")
-        self.assertEqual(bridge._diag_tx_named, 17)
+        self.assertEqual(bridge._diag_tx_named, 22)
 
     def test_router_bridge_caches_spectrometer_valid_from_voltage_payload(self):
         module = _load_script("usv_mavlink_router_bridge_valid_payload_test", "scripts/usv_mavlink_router_bridge.py")
@@ -752,6 +757,50 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         bridge._voltage_cb(msg)
 
         self.assertEqual(bridge._spectrometer_valid, 1.0)
+
+    def test_router_bridge_adds_system_health_named_value_fields(self):
+        module = _load_script("usv_mavlink_router_bridge_health_payload_test", "scripts/usv_mavlink_router_bridge.py")
+        bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
+        bridge._lock = threading.Lock()
+        bridge._boot_time = 0.0
+        bridge._pkt_count = 7
+        bridge._diag_tx_total = 0
+        bridge._diag_tx_named = 0
+        bridge._diag_pub_errors = 0
+        bridge._health_fields = module.DEFAULT_HEALTH_FIELDS.copy()
+        mav = RecordingMav()
+        bridge._conn = types.SimpleNamespace(mav=mav)
+        msg = sys.modules["std_msgs.msg"].String()
+        msg.data = json.dumps({
+            "jetson": {"temperature_c": 55.2, "cpu_percent": 12.5, "memory_percent": 34.0},
+            "detector": {"temperature_c": 43.2, "heap_percent_free": 37.5},
+        })
+
+        bridge._system_health_cb(msg)
+        bridge._send_payload(
+            voltage=1.2,
+            absorbance=0.3,
+            angles={"X": 1.0, "Y": 2.0, "Z": 3.0, "A": 4.0},
+            status=1,
+            automation_step=2.0,
+            automation_total=3.0,
+            sample_count=4.0,
+            pid_error=0.5,
+            pid_mode=1.0,
+            baseline_set=1.0,
+            reference_voltage=1.1,
+            baseline_voltage=1.0,
+            spectrometer_valid=1.0,
+        )
+
+        sent = dict(mav.named_values)
+        self.assertEqual(len(mav.named_values), 22)
+        self.assertAlmostEqual(sent["USV_JTMP"], 55.2)
+        self.assertAlmostEqual(sent["USV_ETMP"], 43.2)
+        self.assertAlmostEqual(sent["USV_JCPU"], 12.5)
+        self.assertAlmostEqual(sent["USV_JMEM"], 34.0)
+        self.assertAlmostEqual(sent["USV_EHEAP"], 37.5)
+        self.assertEqual(bridge._diag_tx_named, 22)
 
     def test_trigger_node_set_baseline_uses_latest_valid_voltage(self):
         module = _load_script("mavlink_trigger_node_baseline_valid_test", "scripts/mavlink_trigger_node.py")

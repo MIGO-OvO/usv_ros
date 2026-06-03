@@ -83,6 +83,34 @@ interface RadioStatus {
   txbuf: number
 }
 
+interface SystemHealth {
+  ts?: string
+  jetson?: {
+    cpu_percent?: number | null
+    memory_percent?: number | null
+    memory_used_mb?: number | null
+    memory_total_mb?: number | null
+    temperature_c?: number | null
+    uptime_s?: number | null
+  }
+  detector?: {
+    online?: boolean
+    temperature_c?: number | null
+    heap_free?: number | null
+    heap_total?: number | null
+    heap_percent_free?: number | null
+    uptime_s?: number | null
+    task_count?: number | null
+    task_stack_hwm?: Record<string, number>
+  }
+  ros_nodes?: { name: string; alive: boolean }[]
+  health?: {
+    code?: number
+    level?: string
+    summary?: string
+  }
+}
+
 interface ManualStatus {
   enabled: boolean
   automation_active: boolean
@@ -170,6 +198,8 @@ interface AppState {
   mavrosState: MavrosState
   bridgeDiag: BridgeDiag | null
   radioStatus: RadioStatus | null
+  systemHealth: SystemHealth | null
+  systemHealthHistory: SystemHealth[]
   manualStatus: ManualStatus
   controlEvents: ControlEvent[]
 
@@ -225,6 +255,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   mavrosState: { connected: false, armed: false, mode: '' },
   bridgeDiag: null,
   radioStatus: null,
+  systemHealth: null,
+  systemHealthHistory: [],
   manualStatus: DEFAULT_MANUAL_STATUS,
   controlEvents: [],
 
@@ -342,6 +374,14 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     socket.on('radio_status', (data: RadioStatus) => {
       set({ radioStatus: data })
+    })
+
+    socket.on('system_health', (data: SystemHealth) => {
+      if (!data || Object.keys(data).length === 0) return
+      set((state) => ({
+        systemHealth: data,
+        systemHealthHistory: [...state.systemHealthHistory.slice(-299), data],
+      }))
     })
 
     socket.on('manual_status', (data: ManualStatus) => {

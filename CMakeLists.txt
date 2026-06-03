@@ -43,6 +43,7 @@ catkin_install_python(PROGRAMS
   scripts/pump_control_node.py
   scripts/mission_coordinator_node.py
   scripts/web_config_server.py
+  scripts/system_health_node.py
   scripts/mavlink_trigger_node.py
   scripts/usv_mavlink_bridge.py
   scripts/usv_mavlink_router_bridge.py

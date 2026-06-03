@@ -25,6 +25,14 @@ WAIT_HEARTBEAT_TIMEOUT = 10.0
 MAX_PENDING_SENDS = 50
 RECONNECT_BACKOFF_SEC = 2.0
 
+DEFAULT_HEALTH_FIELDS = {
+    "USV_JTMP": -1.0,
+    "USV_ETMP": -1.0,
+    "USV_JCPU": -1.0,
+    "USV_JMEM": -1.0,
+    "USV_EHEAP": -1.0,
+}
+
 # USV 自定义命令范围
 CMD_START_SAMPLING = 31010
 CMD_CALIBRATE = 31014
@@ -62,6 +70,7 @@ class USVMavlinkRouterBridge(object):
         self._sample_count = 0.0
         self._pid_error = 0.0
         self._pid_mode = 0.0
+        self._health_fields = DEFAULT_HEALTH_FIELDS.copy()
         self._boot_time = time.time()
         self._last_heartbeat = 0.0
         self._last_reconnect_attempt = 0.0
@@ -89,6 +98,7 @@ class USVMavlinkRouterBridge(object):
         rospy.Subscriber("/usv/trigger_status", String, self._trigger_status_cb)
         rospy.Subscriber("/usv/mission_status", String, self._mission_status_cb)
         rospy.Subscriber("/usv/pump_pid_error", String, self._pid_error_cb)
+        rospy.Subscriber("/usv/system_health", String, self._system_health_cb)
         rospy.Subscriber("/mavros/state", State, self._mavros_state_cb, queue_size=5)
         rospy.loginfo("USV Router Bridge: sysid=%d compid=%d router=%s", self._sys_id, self._comp_id, self._router_url)
         self._conn = None
@@ -297,6 +307,32 @@ class USVMavlinkRouterBridge(object):
         except Exception:
             pass
 
+    def _system_health_cb(self, msg):
+        try:
+            data = json.loads(msg.data)
+            jetson = data.get("jetson", {}) if isinstance(data, dict) else {}
+            detector = data.get("detector", {}) if isinstance(data, dict) else {}
+            fields = DEFAULT_HEALTH_FIELDS.copy()
+            fields["USV_JTMP"] = self._finite_float(jetson.get("temperature_c"), -1.0)
+            fields["USV_ETMP"] = self._finite_float(detector.get("temperature_c"), -1.0)
+            fields["USV_JCPU"] = self._finite_float(jetson.get("cpu_percent"), -1.0)
+            fields["USV_JMEM"] = self._finite_float(jetson.get("memory_percent"), -1.0)
+            fields["USV_EHEAP"] = self._finite_float(detector.get("heap_percent_free"), -1.0)
+            with self._lock:
+                self._health_fields = fields
+        except Exception:
+            pass
+
+    @staticmethod
+    def _finite_float(value, default):
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        if result != result:
+            return float(default)
+        return result
+
     def _mavros_state_cb(self, msg):
         was_connected = self._mavros_connected
         self._mavros_connected = bool(msg.connected)
@@ -489,8 +525,10 @@ class USVMavlinkRouterBridge(object):
                 self._diag_tx_total += 1
                 self._diag_tx_heartbeat += 1
 
-    def _send_payload(self, voltage, absorbance, angles, status, automation_step, automation_total, sample_count, pid_error, pid_mode, baseline_set, reference_voltage, baseline_voltage, spectrometer_valid):
+    def _send_payload(self, voltage, absorbance, angles, status, automation_step, automation_total, sample_count, pid_error, pid_mode, baseline_set, reference_voltage, baseline_voltage, spectrometer_valid, health_fields=None):
         t = int((time.time() - self._boot_time) * 1000) & 0xFFFFFFFF
+        health = dict(DEFAULT_HEALTH_FIELDS)
+        health.update(health_fields if health_fields is not None else getattr(self, "_health_fields", {}))
         fields = (
             (b"USV_VOLT\x00\x00", voltage),
             (b"USV_ABS\x00\x00\x00", absorbance),
@@ -509,6 +547,11 @@ class USVMavlinkRouterBridge(object):
             (b"USV_REF\x00\x00\x00", reference_voltage),
             (b"USV_BASE\x00\x00", baseline_voltage),
             (b"USV_VLD\x00\x00\x00", spectrometer_valid),
+            (b"USV_JTMP\x00\x00", health["USV_JTMP"]),
+            (b"USV_ETMP\x00\x00", health["USV_ETMP"]),
+            (b"USV_JCPU\x00\x00", health["USV_JCPU"]),
+            (b"USV_JMEM\x00\x00", health["USV_JMEM"]),
+            (b"USV_EHEAP\x00", health["USV_EHEAP"]),
         )
 
         def send_batch():
@@ -518,8 +561,8 @@ class USVMavlinkRouterBridge(object):
         if self._mav_send_with_retry(send_batch, "payload telemetry"):
             self._pkt_count = (self._pkt_count + 1) % 65536
             with self._lock:
-                self._diag_tx_total += 17
-                self._diag_tx_named += 17
+                self._diag_tx_total += len(fields)
+                self._diag_tx_named += len(fields)
 
     def run(self):
         rate = rospy.Rate(TELEMETRY_RATE_HZ)
@@ -549,6 +592,7 @@ class USVMavlinkRouterBridge(object):
                 reference_voltage = self._reference_voltage
                 baseline_voltage = self._baseline_voltage
                 spectrometer_valid = self._spectrometer_valid
+                health_fields = self._health_fields.copy()
                 pending_st = list(self._pending_statustexts)
                 self._pending_statustexts.clear()
                 pending_ack = list(self._pending_acks)
@@ -563,7 +607,7 @@ class USVMavlinkRouterBridge(object):
             for sample_id in pending_done:
                 self._send_usv_done(sample_id)
 
-            self._send_payload(voltage, absorbance, angles, status, automation_step, automation_total, sample_count, pid_error, pid_mode, baseline_set, reference_voltage, baseline_voltage, spectrometer_valid)
+            self._send_payload(voltage, absorbance, angles, status, automation_step, automation_total, sample_count, pid_error, pid_mode, baseline_set, reference_voltage, baseline_voltage, spectrometer_valid, health_fields)
 
             if now - self._diag_last_report >= DIAG_REPORT_INTERVAL:
                 self._publish_diagnostics()

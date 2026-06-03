@@ -165,6 +165,75 @@ def _load_script(module_name, relative_path):
 
 
 class HardwareRuntimeSyncTests(unittest.TestCase):
+    def test_pump_serial_reader_parses_detector_health_packet(self):
+        module, _, _ = _load_script(
+            "pump_control_node_health_packet_test",
+            "scripts/pump_control_node.py",
+        )
+        reader = module.PumpSerialReader(None)
+        received = []
+        reader.on_health_received = received.append
+
+        body = bytearray()
+        body.extend([module.HEADER2_HEALTH, 1, 0x03])
+        body.extend((123456).to_bytes(4, "little"))
+        body.extend((3600).to_bytes(4, "little"))
+        body.extend((432).to_bytes(2, "little", signed=True))
+        body.extend((240).to_bytes(2, "little"))
+        body.extend((120000).to_bytes(4, "little"))
+        body.extend((80000).to_bytes(4, "little"))
+        body.extend((320000).to_bytes(4, "little"))
+        body.extend([12])
+        body.extend((2048).to_bytes(2, "little"))
+        body.extend((4096).to_bytes(2, "little"))
+        body.extend((1024).to_bytes(2, "little"))
+        checksum = 0
+        for value in body:
+            checksum ^= value
+        packet = bytes([module.HEADER1]) + bytes(body) + bytes([checksum, module.TAIL])
+
+        reader._process_data(packet)
+
+        self.assertEqual(len(received), 1)
+        self.assertEqual(received[0]["version"], 1)
+        self.assertEqual(received[0]["uptime_s"], 3600)
+        self.assertAlmostEqual(received[0]["temperature_c"], 43.2)
+        self.assertEqual(received[0]["heap_free"], 120000)
+        self.assertEqual(received[0]["task_stack_hwm"]["comms"], 4096)
+
+    def test_web_system_health_callback_emits_and_serves_latest_snapshot(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_system_health_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            server.socketio = RecordingSocket()
+            client = server.app.test_client()
+
+            payload = {
+                "jetson": {"cpu_percent": 12.5, "memory_percent": 34.0, "temperature_c": 55.2},
+                "detector": {"online": True, "temperature_c": 43.2, "heap_free": 120000},
+                "health": {"code": 1, "level": "warn", "summary": "warm"},
+            }
+            server._system_health_cb(string_cls(json.dumps(payload)))
+            response = client.get("/api/diagnostics/system")
+
+        self.assertEqual(response.status_code, 200)
+        body = response.get_json()
+        self.assertTrue(body["success"])
+        self.assertEqual(body["data"]["latest"]["health"]["summary"], "warm")
+        self.assertEqual(body["data"]["history"][-1]["detector"]["heap_free"], 120000)
+        self.assertIn(("system_health", payload), server.socketio.events)
+
     def test_web_periodic_snapshot_does_not_emit_synthetic_voltage_sample(self):
         module, _, _ = _load_script(
             "web_config_server_no_synthetic_voltage_test",

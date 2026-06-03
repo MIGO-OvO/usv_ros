@@ -926,6 +926,9 @@ class WebConfigServer(object):
         self.route_waypoints = []
         self.current_waypoint_seq = None
         self.latest_automation_status = {}
+        self.latest_system_health = {}
+        self.system_health_history = []
+        self.system_health_history_max = 300
         self.lab_status = {
             "enabled": False,
             "running": False,
@@ -953,6 +956,7 @@ class WebConfigServer(object):
             self.control_events_sub = rospy.Subscriber('/usv/control_events', String, self._control_event_cb)
             self.manual_status_sub = rospy.Subscriber('/usv/manual_status', String, self._manual_status_cb)
             self.lab_sim_status_sub = rospy.Subscriber('/usv/lab_sim/status', String, self._lab_sim_status_cb)
+            self.system_health_sub = rospy.Subscriber('/usv/system_health', String, self._system_health_cb)
             try:
                 from sensor_msgs.msg import NavSatFix
                 self.gps_sub = rospy.Subscriber('/mavros/global_position/global', NavSatFix, self._gps_cb)
@@ -982,6 +986,7 @@ class WebConfigServer(object):
             self.control_events_sub = None
             self.manual_status_sub = None
             self.lab_sim_status_sub = None
+            self.system_health_sub = None
             self.gps_sub = None
             self.waypoints_sub = None
             self.steps_pub = None
@@ -1646,6 +1651,21 @@ class WebConfigServer(object):
             self._radio_status = data
             if self.socketio:
                 self.socketio.emit('radio_status', data)
+        except Exception:
+            pass
+
+    def _system_health_cb(self, msg):
+        """系统健康状态回调"""
+        try:
+            data = json.loads(msg.data)
+            if not isinstance(data, dict):
+                return
+            self.latest_system_health = data
+            self.system_health_history.append(data)
+            if len(self.system_health_history) > self.system_health_history_max:
+                self.system_health_history = self.system_health_history[-self.system_health_history_max:]
+            if self.socketio:
+                self.socketio.emit('system_health', data)
         except Exception:
             pass
 
@@ -2652,6 +2672,7 @@ class WebConfigServer(object):
                 "raw": self.latest_spectrometer_payload,
             })
             emit('injection_pump_status', self.injection_pump_status)
+            emit('system_health', self.latest_system_health)
 
         # ================= 数据 API =================
         @self.app.route('/api/data/voltage', methods=['GET'])
@@ -3316,6 +3337,17 @@ class WebConfigServer(object):
             """获取链路事件日志"""
             return jsonify({"success": True, "data": self._link_events})
 
+        @self.app.route('/api/diagnostics/system', methods=['GET'])
+        def get_system_health():
+            """获取系统健康状态和短历史"""
+            return jsonify({
+                "success": True,
+                "data": {
+                    "latest": self.latest_system_health,
+                    "history": self.system_health_history,
+                }
+            })
+
         @self.app.route('/api/diagnostics/export', methods=['GET'])
         def export_diagnostics():
             """导出结构化诊断报告 (JSON)"""
@@ -3323,6 +3355,7 @@ class WebConfigServer(object):
                 "exported_at": datetime.now().isoformat(),
                 "mavros_state": self._mavros_state,
                 "bridge_latest": self._bridge_diag,
+                "system_health_latest": self.latest_system_health,
                 "bridge_history": self._diag_history,
                 "link_events": self._link_events,
                 "config": {
