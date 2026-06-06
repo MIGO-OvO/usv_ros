@@ -63,6 +63,7 @@ export default function Monitor() {
   const pumpConnected = useAppStore((state) => state.pumpConnected)
   const missionStatus = useAppStore((state) => state.missionStatus)
   const pumpAngles = useAppStore((state) => state.pumpAngles)
+  const angleTelemetry = useAppStore((state) => state.angleTelemetry)
   const currentVoltage = useAppStore((state) => state.currentVoltage)
   const currentAbsorbance = useAppStore((state) => state.currentAbsorbance)
   const currentReferenceVoltage = useAppStore((state) => state.currentReferenceVoltage)
@@ -150,6 +151,12 @@ export default function Monitor() {
   const spectroStatusLabel = spectroStatusLabels[spectrometerStatus] ?? spectrometerStatus
   const hasSpectroSample = voltageHistory.length > 0
   const showSpectroPlaceholder = !hasSpectroSample
+  const angleStatusLabel = !angleTelemetry.valid ? '未收到' : angleTelemetry.stale ? '陈旧' : '实时'
+  const angleStatusClass = !angleTelemetry.valid
+    ? 'text-muted-foreground'
+    : angleTelemetry.stale
+      ? 'text-amber-500'
+      : 'text-emerald-500'
 
   return (
     <div className="p-4 md:p-8 space-y-6 max-w-7xl mx-auto">
@@ -248,13 +255,20 @@ export default function Monitor() {
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                  <CardTitle className="text-sm font-medium">泵组角度</CardTitle>
             </CardHeader>
-            <CardContent className="grid grid-cols-4 gap-1">
+            <CardContent>
+              <div className={cn("mb-2 text-xs font-medium", angleStatusClass)}>{angleStatusLabel}</div>
+              <div className="grid grid-cols-4 gap-1">
                 {Object.entries(pumpAngles).map(([axis, angle]) => (
                     <div key={axis} className="text-center">
                         <div className="text-xs text-muted-foreground">{axis}</div>
                         <div className="text-sm font-mono font-semibold">{angle.toFixed(1)}°</div>
                     </div>
                 ))}
+              </div>
+              <div className="mt-3 grid grid-cols-2 gap-2 text-[11px] text-muted-foreground">
+                <div>ROS {angleTelemetry.age_ms ?? '--'} ms</div>
+                <div>I2C {angleTelemetry.detector_angle_age_ms ?? '--'} ms</div>
+              </div>
             </CardContent>
         </Card>
       </div>

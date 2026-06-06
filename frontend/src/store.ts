@@ -8,6 +8,17 @@ interface PumpAngles {
   A: number
 }
 
+interface AngleTelemetry {
+  angles: PumpAngles
+  raw_angles: PumpAngles
+  source: string
+  received_at: number | null
+  age_ms: number | null
+  detector_angle_age_ms: number | null
+  stale: boolean
+  valid: boolean
+}
+
 interface InjectionPumpStatus {
   enabled: boolean
   speed: number
@@ -185,6 +196,7 @@ interface AppState {
   missionStatus: string
   pumpAngles: PumpAngles
   rawAngles: PumpAngles
+  angleTelemetry: AngleTelemetry
   currentVoltage: number
   currentAbsorbance: number
   currentReferenceVoltage: number | null
@@ -234,14 +246,28 @@ const DEFAULT_MANUAL_STATUS: ManualStatus = {
   spectrometer_active: false,
 }
 
+const DEFAULT_ANGLES: PumpAngles = { X: 0, Y: 0, Z: 0, A: 0 }
+
+const DEFAULT_ANGLE_TELEMETRY: AngleTelemetry = {
+  angles: DEFAULT_ANGLES,
+  raw_angles: DEFAULT_ANGLES,
+  source: 'not_received',
+  received_at: null,
+  age_ms: null,
+  detector_angle_age_ms: null,
+  stale: true,
+  valid: false,
+}
+
 export const useAppStore = create<AppState>((set, get) => ({
   socket: null,
   connected: false,
   pumpConnected: false,
   automationRunning: false,
   missionStatus: 'IDLE',
-  pumpAngles: { X: 0, Y: 0, Z: 0, A: 0 },
-  rawAngles: { X: 0, Y: 0, Z: 0, A: 0 },
+  pumpAngles: DEFAULT_ANGLES,
+  rawAngles: DEFAULT_ANGLES,
+  angleTelemetry: DEFAULT_ANGLE_TELEMETRY,
   currentVoltage: 0,
   currentAbsorbance: 0,
   currentReferenceVoltage: null,
@@ -278,6 +304,18 @@ export const useAppStore = create<AppState>((set, get) => ({
     })
     const rawAngleCommitter = createThrottledCommit<PumpAngles>(FAST_TELEMETRY_INTERVAL_MS, (data) => {
       set({ rawAngles: data })
+    })
+    const angleTelemetryCommitter = createThrottledCommit<AngleTelemetry>(FAST_TELEMETRY_INTERVAL_MS, (data) => {
+      set((state) => ({
+        angleTelemetry: {
+          ...DEFAULT_ANGLE_TELEMETRY,
+          ...data,
+          angles: data.angles || state.pumpAngles,
+          raw_angles: data.raw_angles || state.rawAngles,
+        },
+        pumpAngles: data.angles || state.pumpAngles,
+        rawAngles: data.raw_angles || state.rawAngles,
+      }))
     })
     const voltageCommitter = createThrottledCommit<VoltagePayload>(VOLTAGE_UI_INTERVAL_MS, (data) => {
       const voltage = data.value ?? 0
@@ -322,6 +360,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     socket.on('disconnect', () => {
       angleCommitter.cancel()
       rawAngleCommitter.cancel()
+      angleTelemetryCommitter.cancel()
       voltageCommitter.cancel()
       set({ connected: false })
       console.log('Socket disconnected')
@@ -346,6 +385,10 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     socket.on('raw_angles', (data: PumpAngles) => {
       rawAngleCommitter.push(data)
+    })
+
+    socket.on('angle_telemetry', (data: AngleTelemetry) => {
+      angleTelemetryCommitter.push(data)
     })
 
     socket.on('voltage', (data: VoltagePayload) => {

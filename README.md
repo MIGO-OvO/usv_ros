@@ -719,7 +719,7 @@ Web 的 `POST /api/hardware/test-pump-port` 使用同一握手逻辑，不能只
 | 停止 | `XDFV0J0` | X 轴停止 |
 | PID 参数 | `PIDCFG:0.14,0.015,0.06,1.0,8.0` | 配置 PID |
 | 进样泵 | `PUMP:ON`、`PUMP:OFF`、`PUMP:SET:60` | 开关和速度 |
-| I2C 映射 | `I2CMAP:X=2,Y=3,Z=6,A=7,SPEC=0` | TCA 通道映射 |
+| I2C 映射 | `I2CMAP:X=0,Y=3,Z=4,A=7,SPEC=2` | TCA 通道映射 |
 | ADS 配置 | `ADSCFG:CH=2,ADDR=0x40,AIN=AIN0,REF=AVDD,GAIN=1,DR=90,MODE=CONT,PR=20` | 分光 ADC |
 | ADS 启停 | `ADSSTART`、`ADSSTOP` | 分光采集 |
 | 校准 | `CALXYZA` | 四轴校准 |

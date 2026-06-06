@@ -106,6 +106,8 @@ DATA_DIR = os.path.expanduser("~/usv_ws/data/missions")
 MAX_LIVE_TRACK_POINTS = 1000
 DEFAULT_SURFACE_SIZE = 50
 MAX_SURFACE_SIZE = 80
+ANGLE_AXES = ("X", "Y", "Z", "A")
+ANGLE_STALE_AFTER_MS = 1000
 
 
 def _to_float_or_none(value):
@@ -625,7 +627,7 @@ DEFAULT_CONFIG = {
         "pump_baudrate": 115200,
         "pump_timeout": 1.0,
         "ads_address": "0x40",
-        "spectro_channel": 0,
+        "spectro_channel": 2,
         "mux": "AIN0_AVSS",
         "gain": 1,
         "vref_mode": "AVDD",
@@ -635,7 +637,7 @@ DEFAULT_CONFIG = {
         "auto_start": False,
         "reference_voltage": 0.0,
         "baseline_voltage": 0.0,
-        "i2c_mapping": {"X": 2, "Y": 3, "Z": 6, "A": 7}
+        "i2c_mapping": {"X": 0, "Y": 3, "Z": 4, "A": 7}
     },
     "lab_mode": {
         "enabled": False,
@@ -813,11 +815,11 @@ class ConfigManager(object):
         )
 
     def _migrate_legacy_hardware_defaults(self):
-        """Migrate old defaults that had spectro on ch2 to correct ch0."""
+        """Reserved for hardware default migrations."""
         hardware = self.config.get('hardware', {})
         if not isinstance(hardware, dict):
             return
-        # No-op: spectro_channel=0 is now the correct default.
+        # No-op: current detector firmware defaults are preserved by DEFAULT_CONFIG.
         # Keep method stub for forward compatibility.
 
     def update(self, data):
@@ -905,6 +907,17 @@ class WebConfigServer(object):
         self.pump_connected = False
         self.automation_running = False
         self.current_angles = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
+        self.raw_angles = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
+        self.latest_angle_telemetry = {
+            "angles": dict(self.current_angles),
+            "raw_angles": dict(self.raw_angles),
+            "source": "not_received",
+            "received_at": None,
+            "age_ms": None,
+            "detector_angle_age_ms": None,
+            "stale": True,
+            "valid": False,
+        }
         self.current_voltage = 0.0
         self.current_absorbance = 0.0
         self.spectrometer_status = "idle"
@@ -946,6 +959,7 @@ class WebConfigServer(object):
         if not self.standalone:
             self.status_sub = rospy.Subscriber('/usv/pump_status', String, self._status_cb)
             self.angles_sub = rospy.Subscriber('/usv/pump_angles', String, self._angles_cb)
+            self.angle_telemetry_sub = rospy.Subscriber('/usv/pump_angle_telemetry', String, self._angle_telemetry_cb)
             self.injection_status_sub = rospy.Subscriber('/usv/injection_pump_status', String, self._injection_status_cb)
             self.voltage_sub = rospy.Subscriber('/usv/spectrometer_voltage', String, self._voltage_cb)
             self.spectro_status_sub = rospy.Subscriber('/usv/spectrometer_status', String, self._spectro_status_cb)
@@ -976,6 +990,7 @@ class WebConfigServer(object):
         else:
             self.status_sub = None
             self.angles_sub = None
+            self.angle_telemetry_sub = None
             self.injection_status_sub = None
             self.voltage_sub = None
             self.spectro_status_sub = None
@@ -1140,37 +1155,120 @@ class WebConfigServer(object):
         except Exception as e:
             rospy.logerr("Error parsing injection pump status: %s", str(e))
 
-    def _angles_cb(self, msg):
-        """电机位置回调"""
+    @staticmethod
+    def _axis_values(data):
+        if not isinstance(data, dict):
+            return {}
+        values = {}
+        for axis in ANGLE_AXES:
+            if axis not in data or data[axis] is None:
+                continue
+            values[axis] = float(data[axis])
+        return values
+
+    def _parse_angle_message(self, text):
         try:
-            # 尝试解析 JSON，兼容旧格式
-            data = {}
+            data = json.loads(text)
+            if isinstance(data, dict):
+                nested = data.get("angles")
+                if isinstance(nested, dict):
+                    return self._axis_values(nested), data
+                return self._axis_values(data), data
+        except ValueError:
+            pass
+
+        values = {}
+        for pair in text.split(','):
+            if ':' in pair:
+                key, val = pair.split(':', 1)
+                key = key.strip()
+                if key in ANGLE_AXES:
+                    values[key] = float(val)
+        return values, {}
+
+    def _update_angle_values(self, raw_angles):
+        if not raw_angles:
+            return {}
+        self.raw_angles.update(raw_angles)
+        corrected_angles = {
+            axis: self.calibration_manager.get_corrected_angle(axis, angle)
+            for axis, angle in raw_angles.items()
+            if axis in ANGLE_AXES
+        }
+        self.current_angles.update(corrected_angles)
+        return corrected_angles
+
+    def _build_angle_telemetry(self, source_payload=None):
+        source_payload = source_payload if isinstance(source_payload, dict) else {}
+        received_at = source_payload.get("received_at")
+        try:
+            received_at = float(received_at) if received_at is not None else None
+        except (TypeError, ValueError):
+            received_at = None
+
+        if received_at:
+            age_ms = max(0, int((time.time() - received_at) * 1000))
+        else:
+            age_ms = source_payload.get("age_ms")
             try:
-                data = json.loads(msg.data)
-            except ValueError:
-                for pair in msg.data.split(','):
-                    if ':' in pair:
-                        key, val = pair.split(':')
-                        data[key] = float(val)
+                age_ms = int(age_ms) if age_ms is not None else None
+            except (TypeError, ValueError):
+                age_ms = None
 
-            # 更新原始角度 (self.raw_angles 需要在 __init__ 中初始化，但这里直接用局部变量也行，或者加上)
-            if not hasattr(self, 'raw_angles'):
-                self.raw_angles = {}
-            self.raw_angles.update(data)
+        detector_age_ms = source_payload.get("detector_angle_age_ms")
+        try:
+            detector_age_ms = int(detector_age_ms) if detector_age_ms is not None else None
+        except (TypeError, ValueError):
+            detector_age_ms = None
 
-            # 应用校准偏移
-            corrected_angles = {}
-            for axis, angle in data.items():
-                # 确保只处理 X, Y, Z, A
-                if axis in ['X', 'Y', 'Z', 'A']:
-                    corrected_angles[axis] = self.calibration_manager.get_corrected_angle(axis, angle)
+        stale = bool(source_payload.get("stale", False))
+        stale = stale or received_at is None
+        stale = stale or (age_ms is not None and age_ms > ANGLE_STALE_AFTER_MS)
+        stale = stale or (detector_age_ms is not None and detector_age_ms > ANGLE_STALE_AFTER_MS)
 
-            self.current_angles.update(corrected_angles)
+        return {
+            "angles": dict(self.current_angles),
+            "raw_angles": dict(self.raw_angles),
+            "source": source_payload.get("source", "legacy_angle_topic"),
+            "received_at": received_at,
+            "age_ms": age_ms,
+            "detector_angle_age_ms": detector_age_ms,
+            "stale": bool(stale),
+            "valid": bool(source_payload.get("valid", bool(received_at))),
+        }
 
-            if self.socketio:
-                self.socketio.emit('pump_angles', self.current_angles)
-                # 也可以选择推送 raw_angles 供前端调试
-                self.socketio.emit('raw_angles', self.raw_angles)
+    def _emit_angle_state(self):
+        if not self.socketio:
+            return
+        self.socketio.emit('pump_angles', self.current_angles)
+        self.socketio.emit('raw_angles', self.raw_angles)
+        self.socketio.emit('angle_telemetry', self.latest_angle_telemetry)
+
+    def _angle_telemetry_cb(self, msg):
+        try:
+            data = json.loads(msg.data)
+            if not isinstance(data, dict):
+                return
+            raw_payload = data.get("raw_angles") if isinstance(data.get("raw_angles"), dict) else data.get("angles")
+            raw_angles = self._axis_values(raw_payload if isinstance(raw_payload, dict) else {})
+            self._update_angle_values(raw_angles)
+            self.latest_angle_telemetry = self._build_angle_telemetry(data)
+            self._emit_angle_state()
+        except Exception as e:
+            rospy.logerr(f"Error parsing angle telemetry: {e}")
+
+    def _angles_cb(self, msg):
+        try:
+            raw_angles, meta = self._parse_angle_message(msg.data)
+            if not raw_angles:
+                return
+            self._update_angle_values(raw_angles)
+            if not self.latest_angle_telemetry.get("valid"):
+                meta = dict(meta or {})
+                meta.setdefault("received_at", time.time())
+                meta.setdefault("valid", True)
+                self.latest_angle_telemetry = self._build_angle_telemetry(meta)
+            self._emit_angle_state()
         except Exception as e:
             rospy.logerr(f"Error parsing angles: {e}")
 
@@ -1734,7 +1832,7 @@ class WebConfigServer(object):
     def _hardware_to_pump_runtime_params(hw):
         mapping = {
             "angles": dict(hw.get("i2c_mapping", {})),
-            "spectro_channel": int(hw.get("spectro_channel", 0)),
+            "spectro_channel": int(hw.get("spectro_channel", 2)),
         }
         spectrometer = {
             "enabled": True,
@@ -1766,7 +1864,7 @@ class WebConfigServer(object):
         """Push saved hardware config into pump_control_node after serial reconnect."""
         mapping = {
             "angles": dict(hw.get("i2c_mapping", {})),
-            "spectro_channel": int(hw.get("spectro_channel", 0)),
+            "spectro_channel": int(hw.get("spectro_channel", 2)),
         }
         ok, message = self._publish_spectrometer_command({
             "cmd": "set_i2c_map",
@@ -1914,7 +2012,7 @@ class WebConfigServer(object):
             hw['pump_baudrate'] = to_int(hw.get('pump_baudrate'), 115200, 1200, 3000000)
             hw['pump_timeout'] = to_float(hw.get('pump_timeout'), 1.0, 0.1, 10.0)
             hw['ads_address'] = clean_string(hw.get('ads_address'), '0x40', 16) or '0x40'
-            hw['spectro_channel'] = clamp_channel(hw.get('spectro_channel'), 0)
+            hw['spectro_channel'] = clamp_channel(hw.get('spectro_channel'), 2)
             mux = clean_string(hw.get('mux'), 'AIN0', 32).upper()
             hw['mux'] = mux if mux.startswith('AIN') else 'AIN0'
             hw['gain'] = normalize_gain(hw.get('gain'), 1)
@@ -2662,6 +2760,7 @@ class WebConfigServer(object):
                 "spectrometer_status": self.spectrometer_status,
             })
             emit('angles', self.current_angles)
+            emit('angle_telemetry', self.latest_angle_telemetry)
             emit('voltage', {
                 "value": self.current_voltage,
                 "absorbance": self.current_absorbance,
@@ -3473,6 +3572,8 @@ class WebConfigServer(object):
                     "spectrometer_status": self.spectrometer_status,
                 })
                 self.socketio.emit('angles', self.current_angles)
+                self.latest_angle_telemetry = self._build_angle_telemetry(self.latest_angle_telemetry)
+                self.socketio.emit('angle_telemetry', self.latest_angle_telemetry)
                 self.socketio.emit('manual_status', self.manual_status)
 
             if self.standalone:
