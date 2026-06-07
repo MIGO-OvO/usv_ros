@@ -165,6 +165,98 @@ def _load_script(module_name, relative_path):
 
 
 class HardwareRuntimeSyncTests(unittest.TestCase):
+    def test_detector_default_i2c_mapping_matches_validated_firmware_defaults(self):
+        pump_module, _, _ = _load_script(
+            "pump_control_node_default_i2c_mapping_test",
+            "scripts/pump_control_node.py",
+        )
+        web_module, _, _ = _load_script(
+            "web_config_server_default_i2c_mapping_test",
+            "scripts/web_config_server.py",
+        )
+
+        expected_angles = {"X": 0, "Y": 3, "Z": 4, "A": 7}
+        self.assertEqual(pump_module.DEFAULT_I2C_MAPPING, {
+            "angles": expected_angles,
+            "spectro_channel": 2,
+        })
+        self.assertEqual(web_module.DEFAULT_CONFIG["hardware"]["i2c_mapping"], expected_angles)
+        self.assertEqual(web_module.DEFAULT_CONFIG["hardware"]["spectro_channel"], 2)
+
+        config_text = (REPO_ROOT / "config" / "usv_params.yaml").read_text(encoding="utf-8")
+        self.assertIn("X: 0", config_text)
+        self.assertIn("Z: 4", config_text)
+        self.assertIn("spectro_channel: 2", config_text)
+
+        settings_text = (REPO_ROOT / "frontend" / "src" / "pages" / "Settings.tsx").read_text(encoding="utf-8")
+        self.assertIn("spectro_channel: 2", settings_text)
+        self.assertIn("i2c_mapping: { X: 0, Y: 3, Z: 4, A: 7 }", settings_text)
+
+    def test_pump_node_publishes_angle_telemetry_and_detector_angle_age(self):
+        module, publishers, _ = _load_script(
+            "pump_control_node_angle_telemetry_test",
+            "scripts/pump_control_node.py",
+        )
+        node = module.PumpControlNode()
+
+        node._on_angle_received({"X": 1.234, "Y": 2.345, "Z": 3.456, "A": 4.567})
+
+        legacy_msg = publishers["/usv/pump_angles"].messages[-1].data
+        self.assertEqual(legacy_msg, "X:1.234,Y:2.345,Z:3.456,A:4.567")
+
+        telemetry_msg = publishers["/usv/pump_angle_telemetry"].messages[-1].data
+        telemetry = json.loads(telemetry_msg)
+        self.assertEqual(telemetry["angles"], {"X": 1.234, "Y": 2.345, "Z": 3.456, "A": 4.567})
+        self.assertEqual(telemetry["source"], "detector_angle_frame")
+        self.assertFalse(telemetry["stale"])
+        self.assertTrue(telemetry["valid"])
+        self.assertGreaterEqual(telemetry["received_at"], 0.0)
+        self.assertGreaterEqual(telemetry["age_ms"], 0)
+
+        node._on_text_received("ANGLE_AGE_MS:2500")
+
+        stale_telemetry = json.loads(publishers["/usv/pump_angle_telemetry"].messages[-1].data)
+        self.assertEqual(stale_telemetry["detector_angle_age_ms"], 2500)
+        self.assertTrue(stale_telemetry["stale"])
+        self.assertEqual(node.latest_detector_health["angle_age_ms"], 2500)
+
+    def test_web_angle_telemetry_emits_staleness_without_polluting_raw_angles(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_angle_telemetry_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            server.socketio = RecordingSocket()
+
+            server._angle_telemetry_cb(string_cls(json.dumps({
+                "angles": {"X": 10.0, "Y": 20.0, "Z": 30.0, "A": 40.0},
+                "raw_angles": {"X": 10.0, "Y": 20.0, "Z": 30.0, "A": 40.0},
+                "source": "detector_angle_frame",
+                "received_at": time.time() - 5.0,
+                "detector_angle_age_ms": 2500,
+                "stale": False,
+                "valid": True,
+            })))
+
+        angle_events = [payload for event, payload in server.socketio.events if event == "angle_telemetry"]
+        self.assertTrue(angle_events)
+        latest = angle_events[-1]
+        self.assertEqual(latest["angles"]["X"], 10.0)
+        self.assertEqual(latest["raw_angles"]["Z"], 30.0)
+        self.assertEqual(latest["detector_angle_age_ms"], 2500)
+        self.assertTrue(latest["stale"])
+        self.assertTrue(latest["valid"])
+        self.assertEqual(server.raw_angles, {"X": 10.0, "Y": 20.0, "Z": 30.0, "A": 40.0})
+
     def test_pump_serial_reader_parses_detector_health_packet(self):
         module, _, _ = _load_script(
             "pump_control_node_health_packet_test",
@@ -292,7 +384,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             "spectrometer_start",
         ])
         first_payload = json.loads(control_calls[-3]["payload_json"])
-        self.assertEqual(first_payload["mapping"]["spectro_channel"], 0)
+        self.assertEqual(first_payload["mapping"]["spectro_channel"], 2)
         self.assertEqual(publishers["/usv/spectrometer_command"].messages, [])
 
     def test_web_spectrometer_stop_route_publishes_stop_command(self):
@@ -1081,6 +1173,16 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertIn("/api/spectrometer/stop", monitor_text)
         self.assertIn("/api/spectrometer/baseline", monitor_text)
 
+    def test_frontend_declares_angle_telemetry_state_and_stale_status(self):
+        store_text = (REPO_ROOT / "frontend" / "src" / "store.ts").read_text(encoding="utf-8")
+        monitor_text = (REPO_ROOT / "frontend" / "src" / "pages" / "Monitor.tsx").read_text(encoding="utf-8")
+
+        self.assertIn("angleTelemetry", store_text)
+        self.assertIn("socket.on('angle_telemetry'", store_text)
+        self.assertIn("detector_angle_age_ms", store_text)
+        self.assertIn("angleTelemetry", monitor_text)
+        self.assertIn("angleStatusLabel", monitor_text)
+
     def test_frontend_declares_map_page_and_leaflet_dependency(self):
         app_text = (REPO_ROOT / "frontend" / "src" / "App.tsx").read_text(encoding="utf-8")
         sidebar_text = (REPO_ROOT / "frontend" / "src" / "components" / "layout" / "Sidebar.tsx").read_text(encoding="utf-8")
@@ -1229,8 +1331,8 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
 
         self.assertTrue(success)
         self.assertEqual(message, "ADS_OK:START")
-        self.assertEqual(sent[0], "I2CMAP:X=2,Y=3,Z=6,A=7,SPEC=0")
-        self.assertIn("ADSCFG:CH=0,ADDR=0x40,AIN=AIN0,REF=AVDD,GAIN=1,DR=90,MODE=CONT,PR=20", sent[1])
+        self.assertEqual(sent[0], "I2CMAP:X=0,Y=3,Z=4,A=7,SPEC=2")
+        self.assertIn("ADSCFG:CH=2,ADDR=0x40,AIN=AIN0,REF=AVDD,GAIN=1,DR=90,MODE=CONT,PR=20", sent[1])
         self.assertEqual(sent[2], "ADSSTART")
         self.assertEqual(node.spectro_reference_voltage, 0.0)
 

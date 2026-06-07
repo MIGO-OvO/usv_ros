@@ -88,8 +88,8 @@ SPECTRO_STATUS_NOT_CONFIG = 0x04
 SPECTRO_STATUS_SATURATED = 0x08
 
 DEFAULT_I2C_MAPPING = {
-    "angles": {"X": 2, "Y": 3, "Z": 6, "A": 7},
-    "spectro_channel": 0,
+    "angles": {"X": 0, "Y": 3, "Z": 4, "A": 7},
+    "spectro_channel": 2,
 }
 
 DEFAULT_SPECTRO_CONFIG = {
@@ -113,6 +113,8 @@ DEFAULT_ANGLE_STREAM = {
     "enabled": True,
     "auto_start": True,
 }
+
+ANGLE_TELEMETRY_STALE_AFTER_MS = 1000
 
 
 MOTOR_CONTROL_APP_SETTINGS_ENV = "USV_LOWER_DEVICE_SETTINGS_FILE"
@@ -503,6 +505,9 @@ class PumpControlNode(object):
         # 当前角度状态
         self.current_angles = {m: 0.0 for m in MOTOR_NAMES}
         self.angles_lock = threading.Lock()
+        self.latest_angle_received_at = 0.0
+        self.detector_angle_age_ms = None
+        self.latest_angle_telemetry = {}
 
         # PID 完成检测
         self.pid_target_angles = {}
@@ -541,6 +546,7 @@ class PumpControlNode(object):
         self.spectro_raw_pub = rospy.Publisher('/usv/spectrometer_raw', String, queue_size=20)
         self.spectro_absorbance_pub = rospy.Publisher('/usv/spectrometer_absorbance', String, queue_size=20)
         self.detector_health_pub = rospy.Publisher('/usv/detector_health', String, queue_size=5)
+        self.angle_telemetry_pub = rospy.Publisher('/usv/pump_angle_telemetry', String, queue_size=10)
 
         # Subscribers
         self.cmd_sub = rospy.Subscriber('/usv/pump_command', String, self._cmd_callback)
@@ -832,11 +838,11 @@ class PumpControlNode(object):
     def _apply_i2c_mapping(self):
         angles = self.i2c_mapping.get('angles', {})
         cmd = "I2CMAP:X={x},Y={y},Z={z},A={a},SPEC={spec}".format(
-            x=angles.get('X', 2),
+            x=angles.get('X', 0),
             y=angles.get('Y', 3),
-            z=angles.get('Z', 6),
+            z=angles.get('Z', 4),
             a=angles.get('A', 7),
-            spec=self.i2c_mapping.get('spectro_channel', 0)
+            spec=self.i2c_mapping.get('spectro_channel', 2)
         )
         ok = self.send_command(cmd)
         if ok:
@@ -863,7 +869,7 @@ class PumpControlNode(object):
         return (
             "ADSCFG:CH={ch},ADDR={addr},AIN={ain},REF={vref},GAIN={gain},DR={rate},MODE={mode},PR={pub}"
             .format(
-                ch=int(self.i2c_mapping.get('spectro_channel', 0)),
+                ch=int(self.i2c_mapping.get('spectro_channel', 2)),
                 addr=str(cfg.get('ads_address', '0x40')).strip(),
                 ain=ain,
                 vref=vref_mode,
@@ -1194,10 +1200,52 @@ class PumpControlNode(object):
             self._publish_status("stopped")
         return success and injection_success
 
+    def _build_angle_telemetry_payload(self, source="detector_angle_frame"):
+        with self.angles_lock:
+            angles = self.current_angles.copy()
+            received_at = float(self.latest_angle_received_at or 0.0)
+
+        now = time.time()
+        if received_at > 0:
+            age_ms = max(0, int((now - received_at) * 1000))
+        else:
+            age_ms = None
+
+        detector_age_ms = self.detector_angle_age_ms
+        stale = (
+            received_at <= 0
+            or (age_ms is not None and age_ms > ANGLE_TELEMETRY_STALE_AFTER_MS)
+            or (detector_age_ms is not None and detector_age_ms > ANGLE_TELEMETRY_STALE_AFTER_MS)
+        )
+        payload = {
+            "angles": angles,
+            "raw_angles": angles,
+            "source": source,
+            "received_at": received_at,
+            "age_ms": age_ms,
+            "detector_angle_age_ms": detector_age_ms,
+            "stale": bool(stale),
+            "valid": received_at > 0,
+        }
+        self.latest_angle_telemetry = payload
+        return payload
+
+    def _publish_angle_telemetry(self, source="detector_angle_frame"):
+        msg = String()
+        msg.data = json.dumps(self._build_angle_telemetry_payload(source), ensure_ascii=False)
+        self.angle_telemetry_pub.publish(msg)
+
+    def _publish_detector_health_payload(self, payload):
+        self.latest_detector_health = dict(payload)
+        msg = String()
+        msg.data = json.dumps(self.latest_detector_health, ensure_ascii=False)
+        self.detector_health_pub.publish(msg)
+
     def _on_angle_received(self, angles):
         """角度数据回调。"""
         with self.angles_lock:
             self.current_angles.update(angles)
+            self.latest_angle_received_at = time.time()
 
         # 更新指令生成器
         self.command_generator.set_current_angles(angles)
@@ -1207,6 +1255,7 @@ class PumpControlNode(object):
         parts = ["{}:{:.3f}".format(k, v) for k, v in angles.items()]
         msg.data = ",".join(parts)
         self.angles_pub.publish(msg)
+        self._publish_angle_telemetry()
 
         # 手动模式下的 PID 完成检查（仅用于 UI 反馈）
         # 自动化模式下 PID 完成由固件 PID_DONE/PID_TIMEOUT/PID_FAIL 文本消息驱动
@@ -1235,6 +1284,30 @@ class PumpControlNode(object):
             rospy.loginfo("MCU text: %s", text)
         else:
             rospy.logdebug("MCU: %s", text)
+
+        if text.startswith("ANGLE_AGE_MS:"):
+            try:
+                age_ms = int(float(text.split(":", 1)[1].strip()))
+                self.detector_angle_age_ms = age_ms
+                payload = dict(self.latest_detector_health or {})
+                payload["received_at"] = time.time()
+                payload["angle_age_ms"] = age_ms
+                self._publish_detector_health_payload(payload)
+                self._publish_angle_telemetry(source="detector_angle_age")
+            except (TypeError, ValueError) as e:
+                rospy.logwarn("Failed to parse ANGLE_AGE_MS: %s (%s)", text, e)
+            return
+
+        if text.startswith("LOOP_GAP_ACTIVE_MAX_US:"):
+            try:
+                gap_us = int(float(text.split(":", 1)[1].strip()))
+                payload = dict(self.latest_detector_health or {})
+                payload["received_at"] = time.time()
+                payload["loop_gap_active_max_us"] = gap_us
+                self._publish_detector_health_payload(payload)
+            except (TypeError, ValueError) as e:
+                rospy.logwarn("Failed to parse LOOP_GAP_ACTIVE_MAX_US: %s (%s)", text, e)
+            return
 
         if self._parse_injection_pump_text(text):
             return
@@ -1414,10 +1487,9 @@ class PumpControlNode(object):
         """检测装置健康数据回调。"""
         payload = dict(data)
         payload["received_at"] = time.time()
-        self.latest_detector_health = payload
-        msg = String()
-        msg.data = json.dumps(payload, ensure_ascii=False)
-        self.detector_health_pub.publish(msg)
+        if self.detector_angle_age_ms is not None:
+            payload["angle_age_ms"] = self.detector_angle_age_ms
+        self._publish_detector_health_payload(payload)
 
     def _spectro_reference_ready(self):
         return (self.spectro_reference_voltage - self.spectro_baseline_voltage) > 1e-6
