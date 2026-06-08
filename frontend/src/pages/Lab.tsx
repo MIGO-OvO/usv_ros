@@ -99,6 +99,7 @@ export default function Lab() {
   const configRef = useRef(config)
   const drawModeRef = useRef(drawMode)
   const pendingRef = useRef(pending)
+  const dirtyRef = useRef(false)
   configRef.current = config
   drawModeRef.current = drawMode
   pendingRef.current = pending
@@ -112,6 +113,7 @@ export default function Lab() {
       })
       const json = await res.json()
       if (json.success && json.data) {
+        dirtyRef.current = false
         setConfig((c) => ({ ...c, mission: json.data }))
         return true
       }
@@ -131,6 +133,7 @@ export default function Lab() {
       })
       const json = await res.json()
       if (json.success && json.data) {
+        dirtyRef.current = false
         setConfig(json.data)
         return true
       }
@@ -144,7 +147,7 @@ export default function Lab() {
   const refresh = async () => {
     const res = await fetch('/api/lab/status')
     const json = await res.json()
-    if (json.data?.config && !drawModeRef.current && !pendingRef.current) setConfig(json.data.config)
+    if (json.data?.config && !drawModeRef.current && !pendingRef.current && !dirtyRef.current) setConfig(json.data.config)
     if (json.data?.status) setStatus({ ...fallbackStatus, ...json.data.status })
     if (json.data?.position?.gcj02 && boatRef.current) {
       boatRef.current.setLatLng([json.data.position.gcj02.lat, json.data.position.gcj02.lng])
@@ -178,6 +181,7 @@ export default function Lab() {
             { lat: e.latlng.lat, lng: e.latlng.lng, seq: current.mission.waypoints.length },
           ]
           const nextMission = { waypoints, center: null }
+          dirtyRef.current = true
           setConfig((c) => ({ ...c, mission: nextMission }))
           persistMission(nextMission).catch(() => {})
         } else if (mode === 'source') {
@@ -189,6 +193,7 @@ export default function Lab() {
               source: { lat: e.latlng.lat, lng: e.latlng.lng },
             },
           }
+          dirtyRef.current = true
           setConfig(nextConfig)
           persistConfig(nextConfig).catch(() => {})
         }
@@ -232,11 +237,18 @@ export default function Lab() {
     return () => window.clearInterval(timer)
   }, [])
 
-  const updateConfig = (patch: Partial<LabConfig>) => setConfig((c) => ({ ...c, ...patch }))
-  const updateSim = (key: keyof LabConfig['sim'], value: string) =>
+  const updateConfig = (patch: Partial<LabConfig>) => {
+    dirtyRef.current = true
+    setConfig((c) => ({ ...c, ...patch }))
+  }
+  const updateSim = (key: keyof LabConfig['sim'], value: string) => {
+    dirtyRef.current = true
     setConfig((c) => ({ ...c, sim: { ...c.sim, [key]: Number(value) || 0 } }))
-  const updatePollution = (patch: Partial<LabPollution>) =>
+  }
+  const updatePollution = (patch: Partial<LabPollution>) => {
+    dirtyRef.current = true
     setConfig((c) => ({ ...c, pollution: { ...c.pollution, ...patch } }))
+  }
 
   const run = async (key: string, action: () => Promise<void>) => {
     if (pending) return
@@ -251,11 +263,15 @@ export default function Lab() {
     })
     const json = await res.json()
     setMessage(json.message || (json.success ? '已保存' : '保存失败'))
-    if (json.data) setConfig(json.data)
+    if (json.data) {
+      dirtyRef.current = false
+      setConfig(json.data)
+    }
   }
 
   const clearWaypoints = async () => {
     const nextMission = { waypoints: [], center: null }
+    dirtyRef.current = true
     setConfig((c) => ({ ...c, mission: nextMission }))
     await persistMission(nextMission)
   }
@@ -264,7 +280,10 @@ export default function Lab() {
     const res = await fetch('/api/lab/mission/import-qgc', { method: 'POST' })
     const json = await res.json()
     setMessage(json.message || (json.success ? '已导入' : '导入失败'))
-    if (json.success && json.data) setConfig((c) => ({ ...c, mission: json.data }))
+    if (json.success && json.data) {
+      dirtyRef.current = false
+      setConfig((c) => ({ ...c, mission: json.data }))
+    }
   }
 
   const start = async () => {

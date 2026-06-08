@@ -2136,7 +2136,7 @@ class WebConfigServer(object):
                     "default_style": "satellite",
                     "min_zoom": mtc.ZOOM_HARD_MIN,
                     "max_zoom": mtc.ZOOM_HARD_MAX,
-                    "default_center": {"lng": 114.305, "lat": 30.593},
+                    "default_center": {"lng": 110.412778, "lat": 25.314167},
                     "default_zoom": 15,
                     "prewarm_zoom": {
                         "min": mtc.DEFAULT_ZOOM_MIN,

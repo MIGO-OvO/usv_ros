@@ -273,6 +273,20 @@ export default function MapPage() {
       }
 
       const [lng, lat] = feature.geometry.coordinates as [number, number]
+      if (layer === 'position') {
+        const marker = L.circleMarker([lat, lng], {
+          radius: 9,
+          fillColor: '#2563eb',
+          fillOpacity: 0.95,
+          color: '#ffffff',
+          weight: 2,
+        })
+        marker.bindPopup('当前飞控定位')
+        marker.addTo(group)
+        bounds.extend([lat, lng])
+        return
+      }
+
       if (layer === 'waypoint') {
         const marker = L.marker([lat, lng], {
           icon: L.divIcon({
@@ -317,6 +331,13 @@ export default function MapPage() {
     const json = await res.json()
     const live = (json.data || {}) as LivePayload
     const features: GeoFeature[] = []
+    if (live.position?.gcj02) {
+      features.push({
+        type: 'Feature',
+        geometry: { type: 'Point', coordinates: [live.position.gcj02.lng, live.position.gcj02.lat] },
+        properties: { layer: 'position' },
+      })
+    }
     const trackPoints = live.track_points || []
     if (trackPoints.length > 1) {
       const coordinates: [number, number][] = trackPoints.map((p) => [p.gcj02.lng, p.gcj02.lat])
