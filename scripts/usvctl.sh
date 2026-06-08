@@ -49,7 +49,7 @@ Commands:
   addr       Print SSH and Web access commands without ROS diagnostics
   update     git pull --ff-only in the usv_ros repository
   build      Run catkin_make in the workspace root
-  deploy     Stop, update, build, then start
+  deploy     Stop, update, chmod runtime scripts, build, then start
 EOF
 }
 
@@ -69,7 +69,7 @@ require_system_stopped() {
         local pid
         pid="$(cat "$LAUNCH_PID_FILE")"
         ctl_log "ERROR: cannot $action while usv_system is running (pid=$pid)"
-        ctl_log "Run 'usvoff' first, or use 'usvdeploy' for stop -> update -> build -> start."
+        ctl_log "Run 'usvoff' first, or use 'usvdeploy' for stop -> update -> chmod -> build -> start."
         exit 1
     fi
 }
@@ -126,6 +126,11 @@ addr_system() {
     "$SCRIPT_DIR/status_usv_all.sh" addr
 }
 
+ensure_scripts_executable() {
+    ctl_log "ensure script permissions: $SCRIPT_DIR/*.sh $SCRIPT_DIR/*.py"
+    chmod +x "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/*.py
+}
+
 update_system() {
     require_system_stopped "update"
     ctl_log "update repo: $PKG_DIR"
@@ -148,6 +153,7 @@ build_system() {
 deploy_system() {
     stop_system
     update_system
+    ensure_scripts_executable
     build_system
     start_system "$@"
 }

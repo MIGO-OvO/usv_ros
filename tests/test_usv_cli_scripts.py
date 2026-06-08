@@ -70,6 +70,12 @@ class UsvCliScriptTests(unittest.TestCase):
         self.assertIn('git -C "$PKG_DIR" pull --ff-only', text)
         self.assertNotIn('git -C "$WS_DIR" pull', text)
 
+    def test_usvctl_can_restore_runtime_script_permissions(self):
+        text = self._read_script("usvctl.sh")
+
+        self.assertIn("ensure_scripts_executable()", text)
+        self.assertIn('chmod +x "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/*.py', text)
+
     def test_build_uses_ros_setup_and_catkin_make(self):
         text = self._read_script("usvctl.sh")
         common_env = self._read_script("common_env.sh")
@@ -87,17 +93,20 @@ class UsvCliScriptTests(unittest.TestCase):
         self.assertIn('require_system_stopped "build"', text[build_index:])
         self.assertIn("use 'usvdeploy'", text)
 
-    def test_deploy_order_is_stop_update_build_start(self):
+    def test_deploy_order_is_stop_update_chmod_build_start(self):
         text = self._read_script("usvctl.sh")
 
         deploy_index = text.index("deploy_system()")
         stop_index = text.index("stop_system", deploy_index)
         update_index = text.index("update_system", deploy_index)
+        chmod_index = text.find("ensure_scripts_executable", deploy_index)
         build_index = text.index("build_system", deploy_index)
         start_index = text.index("start_system", deploy_index)
 
+        self.assertNotEqual(chmod_index, -1, "deploy must chmod runtime scripts after update")
         self.assertLess(stop_index, update_index)
-        self.assertLess(update_index, build_index)
+        self.assertLess(update_index, chmod_index)
+        self.assertLess(chmod_index, build_index)
         self.assertLess(build_index, start_index)
 
 

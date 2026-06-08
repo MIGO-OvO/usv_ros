@@ -28,7 +28,7 @@ source /opt/ros/noetic/setup.bash
 catkin_make
 source devel/setup.bash
 
-chmod +x src/usv_ros/scripts/*.sh
+chmod +x src/usv_ros/scripts/*.sh src/usv_ros/scripts/*.py
 pip3 install pyserial flask flask-cors flask-socketio eventlet
 ```
 

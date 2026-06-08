@@ -213,7 +213,7 @@ Vite writes the output to `../static/dist`, which is served directly by `web_con
 
 ```bash
 cd ~/usv_ws
-chmod +x src/usv_ros/scripts/*.sh
+chmod +x src/usv_ros/scripts/*.sh src/usv_ros/scripts/*.py
 ```
 
 ## Startup and Deployment
