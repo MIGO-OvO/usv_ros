@@ -37,6 +37,7 @@ Usage:
   usvhotspot on|off|status [ssid] [password]
   usvaddr
   usvupdate
+  usvimport [bundle_path] [--build] [--restart]
   usvbuild [catkin_make args...]
   usvdeploy [roslaunch args...]
 
@@ -48,6 +49,7 @@ Commands:
   hotspot    Start, stop, or inspect the USV Wi-Fi hotspot
   addr       Print SSH and Web access commands without ROS diagnostics
   update     git pull --ff-only in the usv_ros repository
+  import     import a git bundle created by create_hotspot_update.bat
   build      Run catkin_make in the workspace root
   deploy     Stop, update, chmod runtime scripts, build, then start
 EOF
@@ -137,6 +139,10 @@ update_system() {
     git -C "$PKG_DIR" pull --ff-only
 }
 
+import_system() {
+    "$SCRIPT_DIR/import_hotspot_update.sh" "$@"
+}
+
 build_system() {
     require_system_stopped "build"
     ensure_file "$ROS_SETUP" "Install ROS Noetic before running usvbuild."
@@ -185,6 +191,9 @@ dispatch() {
         usvupdate)
             cmd="update"
             ;;
+        usvimport)
+            cmd="import"
+            ;;
         usvbuild)
             cmd="build"
             ;;
@@ -226,6 +235,9 @@ dispatch() {
             ;;
         update)
             update_system
+            ;;
+        import)
+            import_system "$@"
             ;;
         build)
             build_system "$@"
