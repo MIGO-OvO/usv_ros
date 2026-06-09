@@ -4,7 +4,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
-import { Save, RefreshCw, Zap, Target, RotateCcw, Usb, Activity } from 'lucide-react'
+import { Save, RefreshCw, Zap, Target, RotateCcw, Usb, Activity, Route } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { useAppStore } from '@/store'
 import { toast } from '@/hooks/use-toast'
@@ -42,7 +42,29 @@ interface PollutionMetricConfig {
   intercept: number
   unit: string
   display_name: string
+  pollutant_name: string
+  method_name: string
+  wavelength_nm: number | null
+  calibration_id: string
+  calibrated_at: string
+  min_valid: number | null
+  max_valid: number | null
+  lod: number | null
+  loq: number | null
+  clamp_negative: boolean
 }
+
+interface MappingProfileConfig {
+  survey_min_distance_m: number
+  survey_min_speed_mps: number
+  survey_max_speed_mps: number
+  survey_require_valid_spectrometer: boolean
+  survey_require_gps: boolean
+  survey_max_position_age_s: number
+}
+
+type PollutionMetricOptionalNumberKey = 'wavelength_nm' | 'min_valid' | 'max_valid' | 'lod' | 'loq'
+type MappingProfileNumberKey = 'survey_min_distance_m' | 'survey_min_speed_mps' | 'survey_max_speed_mps' | 'survey_max_position_age_s'
 
 const DEFAULT_HW: HardwareConfig = {
   pump_serial_port: '/dev/ttyUSB0',
@@ -68,6 +90,31 @@ const DEFAULT_POLLUTION_METRIC: PollutionMetricConfig = {
   intercept: 0.0,
   unit: 'mg/L',
   display_name: '浓度',
+  pollutant_name: '浓度',
+  method_name: '吸光度线性工作曲线',
+  wavelength_nm: null,
+  calibration_id: '',
+  calibrated_at: '',
+  min_valid: null,
+  max_valid: null,
+  lod: null,
+  loq: null,
+  clamp_negative: false,
+}
+
+const DEFAULT_MAPPING_PROFILE: MappingProfileConfig = {
+  survey_min_distance_m: 5.0,
+  survey_min_speed_mps: 0.0,
+  survey_max_speed_mps: 0.0,
+  survey_require_valid_spectrometer: true,
+  survey_require_gps: true,
+  survey_max_position_age_s: 5.0,
+}
+
+const parseOptionalMetricNumber = (value: string): number | null => {
+  if (value.trim() === '') return null
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : null
 }
 
 export default function Settings() {
@@ -80,6 +127,7 @@ export default function Settings() {
 
   const [hw, setHw] = useState<HardwareConfig>({ ...DEFAULT_HW })
   const [pollutionMetric, setPollutionMetric] = useState<PollutionMetricConfig>({ ...DEFAULT_POLLUTION_METRIC })
+  const [mappingProfile, setMappingProfile] = useState<MappingProfileConfig>({ ...DEFAULT_MAPPING_PROFILE })
   const [serialPorts, setSerialPorts] = useState<SerialPort[]>([])
   const [hwLoading, setHwLoading] = useState(false)
   const [hwMsg, setHwMsg] = useState('')
@@ -173,6 +221,7 @@ export default function Settings() {
       const res = await fetch('/api/config')
       const data = await res.json()
       setPollutionMetric({ ...DEFAULT_POLLUTION_METRIC, ...(data.pollution_metric || {}) })
+      setMappingProfile({ ...DEFAULT_MAPPING_PROFILE, ...(data.mapping_profile || {}) })
     } catch (e) {
       console.error(e)
     }
@@ -236,6 +285,31 @@ export default function Settings() {
 
   const handleChange = (key: string, value: string) => {
       setConfig(prev => ({ ...prev, [key]: parseFloat(value) }))
+  }
+
+  const saveMappingProfile = async () => {
+    try {
+      const res = await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mapping_profile: mappingProfile }),
+      })
+      const data = await res.json()
+      if (!data.success) throw new Error(data.message || '保存失败')
+      toast({ title: '走航门控已更新', variant: 'success' })
+    } catch (e) {
+      console.error(e)
+      toast({ title: '走航门控保存失败', variant: 'destructive' })
+    }
+  }
+
+  const setMetricOptionalNumber = (key: PollutionMetricOptionalNumberKey, value: string) => {
+    setPollutionMetric(prev => ({ ...prev, [key]: parseOptionalMetricNumber(value) }))
+  }
+
+  const setMappingNumber = (key: MappingProfileNumberKey, value: string) => {
+    const parsed = Number(value)
+    setMappingProfile(prev => ({ ...prev, [key]: Number.isFinite(parsed) ? Math.max(0, parsed) : 0 }))
   }
 
   return (
@@ -302,7 +376,15 @@ export default function Settings() {
                     </span>
                     <Switch checked={pollutionMetric.enabled} onCheckedChange={v => setPollutionMetric(p => ({ ...p, enabled: v }))} />
                 </label>
-                <div className="grid grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                        <Label>污染物名称</Label>
+                        <Input value={pollutionMetric.pollutant_name} onChange={e => setPollutionMetric(p => ({ ...p, pollutant_name: e.target.value }))} />
+                    </div>
+                    <div className="space-y-2">
+                        <Label>方法名称</Label>
+                        <Input value={pollutionMetric.method_name} onChange={e => setPollutionMetric(p => ({ ...p, method_name: e.target.value }))} />
+                    </div>
                     <div className="space-y-2">
                         <Label>斜率 slope</Label>
                         <Input type="number" step="0.0001" value={pollutionMetric.slope} onChange={e => setPollutionMetric(p => ({ ...p, slope: parseFloat(e.target.value) || 0 }))} />
@@ -319,12 +401,97 @@ export default function Settings() {
                         <Label>单位</Label>
                         <Input value={pollutionMetric.unit} onChange={e => setPollutionMetric(p => ({ ...p, unit: e.target.value }))} />
                     </div>
+                    <div className="space-y-2">
+                        <Label>波长 (nm)</Label>
+                        <Input type="number" step="0.1" value={pollutionMetric.wavelength_nm ?? ''} onChange={e => setMetricOptionalNumber('wavelength_nm', e.target.value)} />
+                    </div>
+                    <div className="space-y-2">
+                        <Label>校准编号</Label>
+                        <Input value={pollutionMetric.calibration_id} onChange={e => setPollutionMetric(p => ({ ...p, calibration_id: e.target.value }))} />
+                    </div>
+                    <div className="space-y-2 md:col-span-2">
+                        <Label>校准时间</Label>
+                        <Input value={pollutionMetric.calibrated_at} onChange={e => setPollutionMetric(p => ({ ...p, calibrated_at: e.target.value }))} />
+                    </div>
+                    <div className="space-y-2">
+                        <Label>有效下限</Label>
+                        <Input type="number" step="0.0001" value={pollutionMetric.min_valid ?? ''} onChange={e => setMetricOptionalNumber('min_valid', e.target.value)} />
+                    </div>
+                    <div className="space-y-2">
+                        <Label>有效上限</Label>
+                        <Input type="number" step="0.0001" value={pollutionMetric.max_valid ?? ''} onChange={e => setMetricOptionalNumber('max_valid', e.target.value)} />
+                    </div>
+                    <div className="space-y-2">
+                        <Label>检出限 LOD</Label>
+                        <Input type="number" step="0.0001" value={pollutionMetric.lod ?? ''} onChange={e => setMetricOptionalNumber('lod', e.target.value)} />
+                    </div>
+                    <div className="space-y-2">
+                        <Label>定量限 LOQ</Label>
+                        <Input type="number" step="0.0001" value={pollutionMetric.loq ?? ''} onChange={e => setMetricOptionalNumber('loq', e.target.value)} />
+                    </div>
+                    <label className="md:col-span-2 flex items-center justify-between gap-3 text-sm">
+                        <span>
+                          <span className="font-medium block">负浓度钳制为 0</span>
+                          <span className="text-xs text-muted-foreground">仅在线性公式计算出负值时生效。</span>
+                        </span>
+                        <Switch checked={pollutionMetric.clamp_negative} onCheckedChange={v => setPollutionMetric(p => ({ ...p, clamp_negative: v }))} />
+                    </label>
                 </div>
                 <div className="rounded-md bg-muted/50 p-3 text-xs text-muted-foreground">
                   当前公式：{pollutionMetric.display_name || '浓度'} = {pollutionMetric.slope || 0} × 吸光度 + {pollutionMetric.intercept || 0}
                 </div>
                 <div className="flex gap-2">
                     <Button className="flex-1" onClick={savePollutionMetric}><Save className="w-4 h-4 mr-2" /> 保存指标</Button>
+                    <Button variant="outline" onClick={fetchPollutionConfig}><RefreshCw className="w-4 h-4" /></Button>
+                </div>
+            </CardContent>
+        </Card>
+
+        <Card>
+            <CardHeader>
+                <CardTitle className="flex items-center gap-2">
+                    <Route className="w-5 h-5 text-cyan-500" />
+                    走航门控配置
+                </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="space-y-2">
+                        <Label>最小距离 (m)</Label>
+                        <Input type="number" min="0" step="0.1" value={mappingProfile.survey_min_distance_m} onChange={e => setMappingNumber('survey_min_distance_m', e.target.value)} />
+                    </div>
+                    <div className="space-y-2">
+                        <Label>位置最大年龄 (s)</Label>
+                        <Input type="number" min="0" step="0.1" value={mappingProfile.survey_max_position_age_s} onChange={e => setMappingNumber('survey_max_position_age_s', e.target.value)} />
+                    </div>
+                    <div className="space-y-2">
+                        <Label>最小速度 (m/s)</Label>
+                        <Input type="number" min="0" step="0.1" value={mappingProfile.survey_min_speed_mps} onChange={e => setMappingNumber('survey_min_speed_mps', e.target.value)} />
+                    </div>
+                    <div className="space-y-2">
+                        <Label>最大速度 (m/s)</Label>
+                        <Input type="number" min="0" step="0.1" value={mappingProfile.survey_max_speed_mps} onChange={e => setMappingNumber('survey_max_speed_mps', e.target.value)} />
+                    </div>
+                    <label className="flex items-center justify-between gap-3 text-sm">
+                        <span>
+                          <span className="font-medium block">需要 GPS</span>
+                          <span className="text-xs text-muted-foreground">缺少或过期位置时跳过本次走航采样。</span>
+                        </span>
+                        <Switch checked={mappingProfile.survey_require_gps} onCheckedChange={v => setMappingProfile(p => ({ ...p, survey_require_gps: v }))} />
+                    </label>
+                    <label className="flex items-center justify-between gap-3 text-sm">
+                        <span>
+                          <span className="font-medium block">需要有效分光</span>
+                          <span className="text-xs text-muted-foreground">分光状态无效时只记录跳过原因。</span>
+                        </span>
+                        <Switch checked={mappingProfile.survey_require_valid_spectrometer} onCheckedChange={v => setMappingProfile(p => ({ ...p, survey_require_valid_spectrometer: v }))} />
+                    </label>
+                </div>
+                <div className="rounded-md bg-muted/50 p-3 text-xs text-muted-foreground">
+                  门控发生在采样启动前；跳过只发布原因，不结束走航任务。
+                </div>
+                <div className="flex gap-2">
+                    <Button className="flex-1" onClick={saveMappingProfile}><Save className="w-4 h-4 mr-2" /> 保存门控</Button>
                     <Button variant="outline" onClick={fetchPollutionConfig}><RefreshCw className="w-4 h-4" /></Button>
                 </div>
             </CardContent>
@@ -344,7 +511,7 @@ export default function Settings() {
                     <div>校准角度</div>
                     <div>操作</div>
                 </div>
-                
+
                 {(['X', 'Y', 'Z', 'A'] as const).map((axis) => (
                     <div key={axis} className="grid grid-cols-4 gap-4 items-center text-sm">
                         <div className="font-bold text-center bg-muted/30 py-2 rounded">{axis}</div>

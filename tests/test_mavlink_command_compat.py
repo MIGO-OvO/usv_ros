@@ -50,6 +50,12 @@ def _install_fake_ros_modules():
     class Imu:
         pass
 
+    class NavSatFix:
+        def __init__(self, latitude=0.0, longitude=0.0, altitude=0.0):
+            self.latitude = latitude
+            self.longitude = longitude
+            self.altitude = altitude
+
     class State:
         connected = False
         mode = ""
@@ -107,6 +113,7 @@ def _install_fake_ros_modules():
     sensor_msgs = types.ModuleType("sensor_msgs")
     sensor_msgs_msg = types.ModuleType("sensor_msgs.msg")
     sensor_msgs_msg.Imu = Imu
+    sensor_msgs_msg.NavSatFix = NavSatFix
     sensor_msgs.msg = sensor_msgs_msg
 
     std_srvs = types.ModuleType("std_srvs")
@@ -849,6 +856,182 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         self.assertIn((module.MissionState.SURVEYING, "5.0"), states)
         self.assertIn("survey_sample_done", statuses)
         self.assertEqual(resumed, [])
+
+    def test_start_survey_keeps_param1_interval_and_default_gates_compatible(self):
+        module = _load_script("mavlink_trigger_node_survey_gate_compat_test", "scripts/mavlink_trigger_node.py")
+        started_threads = []
+
+        class RecordingThread:
+            def __init__(self, target, args=(), kwargs=None, daemon=None):
+                self.target = target
+                self.args = args
+                self.kwargs = kwargs or {}
+                self.daemon = daemon
+
+            def start(self):
+                started_threads.append(self)
+
+        original_thread = module.threading.Thread
+        module.threading.Thread = RecordingThread
+        try:
+            node = module.MAVLinkTriggerNode()
+            accepted = node.handle_mavlink_command(31015, 5.0, 0.0)
+        finally:
+            module.threading.Thread = original_thread
+
+        self.assertTrue(accepted)
+        self.assertTrue(node._survey_active)
+        self.assertEqual(node._survey_interval, 5.0)
+        self.assertEqual(len(started_threads), 1)
+        allowed, reason = node._survey_gate_status({})
+        self.assertTrue(allowed)
+        self.assertEqual(reason, "")
+
+    def _make_survey_gate_node(self, module, config):
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.state_lock = threading.Lock()
+        node.is_sampling = False
+        node._survey_active = True
+        node._survey_sample_active = False
+        node._survey_interval = 5.0
+        node.current_waypoint = 3
+        node.last_linear_speed = 1.0
+        node.latest_spectrometer_payload = {"valid": True}
+        node._latest_global_position = None
+        node._last_survey_sample_position = None
+        node.steps_pub = RecordingPublisher()
+        node.status_pub = RecordingPublisher()
+        node.mission_status_pub = RecordingPublisher()
+        node._load_config = lambda: config
+        node._get_default_config = lambda: {"sampling_sequence": {"steps": [], "loop_count": 1}}
+        node._build_steps_payload = lambda cfg, wp: {"steps": [], "loop_count": 1, "waypoint_seq": int(wp)}
+        node._set_mission_state = lambda *args, **kwargs: None
+        node._call_automation_service = lambda action: True
+        return node
+
+    def test_survey_gate_skips_without_gps_when_required_and_keeps_survey_active(self):
+        module = _load_script("mavlink_trigger_node_survey_gate_no_gps_test", "scripts/mavlink_trigger_node.py")
+        node = self._make_survey_gate_node(module, {
+            "survey_sampling": {
+                "survey_require_gps": True,
+                "survey_min_distance_m": 5.0,
+            }
+        })
+
+        result = node._start_survey_sample_once(node._load_config())
+
+        self.assertEqual(result, "skipped")
+        self.assertTrue(node._survey_active)
+        self.assertFalse(node.is_sampling)
+        self.assertEqual(node.steps_pub.messages, [])
+        self.assertEqual(node.status_pub.messages[-1].data, "survey_gate_skipped:no_gps")
+
+    def test_survey_gate_caches_wgs84_global_position(self):
+        module = _load_script("mavlink_trigger_node_survey_gate_gps_cache_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.state_lock = threading.Lock()
+        node._latest_global_position = None
+
+        node._global_position_cb(module.NavSatFix(latitude=30.1, longitude=120.2, altitude=4.5))
+
+        self.assertAlmostEqual(node._latest_global_position["lat"], 30.1)
+        self.assertAlmostEqual(node._latest_global_position["lon"], 120.2)
+        self.assertAlmostEqual(node._latest_global_position["alt"], 4.5)
+        self.assertIn("received_at", node._latest_global_position)
+
+    def test_survey_gate_skips_stale_gps_when_required(self):
+        module = _load_script("mavlink_trigger_node_survey_gate_stale_gps_test", "scripts/mavlink_trigger_node.py")
+        node = self._make_survey_gate_node(module, {
+            "survey_sampling": {
+                "survey_require_gps": True,
+                "survey_max_position_age_s": 5.0,
+            }
+        })
+        node._latest_global_position = {
+            "lat": 30.0,
+            "lon": 120.0,
+            "received_at": module.time.time() - 10.0,
+        }
+
+        result = node._start_survey_sample_once(node._load_config())
+
+        self.assertEqual(result, "skipped")
+        self.assertEqual(node.status_pub.messages[-1].data, "survey_gate_skipped:gps_stale")
+
+    def test_survey_gate_skips_speed_out_of_range(self):
+        module = _load_script("mavlink_trigger_node_survey_gate_speed_test", "scripts/mavlink_trigger_node.py")
+        node = self._make_survey_gate_node(module, {
+            "survey_sampling": {
+                "survey_min_speed_mps": 0.5,
+                "survey_max_speed_mps": 2.0,
+            }
+        })
+        node.last_linear_speed = 0.1
+
+        low_result = node._start_survey_sample_once(node._load_config())
+
+        self.assertEqual(low_result, "skipped")
+        self.assertEqual(node.status_pub.messages[-1].data, "survey_gate_skipped:speed_too_low")
+
+        node.last_linear_speed = 2.5
+        high_result = node._start_survey_sample_once(node._load_config())
+
+        self.assertEqual(high_result, "skipped")
+        self.assertEqual(node.status_pub.messages[-1].data, "survey_gate_skipped:speed_too_high")
+
+    def test_survey_gate_uses_wgs84_distance_from_last_successful_start(self):
+        module = _load_script("mavlink_trigger_node_survey_gate_distance_test", "scripts/mavlink_trigger_node.py")
+        node = self._make_survey_gate_node(module, {
+            "survey_sampling": {
+                "survey_require_gps": True,
+                "survey_min_distance_m": 5.0,
+                "survey_max_position_age_s": 30.0,
+            }
+        })
+        now = module.time.time()
+        node._last_survey_sample_position = {"lat": 30.0, "lon": 120.0, "received_at": now - 1.0}
+        node._latest_global_position = {"lat": 30.0, "lon": 120.0, "received_at": now}
+
+        skipped = node._start_survey_sample_once(node._load_config())
+
+        self.assertEqual(skipped, "skipped")
+        self.assertEqual(node.status_pub.messages[-1].data, "survey_gate_skipped:distance_too_short")
+
+        node._latest_global_position = {"lat": 30.0001, "lon": 120.0, "received_at": now}
+        started = node._start_survey_sample_once(node._load_config())
+
+        self.assertEqual(started, "started")
+        self.assertTrue(node.is_sampling)
+        self.assertTrue(node._survey_sample_active)
+        self.assertEqual(len(node.steps_pub.messages), 1)
+        payload = json.loads(node.steps_pub.messages[-1].data)
+        self.assertEqual(payload["loop_count"], 1)
+        self.assertEqual(payload["waypoint_seq"], 3)
+        self.assertAlmostEqual(node._last_survey_sample_position["lat"], 30.0001)
+
+    def test_survey_gate_skips_invalid_spectrometer_when_required(self):
+        module = _load_script("mavlink_trigger_node_survey_gate_spectrometer_test", "scripts/mavlink_trigger_node.py")
+        node = self._make_survey_gate_node(module, {
+            "survey_sampling": {
+                "survey_require_valid_spectrometer": True,
+            }
+        })
+        node.latest_spectrometer_payload = {"valid": False}
+
+        result = node._start_survey_sample_once(node._load_config())
+
+        self.assertEqual(result, "skipped")
+        self.assertFalse(node.is_sampling)
+        self.assertEqual(node.steps_pub.messages, [])
+        self.assertEqual(node.status_pub.messages[-1].data, "survey_gate_skipped:spectrometer_invalid")
+
+    def test_bringup_launch_exposes_survey_gate_defaults(self):
+        launch_text = (REPO_ROOT / "launch" / "usv_bringup.launch").read_text(encoding="utf-8")
+
+        self.assertIn('<arg name="survey_interval_s" default="5.0" />', launch_text)
+        self.assertIn('<arg name="survey_min_distance_m" default="0.0" />', launch_text)
+        self.assertIn('<arg name="survey_require_gps" default="false" />', launch_text)
+        self.assertIn('<arg name="survey_require_valid_spectrometer" default="false" />', launch_text)
 
     def test_sampling_failure_publishes_sampling_stopped_for_bridge_completion(self):
         module = _load_script("mavlink_trigger_node_failure_stopped_test", "scripts/mavlink_trigger_node.py")

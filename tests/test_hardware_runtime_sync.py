@@ -1,5 +1,8 @@
+import csv
+import io
 import importlib.util
 import json
+import math
 import os
 import sys
 import tempfile
@@ -441,6 +444,80 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(len(server.data_manager.started), 1)
         self.assertEqual(server.data_manager.stopped, 1)
 
+    def test_web_live_map_exposes_survey_gate_status(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_survey_gate_status_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            client = server.app.test_client()
+            server.automation_running = True
+
+            server._mission_status_cb(string_cls("SURVEYING:5.0"))
+            server._trigger_status_cb(string_cls("survey_gate_skipped:gps_stale"))
+            skipped_live = client.get("/api/map/live").get_json()["data"]
+
+            server._trigger_status_cb(string_cls("survey_sample_done"))
+            done_live = client.get("/api/map/live").get_json()["data"]
+
+        survey = skipped_live["survey_status"]
+        self.assertEqual(survey["mission_status"], "SURVEYING:5.0")
+        self.assertEqual(survey["last_gate"]["status"], "survey_gate_skipped:gps_stale")
+        self.assertEqual(survey["last_gate"]["reason"], "gps_stale")
+        self.assertIn("GPS", survey["last_gate"]["reason_label"])
+        self.assertTrue(skipped_live["automation_running"])
+        self.assertEqual(done_live["survey_status"]["trigger_status"]["status"], "survey_sample_done")
+        self.assertIsNotNone(done_live["survey_status"]["last_sample_done_at"])
+
+    def test_web_config_round_trips_mapping_profile_thresholds(self):
+        module, _, _ = _load_script(
+            "web_config_server_mapping_profile_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            client = server.app.test_client()
+
+            initial = client.get("/api/config").get_json()["mapping_profile"]
+            save_resp = client.post("/api/config", json={
+                "mapping_profile": {
+                    "survey_min_distance_m": "7.5",
+                    "survey_min_speed_mps": "0.25",
+                    "survey_max_speed_mps": "1.8",
+                    "survey_require_gps": True,
+                    "survey_require_valid_spectrometer": True,
+                    "survey_max_position_age_s": "4.0",
+                }
+            })
+            saved = client.get("/api/config").get_json()["mapping_profile"]
+
+        self.assertEqual(save_resp.status_code, 200)
+        self.assertEqual(initial["survey_min_distance_m"], 5.0)
+        self.assertTrue(initial["survey_require_gps"])
+        self.assertEqual(saved["survey_min_distance_m"], 7.5)
+        self.assertEqual(saved["survey_min_speed_mps"], 0.25)
+        self.assertEqual(saved["survey_max_speed_mps"], 1.8)
+        self.assertTrue(saved["survey_require_gps"])
+        self.assertTrue(saved["survey_require_valid_spectrometer"])
+        self.assertEqual(saved["survey_max_position_age_s"], 4.0)
+
     def test_web_structured_automation_status_controls_voltage_recording(self):
         module, _, string_cls = _load_script(
             "web_config_server_automation_status_recording_test",
@@ -667,21 +744,47 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
                     "intercept": 0.1,
                     "unit": "mg/L",
                     "display_name": "COD",
+                    "pollutant_name": "COD",
+                    "method_name": "UV254",
+                    "wavelength_nm": 254.0,
+                    "calibration_id": "cal-20260609",
+                    "calibrated_at": "2026-06-09T09:00:00+08:00",
+                    "min_valid": 0.0,
+                    "max_valid": 5.0,
+                    "lod": 0.05,
+                    "loq": 0.15,
+                    "clamp_negative": True,
                 }
             })
 
             server._start_data_recording_if_needed()
-            server._gps_cb(types.SimpleNamespace(latitude=30.0, longitude=120.0, altitude=4.5))
+            server._gps_cb(types.SimpleNamespace(
+                latitude=30.0,
+                longitude=120.0,
+                altitude=4.5,
+                fix_type=3,
+                hdop=0.8,
+                speed_mps=1.1,
+            ))
+            server.current_position["received_at"] = module.time.time() - 2.0
+            server.route_snapshot_id = "route-test"
+            server.route_source = "mavros"
             server._mission_status_cb(string_cls("SAMPLING:4"))
             server._automation_status_cb(string_cls(json.dumps({
                 "running": True,
                 "step_index": 2,
                 "loop_index": 1,
             })))
+            server._system_health_cb(string_cls(json.dumps({
+                "health": {"summary": "nominal"},
+            })))
             server._voltage_cb(string_cls(json.dumps({
                 "voltage": 1.2,
                 "absorbance": 0.3,
                 "valid": True,
+                "baseline_set": True,
+                "baseline_voltage": 0.05,
+                "reference_voltage": 1.23,
                 "raw_code": 1234,
             })))
 
@@ -693,9 +796,325 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(point["metric_used"], "concentration")
         self.assertAlmostEqual(point["concentration"], 0.7)
         self.assertEqual(point["concentration_unit"], "mg/L")
+        self.assertEqual(point["concentration_display_name"], "COD")
+        self.assertEqual(point["pollutant_name"], "COD")
+        self.assertEqual(point["method_name"], "UV254")
+        self.assertEqual(point["wavelength_nm"], 254.0)
+        self.assertEqual(point["calibration_id"], "cal-20260609")
+        self.assertEqual(point["calibrated_at"], "2026-06-09T09:00:00+08:00")
+        self.assertEqual(point["min_valid"], 0.0)
+        self.assertEqual(point["max_valid"], 5.0)
+        self.assertEqual(point["lod"], 0.05)
+        self.assertEqual(point["loq"], 0.15)
+        self.assertEqual(point["clamp_negative"], True)
         self.assertEqual(point["wgs84"]["lat"], 30.0)
         self.assertEqual(point["wgs84"]["lng"], 120.0)
         self.assertIn("gcj02", point)
+        self.assertGreaterEqual(point["position_age_s"], 2.0)
+        self.assertLess(point["position_age_s"], 3.0)
+        self.assertEqual(point["mission_status"], "SAMPLING:4")
+        self.assertEqual(point["route_snapshot_id"], "route-test")
+        self.assertEqual(point["route_source"], "mavros")
+        quality = point["quality"]
+        self.assertEqual(quality["spectrometer_valid"], True)
+        self.assertEqual(quality["baseline_set"], True)
+        self.assertAlmostEqual(quality["baseline_voltage"], 0.05)
+        self.assertAlmostEqual(quality["reference_voltage"], 1.23)
+        self.assertEqual(quality["gps_valid"], True)
+        self.assertEqual(quality["position_source"], "real")
+        self.assertEqual(quality["gps_fix_type"], 3)
+        self.assertAlmostEqual(quality["hdop"], 0.8)
+        self.assertAlmostEqual(quality["speed_mps"], 1.1)
+        self.assertEqual(quality["detector_health_summary"], "nominal")
+        metric_snapshot = quality["metric_config_snapshot"]
+        self.assertEqual(metric_snapshot["pollutant_name"], "COD")
+        self.assertEqual(metric_snapshot["calibration_id"], "cal-20260609")
+        self.assertEqual(metric_snapshot["clamp_negative"], True)
+
+    def test_web_records_stale_position_age_and_marks_gps_invalid(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_stale_position_age_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=True)
+            server.data_manager = module.MissionDataManager(str(Path(tmpdir) / "missions"))
+            server.data_manager.start_mission("stale-position")
+            server.config_manager.update({
+                "pollution_metric": {
+                    "enabled": True,
+                    "slope": 1.0,
+                    "intercept": 0.0,
+                    "unit": "mg/L",
+                    "display_name": "COD",
+                    "pollutant_name": "COD",
+                }
+            })
+
+            server._start_data_recording_if_needed()
+            server._gps_cb(types.SimpleNamespace(latitude=30.0, longitude=120.0, altitude=4.5))
+            server.current_position["received_at"] = module.time.time() - (module.POSITION_STALE_AFTER_S + 1.0)
+            server._mission_status_cb(string_cls("SAMPLING:2"))
+            server._automation_status_cb(string_cls(json.dumps({"running": True})))
+            server._voltage_cb(string_cls(json.dumps({
+                "voltage": 1.0,
+                "absorbance": 0.2,
+                "valid": True,
+                "baseline_set": True,
+            })))
+
+            point = server.data_manager.current_mission_data["data_points"][-1]
+
+        self.assertGreater(point["position_age_s"], module.POSITION_STALE_AFTER_S)
+        self.assertEqual(point["mission_status"], "SAMPLING:2")
+        self.assertEqual(point["quality"]["gps_valid"], False)
+        self.assertEqual(point["quality"]["position_source"], "real")
+
+    def test_web_route_snapshot_id_tracks_wgs84_waypoints(self):
+        module, _, _ = _load_script(
+            "web_config_server_route_snapshot_test",
+            "scripts/web_config_server.py",
+        )
+
+        server = module.WebConfigServer(standalone=True)
+
+        def waypoint(lat, lng):
+            return types.SimpleNamespace(
+                x_lat=lat,
+                y_long=lng,
+                z_alt=0.0,
+                command=16,
+                frame=3,
+                is_current=False,
+                autocontinue=True,
+            )
+
+        first_route = [
+            waypoint(30.0000, 120.0000),
+            waypoint(30.0010, 120.0020),
+        ]
+        server._waypoints_cb(types.SimpleNamespace(waypoints=first_route))
+        first_id = server.route_snapshot_id
+
+        self.assertIsNotNone(first_id)
+        self.assertEqual(server.route_source, "mavros")
+        self.assertEqual(server.route_waypoints[0]["wgs84"]["lat"], 30.0)
+        self.assertEqual(server.route_waypoints[1]["wgs84"]["lng"], 120.002)
+        self.assertEqual(server._route_snapshot_id(server.route_waypoints), first_id)
+
+        server._waypoints_cb(types.SimpleNamespace(waypoints=first_route))
+        self.assertEqual(server.route_snapshot_id, first_id)
+
+        changed_route = [
+            waypoint(30.0000, 120.0000),
+            waypoint(30.0010, 120.0030),
+        ]
+        server._waypoints_cb(types.SimpleNamespace(waypoints=changed_route))
+        self.assertNotEqual(server.route_snapshot_id, first_id)
+
+        server._waypoints_cb(types.SimpleNamespace(waypoints=[]))
+        self.assertIsNone(server.route_snapshot_id)
+        self.assertEqual(server.route_source, "none")
+
+    def test_web_pollution_metric_clamps_negative_only_when_enabled(self):
+        module, _, _ = _load_script(
+            "web_config_server_pollution_metric_clamp_test",
+            "scripts/web_config_server.py",
+        )
+
+        unclamped = module.resolve_pollution_metric(
+            1.0,
+            0.2,
+            {"enabled": True, "slope": -2.0, "intercept": 0.1},
+        )
+        clamped = module.resolve_pollution_metric(
+            1.0,
+            0.2,
+            {"enabled": True, "slope": -2.0, "intercept": 0.1, "clamp_negative": True},
+        )
+
+        self.assertAlmostEqual(unclamped["concentration"], -0.3)
+        self.assertEqual(unclamped["metric_used"], "concentration")
+        self.assertEqual(unclamped["clamp_negative"], False)
+        self.assertEqual(clamped["concentration"], 0.0)
+        self.assertEqual(clamped["metric_used"], "concentration")
+        self.assertEqual(clamped["clamp_negative"], True)
+
+    def test_web_geojson_and_csv_expose_pollutant_contract_fields(self):
+        module, _, _ = _load_script(
+            "web_config_server_pollution_contract_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=True)
+            server.data_manager = module.MissionDataManager(str(Path(tmpdir) / "missions"))
+            server.data_manager.start_mission("contract")
+            mission_id = server.data_manager.current_mission_data["mission_id"]
+            metric_config = {
+                "enabled": True,
+                "slope": 2.0,
+                "intercept": 0.1,
+                "unit": "mg/L",
+                "display_name": "COD",
+                "pollutant_name": "COD",
+                "method_name": "UV254",
+                "calibration_id": "cal-20260609",
+            }
+            server.data_manager.add_data_point(
+                1.2,
+                0.3,
+                position={
+                    "wgs84": {"lat": 30.0, "lng": 120.0, "alt": 1.0},
+                    "gcj02": {"lat": 29.9975, "lng": 120.0046, "alt": 1.0},
+                    "position_source": "real",
+                },
+                spectrometer_raw={
+                    "valid": True,
+                    "baseline_set": True,
+                    "baseline_voltage": 0.05,
+                    "reference_voltage": 1.23,
+                },
+                pollution_metric=metric_config,
+                system_health={"health": {"summary": "nominal"}},
+            )
+            server.data_manager.add_data_point(
+                1.4,
+                0.5,
+                position={
+                    "wgs84": {"lat": 30.1, "lng": 120.1, "alt": 1.0},
+                    "gcj02": {"lat": 30.1, "lng": 120.1, "alt": 1.0},
+                    "position_source": "lab_sim",
+                    "lab_mode": True,
+                },
+                spectrometer_raw={"valid": True, "baseline_set": True},
+                pollution_metric=metric_config,
+                lab_mode=True,
+            )
+            client = server.app.test_client()
+
+            geojson_resp = client.get(f"/api/data/mission/{mission_id}/geojson?metric=concentration")
+            csv_resp = client.get(f"/api/data/mission/{mission_id}/csv")
+
+        geojson = geojson_resp.get_json()
+        sample_feature = [
+            f for f in geojson["data"]["features"]
+            if f["properties"].get("layer") == "sample"
+        ][0]
+        rows = list(csv.DictReader(io.StringIO(csv_resp.data.decode("utf-8"))))
+        expected_old_columns = [
+            "timestamp",
+            "voltage",
+            "absorbance",
+            "concentration",
+            "concentration_unit",
+            "metric_used",
+        ]
+        expected_new_columns = [
+            "pollutant_name",
+            "method_name",
+            "calibration_id",
+            "quality_flags",
+            "valid_for_surface",
+            "excluded_reason",
+        ]
+
+        self.assertEqual(geojson_resp.status_code, 200)
+        self.assertEqual(sample_feature["properties"]["concentration_unit"], "mg/L")
+        self.assertEqual(sample_feature["properties"]["metric"], "concentration")
+        self.assertEqual(sample_feature["properties"]["pollutant_name"], "COD")
+        self.assertEqual(sample_feature["properties"]["method_name"], "UV254")
+        self.assertEqual(sample_feature["properties"]["calibration_id"], "cal-20260609")
+        self.assertEqual(sample_feature["properties"]["quality_flags"], "")
+        self.assertEqual(sample_feature["properties"]["valid_for_surface"], True)
+        self.assertEqual(sample_feature["properties"]["excluded_reason"], "")
+
+        self.assertEqual(csv_resp.status_code, 200)
+        self.assertEqual(rows[0].keys() & set(expected_old_columns), set(expected_old_columns))
+        self.assertEqual(list(rows[0].keys())[-6:], expected_new_columns)
+        self.assertIn("concentration", rows[0])
+        self.assertIn("concentration_unit", rows[0])
+        self.assertIn("metric_used", rows[0])
+        self.assertEqual(rows[0]["pollutant_name"], "COD")
+        self.assertEqual(rows[0]["method_name"], "UV254")
+        self.assertEqual(rows[0]["calibration_id"], "cal-20260609")
+        self.assertEqual(rows[0]["quality_flags"], "")
+        self.assertEqual(rows[0]["valid_for_surface"], "true")
+        self.assertEqual(rows[0]["excluded_reason"], "")
+        self.assertEqual(rows[1]["quality_flags"], "gps_invalid|lab_mode")
+        self.assertEqual(rows[1]["valid_for_surface"], "false")
+        self.assertEqual(rows[1]["excluded_reason"], "lab_excluded")
+
+    def test_web_pollutant_map_exports_have_download_headers(self):
+        module, _, _ = _load_script(
+            "web_config_server_pollutant_map_export_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=True)
+            server.data_manager = module.MissionDataManager(str(Path(tmpdir) / "missions"))
+            server.data_manager.start_mission("export")
+            mission_id = server.data_manager.current_mission_data["mission_id"]
+            metric_config = {
+                "enabled": True,
+                "slope": 1.0,
+                "intercept": 0.0,
+                "unit": "mg/L",
+                "display_name": "COD",
+                "pollutant_name": "COD",
+                "calibration_id": "cal-export-20260609",
+                "min_valid": 0.0,
+                "max_valid": 1.0,
+            }
+            for lat, lng, absorbance in [
+                (30.000, 120.000, 0.2),
+                (30.001, 120.000, 0.4),
+                (30.000, 120.001, 0.6),
+            ]:
+                server.data_manager.add_data_point(1.0, absorbance, position={
+                    "wgs84": {"lat": lat, "lng": lng, "alt": 0.0},
+                    "gcj02": {"lat": lat, "lng": lng, "alt": 0.0},
+                    "position_source": "real",
+                }, spectrometer_raw={"valid": True, "baseline_set": True}, pollution_metric=metric_config)
+            client = server.app.test_client()
+            geojson_resp = client.get(f"/api/data/mission/{mission_id}/geojson?metric=concentration&download=true")
+            surface_resp = client.get(f"/api/data/mission/{mission_id}/surface?metric=concentration&size=4&download=true")
+            csv_resp = client.get(f"/api/data/mission/{mission_id}/csv")
+
+        self.assertEqual(geojson_resp.status_code, 200)
+        self.assertEqual(surface_resp.status_code, 200)
+        self.assertEqual(csv_resp.status_code, 200)
+        self.assertIn("application/json", geojson_resp.content_type)
+        self.assertIn("application/json", surface_resp.content_type)
+        self.assertIn(f"mission_{mission_id}.geojson", geojson_resp.headers.get("Content-Disposition", ""))
+        self.assertIn(f"mission_{mission_id}_surface.json", surface_resp.headers.get("Content-Disposition", ""))
+        self.assertIn(f"mission_{mission_id}.csv", csv_resp.headers.get("Content-Disposition", ""))
+        surface_payload = json.loads(surface_resp.data.decode("utf-8"))
+        self.assertTrue(surface_payload["data"]["valid"])
+        self.assertEqual(len(surface_payload["data"]["grid"]), 16)
 
     def test_web_geojson_excludes_samples_without_gps_and_surface_reports_empty(self):
         module, _, _ = _load_script(
@@ -718,8 +1137,15 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             server.data_manager.add_data_point(1.0, 0.2, position={
                 "wgs84": {"lat": 30.0, "lng": 120.0, "alt": 1.0},
                 "gcj02": {"lat": 29.9975, "lng": 120.0046, "alt": 1.0},
-            })
+                "position_source": "real",
+            }, spectrometer_raw={"valid": True, "baseline_set": True})
             server.data_manager.add_data_point(2.0, 0.4)
+            no_gps_point = server.data_manager.current_mission_data["data_points"][-1]
+            server.data_manager.add_data_point(2.2, 0.6, position={
+                "wgs84": {"lat": 30.001, "lng": 120.001, "alt": 1.0},
+                "gcj02": {"lat": 30.001, "lng": 120.001, "alt": 1.0},
+                "position_source": "real",
+            }, spectrometer_raw={"valid": False, "baseline_set": True})
             client = server.app.test_client()
 
             geojson_resp = client.get(f"/api/data/mission/{mission_id}/geojson?metric=absorbance")
@@ -733,11 +1159,27 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         ]
 
         self.assertEqual(geojson_resp.status_code, 200)
-        self.assertEqual(len(sample_features), 1)
-        self.assertEqual(sample_features[0]["properties"]["value"], 0.2)
+        self.assertEqual(len(sample_features), 2)
+        surface_ready_features = [
+            f for f in sample_features
+            if f["properties"]["valid_for_surface"]
+        ]
+        excluded_features = [
+            f for f in sample_features
+            if not f["properties"]["valid_for_surface"]
+        ]
+        self.assertEqual(len(surface_ready_features), 1)
+        self.assertEqual(surface_ready_features[0]["properties"]["value"], 0.2)
+        self.assertEqual(excluded_features[0]["properties"]["excluded_reason"], "spectrometer_invalid")
+        self.assertEqual(no_gps_point["quality"]["gps_valid"], False)
+        self.assertEqual(no_gps_point["quality"]["position_source"], "none")
         self.assertEqual(surface_resp.status_code, 200)
         self.assertFalse(surface["data"]["valid"])
         self.assertIn("3", surface["data"]["reason"])
+        self.assertEqual(surface["data"]["point_count"], 1)
+        self.assertEqual(surface["data"]["excluded_count"], 2)
+        self.assertEqual(surface["data"]["excluded_reasons"]["missing_gps"], 1)
+        self.assertEqual(surface["data"]["excluded_reasons"]["spectrometer_invalid"], 1)
 
     def test_web_idw_surface_uses_valid_metric_points(self):
         module, _, _ = _load_script(
@@ -757,6 +1199,17 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             server.data_manager = module.MissionDataManager(str(Path(tmpdir) / "missions"))
             server.data_manager.start_mission("surface")
             mission_id = server.data_manager.current_mission_data["mission_id"]
+            metric_config = {
+                "enabled": True,
+                "slope": 1.0,
+                "intercept": 0.0,
+                "unit": "mg/L",
+                "display_name": "COD",
+                "pollutant_name": "COD",
+                "calibration_id": "cal-surface-20260609",
+                "min_valid": 0.0,
+                "max_valid": 1.0,
+            }
             for lat, lng, absorbance in [
                 (30.000, 120.000, 0.1),
                 (30.001, 120.000, 0.3),
@@ -765,18 +1218,398 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
                 server.data_manager.add_data_point(1.0, absorbance, position={
                     "wgs84": {"lat": lat, "lng": lng, "alt": 0.0},
                     "gcj02": {"lat": lat, "lng": lng, "alt": 0.0},
-                })
+                    "position_source": "real",
+                }, spectrometer_raw={"valid": True, "baseline_set": True}, pollution_metric=metric_config)
+            server.data_manager.add_data_point(
+                1.0,
+                0.7,
+                spectrometer_raw={"valid": True, "baseline_set": True},
+                pollution_metric=metric_config,
+            )
+            server.data_manager.add_data_point(1.0, 0.4, position={
+                "wgs84": {"lat": 30.002, "lng": 120.000, "alt": 0.0},
+                "gcj02": {"lat": 30.002, "lng": 120.000, "alt": 0.0},
+                "position_source": "real",
+            }, spectrometer_raw={"valid": False, "baseline_set": True}, pollution_metric=metric_config)
+            server.data_manager.add_data_point(1.0, 2.0, position={
+                "wgs84": {"lat": 30.003, "lng": 120.000, "alt": 0.0},
+                "gcj02": {"lat": 30.003, "lng": 120.000, "alt": 0.0},
+                "position_source": "real",
+            }, spectrometer_raw={"valid": True, "baseline_set": True}, pollution_metric=metric_config)
+            server.data_manager.add_data_point(1.0, -0.1, position={
+                "wgs84": {"lat": 30.0035, "lng": 120.000, "alt": 0.0},
+                "gcj02": {"lat": 30.0035, "lng": 120.000, "alt": 0.0},
+                "position_source": "real",
+            }, spectrometer_raw={"valid": True, "baseline_set": True}, pollution_metric=metric_config)
+            server.data_manager.add_data_point(1.0, 0.6, position={
+                "wgs84": {"lat": 30.004, "lng": 120.000, "alt": 0.0},
+                "gcj02": {"lat": 30.004, "lng": 120.000, "alt": 0.0},
+                "position_source": "lab_sim",
+                "lab_mode": True,
+            }, spectrometer_raw={"valid": True, "baseline_set": True}, pollution_metric=metric_config, lab_mode=True)
+            server.data_manager.current_mission_data["data_points"].append({
+                "voltage": 1.0,
+                "absorbance": float("nan"),
+                "concentration": float("nan"),
+                "concentration_unit": "mg/L",
+                "concentration_display_name": "COD",
+                "pollutant_name": "COD",
+                "metric_used": "concentration",
+                "gcj02": {"lat": 30.005, "lng": 120.000, "alt": 0.0},
+                "quality": {
+                    "spectrometer_valid": True,
+                    "gps_valid": True,
+                    "metric_config_snapshot": metric_config,
+                },
+            })
             client = server.app.test_client()
 
-            response = client.get(f"/api/data/mission/{mission_id}/surface?metric=absorbance&size=4")
+            geojson_response = client.get(f"/api/data/mission/{mission_id}/geojson?metric=concentration")
+            response = client.get(f"/api/data/mission/{mission_id}/surface?metric=concentration&size=4")
+            include_lab_response = client.get(
+                f"/api/data/mission/{mission_id}/surface?metric=concentration&size=4&include_lab=true"
+            )
 
+        geojson_payload = geojson_response.get_json()
         payload = response.get_json()
+        include_lab_payload = include_lab_response.get_json()
 
+        self.assertEqual(geojson_response.status_code, 200)
+        self.assertIn("features", geojson_payload["data"])
+        self.assertEqual(geojson_payload["data"]["meta"]["metric_label"], "COD")
+        self.assertEqual(geojson_payload["data"]["meta"]["unit"], "mg/L")
+        self.assertEqual(geojson_payload["data"]["meta"]["pollutant_name"], "COD")
+        self.assertEqual(geojson_payload["data"]["meta"]["calibration_id"], "cal-surface-20260609")
+        self.assertEqual(geojson_payload["data"]["meta"]["valid_surface_point_count"], 3)
+        self.assertEqual(geojson_payload["data"]["meta"]["excluded_reasons"]["lab_excluded"], 1)
+        self.assertEqual(geojson_payload["data"]["meta"]["include_lab"], False)
+        self.assertEqual(geojson_payload["data"]["meta"]["idw"]["size"], module.DEFAULT_SURFACE_SIZE)
+        self.assertAlmostEqual(geojson_payload["data"]["meta"]["idw"]["power"], 2.0)
         self.assertEqual(response.status_code, 200)
         self.assertTrue(payload["data"]["valid"])
+        self.assertIn("grid", payload["data"])
+        self.assertEqual(payload["data"]["meta"]["metric_label"], "COD")
+        self.assertEqual(payload["data"]["meta"]["unit"], "mg/L")
+        self.assertEqual(payload["data"]["meta"]["pollutant_name"], "COD")
+        self.assertEqual(payload["data"]["meta"]["calibration_id"], "cal-surface-20260609")
+        self.assertEqual(payload["data"]["meta"]["valid_surface_point_count"], 3)
+        self.assertEqual(payload["data"]["meta"]["excluded_reasons"]["above_max_valid"], 1)
+        self.assertEqual(payload["data"]["meta"]["idw"]["size"], 4)
+        self.assertAlmostEqual(payload["data"]["meta"]["idw"]["power"], 2.0)
         self.assertEqual(len(payload["data"]["grid"]), 16)
         self.assertAlmostEqual(payload["data"]["min"], 0.1)
         self.assertAlmostEqual(payload["data"]["max"], 0.5)
+        self.assertEqual(payload["data"]["point_count"], 3)
+        self.assertEqual(payload["data"]["excluded_count"], 6)
+        self.assertEqual(payload["data"]["excluded_reasons"]["missing_gps"], 1)
+        self.assertEqual(payload["data"]["excluded_reasons"]["spectrometer_invalid"], 1)
+        self.assertEqual(payload["data"]["excluded_reasons"]["below_min_valid"], 1)
+        self.assertEqual(payload["data"]["excluded_reasons"]["above_max_valid"], 1)
+        self.assertEqual(payload["data"]["excluded_reasons"]["lab_excluded"], 1)
+        self.assertEqual(payload["data"]["excluded_reasons"]["non_finite_metric"], 1)
+        self.assertEqual(payload["data"]["metric_label"], "COD")
+        self.assertEqual(payload["data"]["unit"], "mg/L")
+        self.assertEqual(payload["data"]["size"], 4)
+        self.assertAlmostEqual(payload["data"]["power"], 2.0)
+        self.assertEqual(include_lab_response.status_code, 200)
+        self.assertTrue(include_lab_payload["data"]["valid"])
+        self.assertEqual(include_lab_payload["data"]["meta"]["include_lab"], True)
+        self.assertEqual(include_lab_payload["data"]["meta"]["valid_surface_point_count"], 4)
+        self.assertEqual(include_lab_payload["data"]["point_count"], 4)
+        self.assertEqual(include_lab_payload["data"]["excluded_count"], 5)
+        self.assertNotIn("lab_excluded", include_lab_payload["data"]["excluded_reasons"])
+        self.assertEqual(include_lab_payload["data"]["excluded_reasons"]["below_min_valid"], 1)
+        self.assertAlmostEqual(include_lab_payload["data"]["min"], 0.1)
+        self.assertAlmostEqual(include_lab_payload["data"]["max"], 0.6)
+
+    def test_web_mission_list_and_detail_include_pollutant_summary(self):
+        module, _, _ = _load_script(
+            "web_config_server_mission_summary_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = module.MissionDataManager(str(Path(tmpdir) / "missions"))
+            manager.start_mission("summary")
+            mission_id = manager.current_mission_data["mission_id"]
+            metric_config = {
+                "enabled": True,
+                "slope": 1.0,
+                "intercept": 0.0,
+                "unit": "mg/L",
+                "display_name": "COD",
+                "pollutant_name": "COD",
+                "calibration_id": "cal-summary-20260609",
+                "min_valid": 0.0,
+                "max_valid": 1.0,
+            }
+            for lat, lng, absorbance in [
+                (30.000, 120.000, 0.2),
+                (30.001, 120.000, 0.4),
+                (30.000, 120.001, 0.6),
+            ]:
+                manager.add_data_point(1.0, absorbance, position={
+                    "wgs84": {"lat": lat, "lng": lng, "alt": 0.0},
+                    "gcj02": {"lat": lat, "lng": lng, "alt": 0.0},
+                    "position_source": "real",
+                }, spectrometer_raw={"valid": True, "baseline_set": True}, pollution_metric=metric_config)
+            manager.add_data_point(
+                1.0,
+                0.8,
+                spectrometer_raw={"valid": True, "baseline_set": True},
+                pollution_metric=metric_config,
+            )
+            manager.add_data_point(1.0, 0.5, position={
+                "wgs84": {"lat": 30.002, "lng": 120.000, "alt": 0.0},
+                "gcj02": {"lat": 30.002, "lng": 120.000, "alt": 0.0},
+                "position_source": "real",
+            }, spectrometer_raw={"valid": False, "baseline_set": True}, pollution_metric=metric_config)
+            manager.add_data_point(1.0, 2.0, position={
+                "wgs84": {"lat": 30.003, "lng": 120.000, "alt": 0.0},
+                "gcj02": {"lat": 30.003, "lng": 120.000, "alt": 0.0},
+                "position_source": "real",
+            }, spectrometer_raw={"valid": True, "baseline_set": True}, pollution_metric=metric_config)
+            manager.stop_mission()
+
+            server = module.WebConfigServer(standalone=True)
+            server.data_manager = manager
+            client = server.app.test_client()
+
+            missions_response = client.get("/api/data/missions")
+            detail_response = client.get(f"/api/data/mission/{mission_id}")
+
+        self.assertEqual(missions_response.status_code, 200)
+        self.assertEqual(detail_response.status_code, 200)
+        listed = missions_response.get_json()["data"][0]
+        detail = detail_response.get_json()["data"]
+
+        self.assertEqual(listed["id"], mission_id)
+        self.assertEqual(listed["point_count"], 6)
+        self.assertEqual(listed["valid_surface_point_count"], 3)
+        self.assertEqual(listed["pollutant_name"], "COD")
+        self.assertEqual(listed["unit"], "mg/L")
+        self.assertAlmostEqual(listed["concentration_min"], 0.2)
+        self.assertAlmostEqual(listed["concentration_max"], 2.0)
+        self.assertEqual(listed["surface_ready"], True)
+        self.assertEqual(listed["quality_summary"]["excluded_reasons"]["missing_gps"], 1)
+        self.assertEqual(listed["quality_summary"]["excluded_reasons"]["spectrometer_invalid"], 1)
+        self.assertEqual(listed["quality_summary"]["excluded_reasons"]["above_max_valid"], 1)
+        self.assertEqual(detail["summary"]["calibration_id"], "cal-summary-20260609")
+        self.assertEqual(detail["summary"]["valid_surface_point_count"], 3)
+        self.assertEqual(detail["summary"]["quality_summary"]["excluded_count"], 3)
+
+    def test_web_live_surface_uses_current_mission_points(self):
+        module, _, _ = _load_script(
+            "web_config_server_live_surface_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=True)
+            server.data_manager = module.MissionDataManager(str(Path(tmpdir) / "missions"))
+            client = server.app.test_client()
+            metric_config = {
+                "enabled": True,
+                "slope": 1.0,
+                "intercept": 0.0,
+                "unit": "mg/L",
+                "display_name": "COD",
+                "pollutant_name": "COD",
+                "calibration_id": "cal-live-20260609",
+                "min_valid": 0.0,
+                "max_valid": 1.0,
+            }
+
+            server.data_manager.start_mission("live-surface")
+            for lat, lng, absorbance in [
+                (30.000, 120.000, 0.2),
+                (30.001, 120.000, 0.4),
+                (30.000, 120.001, 0.6),
+            ]:
+                server.data_manager.add_data_point(1.0, absorbance, position={
+                    "wgs84": {"lat": lat, "lng": lng, "alt": 0.0},
+                    "gcj02": {"lat": lat, "lng": lng, "alt": 0.0},
+                    "position_source": "real",
+                }, spectrometer_raw={"valid": True, "baseline_set": True}, pollution_metric=metric_config)
+            valid_surface_resp = client.get("/api/map/live/surface?metric=concentration&size=4&power=1.5")
+            live_resp = client.get("/api/map/live?metric=concentration&size=4&power=1.5")
+
+            server.data_manager.start_mission("live-too-few")
+            for lat, lng, absorbance in [
+                (30.000, 120.000, 0.2),
+                (30.001, 120.000, 0.4),
+            ]:
+                server.data_manager.add_data_point(1.0, absorbance, position={
+                    "wgs84": {"lat": lat, "lng": lng, "alt": 0.0},
+                    "gcj02": {"lat": lat, "lng": lng, "alt": 0.0},
+                    "position_source": "real",
+                }, spectrometer_raw={"valid": True, "baseline_set": True}, pollution_metric=metric_config)
+            invalid_surface_resp = client.get("/api/map/live/surface?metric=concentration&size=4&power=1.5")
+
+        self.assertEqual(valid_surface_resp.status_code, 200)
+        surface = valid_surface_resp.get_json()["data"]
+        self.assertTrue(surface["valid"])
+        self.assertEqual(surface["point_count"], 3)
+        self.assertEqual(len(surface["grid"]), 16)
+        self.assertEqual(surface["meta"]["metric_label"], "COD")
+        self.assertEqual(surface["meta"]["unit"], "mg/L")
+        self.assertEqual(surface["meta"]["calibration_id"], "cal-live-20260609")
+        self.assertEqual(surface["meta"]["idw"]["size"], 4)
+        self.assertAlmostEqual(surface["meta"]["idw"]["power"], 1.5)
+
+        self.assertEqual(live_resp.status_code, 200)
+        live = live_resp.get_json()["data"]
+        self.assertEqual(len(live["data_points"]), 3)
+        self.assertTrue(live["surface"]["valid"])
+        self.assertEqual(live["surface"]["point_count"], 3)
+
+        self.assertEqual(invalid_surface_resp.status_code, 200)
+        invalid_surface = invalid_surface_resp.get_json()["data"]
+        self.assertFalse(invalid_surface["valid"])
+        self.assertIn("3", invalid_surface["reason"])
+        self.assertEqual(invalid_surface["point_count"], 2)
+        self.assertEqual(invalid_surface["grid"], [])
+
+    def test_web_idw_surface_clamps_params_and_handles_exact_or_zero_span_points(self):
+        module, _, _ = _load_script(
+            "web_config_server_idw_boundary_params_test",
+            "scripts/web_config_server.py",
+        )
+
+        metric_config = {
+            "enabled": True,
+            "slope": 1.0,
+            "intercept": 0.0,
+            "unit": "mg/L",
+            "display_name": "COD",
+            "pollutant_name": "COD",
+            "min_valid": 0.0,
+            "max_valid": 1.0,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            server = module.WebConfigServer(standalone=True)
+            manager = module.MissionDataManager(str(Path(tmpdir) / "missions"))
+            manager.start_mission("idw-boundary")
+            for lat, lng, absorbance in [
+                (30.0000, 120.0000, 0.1),
+                (30.0010, 120.0000, 0.2),
+                (30.0000, 120.0010, 0.3),
+            ]:
+                manager.add_data_point(1.0, absorbance, position={
+                    "wgs84": {"lat": lat, "lng": lng, "alt": 0.0},
+                    "gcj02": {"lat": lat, "lng": lng, "alt": 0.0},
+                    "position_source": "real",
+                }, spectrometer_raw={"valid": True, "baseline_set": True}, pollution_metric=metric_config)
+            clamped_low = server._build_idw_surface(
+                manager.current_mission_data,
+                metric="concentration",
+                size=1,
+                power=0.1,
+            )
+            clamped_high = server._build_idw_surface(
+                manager.current_mission_data,
+                metric="concentration",
+                size=999,
+                power=9.0,
+            )
+
+            zero_span_manager = module.MissionDataManager(str(Path(tmpdir) / "zero-span"))
+            zero_span_manager.start_mission("zero-span")
+            for absorbance in [0.1, 0.2, 0.3]:
+                zero_span_manager.add_data_point(1.0, absorbance, position={
+                    "wgs84": {"lat": 30.0, "lng": 120.0, "alt": 0.0},
+                    "gcj02": {"lat": 30.0, "lng": 120.0, "alt": 0.0},
+                    "position_source": "real",
+                }, spectrometer_raw={"valid": True, "baseline_set": True}, pollution_metric=metric_config)
+            zero_span = server._build_idw_surface(
+                zero_span_manager.current_mission_data,
+                metric="concentration",
+                size=3,
+                power=2.0,
+            )
+
+        self.assertTrue(clamped_low["valid"])
+        self.assertEqual(clamped_low["size"], 3)
+        self.assertAlmostEqual(clamped_low["power"], 0.5)
+        self.assertEqual(len(clamped_low["grid"]), 9)
+        self.assertAlmostEqual(clamped_low["grid"][0]["value"], 0.1)
+        self.assertEqual(clamped_high["size"], module.MAX_SURFACE_SIZE)
+        self.assertAlmostEqual(clamped_high["power"], 5.0)
+        self.assertEqual(len(clamped_high["grid"]), module.MAX_SURFACE_SIZE * module.MAX_SURFACE_SIZE)
+        self.assertTrue(zero_span["valid"])
+        self.assertEqual(len(zero_span["grid"]), 9)
+        self.assertAlmostEqual(zero_span["bounds"]["southwest"]["lat"], 30.0)
+        self.assertAlmostEqual(zero_span["bounds"]["northeast"]["lng"], 120.0)
+        self.assertTrue(all(math.isfinite(cell["value"]) for cell in zero_span["grid"]))
+
+    def test_web_idw_surface_reports_all_invalid_metric_values(self):
+        module, _, _ = _load_script(
+            "web_config_server_idw_all_invalid_test",
+            "scripts/web_config_server.py",
+        )
+
+        metric_config = {
+            "enabled": True,
+            "slope": 1.0,
+            "intercept": 0.0,
+            "unit": "mg/L",
+            "display_name": "COD",
+            "pollutant_name": "COD",
+            "min_valid": 0.0,
+            "max_valid": 1.0,
+        }
+        with tempfile.TemporaryDirectory() as tmpdir:
+            server = module.WebConfigServer(standalone=True)
+            manager = module.MissionDataManager(str(Path(tmpdir) / "missions"))
+            manager.start_mission("idw-all-invalid")
+            manager.add_data_point(1.0, -0.1, position={
+                "wgs84": {"lat": 30.0, "lng": 120.0, "alt": 0.0},
+                "gcj02": {"lat": 30.0, "lng": 120.0, "alt": 0.0},
+                "position_source": "real",
+            }, spectrometer_raw={"valid": True, "baseline_set": True}, pollution_metric=metric_config)
+            manager.add_data_point(1.0, 2.0, position={
+                "wgs84": {"lat": 30.001, "lng": 120.0, "alt": 0.0},
+                "gcj02": {"lat": 30.001, "lng": 120.0, "alt": 0.0},
+                "position_source": "real",
+            }, spectrometer_raw={"valid": True, "baseline_set": True}, pollution_metric=metric_config)
+            manager.current_mission_data["data_points"].append({
+                "voltage": 1.0,
+                "absorbance": float("nan"),
+                "concentration": float("nan"),
+                "concentration_unit": "mg/L",
+                "concentration_display_name": "COD",
+                "pollutant_name": "COD",
+                "metric_used": "concentration",
+                "gcj02": {"lat": 30.002, "lng": 120.0, "alt": 0.0},
+                "quality": {
+                    "spectrometer_valid": True,
+                    "gps_valid": True,
+                    "metric_config_snapshot": metric_config,
+                },
+            })
+            surface = server._build_idw_surface(
+                manager.current_mission_data,
+                metric="concentration",
+                size=4,
+                power=2.0,
+            )
+
+        self.assertFalse(surface["valid"])
+        self.assertEqual(surface["grid"], [])
+        self.assertIsNone(surface["min"])
+        self.assertIsNone(surface["max"])
+        self.assertEqual(surface["point_count"], 0)
+        self.assertEqual(surface["excluded_count"], 3)
+        self.assertEqual(surface["excluded_reasons"]["below_min_valid"], 1)
+        self.assertEqual(surface["excluded_reasons"]["above_max_valid"], 1)
+        self.assertEqual(surface["excluded_reasons"]["non_finite_metric"], 1)
 
     def test_web_lab_config_api_and_sim_status_feed_live_map(self):
         module, _, string_cls = _load_script(

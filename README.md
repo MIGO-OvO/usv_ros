@@ -575,6 +575,9 @@ REST API 和 Socket.IO 实时事件。
 | `GET /api/data/missions` | 历史任务文件列表 |
 | `GET /api/data/mission/<id>` | 历史任务 JSON |
 | `GET /api/data/mission/<id>/csv` | 历史任务 CSV 下载 |
+| `GET /api/data/mission/<id>/geojson` | 历史污染物点位 GeoJSON；可带 `metric=concentration` 与 `download=true` |
+| `GET /api/data/mission/<id>/surface` | 历史污染物 IDW surface；可带 `metric`、`size`、`power` 与 `download=true` |
+| `GET /api/map/live` | 当前任务实时点位、轨迹、污染物 surface、走航门控状态 |
 | `GET /api/logs/files`、`GET /api/logs/<filename>` | 系统日志查看 |
 | `GET /api/hardware/config`、`POST /api/hardware/config` | 硬件连接配置 |
 | `GET /api/hardware/serial-ports` | 枚举串口 |
@@ -763,7 +766,23 @@ curl "http://127.0.0.1:5000/api/logs/usv_system.log?lines=100"
 ```bash
 curl http://127.0.0.1:5000/api/data/missions
 curl http://127.0.0.1:5000/api/data/mission/<mission_id>/csv > mission.csv
+curl "http://127.0.0.1:5000/api/data/mission/<mission_id>/geojson?metric=concentration&download=true" > mission.geojson
+curl "http://127.0.0.1:5000/api/data/mission/<mission_id>/surface?metric=concentration&size=80&power=2&download=true" > mission_surface.json
+curl http://127.0.0.1:5000/api/map/live > live_map_snapshot.json
 ```
+
+污染物地图现场证据包至少保存：
+
+| 字段 | 说明 |
+|---|---|
+| `mission_id` | Web 任务 ID，对应 `~/usv_ws/data/missions/mission_*.json` |
+| `pollutant_name` / `unit` | 单污染物线性模型名称与单位 |
+| `calibration_id` / `work_curve_id` | Web 当前校准或工作曲线标识 |
+| `sample_total` / `csv_rows` | 原始任务点数与 CSV 行数 |
+| `valid_gps_points` / `excluded_points` | 进入 GeoJSON/IDW 的有效 GPS 点数与被质量门控剔除点数 |
+| `surface_grid` | IDW 网格大小，如 `80x80`，以及 `power` 参数 |
+| `screenshot_path` | Web 地图 16:9 桌面截图路径 |
+| `USV_SMPL/USV_DONE` | bridge 或 roslaunch 日志中 mission script 采样闭环片段 |
 
 ## 验证
 
@@ -791,6 +810,15 @@ cd ~/usv_ws/src/usv_ros/frontend
 npm run lint
 npm run build
 ```
+
+污染物地图离线验证：
+
+```bash
+cd ~/usv_ws/src/usv_ros
+python3 scripts/verify_pollution_workflow.py --mock --evidence .omo/evidence/pollution-workflow-verify.json
+```
+
+该脚本只创建 mock mission 并调用 Web API，不启动 `mavlink-routerd`，不访问 Pixhawk 或检测装置串口。
 
 ### 运行时基线检查
 

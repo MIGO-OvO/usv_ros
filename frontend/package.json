@@ -7,6 +7,8 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
+    "smoke:map": "node scripts/smoke-map.mjs",
+    "smoke:map:browser": "node scripts/smoke-map-browser.mjs",
     "preview": "vite preview"
   },
   "dependencies": {

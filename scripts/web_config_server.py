@@ -26,6 +26,7 @@ from __future__ import print_function
 
 import json
 import copy
+import hashlib
 import math
 import os
 import sys
@@ -106,8 +107,26 @@ DATA_DIR = os.path.expanduser("~/usv_ws/data/missions")
 MAX_LIVE_TRACK_POINTS = 1000
 DEFAULT_SURFACE_SIZE = 50
 MAX_SURFACE_SIZE = 80
+POSITION_STALE_AFTER_S = 5.0
 ANGLE_AXES = ("X", "Y", "Z", "A")
 ANGLE_STALE_AFTER_MS = 1000
+DEFAULT_MAPPING_PROFILE = {
+    "survey_min_distance_m": 5.0,
+    "survey_min_speed_mps": 0.0,
+    "survey_max_speed_mps": 0.0,
+    "survey_require_valid_spectrometer": True,
+    "survey_require_gps": True,
+    "survey_max_position_age_s": 5.0,
+}
+SURVEY_GATE_REASON_LABELS = {
+    "no_gps": "GPS unavailable",
+    "gps_stale": "GPS stale",
+    "distance_too_short": "distance too short",
+    "speed_too_low": "speed too low",
+    "speed_too_high": "speed too high",
+    "spectrometer_invalid": "spectrometer invalid",
+    "unknown": "unknown",
+}
 
 
 def _to_float_or_none(value):
@@ -116,6 +135,21 @@ def _to_float_or_none(value):
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) else None
+
+
+def _text_or_default(value, default, max_len):
+    text = str(default if value is None else value).strip()
+    return text[:max_len] or default
+
+
+def _bool_or_default(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
 
 
 def _out_of_china(lat, lng):
@@ -282,21 +316,65 @@ def normalize_lab_pollution(config):
 
 def normalize_pollution_metric_config(config):
     raw = config if isinstance(config, dict) else {}
-    enabled = bool(raw.get("enabled", False))
+    enabled = _bool_or_default(raw.get("enabled", False), False)
     slope = _to_float_or_none(raw.get("slope", 1.0))
     intercept = _to_float_or_none(raw.get("intercept", 0.0))
     if slope is None:
         slope = 1.0
     if intercept is None:
         intercept = 0.0
-    unit = str(raw.get("unit", "mg/L") or "mg/L").strip()[:32] or "mg/L"
-    display_name = str(raw.get("display_name", "浓度") or "浓度").strip()[:64] or "浓度"
+    unit = _text_or_default(raw.get("unit", "mg/L"), "mg/L", 32)
+    display_name = _text_or_default(raw.get("display_name", "浓度"), "浓度", 64)
+    pollutant_name = _text_or_default(raw.get("pollutant_name", display_name), display_name, 64)
+    method_name = _text_or_default(raw.get("method_name", "吸光度线性工作曲线"), "吸光度线性工作曲线", 64)
+    calibration_id = _text_or_default(raw.get("calibration_id", ""), "", 96)
+    calibrated_at = _text_or_default(raw.get("calibrated_at", ""), "", 64)
     return {
         "enabled": enabled,
         "slope": slope,
         "intercept": intercept,
         "unit": unit,
         "display_name": display_name,
+        "pollutant_name": pollutant_name,
+        "method_name": method_name,
+        "wavelength_nm": _to_float_or_none(raw.get("wavelength_nm")),
+        "calibration_id": calibration_id,
+        "calibrated_at": calibrated_at,
+        "min_valid": _to_float_or_none(raw.get("min_valid")),
+        "max_valid": _to_float_or_none(raw.get("max_valid")),
+        "lod": _to_float_or_none(raw.get("lod")),
+        "loq": _to_float_or_none(raw.get("loq")),
+        "clamp_negative": _bool_or_default(raw.get("clamp_negative", False), False),
+    }
+
+
+def normalize_mapping_profile_config(config):
+    raw = config if isinstance(config, dict) else {}
+
+    def fnum(name):
+        value = _to_float_or_none(raw.get(name, DEFAULT_MAPPING_PROFILE[name]))
+        if value is None:
+            value = DEFAULT_MAPPING_PROFILE[name]
+        return max(0.0, value)
+
+    min_speed = fnum("survey_min_speed_mps")
+    max_speed = fnum("survey_max_speed_mps")
+    if max_speed > 0.0 and max_speed < min_speed:
+        max_speed = min_speed
+
+    return {
+        "survey_min_distance_m": fnum("survey_min_distance_m"),
+        "survey_min_speed_mps": min_speed,
+        "survey_max_speed_mps": max_speed,
+        "survey_require_valid_spectrometer": _bool_or_default(
+            raw.get("survey_require_valid_spectrometer", DEFAULT_MAPPING_PROFILE["survey_require_valid_spectrometer"]),
+            DEFAULT_MAPPING_PROFILE["survey_require_valid_spectrometer"],
+        ),
+        "survey_require_gps": _bool_or_default(
+            raw.get("survey_require_gps", DEFAULT_MAPPING_PROFILE["survey_require_gps"]),
+            DEFAULT_MAPPING_PROFILE["survey_require_gps"],
+        ),
+        "survey_max_position_age_s": fnum("survey_max_position_age_s"),
     }
 
 
@@ -308,6 +386,8 @@ def resolve_pollution_metric(voltage, absorbance, metric_config=None):
     metric_used = "absorbance"
     if cfg["enabled"] and absorbance_value is not None:
         concentration = cfg["slope"] * absorbance_value + cfg["intercept"]
+        if cfg["clamp_negative"] and concentration < 0.0:
+            concentration = 0.0
         if math.isfinite(concentration):
             metric_used = "concentration"
         else:
@@ -318,7 +398,108 @@ def resolve_pollution_metric(voltage, absorbance, metric_config=None):
         "concentration": concentration,
         "concentration_unit": cfg["unit"],
         "concentration_display_name": cfg["display_name"],
+        "pollutant_name": cfg["pollutant_name"],
+        "method_name": cfg["method_name"],
+        "wavelength_nm": cfg["wavelength_nm"],
+        "calibration_id": cfg["calibration_id"],
+        "calibrated_at": cfg["calibrated_at"],
+        "min_valid": cfg["min_valid"],
+        "max_valid": cfg["max_valid"],
+        "lod": cfg["lod"],
+        "loq": cfg["loq"],
+        "clamp_negative": cfg["clamp_negative"],
         "metric_used": metric_used,
+    }
+
+
+def _metric_config_snapshot(metric_config=None):
+    cfg = normalize_pollution_metric_config(metric_config or {})
+    return {
+        "enabled": cfg["enabled"],
+        "slope": cfg["slope"],
+        "intercept": cfg["intercept"],
+        "unit": cfg["unit"],
+        "display_name": cfg["display_name"],
+        "pollutant_name": cfg["pollutant_name"],
+        "method_name": cfg["method_name"],
+        "wavelength_nm": cfg["wavelength_nm"],
+        "calibration_id": cfg["calibration_id"],
+        "calibrated_at": cfg["calibrated_at"],
+        "min_valid": cfg["min_valid"],
+        "max_valid": cfg["max_valid"],
+        "lod": cfg["lod"],
+        "loq": cfg["loq"],
+        "clamp_negative": cfg["clamp_negative"],
+    }
+
+
+def _detector_health_summary(system_health=None):
+    if not isinstance(system_health, dict):
+        return None
+    for key in ("detector", "health"):
+        section = system_health.get(key)
+        if isinstance(section, dict):
+            summary = section.get("summary") or section.get("level") or section.get("status")
+            if summary is not None:
+                return str(summary)
+    summary = (
+        system_health.get("detector_health_summary")
+        or system_health.get("summary")
+        or system_health.get("status")
+    )
+    return str(summary) if summary is not None else None
+
+
+def _position_with_age(position=None, now=None):
+    if not isinstance(position, dict):
+        return None
+    result = copy.deepcopy(position)
+    received_at = _to_float_or_none(result.get("received_at"))
+    if received_at is not None:
+        current_time = time.time() if now is None else now
+        age_s = max(0.0, current_time - received_at)
+        result["position_age_s"] = age_s
+        if age_s > POSITION_STALE_AFTER_S:
+            result["gps_valid"] = False
+    return result
+
+
+def build_sample_quality(
+    spectrometer_raw=None,
+    position=None,
+    metric_config=None,
+    system_health=None,
+    quality=None,
+):
+    raw = spectrometer_raw if isinstance(spectrometer_raw, dict) else {}
+    pos = position if isinstance(position, dict) else {}
+    overrides = quality if isinstance(quality, dict) else {}
+
+    def pick(name, value):
+        return overrides.get(name, value)
+
+    position_source = str(pos.get("position_source") or ("real" if pos else "none"))
+    gps_valid = bool(pos.get("wgs84")) and position_source == "real" and not bool(pos.get("lab_mode", False))
+    if "gps_valid" in pos:
+        gps_valid = gps_valid and bool(pos.get("gps_valid"))
+    gps_fix_type = pos.get("gps_fix_type")
+    try:
+        gps_fix_type = int(gps_fix_type) if gps_fix_type is not None else None
+    except (TypeError, ValueError):
+        gps_fix_type = None
+
+    return {
+        "spectrometer_valid": _bool_or_default(pick("spectrometer_valid", raw.get("valid")), False),
+        "baseline_set": _bool_or_default(pick("baseline_set", raw.get("baseline_set")), False),
+        "baseline_voltage": _to_float_or_none(pick("baseline_voltage", raw.get("baseline_voltage"))),
+        "reference_voltage": _to_float_or_none(pick("reference_voltage", raw.get("reference_voltage"))),
+        "gps_valid": bool(pick("gps_valid", gps_valid)),
+        "position_source": str(pick("position_source", position_source)),
+        "gps_fix_type": pick("gps_fix_type", gps_fix_type),
+        "hdop": _to_float_or_none(pick("hdop", pos.get("hdop"))),
+        "speed_mps": _to_float_or_none(pick("speed_mps", pos.get("speed_mps"))),
+        "detector_health_summary": pick("detector_health_summary", _detector_health_summary(system_health)),
+        "metric_config_snapshot": _metric_config_snapshot(metric_config),
     }
 
 
@@ -335,6 +516,137 @@ def _extract_metric_value(point, metric):
     else:
         value = point.get("absorbance")
     return _to_float_or_none(value)
+
+
+def _point_coord_for_summary(point):
+    if not isinstance(point, dict):
+        return None
+    for key in ("gcj02", "wgs84"):
+        coord = point.get(key)
+        if not isinstance(coord, dict):
+            continue
+        lat = _to_float_or_none(coord.get("lat"))
+        lng = _to_float_or_none(coord.get("lng"))
+        if lat is not None and lng is not None:
+            return {"lat": lat, "lng": lng}
+    return None
+
+
+def _point_metric_config_for_summary(point):
+    if not isinstance(point, dict):
+        return {}
+    quality = point.get("quality")
+    if isinstance(quality, dict):
+        snapshot = quality.get("metric_config_snapshot")
+        if isinstance(snapshot, dict):
+            return snapshot
+    return point
+
+
+def _first_text_value(*values):
+    for value in values:
+        if value is not None and str(value) != "":
+            return str(value)
+    return None
+
+
+def _point_summary_surface_reason(point):
+    if not isinstance(point, dict):
+        return "invalid_point"
+    if point.get("lab_mode"):
+        return "lab_excluded"
+    if _point_coord_for_summary(point) is None:
+        return "missing_gps"
+
+    quality = point.get("quality")
+    quality = quality if isinstance(quality, dict) else {}
+    if quality.get("spectrometer_valid") is False:
+        return "spectrometer_invalid"
+    if quality.get("gps_valid") is False:
+        return "gps_invalid"
+
+    raw_value = point.get("concentration")
+    metric_name = "concentration"
+    if raw_value is None:
+        raw_value = point.get("absorbance")
+        metric_name = "absorbance"
+    value = _to_float_or_none(raw_value)
+    if value is None:
+        if raw_value is not None:
+            try:
+                raw_float = float(raw_value)
+            except (TypeError, ValueError):
+                raw_float = None
+            if raw_float is not None and not math.isfinite(raw_float):
+                return "non_finite_metric"
+        return "missing_metric"
+
+    if metric_name == "concentration":
+        cfg = _point_metric_config_for_summary(point)
+        min_valid = _to_float_or_none(cfg.get("min_valid"))
+        max_valid = _to_float_or_none(cfg.get("max_valid"))
+        if min_valid is not None and value < min_valid:
+            return "below_min_valid"
+        if max_valid is not None and value > max_valid:
+            return "above_max_valid"
+    return ""
+
+
+def build_mission_summary(mission_data):
+    data = mission_data if isinstance(mission_data, dict) else {}
+    points = data.get("data_points", [])
+    points = points if isinstance(points, list) else []
+    excluded_reasons = {}
+    concentration_values = []
+    valid_surface_point_count = 0
+    pollutant_name = None
+    unit = None
+    calibration_id = None
+
+    def count(reason):
+        excluded_reasons[reason] = excluded_reasons.get(reason, 0) + 1
+
+    for point in points:
+        point = point if isinstance(point, dict) else {}
+        cfg = _point_metric_config_for_summary(point)
+        pollutant_name = pollutant_name or _first_text_value(
+            point.get("pollutant_name"),
+            cfg.get("pollutant_name"),
+            point.get("concentration_display_name"),
+            cfg.get("display_name"),
+        )
+        unit = unit or _first_text_value(point.get("concentration_unit"), cfg.get("unit"))
+        calibration_id = calibration_id or _first_text_value(point.get("calibration_id"), cfg.get("calibration_id"))
+
+        concentration = _to_float_or_none(point.get("concentration"))
+        if concentration is not None:
+            concentration_values.append(concentration)
+
+        reason = _point_summary_surface_reason(point)
+        if reason:
+            count(reason)
+        else:
+            valid_surface_point_count += 1
+
+    excluded_count = sum(excluded_reasons.values())
+    quality_summary = {
+        "total_points": len(points),
+        "valid_surface_point_count": valid_surface_point_count,
+        "excluded_count": excluded_count,
+        "excluded_reasons": excluded_reasons,
+    }
+    return {
+        "point_count": len(points),
+        "valid_surface_point_count": valid_surface_point_count,
+        "pollutant_name": pollutant_name,
+        "unit": unit,
+        "calibration_id": calibration_id,
+        "concentration_min": min(concentration_values) if concentration_values else None,
+        "concentration_max": max(concentration_values) if concentration_values else None,
+        "surface_ready": valid_surface_point_count >= 3,
+        "quality_summary": quality_summary,
+    }
+
 
 class CalibrationManager(object):
     """零点校准管理器"""
@@ -455,10 +767,16 @@ class MissionDataManager(object):
         pollution_metric=None,
         position_source=None,
         lab_mode=False,
+        quality=None,
+        system_health=None,
+        mission_status=None,
+        route_snapshot_id=None,
+        route_source=None,
     ):
         """添加数据点（含电压、吸光度、地理位置和污染指标）。"""
         if self.current_mission_file:
             metric = resolve_pollution_metric(voltage, absorbance, pollution_metric)
+            position_payload = _position_with_age(position)
             point = {
                 "timestamp": datetime.now().isoformat(),
                 "voltage": metric["voltage"],
@@ -466,14 +784,37 @@ class MissionDataManager(object):
                 "concentration": metric["concentration"],
                 "concentration_unit": metric["concentration_unit"],
                 "concentration_display_name": metric["concentration_display_name"],
+                "pollutant_name": metric["pollutant_name"],
+                "method_name": metric["method_name"],
+                "wavelength_nm": metric["wavelength_nm"],
+                "calibration_id": metric["calibration_id"],
+                "calibrated_at": metric["calibrated_at"],
+                "min_valid": metric["min_valid"],
+                "max_valid": metric["max_valid"],
+                "lod": metric["lod"],
+                "loq": metric["loq"],
+                "clamp_negative": metric["clamp_negative"],
                 "metric_used": metric["metric_used"],
+                "quality": build_sample_quality(
+                    spectrometer_raw=spectrometer_raw,
+                    position=position_payload,
+                    metric_config=pollution_metric,
+                    system_health=system_health,
+                    quality=quality,
+                ),
             }
-            if position:
-                point.update(position)
+            if position_payload:
+                point.update(position_payload)
             if "position_source" not in point:
-                point["position_source"] = str(position_source or ("real" if position else "none"))
+                point["position_source"] = str(position_source or ("real" if position_payload else "none"))
             if "lab_mode" not in point:
                 point["lab_mode"] = bool(lab_mode)
+            if mission_status is not None:
+                point["mission_status"] = str(mission_status)
+            if route_snapshot_id is not None:
+                point["route_snapshot_id"] = str(route_snapshot_id)
+            if route_source is not None:
+                point["route_source"] = str(route_source)
             if waypoint_seq is not None:
                 try:
                     point["waypoint_seq"] = int(waypoint_seq)
@@ -504,6 +845,14 @@ class MissionDataManager(object):
             with open(self.current_mission_file, 'w', encoding='utf-8') as f:
                 json.dump(self.current_mission_data, f, ensure_ascii=False, indent=2)
 
+    @staticmethod
+    def _with_summary(data):
+        if not isinstance(data, dict):
+            return data
+        result = dict(data)
+        result["summary"] = build_mission_summary(result)
+        return result
+
     def list_missions(self):
         """列出所有任务。"""
         missions = []
@@ -519,7 +868,8 @@ class MissionDataManager(object):
                         # 为了效率，这里假设文件较小，或者只读前几行
                         # 简单起见，这里读整个文件，但在生产环境中应该优化
                         data = json.load(file)
-                        missions.append({
+                        summary = build_mission_summary(data)
+                        mission = {
                             "id": data.get("mission_id", f),
                             "name": data.get("name", f),
                             "start_time": data.get("start_time"),
@@ -527,7 +877,10 @@ class MissionDataManager(object):
                             "point_count": len(data.get("data_points", [])),
                             "track_count": len(data.get("track_points", [])),
                             "route_count": len(data.get("route_waypoints", [])),
-                        })
+                            "summary": summary,
+                        }
+                        mission.update(summary)
+                        missions.append(mission)
                 except Exception:
                     continue
         # 按时间倒序
@@ -540,12 +893,12 @@ class MissionDataManager(object):
             and isinstance(self.current_mission_data, dict)
             and str(self.current_mission_data.get("mission_id")) == str(mission_id)
         ):
-            return self.current_mission_data
+            return self._with_summary(self.current_mission_data)
         filename = f"mission_{mission_id}.json"
         path = os.path.join(self.data_dir, filename)
         if os.path.exists(path):
             with open(path, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                return self._with_summary(json.load(f))
         return None
 
     def delete_mission(self, mission_id):
@@ -611,6 +964,7 @@ DEFAULT_CONFIG = {
             "on_fail": "HOLD"
         }
     },
+    "mapping_profile": copy.deepcopy(DEFAULT_MAPPING_PROFILE),
     "detection_settings": {
         "duration": 5.0,
         "sample_rate": 100
@@ -620,7 +974,17 @@ DEFAULT_CONFIG = {
         "slope": 1.0,
         "intercept": 0.0,
         "unit": "mg/L",
-        "display_name": "浓度"
+        "display_name": "浓度",
+        "pollutant_name": "浓度",
+        "method_name": "吸光度线性工作曲线",
+        "wavelength_nm": None,
+        "calibration_id": "",
+        "calibrated_at": "",
+        "min_valid": None,
+        "max_valid": None,
+        "lod": None,
+        "loq": None,
+        "clamp_negative": False
     },
     "hardware": {
         "pump_serial_port": "/dev/ttyUSB0",
@@ -742,6 +1106,10 @@ class ConfigManager(object):
         return normalize_pollution_metric_config(data)
 
     @staticmethod
+    def _normalize_mapping_profile(data):
+        return normalize_mapping_profile_config(data)
+
+    @staticmethod
     def _normalize_lab_mode(data):
         return normalize_lab_config(data)
 
@@ -780,6 +1148,9 @@ class ConfigManager(object):
             self.config['pollution_metric'] = self._normalize_pollution_metric(
                 self.config.get('pollution_metric', {})
             )
+            self.config['mapping_profile'] = self._normalize_mapping_profile(
+                self.config.get('mapping_profile', {})
+            )
             self.config['lab_mode'] = self._normalize_lab_mode(
                 self.config.get('lab_mode', {})
             )
@@ -810,6 +1181,9 @@ class ConfigManager(object):
         self.config['pollution_metric'] = self._normalize_pollution_metric(
             self.config.get('pollution_metric', {})
         )
+        self.config['mapping_profile'] = self._normalize_mapping_profile(
+            self.config.get('mapping_profile', {})
+        )
         self.config['lab_mode'] = self._normalize_lab_mode(
             self.config.get('lab_mode', {})
         )
@@ -839,6 +1213,9 @@ class ConfigManager(object):
         self.config['pollution_metric'] = self._normalize_pollution_metric(
             self.config.get('pollution_metric', {})
         )
+        self.config['mapping_profile'] = self._normalize_mapping_profile(
+            self.config.get('mapping_profile', {})
+        )
         self.config['lab_mode'] = self._normalize_lab_mode(
             self.config.get('lab_mode', {})
         )
@@ -855,6 +1232,9 @@ class ConfigManager(object):
         )
         config['pollution_metric'] = self._normalize_pollution_metric(
             config.get('pollution_metric', {})
+        )
+        config['mapping_profile'] = self._normalize_mapping_profile(
+            config.get('mapping_profile', {})
         )
         config['lab_mode'] = self._normalize_lab_mode(
             config.get('lab_mode', {})
@@ -923,6 +1303,9 @@ class WebConfigServer(object):
         self.spectrometer_status = "idle"
         self.latest_spectrometer_payload = {}
         self.mission_status = "IDLE"
+        self.latest_trigger_status = {"status": "", "received_at": None}
+        self.latest_survey_gate = None
+        self.latest_survey_sample_done_at = None
         self.injection_pump_status = {
             "enabled": False,
             "speed": 0,
@@ -937,6 +1320,8 @@ class WebConfigServer(object):
         self.current_position = None
         self.live_track_points = []
         self.route_waypoints = []
+        self.route_snapshot_id = None
+        self.route_source = "none"
         self.current_waypoint_seq = None
         self.latest_automation_status = {}
         self.latest_system_health = {}
@@ -1127,7 +1512,24 @@ class WebConfigServer(object):
 
     def _trigger_status_cb(self, msg):
         """采样生命周期回调，用于 Web 数据中心自动建档。"""
-        status = (msg.data or '').lower()
+        raw_status = str(getattr(msg, "data", "") or "")
+        status = raw_status.lower()
+        received_at = datetime.now().isoformat()
+        self.latest_trigger_status = {
+            "status": raw_status,
+            "received_at": received_at,
+        }
+        if status.startswith("survey_gate_skipped:"):
+            reason = raw_status.split(":", 1)[1].strip() or "unknown"
+            self.latest_survey_gate = {
+                "status": raw_status,
+                "reason": reason,
+                "reason_label": SURVEY_GATE_REASON_LABELS.get(reason, reason),
+                "skipped": True,
+                "received_at": received_at,
+            }
+        elif "survey_sample_done" in status:
+            self.latest_survey_sample_done_at = received_at
         if 'sampling_started' in status:
             self.automation_running = True
             self._start_data_recording_if_needed(source="trigger")
@@ -1139,6 +1541,8 @@ class WebConfigServer(object):
         ):
             self.automation_running = False
             self._stop_data_recording_if_active()
+        if self.socketio:
+            self.socketio.emit("survey_status", self._survey_status_snapshot())
 
     def _injection_status_cb(self, msg):
         """进样泵状态回调。"""
@@ -1297,6 +1701,10 @@ class WebConfigServer(object):
                     sample_id=automation.get("sample_id"),
                     spectrometer_raw=data,
                     pollution_metric=self._current_metric_config(),
+                    system_health=self.latest_system_health,
+                    mission_status=self.mission_status,
+                    route_snapshot_id=self.route_snapshot_id,
+                    route_source=self.route_source,
                 )
             except TypeError:
                 # Test doubles and older integrations may still expose the legacy two-argument API.
@@ -1332,6 +1740,8 @@ class WebConfigServer(object):
         waypoint_seq = self._parse_status_waypoint(msg.data)
         if waypoint_seq is not None:
             self.current_waypoint_seq = waypoint_seq
+        if self.socketio:
+            self.socketio.emit("survey_status", self._survey_status_snapshot())
 
     def _pid_error_cb(self, msg):
         """PID 误差回调"""
@@ -1444,6 +1854,22 @@ class WebConfigServer(object):
         )
         if not position:
             return
+        position["received_at"] = time.time()
+        gps_fix_type = getattr(msg, "fix_type", None)
+        status = getattr(msg, "status", None)
+        if gps_fix_type is None and status is not None:
+            gps_fix_type = getattr(status, "status", None)
+        if gps_fix_type is not None:
+            try:
+                position["gps_fix_type"] = int(gps_fix_type)
+            except (TypeError, ValueError):
+                position["gps_fix_type"] = gps_fix_type
+        hdop = _to_float_or_none(getattr(msg, "hdop", None))
+        if hdop is not None:
+            position["hdop"] = hdop
+        speed_mps = _to_float_or_none(getattr(msg, "speed_mps", None))
+        if speed_mps is not None:
+            position["speed_mps"] = speed_mps
         self.current_position = position
         self.live_track_points.append(position)
         if len(self.live_track_points) > MAX_LIVE_TRACK_POINTS:
@@ -1452,6 +1878,23 @@ class WebConfigServer(object):
             self.data_manager.add_track_point(position)
         if self.socketio:
             self.socketio.emit("map_position", position)
+
+    @staticmethod
+    def _route_snapshot_id(waypoints):
+        compact = []
+        for wp in waypoints or []:
+            coord = wp.get("wgs84") if isinstance(wp, dict) else None
+            if not isinstance(coord, dict):
+                continue
+            compact.append({
+                "seq": wp.get("seq"),
+                "lat": _to_float_or_none(coord.get("lat")),
+                "lng": _to_float_or_none(coord.get("lng")),
+            })
+        if not compact:
+            return None
+        payload = json.dumps(compact, sort_keys=True, separators=(",", ":"))
+        return hashlib.sha1(payload.encode("utf-8")).hexdigest()[:12]
 
     def _waypoints_cb(self, msg):
         """MAVROS 航点列表回调：缓存航线，用于地图叠加。"""
@@ -1472,6 +1915,8 @@ class WebConfigServer(object):
                 **position,
             })
         self.route_waypoints = waypoints
+        self.route_snapshot_id = self._route_snapshot_id(waypoints)
+        self.route_source = "mavros" if waypoints else "none"
         if self._data_recording_active():
             self.data_manager.set_route_waypoints(waypoints)
         if self.socketio:
@@ -1489,6 +1934,21 @@ class WebConfigServer(object):
 
     def _current_metric_config(self):
         return self.config_manager.get().get("pollution_metric", {})
+
+    def _current_mapping_profile(self):
+        return normalize_mapping_profile_config(
+            self.config_manager.get().get("mapping_profile", {})
+        )
+
+    def _survey_status_snapshot(self):
+        return {
+            "mission_status": self.mission_status,
+            "surveying": str(self.mission_status or "").upper().startswith("SURVEYING"),
+            "trigger_status": dict(self.latest_trigger_status),
+            "last_gate": dict(self.latest_survey_gate) if isinstance(self.latest_survey_gate, dict) else None,
+            "last_sample_done_at": self.latest_survey_sample_done_at,
+            "mapping_profile": self._current_mapping_profile(),
+        }
 
     def _resolve_prewarm_bbox(self, client_bbox):
         """预热范围: 优先航点包络(gcj02), 无航点回退到前端传入的当前视野。
@@ -1540,6 +2000,37 @@ class WebConfigServer(object):
             return list(data.get("data_points", []) or [])
         return []
 
+    def _current_live_mission_data(self):
+        data = getattr(self.data_manager, "current_mission_data", {})
+        live_data = dict(data) if isinstance(data, dict) else {}
+        live_data.setdefault("mission_id", "live")
+        live_data.setdefault("name", "live")
+        live_data["data_points"] = self._current_live_samples()
+        live_data["track_points"] = self.live_track_points[-MAX_LIVE_TRACK_POINTS:]
+        live_data["route_waypoints"] = self.route_waypoints
+        return live_data
+
+    def _build_live_surface(self, metric="auto", size=DEFAULT_SURFACE_SIZE, power=2.0, include_lab=False):
+        return self._build_idw_surface(
+            self._current_live_mission_data(),
+            metric,
+            size=size,
+            power=power,
+            include_lab=include_lab,
+        )
+
+    @staticmethod
+    def _is_download_request():
+        return str(request.args.get("download", "")).strip().lower() in ("1", "true", "yes", "on")
+
+    @staticmethod
+    def _json_download_response(payload, filename):
+        return Response(
+            json.dumps(payload, ensure_ascii=False, indent=2),
+            mimetype="application/json",
+            headers={"Content-Disposition": f"attachment; filename={filename}"},
+        )
+
     @staticmethod
     def _point_display_coord(point):
         coord = point.get("gcj02") if isinstance(point, dict) else None
@@ -1550,6 +2041,164 @@ class WebConfigServer(object):
         if lat is None or lng is None:
             return None
         return lng, lat
+
+    @staticmethod
+    def _point_quality_flags(point):
+        quality = point.get("quality") if isinstance(point, dict) else None
+        quality = quality if isinstance(quality, dict) else {}
+        flags = []
+        if quality.get("spectrometer_valid") is False:
+            flags.append("spectrometer_invalid")
+        if quality.get("gps_valid") is False:
+            flags.append("gps_invalid")
+        if quality.get("baseline_set") is False:
+            flags.append("baseline_unset")
+        if point.get("lab_mode"):
+            flags.append("lab_mode")
+        return "|".join(flags)
+
+    @staticmethod
+    def _point_metric_config_snapshot(point):
+        quality = point.get("quality") if isinstance(point, dict) else None
+        quality = quality if isinstance(quality, dict) else {}
+        snapshot = quality.get("metric_config_snapshot")
+        if isinstance(snapshot, dict):
+            return snapshot
+        return point if isinstance(point, dict) else {}
+
+    @staticmethod
+    def _surface_metric_name(point, metric):
+        metric_name = (metric or "auto").strip().lower()
+        if metric_name == "auto":
+            metric_name = point.get("metric_used") or (
+                "concentration" if point.get("concentration") is not None else "absorbance"
+            )
+        if metric_name == "concentration" and point.get("concentration") is None and point.get("absorbance") is not None:
+            metric_name = "absorbance"
+        if metric_name not in ("concentration", "voltage", "absorbance"):
+            metric_name = "absorbance"
+        return metric_name
+
+    def _surface_raw_metric_value(self, point, metric):
+        metric_name = self._surface_metric_name(point, metric)
+        if metric_name == "concentration":
+            return point.get("concentration")
+        if metric_name == "voltage":
+            return point.get("voltage")
+        return point.get("absorbance")
+
+    def _surface_metric_metadata(self, point, metric):
+        metric_name = self._surface_metric_name(point or {}, metric)
+        if metric_name == "voltage":
+            return "voltage", "V"
+        if metric_name == "concentration":
+            cfg = self._point_metric_config_snapshot(point or {})
+            label = (
+                (point or {}).get("concentration_display_name")
+                or (point or {}).get("pollutant_name")
+                or cfg.get("display_name")
+                or cfg.get("pollutant_name")
+                or "concentration"
+            )
+            unit = (point or {}).get("concentration_unit") or cfg.get("unit") or ""
+            return str(label), str(unit)
+        return "absorbance", ""
+
+    def _point_surface_exclusion_reason(self, point, metric="auto", include_lab=False):
+        if not isinstance(point, dict):
+            return "invalid_point"
+        if point.get("lab_mode") and not include_lab:
+            return "lab_excluded"
+        coord = self._point_display_coord(point)
+        if not coord:
+            return "missing_gps"
+
+        quality = point.get("quality") if isinstance(point, dict) else None
+        quality = quality if isinstance(quality, dict) else {}
+        if quality.get("spectrometer_valid") is False:
+            return "spectrometer_invalid"
+        if quality.get("gps_valid") is False and not (include_lab and point.get("lab_mode")):
+            return "gps_invalid"
+
+        raw_value = self._surface_raw_metric_value(point, metric)
+        value = _to_float_or_none(raw_value)
+        if value is None:
+            if raw_value is not None:
+                try:
+                    raw_float = float(raw_value)
+                except (TypeError, ValueError):
+                    raw_float = None
+                if raw_float is not None and not math.isfinite(raw_float):
+                    return "non_finite_metric"
+            return "missing_metric"
+
+        if self._surface_metric_name(point, metric) == "concentration":
+            cfg = self._point_metric_config_snapshot(point)
+            min_valid = _to_float_or_none(cfg.get("min_valid"))
+            max_valid = _to_float_or_none(cfg.get("max_valid"))
+            if min_valid is not None and value < min_valid:
+                return "below_min_valid"
+            if max_valid is not None and value > max_valid:
+                return "above_max_valid"
+        return ""
+
+    def _point_surface_contract(self, point, metric="auto", include_lab=False):
+        reason = self._point_surface_exclusion_reason(
+            point,
+            metric,
+            include_lab=include_lab,
+        )
+        return not bool(reason), reason
+
+    def _build_map_meta(self, mission_data, metric="auto", include_lab=False, surface=None):
+        data = mission_data or {}
+        excluded_reasons = {}
+        valid_count = 0
+        metric_label, unit = self._surface_metric_metadata({}, metric)
+        pollutant_name = None
+        calibration_id = None
+
+        def count(reason):
+            excluded_reasons[reason] = excluded_reasons.get(reason, 0) + 1
+
+        for point in data.get("data_points", []) or []:
+            reason = self._point_surface_exclusion_reason(point, metric, include_lab=include_lab)
+            if reason:
+                count(reason)
+                continue
+            valid_count += 1
+            if valid_count == 1:
+                metric_label, unit = self._surface_metric_metadata(point, metric)
+                pollutant_name = point.get("pollutant_name") or metric_label
+                calibration_id = point.get("calibration_id") or None
+
+        meta = {
+            "metric": metric,
+            "metric_label": metric_label,
+            "unit": unit,
+            "pollutant_name": pollutant_name or metric_label,
+            "calibration_id": calibration_id,
+            "valid_surface_point_count": valid_count,
+            "excluded_count": sum(excluded_reasons.values()),
+            "excluded_reasons": excluded_reasons,
+            "include_lab": bool(include_lab),
+            "idw": {
+                "size": DEFAULT_SURFACE_SIZE,
+                "power": 2.0,
+            },
+        }
+        if isinstance(surface, dict):
+            meta.update({
+                "surface_valid": bool(surface.get("valid", False)),
+                "point_count": surface.get("point_count", valid_count),
+                "min": surface.get("min"),
+                "max": surface.get("max"),
+                "idw": {
+                    "size": surface.get("size"),
+                    "power": surface.get("power"),
+                },
+            })
+        return meta
 
     def _build_mission_geojson(self, mission_data, metric="auto", include_lab=False):
         features = []
@@ -1596,6 +2245,11 @@ class WebConfigServer(object):
             value = _extract_metric_value(point, metric)
             if not coord or value is None:
                 continue
+            valid_for_surface, excluded_reason = self._point_surface_contract(
+                point,
+                metric,
+                include_lab=include_lab,
+            )
             features.append({
                 "type": "Feature",
                 "geometry": {"type": "Point", "coordinates": [coord[0], coord[1]]},
@@ -1608,6 +2262,12 @@ class WebConfigServer(object):
                     "absorbance": point.get("absorbance"),
                     "concentration": point.get("concentration"),
                     "concentration_unit": point.get("concentration_unit"),
+                    "pollutant_name": point.get("pollutant_name"),
+                    "method_name": point.get("method_name"),
+                    "calibration_id": point.get("calibration_id"),
+                    "quality_flags": self._point_quality_flags(point),
+                    "valid_for_surface": valid_for_surface,
+                    "excluded_reason": excluded_reason,
                     "waypoint_seq": point.get("waypoint_seq"),
                     "step_index": point.get("step_index"),
                     "loop_index": point.get("loop_index"),
@@ -1618,6 +2278,7 @@ class WebConfigServer(object):
         return {
             "type": "FeatureCollection",
             "features": features,
+            "meta": self._build_map_meta(data, metric, include_lab=include_lab),
             "properties": {
                 "mission_id": data.get("mission_id"),
                 "name": data.get("name"),
@@ -1625,23 +2286,6 @@ class WebConfigServer(object):
         }
 
     def _build_idw_surface(self, mission_data, metric="auto", size=DEFAULT_SURFACE_SIZE, power=2.0, include_lab=False):
-        valid_points = []
-        for point in (mission_data or {}).get("data_points", []) or []:
-            if point.get("lab_mode") and not include_lab:
-                continue
-            coord = self._point_display_coord(point)
-            value = _extract_metric_value(point, metric)
-            if coord and value is not None:
-                valid_points.append({"lng": coord[0], "lat": coord[1], "value": value})
-        if len(valid_points) < 3:
-            return {
-                "valid": False,
-                "reason": "至少需要 3 个带 GPS 的有效采样点才能生成 IDW 插值面",
-                "metric": metric,
-                "grid": [],
-                "bounds": None,
-            }
-
         try:
             size = int(size)
         except (TypeError, ValueError):
@@ -1653,9 +2297,63 @@ class WebConfigServer(object):
             power = 2.0
         power = max(0.5, min(5.0, power))
 
+        valid_points = []
+        excluded_reasons = {}
+        metric_label, unit = self._surface_metric_metadata({}, metric)
+
+        def count_excluded(reason):
+            excluded_reasons[reason] = excluded_reasons.get(reason, 0) + 1
+
+        for point in (mission_data or {}).get("data_points", []) or []:
+            reason = self._point_surface_exclusion_reason(
+                point,
+                metric,
+                include_lab=include_lab,
+            )
+            if reason:
+                count_excluded(reason)
+                continue
+            coord = self._point_display_coord(point)
+            value = _extract_metric_value(point, metric)
+            if coord is None:
+                count_excluded("missing_gps")
+                continue
+            if value is None:
+                count_excluded("missing_metric")
+                continue
+            if not valid_points:
+                metric_label, unit = self._surface_metric_metadata(point, metric)
+            valid_points.append({"lng": coord[0], "lat": coord[1], "value": value})
+
+        values = [p["value"] for p in valid_points]
+        if len(valid_points) < 3:
+            return {
+                "valid": False,
+                "reason": "至少需要 3 个带 GPS 的有效采样点才能生成 IDW 插值面",
+                "metric": metric,
+                "grid": [],
+                "bounds": None,
+                "min": min(values) if values else None,
+                "max": max(values) if values else None,
+                "point_count": len(valid_points),
+                "excluded_count": sum(excluded_reasons.values()),
+                "excluded_reasons": excluded_reasons,
+                "metric_label": metric_label,
+                "unit": unit,
+                "size": size,
+                "power": power,
+                "meta": self._build_map_meta(mission_data, metric, include_lab=include_lab, surface={
+                    "valid": False,
+                    "point_count": len(valid_points),
+                    "min": min(values) if values else None,
+                    "max": max(values) if values else None,
+                    "size": size,
+                    "power": power,
+                }),
+            }
+
         lngs = [p["lng"] for p in valid_points]
         lats = [p["lat"] for p in valid_points]
-        values = [p["value"] for p in valid_points]
         min_lng, max_lng = min(lngs), max(lngs)
         min_lat, max_lat = min(lats), max(lats)
         lng_span = max(max_lng - min_lng, 0.00001)
@@ -1690,8 +2388,20 @@ class WebConfigServer(object):
             "min": min(values),
             "max": max(values),
             "point_count": len(valid_points),
+            "excluded_count": sum(excluded_reasons.values()),
+            "excluded_reasons": excluded_reasons,
+            "metric_label": metric_label,
+            "unit": unit,
             "size": size,
             "power": power,
+            "meta": self._build_map_meta(mission_data, metric, include_lab=include_lab, surface={
+                "valid": True,
+                "point_count": len(valid_points),
+                "min": min(values),
+                "max": max(values),
+                "size": size,
+                "power": power,
+            }),
         }
 
     def _add_log(self, message, level='info'):
@@ -2241,6 +2951,10 @@ class WebConfigServer(object):
 
         @self.app.route('/api/map/live', methods=['GET'])
         def get_live_map():
+            metric = request.args.get("metric", "auto")
+            size = request.args.get("size", DEFAULT_SURFACE_SIZE)
+            power = request.args.get("power", 2.0)
+            include_lab = str(request.args.get("include_lab", "")).strip().lower() in ("1", "true", "yes", "on")
             return jsonify({
                 "success": True,
                 "data": {
@@ -2248,12 +2962,26 @@ class WebConfigServer(object):
                     "track_points": self.live_track_points[-MAX_LIVE_TRACK_POINTS:],
                     "route_waypoints": self.route_waypoints,
                     "data_points": self._current_live_samples(),
+                    "surface": self._build_live_surface(metric, size=size, power=power, include_lab=include_lab),
                     "metric_config": self._current_metric_config(),
+                    "mapping_profile": self._current_mapping_profile(),
+                    "survey_status": self._survey_status_snapshot(),
                     "mission_status": self.mission_status,
                     "automation_running": self.automation_running,
                     "lab_config": self._current_lab_config(),
                     "lab_status": self.lab_status,
                 },
+            })
+
+        @self.app.route('/api/map/live/surface', methods=['GET'])
+        def get_live_surface():
+            metric = request.args.get("metric", "auto")
+            size = request.args.get("size", DEFAULT_SURFACE_SIZE)
+            power = request.args.get("power", 2.0)
+            include_lab = str(request.args.get("include_lab", "")).strip().lower() in ("1", "true", "yes", "on")
+            return jsonify({
+                "success": True,
+                "data": self._build_live_surface(metric, size=size, power=power, include_lab=include_lab),
             })
 
         @self.app.route('/api/lab/config', methods=['GET'])
@@ -2940,10 +3668,13 @@ class WebConfigServer(object):
                 return jsonify({"success": False, "message": "任务不存在"}), 404
             metric = request.args.get("metric", "auto")
             include_lab = str(request.args.get("include_lab", "")).strip().lower() in ("1", "true", "yes", "on")
-            return jsonify({
+            payload = {
                 "success": True,
                 "data": self._build_mission_geojson(data, metric, include_lab=include_lab),
-            })
+            }
+            if self._is_download_request():
+                return self._json_download_response(payload, f"mission_{mission_id}.geojson")
+            return jsonify(payload)
 
         @self.app.route('/api/data/mission/<mission_id>/surface', methods=['GET'])
         def get_mission_surface(mission_id):
@@ -2954,10 +3685,13 @@ class WebConfigServer(object):
             size = request.args.get("size", DEFAULT_SURFACE_SIZE)
             power = request.args.get("power", 2.0)
             include_lab = str(request.args.get("include_lab", "")).strip().lower() in ("1", "true", "yes", "on")
-            return jsonify({
+            payload = {
                 "success": True,
                 "data": self._build_idw_surface(data, metric, size=size, power=power, include_lab=include_lab),
-            })
+            }
+            if self._is_download_request():
+                return self._json_download_response(payload, f"mission_{mission_id}_surface.json")
+            return jsonify(payload)
 
         @self.app.route('/api/data/mission/<mission_id>', methods=['DELETE'])
         def delete_mission_data(mission_id):
@@ -2990,10 +3724,17 @@ class WebConfigServer(object):
                 "waypoint_seq",
                 "step_index",
                 "loop_index",
+                "pollutant_name",
+                "method_name",
+                "calibration_id",
+                "quality_flags",
+                "valid_for_surface",
+                "excluded_reason",
             ])
             for pt in data.get("data_points", []):
                 wgs84 = pt.get("wgs84", {}) if isinstance(pt.get("wgs84"), dict) else {}
                 gcj02 = pt.get("gcj02", {}) if isinstance(pt.get("gcj02"), dict) else {}
+                valid_for_surface, excluded_reason = self._point_surface_contract(pt, "auto", include_lab=False)
                 writer.writerow([
                     pt.get("timestamp", ""),
                     pt.get("voltage", ""),
@@ -3010,6 +3751,12 @@ class WebConfigServer(object):
                     pt.get("waypoint_seq", ""),
                     pt.get("step_index", ""),
                     pt.get("loop_index", ""),
+                    pt.get("pollutant_name", ""),
+                    pt.get("method_name", ""),
+                    pt.get("calibration_id", ""),
+                    self._point_quality_flags(pt),
+                    "true" if valid_for_surface else "false",
+                    excluded_reason,
                 ])
             return Response(
                 output.getvalue(),
