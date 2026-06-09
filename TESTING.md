@@ -16,6 +16,7 @@ Updated: 2026-06-03
 | QGC 指令/遥测 | [5.4 MAVLink 路由](#mavlink-router-bridge) | `mavlink_cmd_rx` 有下行，`bridge_diagnostics` 计数增长 |
 | 系统健康 | [5.5 系统健康监测](#system-health-flow) | Web、ROS、MAVLink 健康字段同步更新 |
 | 现场闭环 | [6. 现场全链路](#field-e2e) | QGC 指令、飞控链路、载荷执行、遥测回传均连通 |
+| 污染物地图 | [6.5 污染物地图现场证据包](#pollution-map-evidence) | Web 地图、CSV、GeoJSON、surface 和采样闭环日志可追溯 |
 | 故障排查 | [7. 故障索引](#troubleshooting-index) | 按现象映射到日志、命令、责任模块 |
 
 ## 1. 基线准备
@@ -409,6 +410,61 @@ roslaunch usv_ros usv_bringup.launch \
   sampling_retry_count:=1 \
   sampling_on_fail:=SKIP
 ```
+
+<a id="pollution-map-evidence"></a>
+
+### 6.5 污染物地图现场证据包
+
+前置：Web 设置页已保存单污染物线性模型、单位、校准 ID 或工作曲线 ID；走航门控已按现场水域设置最小距离、GPS 必需和分光 valid 必需。
+
+采集流程：
+
+1. QGC 上传航线并执行 `NAV_SCRIPT_TIME(param1=1)` 定点采样，或通过 `31015/31016` 启停走航采样。
+2. Web 地图页选择当前任务，确认状态包含实时点位、污染物 surface 和走航门控信息；桌面端按 16:9 截图。
+3. 导出任务 CSV、GeoJSON 和 IDW surface，并把 `/api/map/live` 快照一并保存。
+4. 从 roslaunch/bridge 日志截取 `USV_SMPL/USV_DONE`、`USV_SURV` 或 `survey_gate_skipped:*` 片段。
+
+导出命令：
+
+```bash
+MISSION_ID=<mission_id>
+mkdir -p ~/usv_ws/evidence/$MISSION_ID
+curl "http://127.0.0.1:5000/api/data/mission/$MISSION_ID/csv" \
+  > ~/usv_ws/evidence/$MISSION_ID/mission.csv
+curl "http://127.0.0.1:5000/api/data/mission/$MISSION_ID/geojson?metric=concentration&download=true" \
+  > ~/usv_ws/evidence/$MISSION_ID/mission.geojson
+curl "http://127.0.0.1:5000/api/data/mission/$MISSION_ID/surface?metric=concentration&size=80&power=2&download=true" \
+  > ~/usv_ws/evidence/$MISSION_ID/mission_surface.json
+curl "http://127.0.0.1:5000/api/map/live" \
+  > ~/usv_ws/evidence/$MISSION_ID/live_map_snapshot.json
+grep -E "USV_SMPL|USV_DONE|USV_SURV|survey_gate_skipped" \
+  ~/usv_ws/.usv_run/logs/usv_system.log \
+  > ~/usv_ws/evidence/$MISSION_ID/mavlink_sampling.log
+```
+
+离线自检命令：
+
+```bash
+cd ~/usv_ws/src/usv_ros
+python3 scripts/verify_pollution_workflow.py --mock --evidence .omo/evidence/pollution-workflow-verify.json
+```
+
+通过判据：命令退出码为 0，JSON 证据中 `hardware_required=false`，并包含 CSV、GeoJSON、surface、导出头和前端 smoke/build 产物检查。
+
+记录模板：
+
+| 字段 | 记录值 |
+|---|---|
+| `mission_id` |  |
+| `pollutant_name` / `unit` |  |
+| `calibration_id` / `work_curve_id` |  |
+| `sample_total` / `csv_rows` |  |
+| `valid_gps_points` / `excluded_points` |  |
+| `excluded_reasons` |  |
+| `surface_grid` / `idw_power` |  |
+| `survey_min_distance_m` / `last_gate_reason` |  |
+| `screenshot_path` |  |
+| `USV_SMPL/USV_DONE` 日志 |  |
 
 <a id="troubleshooting-index"></a>
 
