@@ -45,6 +45,10 @@ interface MissionMeta {
   name: string
   start_time: string
   point_count: number
+  valid_surface_point_count?: number
+  pollutant_name?: string | null
+  unit?: string | null
+  surface_ready?: boolean
 }
 
 interface GeoFeature {
@@ -59,6 +63,7 @@ interface GeoFeature {
 interface GeoJsonPayload {
   type: 'FeatureCollection'
   features: GeoFeature[]
+  meta?: MapMeta
   properties?: Record<string, unknown>
 }
 
@@ -75,6 +80,59 @@ interface SurfacePayload {
   grid: SurfacePoint[]
   min?: number
   max?: number
+  point_count?: number
+  excluded_count?: number
+  excluded_reasons?: Record<string, number>
+  metric_label?: string
+  unit?: string
+  size?: number
+  power?: number
+  meta?: MapMeta
+}
+
+interface MappingProfileConfig {
+  survey_min_distance_m?: number
+  survey_min_speed_mps?: number
+  survey_max_speed_mps?: number
+  survey_require_valid_spectrometer?: boolean
+  survey_require_gps?: boolean
+  survey_max_position_age_s?: number
+}
+
+interface SurveyGateStatus {
+  status: string
+  reason: string
+  reason_label?: string
+  skipped?: boolean
+  received_at?: string | null
+}
+
+interface SurveyStatus {
+  mission_status?: string
+  surveying?: boolean
+  trigger_status?: { status?: string; received_at?: string | null }
+  last_gate?: SurveyGateStatus | null
+  last_sample_done_at?: string | null
+  mapping_profile?: MappingProfileConfig
+}
+
+interface MapMeta {
+  metric?: string
+  metric_label?: string
+  unit?: string
+  pollutant_name?: string | null
+  calibration_id?: string | null
+  valid_surface_point_count?: number
+  excluded_count?: number
+  excluded_reasons?: Record<string, number>
+  include_lab?: boolean
+  point_count?: number
+  min?: number | null
+  max?: number | null
+  idw?: {
+    size?: number
+    power?: number
+  }
 }
 
 interface MapCoordinate {
@@ -103,6 +161,11 @@ interface LivePayload {
   track_points?: GeoPoint[]
   route_waypoints?: LiveRouteWaypoint[]
   data_points?: LiveSample[]
+  surface?: SurfacePayload | null
+  survey_status?: SurveyStatus | null
+  mapping_profile?: MappingProfileConfig
+  mission_status?: string
+  automation_running?: boolean
 }
 
 type HeatLayer = L.Layer & {
@@ -118,9 +181,58 @@ const metricLabels: Record<MetricMode, string> = {
 
 const sampleColors = ['#2f9e44', '#74b816', '#f59f00', '#f08c00', '#e03131']
 
+const reasonLabels: Record<string, string> = {
+  missing_gps: '缺少 GPS',
+  gps_invalid: 'GPS 无效',
+  spectrometer_invalid: '分光无效',
+  below_min_valid: '低于量程',
+  above_max_valid: '高于量程',
+  lab_excluded: '实验点排除',
+  non_finite_metric: '非有限值',
+  missing_metric: '缺少指标',
+}
+
+const surveyGateReasonLabels: Record<string, string> = {
+  no_gps: '缺少 GPS',
+  gps_stale: 'GPS 过期',
+  distance_too_short: '距离不足',
+  speed_too_low: '速度过低',
+  speed_too_high: '速度过高',
+  spectrometer_invalid: '分光无效',
+}
+
 function numeric(value: unknown) {
   const n = Number(value)
   return Number.isFinite(n) ? n : null
+}
+
+function formatNumber(value: unknown, digits = 3) {
+  const n = numeric(value)
+  if (n === null) return '—'
+  return n.toLocaleString(undefined, { maximumFractionDigits: digits })
+}
+
+function formatMetricValue(value: unknown, unit?: string | null) {
+  const formatted = formatNumber(value, 4)
+  return unit ? `${formatted} ${unit}` : formatted
+}
+
+function formatSurveyGateReason(gate?: SurveyGateStatus | null) {
+  if (!gate) return ''
+  return gate.reason_label || surveyGateReasonLabels[gate.reason] || gate.reason || gate.status
+}
+
+function escapeHtml(value: unknown) {
+  return String(value ?? '').replace(/[&<>"']/g, (char) => {
+    const entities: Record<string, string> = {
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;',
+    }
+    return entities[char] || char
+  })
 }
 
 // WGS-84 -> GCJ-02, 与后端 web_config_server.py:wgs84_to_gcj02 算法一致,
@@ -148,7 +260,7 @@ function transformLng(x: number, y: number) {
 function wgs84ToGcj02(lat: number, lng: number): MapCoordinate {
   if (outOfChina(lat, lng)) return { lat, lng }
   const a = 6378245.0
-  const ee = 0.00669342162296594323
+  const ee = 0.006693421622965943
   let dLat = transformLat(lng - 105.0, lat - 35.0)
   let dLng = transformLng(lng - 105.0, lat - 35.0)
   const radLat = (lat / 180.0) * Math.PI
@@ -181,7 +293,10 @@ export default function MapPage() {
   const overlaysRef = useRef<L.LayerGroup | null>(null)
   const heatRef = useRef<HeatLayer | null>(null)
   const socket = useAppStore((state) => state.socket)
-  const [mode, setMode] = useState<MapMode>('live')
+  const [mode, setMode] = useState<MapMode>(() => {
+    if (typeof window === 'undefined') return 'live'
+    return new URLSearchParams(window.location.search).get('mode') === 'history' ? 'history' : 'live'
+  })
   const [metric, setMetric] = useState<MetricMode>('auto')
   const [mapConfig, setMapConfig] = useState<MapConfig | null>(null)
   const [mapError, setMapError] = useState('')
@@ -190,6 +305,9 @@ export default function MapPage() {
   const [selectedMission, setSelectedMission] = useState('')
   const [geojson, setGeojson] = useState<GeoJsonPayload | null>(null)
   const [surface, setSurface] = useState<SurfacePayload | null>(null)
+  const [surveyStatus, setSurveyStatus] = useState<SurveyStatus | null>(null)
+  const [idwSize, setIdwSize] = useState(50)
+  const [idwPower, setIdwPower] = useState(2)
   const [statusText, setStatusText] = useState('等待地图数据')
   const [online, setOnline] = useState<boolean | null>(null)
   const [prewarm, setPrewarm] = useState<PrewarmStatus | null>(null)
@@ -208,6 +326,30 @@ export default function MapPage() {
     () => geojson?.features.filter((f) => f.properties?.layer === 'sample') || [],
     [geojson],
   )
+  const activeMeta = useMemo(() => surface?.meta || geojson?.meta || null, [geojson, surface])
+  const activeRange = useMemo(() => {
+    const sample = sampleRange(geojson?.features || [])
+    return {
+      min: numeric(activeMeta?.min) ?? numeric(surface?.min) ?? sample.min,
+      max: numeric(activeMeta?.max) ?? numeric(surface?.max) ?? sample.max,
+    }
+  }, [activeMeta, geojson, surface])
+  const excludedEntries = useMemo(
+    () => Object.entries(activeMeta?.excluded_reasons || surface?.excluded_reasons || {})
+      .filter(([, count]) => count > 0)
+      .sort((a, b) => b[1] - a[1]),
+    [activeMeta, surface],
+  )
+  const exportUrls = useMemo(() => {
+    if (!selectedMission) return null
+    const mission = encodeURIComponent(selectedMission)
+    const metricParam = encodeURIComponent(metric)
+    return {
+      csv: `/api/data/mission/${mission}/csv`,
+      geojson: `/api/data/mission/${mission}/geojson?metric=${metricParam}&download=true`,
+      surface: `/api/data/mission/${mission}/surface?metric=${metricParam}&size=${idwSize}&power=${idwPower}&download=true`,
+    }
+  }, [idwPower, idwSize, metric, selectedMission])
 
   const loadConfig = useCallback(async () => {
     const res = await fetch('/api/map/config')
@@ -364,7 +506,7 @@ export default function MapPage() {
         const marker = L.marker([lat, lng], {
           icon: L.divIcon({
             className: 'usv-waypoint-icon',
-            html: `<span>#${feature.properties?.seq ?? ''}</span>`,
+            html: `<span>#${escapeHtml(feature.properties?.seq ?? '')}</span>`,
             iconAnchor: [0, 0],
           }),
         })
@@ -381,8 +523,22 @@ export default function MapPage() {
         color: '#ffffff',
         weight: 2,
       })
+      const unit = String(feature.properties?.concentration_unit || payload.meta?.unit || surfacePayload?.meta?.unit || '')
+      const pollutant = String(feature.properties?.pollutant_name || payload.meta?.pollutant_name || surfacePayload?.meta?.pollutant_name || metricLabels[metric])
+      const qualityFlags = String(feature.properties?.quality_flags || '')
+      const excludedReason = String(feature.properties?.excluded_reason || '')
+      const validForSurface = feature.properties?.valid_for_surface !== false
+      const surfaceStatus = validForSurface
+        ? '参与'
+        : `排除 ${reasonLabels[excludedReason] || excludedReason || '-'}`
       marker.bindPopup(
-        `<div style="min-width:160px;font-size:12px;line-height:1.6"><b>${metricLabels[metric]}</b><br/>值: ${value.toPrecision(5)}<br/>航点: ${feature.properties?.waypoint_seq ?? '-'}</div>`,
+        `<div style="min-width:190px;font-size:12px;line-height:1.65">
+          <b>${escapeHtml(pollutant)}</b><br/>
+          值: ${escapeHtml(formatMetricValue(value, unit))}<br/>
+          航点: ${escapeHtml(feature.properties?.waypoint_seq ?? '-')}<br/>
+          质量: ${escapeHtml(qualityFlags || 'ok')}<br/>
+          Surface: ${escapeHtml(surfaceStatus)}
+        </div>`,
       )
       marker.addTo(group)
       bounds.extend([lat, lng])
@@ -400,9 +556,11 @@ export default function MapPage() {
   }, [clearOverlays, metric])
 
   const loadLive = useCallback(async () => {
-    const res = await fetch('/api/map/live')
+    const res = await fetch(`/api/map/live?metric=${metric}&size=${idwSize}&power=${idwPower}`)
     const json = await res.json()
     const live = (json.data || {}) as LivePayload
+    const liveSurface = live.surface || null
+    const liveSurveyStatus = live.survey_status || null
     const features: GeoFeature[] = []
     if (live.position?.gcj02) {
       features.push({
@@ -444,23 +602,32 @@ export default function MapPage() {
         properties: { ...point, layer: 'sample', value },
       })
     })
-    setGeojson({ type: 'FeatureCollection', features })
-    setSurface(null)
-    setStatusText(live.position ? `实时船位 ${live.position.gcj02.lat.toFixed(6)}, ${live.position.gcj02.lng.toFixed(6)}` : '等待 GPS 船位')
-  }, [metric])
+    setGeojson({ type: 'FeatureCollection', features, meta: liveSurface?.meta })
+    setSurface(liveSurface)
+    setSurveyStatus(liveSurveyStatus)
+    const gateText = formatSurveyGateReason(liveSurveyStatus?.last_gate)
+    if (liveSurface?.valid) {
+      setStatusText(gateText ? `实时污染面已生成 · 走航门控: ${gateText}` : '实时污染面已生成')
+    } else if (liveSurface?.reason) {
+      setStatusText(gateText ? `${liveSurface.reason} · 走航门控: ${gateText}` : liveSurface.reason)
+    } else {
+      const positionText = live.position ? `实时船位 ${live.position.gcj02.lat.toFixed(6)}, ${live.position.gcj02.lng.toFixed(6)}` : '等待 GPS 船位'
+      setStatusText(gateText ? `${positionText} · 走航门控: ${gateText}` : positionText)
+    }
+  }, [idwPower, idwSize, metric])
 
   const loadHistory = useCallback(async () => {
     if (!selectedMission) return
     const [geoRes, surfaceRes] = await Promise.all([
       fetch(`/api/data/mission/${selectedMission}/geojson?metric=${metric}`),
-      fetch(`/api/data/mission/${selectedMission}/surface?metric=${metric}`),
+      fetch(`/api/data/mission/${selectedMission}/surface?metric=${metric}&size=${idwSize}&power=${idwPower}`),
     ])
     const geo = await geoRes.json()
     const surfaceJson = await surfaceRes.json()
     setGeojson(geo.data)
     setSurface(surfaceJson.data)
     setStatusText(surfaceJson.data?.valid ? '历史污染面已生成' : surfaceJson.data?.reason || '历史任务已加载')
-  }, [metric, selectedMission])
+  }, [idwPower, idwSize, metric, selectedMission])
 
   const startPrewarm = useCallback(async () => {
     const map = mapRef.current
@@ -604,6 +771,53 @@ export default function MapPage() {
                     <option key={mission.id} value={mission.id}>{mission.name || mission.id}</option>
                   ))}
                 </select>
+                <div className="mt-3 grid grid-cols-2 gap-2">
+                  <label className="space-y-1 text-xs text-muted-foreground">
+                    <span>IDW size</span>
+                    <input
+                      type="number"
+                      min={3}
+                      max={120}
+                      value={idwSize}
+                      onChange={(e) => setIdwSize(Math.max(3, Number(e.target.value) || 3))}
+                      className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm text-foreground"
+                    />
+                  </label>
+                  <label className="space-y-1 text-xs text-muted-foreground">
+                    <span>IDW power</span>
+                    <input
+                      type="number"
+                      min={0.5}
+                      max={5}
+                      step={0.1}
+                      value={idwPower}
+                      onChange={(e) => setIdwPower(Math.max(0.5, Math.min(5, Number(e.target.value) || 2)))}
+                      className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm text-foreground"
+                    />
+                  </label>
+                </div>
+                {exportUrls && (
+                  <div className="mt-3 grid grid-cols-3 gap-2">
+                    <Button asChild variant="outline" size="sm" className="gap-1 px-2 text-xs">
+                      <a href={exportUrls.csv} download title="导出 CSV">
+                        <Download className="h-3.5 w-3.5" />
+                        CSV
+                      </a>
+                    </Button>
+                    <Button asChild variant="outline" size="sm" className="gap-1 px-2 text-xs">
+                      <a href={exportUrls.geojson} download title="导出 GeoJSON">
+                        <Download className="h-3.5 w-3.5" />
+                        GeoJSON
+                      </a>
+                    </Button>
+                    <Button asChild variant="outline" size="sm" className="gap-1 px-2 text-xs">
+                      <a href={exportUrls.surface} download title="导出 surface JSON">
+                        <Download className="h-3.5 w-3.5" />
+                        Surface
+                      </a>
+                    </Button>
+                  </div>
+                )}
                 <div className="mt-3 space-y-2">
                   {missions.slice(0, 6).map((mission) => (
                     <button
@@ -615,13 +829,67 @@ export default function MapPage() {
                       onClick={() => setSelectedMission(mission.id)}
                     >
                       <div className="font-medium truncate">{mission.name || mission.id}</div>
-                      <div className="text-xs text-muted-foreground">{mission.point_count} 点 · {new Date(mission.start_time).toLocaleString()}</div>
+                      <div className="text-xs text-muted-foreground">{mission.point_count} 点 · {mission.valid_surface_point_count ?? '—'} 有效 · {new Date(mission.start_time).toLocaleString()}</div>
+                      {(mission.pollutant_name || mission.surface_ready !== undefined) && (
+                        <div className="mt-1 flex items-center justify-between text-xs">
+                          <span className="text-muted-foreground truncate">{mission.pollutant_name || '污染物'} {mission.unit || ''}</span>
+                          <span className={cn('font-medium', mission.surface_ready ? 'text-emerald-600' : 'text-amber-600')}>
+                            {mission.surface_ready ? '可成面' : '样本不足'}
+                          </span>
+                        </div>
+                      )}
                     </button>
                   ))}
                 </div>
               </CardContent>
             </Card>
           )}
+
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-base flex items-center gap-2"><Activity className="w-4 h-4" />走航门控</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3 text-sm">
+              <div className="grid grid-cols-2 gap-2">
+                <div>
+                  <div className="text-xs text-muted-foreground">任务状态</div>
+                  <div className="font-mono text-xs truncate">{surveyStatus?.mission_status || 'IDLE'}</div>
+                </div>
+                <div>
+                  <div className="text-xs text-muted-foreground">最近采样</div>
+                  <div className="font-mono text-xs truncate">
+                    {surveyStatus?.last_sample_done_at ? new Date(surveyStatus.last_sample_done_at).toLocaleTimeString() : '—'}
+                  </div>
+                </div>
+              </div>
+              <div className={cn(
+                'rounded-md border px-3 py-2',
+                surveyStatus?.last_gate ? 'border-amber-500/40 bg-amber-500/10' : 'border-border bg-muted/20',
+              )}>
+                <div className="text-xs text-muted-foreground">最近门控</div>
+                <div className="mt-1 font-medium">
+                  {surveyStatus?.last_gate ? formatSurveyGateReason(surveyStatus.last_gate) : '暂无跳过'}
+                </div>
+                {surveyStatus?.last_gate?.received_at && (
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    {new Date(surveyStatus.last_gate.received_at).toLocaleString()}
+                  </div>
+                )}
+              </div>
+              <div className="grid grid-cols-2 gap-x-3 gap-y-1 text-xs text-muted-foreground">
+                <span>最小距离</span>
+                <span className="text-right font-mono">{formatNumber(surveyStatus?.mapping_profile?.survey_min_distance_m, 2)} m</span>
+                <span>速度范围</span>
+                <span className="text-right font-mono">
+                  {formatNumber(surveyStatus?.mapping_profile?.survey_min_speed_mps, 2)}-{formatNumber(surveyStatus?.mapping_profile?.survey_max_speed_mps, 2)} m/s
+                </span>
+                <span>GPS / 分光</span>
+                <span className="text-right">
+                  {surveyStatus?.mapping_profile?.survey_require_gps ? 'GPS' : 'GPS 可选'} · {surveyStatus?.mapping_profile?.survey_require_valid_spectrometer ? 'valid' : 'valid 可选'}
+                </span>
+              </div>
+            </CardContent>
+          </Card>
 
           <Card>
             <CardHeader className="pb-2">
@@ -679,11 +947,43 @@ export default function MapPage() {
             </CardHeader>
             <CardContent className="space-y-3 text-sm">
               <div className="flex justify-between"><span className="text-muted-foreground">采样点</span><span className="font-medium">{activeSamples.length}</span></div>
-              <div className="flex justify-between"><span className="text-muted-foreground">指标</span><span className="font-medium">{metricLabels[metric]}</span></div>
-              <div className="flex justify-between"><span className="text-muted-foreground">IDW</span><span className="font-medium">{surface?.valid ? `${surface.grid.length} 格` : '未生成'}</span></div>
-              <div className="grid grid-cols-5 gap-1 pt-1">
-                {sampleColors.map((color) => <div key={color} className="h-2 rounded-full" style={{ background: color }} />)}
+              <div className="flex justify-between"><span className="text-muted-foreground">指标</span><span className="font-medium">{activeMeta?.metric_label || metricLabels[metric]}</span></div>
+              <div className="flex justify-between"><span className="text-muted-foreground">单位</span><span className="font-medium">{activeMeta?.unit || '—'}</span></div>
+              <div className="flex justify-between"><span className="text-muted-foreground">污染物</span><span className="font-medium truncate max-w-[160px]">{activeMeta?.pollutant_name || '—'}</span></div>
+              <div className="flex justify-between"><span className="text-muted-foreground">校准</span><span className="font-mono text-xs truncate max-w-[150px]">{activeMeta?.calibration_id || '—'}</span></div>
+              <div className="grid grid-cols-2 gap-2">
+                <div className="rounded-md border bg-background px-2 py-1.5">
+                  <div className="text-xs text-muted-foreground">有效点</div>
+                  <div className="font-semibold">{activeMeta?.valid_surface_point_count ?? surface?.point_count ?? '—'}</div>
+                </div>
+                <div className="rounded-md border bg-background px-2 py-1.5">
+                  <div className="text-xs text-muted-foreground">排除点</div>
+                  <div className="font-semibold">{activeMeta?.excluded_count ?? surface?.excluded_count ?? 0}</div>
+                </div>
               </div>
+              <div className="flex justify-between"><span className="text-muted-foreground">IDW</span><span className="font-medium">{surface?.valid ? `${surface.grid.length} 格` : '未生成'}</span></div>
+              <div className="flex justify-between text-xs"><span className="text-muted-foreground">参数</span><span className="font-mono">size {activeMeta?.idw?.size ?? surface?.size ?? idwSize} · p {formatNumber(activeMeta?.idw?.power ?? surface?.power ?? idwPower, 1)}</span></div>
+              <div className="pt-1">
+                <div className="h-2 rounded-full" style={{ background: `linear-gradient(90deg, ${sampleColors.join(',')})` }} />
+                <div className="mt-1 flex justify-between text-[11px] text-muted-foreground">
+                  <span>{formatMetricValue(activeRange.min, activeMeta?.unit)}</span>
+                  <span>{formatMetricValue((activeRange.min + activeRange.max) / 2, activeMeta?.unit)}</span>
+                  <span>{formatMetricValue(activeRange.max, activeMeta?.unit)}</span>
+                </div>
+              </div>
+              {excludedEntries.length > 0 && (
+                <div className="rounded-md border bg-background p-2">
+                  <div className="mb-1 text-xs font-medium text-muted-foreground">低质量/排除原因</div>
+                  <div className="space-y-1">
+                    {excludedEntries.slice(0, 5).map(([reason, count]) => (
+                      <div key={reason} className="flex justify-between text-xs">
+                        <span>{reasonLabels[reason] || reason}</span>
+                        <span className="font-medium">{count}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
               {surface && !surface.valid && <div className="rounded-md bg-amber-500/10 p-2 text-xs text-amber-700 dark:text-amber-300">{surface.reason}</div>}
             </CardContent>
           </Card>
