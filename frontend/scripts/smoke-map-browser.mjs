@@ -11,6 +11,8 @@ const workspaceRoot = resolve(repoRoot, '..', '..')
 const evidenceRoot = resolve(workspaceRoot, '.omo/evidence')
 const screenshotPath = process.env.USV_MAP_SMOKE_SCREENSHOT || resolve(evidenceRoot, 'task-T18-pollution-web-map.png')
 const domPath = process.env.USV_MAP_SMOKE_DOM || resolve(evidenceRoot, 'task-T18-pollution-web-map-dom.html')
+const labScreenshotPath = process.env.USV_LAB_SMOKE_SCREENSHOT || resolve(evidenceRoot, 'task-map-layout-lab.png')
+const labDomPath = process.env.USV_LAB_SMOKE_DOM || resolve(evidenceRoot, 'task-map-layout-lab-dom.html')
 const distIndex = resolve(repoRoot, 'static/dist/index.html')
 
 const requiredDomTokens = [
@@ -25,6 +27,15 @@ const requiredDomTokens = [
   '缺少 GPS',
   '/api/data/mission/',
   'download=true',
+]
+
+const requiredLabDomTokens = [
+  '实验室测试',
+  '虚拟航线',
+  '适配范围',
+  'lab-map-workspace',
+  '25.314167',
+  '110.412778',
 ]
 
 function assert(condition, message) {
@@ -198,6 +209,7 @@ async function main() {
   try {
     const ready = await waitForReady(serverProcess)
     const url = `http://127.0.0.1:${port}/map?mode=history`
+    const labUrl = `http://127.0.0.1:${port}/lab`
     const commonChromeArgs = [
       '--headless=new',
       '--disable-gpu',
@@ -230,12 +242,29 @@ async function main() {
     assert(screenshot.length > 5000, 'Map browser smoke failed: screenshot is too small')
     assert(screenshot[0] === 0x89 && screenshot[1] === 0x50 && screenshot[2] === 0x4e && screenshot[3] === 0x47, 'Map browser smoke failed: screenshot is not a PNG')
 
+    const labDomRun = await runChrome(chrome, [...commonChromeArgs, '--dump-dom', labUrl])
+    writeFileSync(labDomPath, labDomRun.stdout, 'utf8')
+    for (const token of requiredLabDomTokens) {
+      assert(labDomRun.stdout.includes(token), `Lab browser smoke failed: DOM missing ${token}`)
+    }
+    await runChrome(chrome, [
+      ...commonChromeArgs,
+      `--screenshot=${labScreenshotPath}`,
+      labUrl,
+    ])
+    const labScreenshot = readFileSync(labScreenshotPath)
+    assert(labScreenshot.length > 5000, 'Lab browser smoke failed: screenshot is too small')
+    assert(labScreenshot[0] === 0x89 && labScreenshot[1] === 0x50 && labScreenshot[2] === 0x4e && labScreenshot[3] === 0x47, 'Lab browser smoke failed: screenshot is not a PNG')
+
     console.log(JSON.stringify({
       ok: true,
       mission_id: ready.mission_id,
       url,
+      lab_url: labUrl,
       screenshot: screenshotPath,
+      lab_screenshot: labScreenshotPath,
       dom: domPath,
+      lab_dom: labDomPath,
       viewport: '1600x900',
       chrome,
     }, null, 2))

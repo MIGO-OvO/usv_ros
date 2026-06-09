@@ -35,6 +35,9 @@ from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import map_tile_cache as mtc  # noqa: E402
 
+DEFAULT_INTERACTIVE_BBOX = (110.35, 25.25, 110.47, 25.38)
+DEFAULT_INTERACTIVE_OUT = "guilin_area_map.tar"
+
 
 def _download_to_root(tiles_root, bbox, zoom_min, zoom_max, styles, workers):
     """按 bbox 下载瓦片到 tiles_root/{style}/{z}/{x}/{y}.png。返回 (ok, fail)。"""
@@ -76,9 +79,79 @@ def _download_to_root(tiles_root, bbox, zoom_min, zoom_max, styles, workers):
     return counter["ok"], counter["fail"]
 
 
+def _prompt_text(label, default):
+    try:
+        raw = input("%s [%s]: " % (label, default)).strip()
+    except EOFError:
+        raw = ""
+    return raw or str(default)
+
+
+def _prompt_int(label, default, lo=None, hi=None):
+    while True:
+        raw = _prompt_text(label, default)
+        try:
+            value = int(raw)
+            if lo is not None:
+                value = max(lo, value)
+            if hi is not None:
+                value = min(hi, value)
+            return value
+        except ValueError:
+            print("请输入整数。")
+
+
+def _prompt_bbox(default):
+    labels = ("西边界经度 W", "南边界纬度 S", "东边界经度 E", "北边界纬度 N")
+    values = []
+    for label, value in zip(labels, default):
+        while True:
+            raw = _prompt_text(label, value)
+            try:
+                values.append(float(raw))
+                break
+            except ValueError:
+                print("请输入有效经纬度。")
+    return values
+
+
+def _prompt_styles(default):
+    default_text = ",".join(default)
+    valid = set(mtc.VALID_STYLES)
+    while True:
+        raw = _prompt_text("瓦片类型 satellite/annotation, 逗号分隔", default_text)
+        styles = [s.strip() for s in raw.replace(";", ",").split(",") if s.strip()]
+        if styles and all(style in valid for style in styles):
+            return styles
+        print("可选瓦片类型: %s" % ", ".join(mtc.VALID_STYLES))
+
+
+def _fill_interactive_args(args):
+    print("USV 地图离线包导出向导 (高德缓存优先瓦片)")
+    mode = _prompt_text("来源 download/from-cache", "download").lower()
+    if mode in ("cache", "from-cache", "from_cache"):
+        args.from_cache = args.from_cache or _prompt_text("已有缓存目录", mtc.CACHE_DIR)
+    args.out = args.out or _prompt_text("输出 tar 包路径", DEFAULT_INTERACTIVE_OUT)
+    args.styles = _prompt_styles(args.styles)
+    args.zoom_min = _prompt_int("最小缩放级别", args.zoom_min, mtc.ZOOM_HARD_MIN, mtc.ZOOM_HARD_MAX)
+    args.zoom_max = _prompt_int("最大缩放级别", args.zoom_max, mtc.ZOOM_HARD_MIN, mtc.ZOOM_HARD_MAX)
+    if args.zoom_min > args.zoom_max:
+        args.zoom_min, args.zoom_max = args.zoom_max, args.zoom_min
+    args.workers = _prompt_int("并发下载线程", args.workers, 1, 32)
+    if not args.from_cache:
+        args.bbox = args.bbox or _prompt_bbox(DEFAULT_INTERACTIVE_BBOX)
+        bbox = (args.bbox[0], args.bbox[1], args.bbox[2], args.bbox[3])
+        _tasks, total = mtc.enumerate_tiles(bbox, args.zoom_min, args.zoom_max, args.styles)
+        print("预计下载瓦片: %d 张 (z%d-z%d)" % (total, args.zoom_min, args.zoom_max))
+        confirm = _prompt_text("开始下载并打包? y/n", "y").lower()
+        if confirm not in ("y", "yes"):
+            args.cancelled = True
+
+
 def main(argv=None):
+    raw_argv = sys.argv[1:] if argv is None else argv
     parser = argparse.ArgumentParser(description="离线地图瓦片包导出")
-    parser.add_argument("--out", required=True, help="输出 tar 包路径")
+    parser.add_argument("--out", help="输出 tar 包路径")
     parser.add_argument("--bbox", nargs=4, type=float, metavar=("W", "S", "E", "N"),
                         help="经纬度范围: 西 南 东 北 (下载模式必填)")
     parser.add_argument("--zoom-min", type=int, default=mtc.DEFAULT_ZOOM_MIN)
@@ -88,7 +161,19 @@ def main(argv=None):
     parser.add_argument("--workers", type=int, default=mtc.PREWARM_WORKERS)
     parser.add_argument("--from-cache", metavar="DIR",
                         help="跳过下载, 直接打包该缓存目录")
+    parser.add_argument("-i", "--interactive", action="store_true",
+                        help="交互式问询输出路径、经纬度范围和缩放级别")
     args = parser.parse_args(argv)
+    args.cancelled = False
+
+    interactive = args.interactive or len(raw_argv) == 0
+    if interactive:
+        _fill_interactive_args(args)
+        if args.cancelled:
+            print("已取消。")
+            return 1
+    if not args.out:
+        parser.error("需要 --out, 或直接无参数运行进入交互式向导")
 
     zoom_min = mtc.clamp_zoom(args.zoom_min, mtc.DEFAULT_ZOOM_MIN)
     zoom_max = mtc.clamp_zoom(args.zoom_max, mtc.DEFAULT_ZOOM_MAX)

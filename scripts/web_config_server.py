@@ -250,8 +250,8 @@ def normalize_lab_config(config):
         "real_propulsion_enabled": to_bool("real_propulsion_enabled", False),
         "include_lab_data_by_default": to_bool("include_lab_data_by_default", False),
         "sim": {
-            "start_lat": sim_float("start_lat", 30.0, -90.0, 90.0),
-            "start_lng": sim_float("start_lng", 120.0, -180.0, 180.0),
+            "start_lat": sim_float("start_lat", 25.314167, -90.0, 90.0),
+            "start_lng": sim_float("start_lng", 110.412778, -180.0, 180.0),
             "heading_deg": sim_float("heading_deg", 0.0, 0.0, 360.0),
             "max_speed_mps": sim_float("max_speed_mps", 1.0, 0.0, 20.0),
             "wheel_base_m": sim_float("wheel_base_m", 0.6, 0.05, 10.0),
@@ -1013,8 +1013,8 @@ DEFAULT_CONFIG = {
         "real_propulsion_enabled": False,
         "include_lab_data_by_default": False,
         "sim": {
-            "start_lat": 30.0,
-            "start_lng": 120.0,
+            "start_lat": 25.314167,
+            "start_lng": 110.412778,
             "heading_deg": 0.0,
             "max_speed_mps": 1.0,
             "wheel_base_m": 0.6,
@@ -2917,9 +2917,9 @@ class WebConfigServer(object):
         def set_offline_mode():
             data = json_object() or {}
             enabled = self.tile_cache.set_offline_mode(bool(data.get("enabled", False)))
-            self._add_log("离线地图模式: %s" % ("开启" if enabled else "关闭"))
+            self._add_log("地图缓存策略: 缓存优先, 联网自动回源")
             return jsonify({"success": True, "data": {"offline_mode": enabled},
-                            "message": "离线模式已%s" % ("开启" if enabled else "关闭")})
+                            "message": "已使用缓存优先策略"})
 
         @self.app.route('/api/map/cache/import', methods=['POST'])
         def import_map_pack():

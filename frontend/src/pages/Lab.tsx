@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
 import { Activity, Crosshair, Download, FlaskConical, MapPin, Play, RotateCcw, Save, Square, Trash2 } from 'lucide-react'
@@ -70,7 +70,7 @@ const fallbackConfig: LabConfig = {
   allow_no_gps: true,
   bypass_pid_wait: true,
   include_lab_data_by_default: false,
-  sim: { start_lat: 30, start_lng: 120, heading_deg: 0, max_speed_mps: 1, wheel_base_m: 0.6, arrival_radius_m: 3 },
+  sim: { start_lat: 25.314167, start_lng: 110.412778, heading_deg: 0, max_speed_mps: 1, wheel_base_m: 0.6, arrival_radius_m: 3 },
   mission: { waypoints: [], center: null },
   pollution: { mode: 'center', source: null, strength: 0.8, radius_m: 150, reference_voltage: 3 },
 }
@@ -96,13 +96,26 @@ export default function Lab() {
   const mapRef = useRef<L.Map | null>(null)
   const layerRef = useRef<L.LayerGroup | null>(null)
   const boatRef = useRef<L.Marker | null>(null)
+  const labBoundsRef = useRef<L.LatLngBounds | null>(null)
+  const labInitialFitDoneRef = useRef(false)
   const configRef = useRef(config)
   const drawModeRef = useRef(drawMode)
   const pendingRef = useRef(pending)
   const dirtyRef = useRef(false)
+  const [mapReady, setMapReady] = useState(false)
+  const [hasLabBounds, setHasLabBounds] = useState(false)
   configRef.current = config
   drawModeRef.current = drawMode
   pendingRef.current = pending
+
+  const fitLabBounds = useCallback(() => {
+    const map = mapRef.current
+    const bounds = labBoundsRef.current
+    if (!map || !bounds?.isValid()) return
+    map.invalidateSize()
+    map.fitBounds(bounds, { padding: [36, 36], maxZoom: 15 })
+    labInitialFitDoneRef.current = true
+  }, [])
 
   const persistMission = async (mission: LabMission) => {
     try {
@@ -157,6 +170,7 @@ export default function Lab() {
   // 初始化编辑地图 (复用 /api/map/config 的瓦片代理)
   useEffect(() => {
     let cancelled = false
+    let resizeObserver: ResizeObserver | null = null
     fetch('/api/map/config').then((r) => r.json()).then((json) => {
       const cfg = json.data as MapConfigLite | undefined
       if (cancelled || !cfg || !containerRef.current || mapRef.current) return
@@ -198,23 +212,37 @@ export default function Lab() {
           persistConfig(nextConfig).catch(() => {})
         }
       })
+      if (typeof ResizeObserver !== 'undefined') {
+        resizeObserver = new ResizeObserver(() => map.invalidateSize())
+        resizeObserver.observe(containerRef.current)
+      }
       mapRef.current = map
+      setMapReady(true)
+      window.setTimeout(() => map.invalidateSize(), 0)
     }).catch(() => {})
     return () => {
       cancelled = true
+      resizeObserver?.disconnect()
       mapRef.current?.remove()
       mapRef.current = null
       layerRef.current = null
       boatRef.current = null
+      setMapReady(false)
     }
   }, [])
 
   // 重绘航线/航点/污染源
   useEffect(() => {
     const group = layerRef.current
-    if (!group) return
+    if (!mapReady || !group) return
     group.clearLayers()
     const pts = config.mission.waypoints.map((w) => [w.lat, w.lng] as [number, number])
+    const bounds = L.latLngBounds([])
+    const startLat = Number(config.sim.start_lat)
+    const startLng = Number(config.sim.start_lng)
+    if (Number.isFinite(startLat) && Number.isFinite(startLng)) {
+      bounds.extend([startLat, startLng])
+    }
     if (pts.length > 1) {
       L.polyline(pts, { color: '#2563eb', weight: 3, opacity: 0.7 }).addTo(group)
     }
@@ -222,14 +250,29 @@ export default function Lab() {
       L.marker([w.lat, w.lng], {
         icon: L.divIcon({ className: 'usv-waypoint-icon', html: `<span>#${i}</span>`, iconAnchor: [0, 0] }),
       }).addTo(group)
+      bounds.extend([w.lat, w.lng])
     })
     const src = config.pollution.mode === 'manual' ? config.pollution.source : config.mission.center
     if (src) {
       L.circle([src.lat, src.lng], {
         radius: config.pollution.radius_m, color: '#e03131', fillColor: '#e03131', fillOpacity: 0.12, weight: 1,
       }).addTo(group)
+      bounds.extend([src.lat, src.lng])
     }
-  }, [config.mission, config.pollution])
+    if (bounds.isValid()) {
+      labBoundsRef.current = bounds
+      setHasLabBounds(true)
+      if (!labInitialFitDoneRef.current) {
+        const map = mapRef.current
+        map?.invalidateSize()
+        map?.fitBounds(bounds, { padding: [36, 36], maxZoom: 15 })
+        labInitialFitDoneRef.current = true
+      }
+    } else {
+      labBoundsRef.current = null
+      setHasLabBounds(false)
+    }
+  }, [config.mission, config.pollution, config.sim.start_lat, config.sim.start_lng, mapReady])
 
   useEffect(() => {
     refresh().catch(() => {})
@@ -309,13 +352,13 @@ export default function Lab() {
     : '就绪'
 
   return (
-    <div className="p-4 md:p-8 space-y-6 max-w-7xl mx-auto">
-      <header className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+    <div className="h-[calc(100vh-5rem)] md:h-screen p-3 md:p-5 flex flex-col gap-3 bg-muted/20">
+      <header className="flex flex-col md:flex-row md:items-center justify-between gap-3 shrink-0">
         <div>
-          <h1 className="text-3xl font-bold tracking-tight">实验室测试</h1>
-          <p className="text-muted-foreground">半实物采样、模拟走航与虚拟差速输出</p>
+          <h1 className="text-2xl font-semibold tracking-tight">实验室测试</h1>
+          <p className="text-sm text-muted-foreground">半实物采样、模拟走航与虚拟差速输出</p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
           <Button variant="outline" disabled={!!pending} onClick={() => run('save', saveConfig)}>
             <Save className="w-4 h-4 mr-2" />
             保存
@@ -334,11 +377,11 @@ export default function Lab() {
       {message && <div className="rounded-md border bg-card px-4 py-3 text-sm">{message}</div>}
 
       {/* 当前阶段引导横幅 */}
-      <div className="flex items-center gap-3 rounded-md border bg-muted/40 px-4 py-3 text-sm">
+      <div className="flex items-center gap-3 rounded-md border bg-background px-4 py-3 text-sm shadow-sm shrink-0">
         <Activity className="h-4 w-4 text-primary shrink-0" />
         <span className="font-medium">当前阶段: {stage}</span>
         <span className="text-muted-foreground">
-          {stage === '未配置航点' && '在右侧地图点击"画航点"放置虚拟航点, 或从 QGC 导入, 再点启动。'}
+          {stage === '未配置航点' && '在地图点击"画航点"放置虚拟航点, 或从 QGC 导入, 再点启动。'}
           {stage === '就绪' && '已配置航线, 点"启动"让虚拟船自动巡航并到点采样。'}
           {stage.startsWith('航行中') && `虚拟船自动巡航中, 已到达 ${mission.reached_count}/${config.mission.waypoints.length} 点。`}
           {stage === '采样中' && '到达航点, 正在按数据源采集 (模拟生成或真实设备)。'}
@@ -346,81 +389,48 @@ export default function Lab() {
         </span>
       </div>
 
-      <div className="grid grid-cols-1 xl:grid-cols-[1fr_360px] gap-6">
-        <div className="space-y-6">
+      <div className="grid grid-cols-1 xl:grid-cols-[360px_minmax(0,1fr)] gap-3 flex-1 min-h-0 overflow-auto xl:overflow-hidden lab-map-workspace">
+        <aside className="space-y-3 min-h-0 xl:overflow-auto xl:pr-1">
           <Card>
-            <CardHeader>
-              <CardTitle className="flex items-center gap-2">
+            <CardHeader className="pb-2">
+              <CardTitle className="flex items-center gap-2 text-base">
                 <FlaskConical className="h-5 w-5" />
                 模式与数据源
               </CardTitle>
             </CardHeader>
-            <CardContent className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <label className="flex items-center justify-between rounded-md border p-3">
+            <CardContent className="grid grid-cols-1 gap-3">
+              <label className="flex items-center justify-between gap-3 rounded-md border p-3">
                 <span>启用实验模式</span>
                 <Switch checked={config.enabled} onCheckedChange={(enabled) => updateConfig({ enabled })} />
               </label>
-              <div className="flex items-center justify-between rounded-md border p-3">
-                <span>数据源</span>
-                <div className="inline-flex rounded-md border bg-background p-1">
+              <div className="space-y-2 rounded-md border p-3">
+                <span className="text-sm font-medium">数据源</span>
+                <div className="grid grid-cols-2 rounded-md border bg-background p-1">
                   {(['simulated', 'real'] as const).map((ds) => (
-                    <Button key={ds} size="sm" variant={config.data_source === ds ? 'default' : 'ghost'}
+                    <Button key={ds} size="sm" className="min-w-0" variant={config.data_source === ds ? 'default' : 'ghost'}
                       onClick={() => updateConfig({ data_source: ds })}>
                       {ds === 'simulated' ? '模拟生成' : '真实设备'}
                     </Button>
                   ))}
                 </div>
               </div>
-              <label className="flex items-center justify-between rounded-md border p-3">
+              <label className="flex items-center justify-between gap-3 rounded-md border p-3">
                 <span>跳过 PID 角度等待</span>
                 <Switch checked={config.bypass_pid_wait} onCheckedChange={(bypass_pid_wait) => updateConfig({ bypass_pid_wait })} />
               </label>
-              <label className="flex items-center justify-between rounded-md border p-3">
+              <label className="flex items-center justify-between gap-3 rounded-md border p-3">
                 <span>允许无 GPS</span>
                 <Switch checked={config.allow_no_gps} onCheckedChange={(allow_no_gps) => updateConfig({ allow_no_gps })} />
               </label>
             </CardContent>
           </Card>
 
-          {/* 虚拟航线编辑地图 */}
           <Card>
             <CardHeader className="pb-2">
-              <CardTitle className="flex items-center justify-between">
-                <span className="flex items-center gap-2"><MapPin className="h-5 w-5" />虚拟航线</span>
-                <div className="flex items-center gap-2">
-                  <Button size="sm" variant={drawMode === 'waypoint' ? 'default' : 'outline'}
-                    onClick={() => setDrawMode((m) => (m === 'waypoint' ? '' : 'waypoint'))}>
-                    <MapPin className="w-4 h-4 mr-1" />画航点
-                  </Button>
-                  <Button size="sm" variant={drawMode === 'source' ? 'default' : 'outline'}
-                    onClick={() => setDrawMode((m) => (m === 'source' ? '' : 'source'))}>
-                    <Crosshair className="w-4 h-4 mr-1" />放污染源
-                  </Button>
-                  <Button size="sm" variant="outline" onClick={() => run('import', importQgc)} disabled={!!pending}>
-                    <Download className="w-4 h-4 mr-1" />导入QGC
-                  </Button>
-                  <Button size="sm" variant="outline" onClick={clearWaypoints}>
-                    <Trash2 className="w-4 h-4 mr-1" />清空
-                  </Button>
-                </div>
-              </CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div ref={containerRef} className="h-[360px] w-full rounded-md border overflow-hidden" />
-              <p className="mt-2 text-xs text-muted-foreground">
-                {drawMode === 'waypoint' ? '点击地图添加航点。'
-                  : drawMode === 'source' ? '点击地图放置污染源 (切换为手动模式)。'
-                  : `已配置 ${config.mission.waypoints.length} 个航点。`}
-              </p>
-            </CardContent>
-          </Card>
-
-          <Card>
-            <CardHeader>
-              <CardTitle>模拟参数与污染源</CardTitle>
+              <CardTitle className="text-base">模拟参数与污染源</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+              <div className="grid grid-cols-2 gap-3">
                 {([
                   ['start_lat', '起始纬度'],
                   ['start_lng', '起始经度'],
@@ -435,12 +445,12 @@ export default function Lab() {
                   </div>
                 ))}
               </div>
-              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 border-t pt-4">
-                <div className="space-y-2">
+              <div className="grid grid-cols-2 gap-3 border-t pt-4">
+                <div className="col-span-2 space-y-2">
                   <Label>污染源模式</Label>
-                  <div className="inline-flex rounded-md border bg-background p-1 w-full">
+                  <div className="grid grid-cols-2 rounded-md border bg-background p-1">
                     {(['center', 'manual'] as const).map((pm) => (
-                      <Button key={pm} size="sm" className="flex-1" variant={config.pollution.mode === pm ? 'default' : 'ghost'}
+                      <Button key={pm} size="sm" variant={config.pollution.mode === pm ? 'default' : 'ghost'}
                         onClick={() => updatePollution({ mode: pm })}>
                         {pm === 'center' ? '航线中心' : '手动放置'}
                       </Button>
@@ -460,54 +470,90 @@ export default function Lab() {
               </div>
             </CardContent>
           </Card>
-        </div>
 
-        <Card>
-          <CardHeader>
-            <CardTitle className="flex items-center gap-2">
-              <Activity className="h-5 w-5" />
-              状态
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="flex items-center gap-2 text-base">
+                <Activity className="h-5 w-5" />
+                状态
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="grid grid-cols-2 gap-3 text-sm">
+                <div className="rounded-md border p-3">
+                  <div className="text-muted-foreground">运行</div>
+                  <div className="font-medium">{status.running ? '是' : '否'}</div>
+                </div>
+                <div className="rounded-md border p-3">
+                  <div className="text-muted-foreground">航速</div>
+                  <div className="font-medium">{(status.speed_mps || 0).toFixed(2)} m/s</div>
+                </div>
+                <div className="rounded-md border p-3">
+                  <div className="text-muted-foreground">航向</div>
+                  <div className="font-medium">{(status.heading_deg || 0).toFixed(1)} deg</div>
+                </div>
+                <div className="rounded-md border p-3">
+                  <div className="text-muted-foreground">到达进度</div>
+                  <div className="font-medium">{mission.reached_count}/{config.mission.waypoints.length}</div>
+                </div>
+              </div>
+              <div className="rounded-md border p-3 space-y-2">
+                <div className="flex justify-between text-sm">
+                  <span>左推进 (制导)</span>
+                  <span className="font-mono">{(propulsion.left || 0).toFixed(2)}</span>
+                </div>
+                <div className="h-2 rounded bg-muted">
+                  <div className="h-2 rounded bg-primary" style={{ width: `${Math.abs(propulsion.left || 0) * 100}%` }} />
+                </div>
+                <div className="flex justify-between text-sm">
+                  <span>右推进 (制导)</span>
+                  <span className="font-mono">{(propulsion.right || 0).toFixed(2)}</span>
+                </div>
+                <div className="h-2 rounded bg-muted">
+                  <div className="h-2 rounded bg-primary" style={{ width: `${Math.abs(propulsion.right || 0) * 100}%` }} />
+                </div>
+              </div>
+              <Button variant="outline" className="w-full" onClick={() => refresh().catch(() => {})}>
+                <RotateCcw className="w-4 h-4 mr-2" />
+                刷新
+              </Button>
+            </CardContent>
+          </Card>
+        </aside>
+
+        {/* 虚拟航线编辑地图 */}
+        <Card className="flex min-h-[520px] flex-col overflow-hidden xl:min-h-0">
+          <CardHeader className="pb-2">
+            <CardTitle className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+              <span className="flex items-center gap-2"><MapPin className="h-5 w-5" />虚拟航线</span>
+              <div className="flex flex-wrap items-center gap-2">
+                <Button size="sm" variant={drawMode === 'waypoint' ? 'default' : 'outline'}
+                  onClick={() => setDrawMode((m) => (m === 'waypoint' ? '' : 'waypoint'))}>
+                  <MapPin className="w-4 h-4 mr-1" />画航点
+                </Button>
+                <Button size="sm" variant={drawMode === 'source' ? 'default' : 'outline'}
+                  onClick={() => setDrawMode((m) => (m === 'source' ? '' : 'source'))}>
+                  <Crosshair className="w-4 h-4 mr-1" />放污染源
+                </Button>
+                <Button size="sm" variant="outline" onClick={fitLabBounds} disabled={!hasLabBounds}>
+                  <Crosshair className="w-4 h-4 mr-1" />适配范围
+                </Button>
+                <Button size="sm" variant="outline" onClick={() => run('import', importQgc)} disabled={!!pending}>
+                  <Download className="w-4 h-4 mr-1" />导入QGC
+                </Button>
+                <Button size="sm" variant="outline" onClick={clearWaypoints}>
+                  <Trash2 className="w-4 h-4 mr-1" />清空
+                </Button>
+              </div>
             </CardTitle>
           </CardHeader>
-          <CardContent className="space-y-4">
-            <div className="grid grid-cols-2 gap-3 text-sm">
-              <div className="rounded-md border p-3">
-                <div className="text-muted-foreground">运行</div>
-                <div className="font-medium">{status.running ? '是' : '否'}</div>
-              </div>
-              <div className="rounded-md border p-3">
-                <div className="text-muted-foreground">航速</div>
-                <div className="font-medium">{(status.speed_mps || 0).toFixed(2)} m/s</div>
-              </div>
-              <div className="rounded-md border p-3">
-                <div className="text-muted-foreground">航向</div>
-                <div className="font-medium">{(status.heading_deg || 0).toFixed(1)} deg</div>
-              </div>
-              <div className="rounded-md border p-3">
-                <div className="text-muted-foreground">到达进度</div>
-                <div className="font-medium">{mission.reached_count}/{config.mission.waypoints.length}</div>
-              </div>
-            </div>
-            <div className="rounded-md border p-3 space-y-2">
-              <div className="flex justify-between text-sm">
-                <span>左推进 (制导)</span>
-                <span className="font-mono">{(propulsion.left || 0).toFixed(2)}</span>
-              </div>
-              <div className="h-2 rounded bg-muted">
-                <div className="h-2 rounded bg-primary" style={{ width: `${Math.abs(propulsion.left || 0) * 100}%` }} />
-              </div>
-              <div className="flex justify-between text-sm">
-                <span>右推进 (制导)</span>
-                <span className="font-mono">{(propulsion.right || 0).toFixed(2)}</span>
-              </div>
-              <div className="h-2 rounded bg-muted">
-                <div className="h-2 rounded bg-primary" style={{ width: `${Math.abs(propulsion.right || 0) * 100}%` }} />
-              </div>
-            </div>
-            <Button variant="outline" className="w-full" onClick={() => refresh().catch(() => {})}>
-              <RotateCcw className="w-4 h-4 mr-2" />
-              刷新
-            </Button>
+          <CardContent className="flex flex-1 min-h-0 flex-col p-3 pt-0">
+            <div ref={containerRef} className="min-h-0 flex-1 w-full rounded-md border overflow-hidden" />
+            <p className="mt-2 text-xs text-muted-foreground">
+              {drawMode === 'waypoint' ? '点击地图添加航点。'
+                : drawMode === 'source' ? '点击地图放置污染源 (切换为手动模式)。'
+                : `已配置 ${config.mission.waypoints.length} 个航点。`}
+            </p>
           </CardContent>
         </Card>
       </div>

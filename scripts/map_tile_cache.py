@@ -165,10 +165,10 @@ class MapTileCache(object):
         self._log = logger or (lambda *a, **k: None)
         self._sub_idx = 0
         self._sub_lock = threading.Lock()
-        # 离线模式: 跳过一切回源, 仅用本地缓存+占位 (弱网防超时卡顿)
-        # 状态持久化到缓存目录下的 state 文件, 重启保持
         self._state_path = os.path.join(cache_dir, ".offline_mode")
-        self.offline_mode = self._load_offline_state(offline_mode)
+        # 旧版本的离线模式会持久化并阻止回源; 现在统一使用缓存优先,
+        # 联网可用时自动落盘, 无网时自然回退到已缓存瓦片/占位瓦片。
+        self.offline_mode = False
         # 预热任务状态
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
@@ -221,24 +221,20 @@ class MapTileCache(object):
             return bool(default)
 
     def set_offline_mode(self, enabled):
-        """设置离线模式; 开启后 get_tile 不再回源。状态持久化。"""
-        self.offline_mode = bool(enabled)
+        """兼容旧接口; 新策略始终为缓存优先并允许联网回源。"""
+        self.offline_mode = False
         try:
-            os.makedirs(self.cache_dir, exist_ok=True)
-            with open(self._state_path, "w") as f:
-                f.write("1" if self.offline_mode else "0")
+            if os.path.exists(self._state_path):
+                os.remove(self._state_path)
         except OSError as exc:
-            self._log("写入离线模式状态失败: %s", str(exc))
+            self._log("清理旧离线模式状态失败: %s", str(exc))
         return self.offline_mode
 
     def get_tile(self, style, z, x, y, allow_remote=True):
         """读取瓦片: 缓存优先 -> (在线)回源落盘 -> 占位瓦片。
 
         返回 (data_bytes, hit_str)。hit_str: cache/remote/placeholder。
-        离线模式下强制 allow_remote=False。
         """
-        if self.offline_mode:
-            allow_remote = False
         if style not in VALID_STYLES:
             return PLACEHOLDER_TILE, "placeholder"
         path = self._tile_path(style, z, x, y)
