@@ -11,6 +11,7 @@ import { useAppStore } from '@/store'
 type MapMode = 'live' | 'history'
 type MetricMode = 'auto' | 'concentration' | 'absorbance' | 'voltage'
 type TileStyle = 'satellite' | 'annotation'
+type CoordinateDatum = 'gcj02' | 'wgs84'
 
 interface MapConfig {
   enabled: boolean
@@ -122,6 +123,43 @@ function numeric(value: unknown) {
   return Number.isFinite(n) ? n : null
 }
 
+// WGS-84 -> GCJ-02, 与后端 web_config_server.py:wgs84_to_gcj02 算法一致,
+// 用于把手持 GPS 的实测 WGS-84 读数对齐到高德 GCJ-02 底图。
+function outOfChina(lat: number, lng: number) {
+  return lng < 72.004 || lng > 137.8347 || lat < 0.8293 || lat > 55.8271
+}
+
+function transformLat(x: number, y: number) {
+  let ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * Math.sqrt(Math.abs(x))
+  ret += ((20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0) / 3.0
+  ret += ((20.0 * Math.sin(y * Math.PI) + 40.0 * Math.sin((y / 3.0) * Math.PI)) * 2.0) / 3.0
+  ret += ((160.0 * Math.sin((y / 12.0) * Math.PI) + 320 * Math.sin((y * Math.PI) / 30.0)) * 2.0) / 3.0
+  return ret
+}
+
+function transformLng(x: number, y: number) {
+  let ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x))
+  ret += ((20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0) / 3.0
+  ret += ((20.0 * Math.sin(x * Math.PI) + 40.0 * Math.sin((x / 3.0) * Math.PI)) * 2.0) / 3.0
+  ret += ((150.0 * Math.sin((x / 12.0) * Math.PI) + 300.0 * Math.sin((x / 30.0) * Math.PI)) * 2.0) / 3.0
+  return ret
+}
+
+function wgs84ToGcj02(lat: number, lng: number): MapCoordinate {
+  if (outOfChina(lat, lng)) return { lat, lng }
+  const a = 6378245.0
+  const ee = 0.00669342162296594323
+  let dLat = transformLat(lng - 105.0, lat - 35.0)
+  let dLng = transformLng(lng - 105.0, lat - 35.0)
+  const radLat = (lat / 180.0) * Math.PI
+  let magic = Math.sin(radLat)
+  magic = 1 - ee * magic * magic
+  const sqrtMagic = Math.sqrt(magic)
+  dLat = (dLat * 180.0) / (((a * (1 - ee)) / (magic * sqrtMagic)) * Math.PI)
+  dLng = (dLng * 180.0) / ((a / sqrtMagic) * Math.cos(radLat) * Math.PI)
+  return { lat: lat + dLat, lng: lng + dLng }
+}
+
 function colorFor(value: number, min: number, max: number) {
   if (max <= min) return sampleColors[0]
   const idx = Math.max(0, Math.min(sampleColors.length - 1, Math.floor(((value - min) / (max - min)) * sampleColors.length)))
@@ -160,6 +198,11 @@ export default function MapPage() {
   const [offlineMode, setOfflineMode] = useState(false)
   const [importing, setImporting] = useState(false)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
+  const gotoMarkerRef = useRef<L.Marker | null>(null)
+  const [gotoLat, setGotoLat] = useState('')
+  const [gotoLng, setGotoLng] = useState('')
+  const [gotoDatum, setGotoDatum] = useState<CoordinateDatum>('gcj02')
+  const [gotoMsg, setGotoMsg] = useState('')
 
   const activeSamples = useMemo(
     () => geojson?.features.filter((f) => f.properties?.layer === 'sample') || [],
@@ -201,6 +244,36 @@ export default function MapPage() {
       setCacheMsg('离线模式切换失败')
     }
   }, [])
+
+  const flyToCoordinate = useCallback(() => {
+    const map = mapRef.current
+    if (!map) {
+      setGotoMsg('地图尚未就绪')
+      return
+    }
+    const lat = numeric(gotoLat)
+    const lng = numeric(gotoLng)
+    if (lat === null || lng === null || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+      setGotoMsg('请输入有效经纬度 (纬度 -90~90, 经度 -180~180)')
+      return
+    }
+    const target = gotoDatum === 'wgs84' ? wgs84ToGcj02(lat, lng) : { lat, lng }
+    const zoom = Math.max(map.getZoom(), mapConfig?.default_zoom ?? 15)
+    map.flyTo([target.lat, target.lng], zoom)
+    if (gotoMarkerRef.current) {
+      gotoMarkerRef.current.setLatLng([target.lat, target.lng])
+    } else {
+      gotoMarkerRef.current = L.marker([target.lat, target.lng], {
+        icon: L.divIcon({
+          className: 'usv-goto-icon',
+          html: '<span>★</span>',
+          iconAnchor: [0, 0],
+        }),
+      }).addTo(map)
+    }
+    gotoMarkerRef.current.bindPopup(`手动定位点<br/>${target.lat.toFixed(6)}, ${target.lng.toFixed(6)}`)
+    setGotoMsg(`已跳转至 ${target.lat.toFixed(6)}, ${target.lng.toFixed(6)}`)
+  }, [gotoLat, gotoLng, gotoDatum, mapConfig])
 
   const importPack = useCallback(async (file: File) => {
     setImporting(true)
@@ -549,6 +622,56 @@ export default function MapPage() {
               </CardContent>
             </Card>
           )}
+
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="text-base flex items-center gap-2"><MapPinned className="w-4 h-4" />定位跳转</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3 text-sm">
+              <div className="grid grid-cols-2 gap-2">
+                <label className="space-y-1">
+                  <span className="text-xs text-muted-foreground">纬度 Lat</span>
+                  <input
+                    type="number"
+                    inputMode="decimal"
+                    step="any"
+                    placeholder="25.0"
+                    value={gotoLat}
+                    onChange={(e) => setGotoLat(e.target.value)}
+                    className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
+                  />
+                </label>
+                <label className="space-y-1">
+                  <span className="text-xs text-muted-foreground">经度 Lng</span>
+                  <input
+                    type="number"
+                    inputMode="decimal"
+                    step="any"
+                    placeholder="115.0"
+                    value={gotoLng}
+                    onChange={(e) => setGotoLng(e.target.value)}
+                    className="h-9 w-full rounded-md border border-input bg-background px-2 text-sm"
+                  />
+                </label>
+              </div>
+              <label className="flex items-center justify-between">
+                <span className="text-muted-foreground">坐标系</span>
+                <select
+                  className="h-9 rounded-md border border-input bg-background px-2 text-sm"
+                  value={gotoDatum}
+                  onChange={(e) => setGotoDatum(e.target.value as CoordinateDatum)}
+                >
+                  <option value="gcj02">图面 GCJ-02</option>
+                  <option value="wgs84">实测 WGS-84</option>
+                </select>
+              </label>
+              <Button size="sm" className="w-full" onClick={flyToCoordinate} disabled={!mapConfig?.enabled}>
+                <Navigation className="w-4 h-4 mr-1" />跳转到坐标
+              </Button>
+              {gotoMsg && <div className="rounded-md bg-muted p-2 text-xs">{gotoMsg}</div>}
+              <p className="text-xs text-muted-foreground">无 GPS 信号时手动跳转到作业区。手持 GPS 读数选实测 WGS-84, 自动对齐底图。</p>
+            </CardContent>
+          </Card>
 
           <Card>
             <CardHeader className="pb-2">
