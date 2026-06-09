@@ -38,7 +38,7 @@ import time
 
 import rospy
 from geometry_msgs.msg import TwistStamped
-from sensor_msgs.msg import Imu
+from sensor_msgs.msg import Imu, NavSatFix
 from std_msgs.msg import String, Float32MultiArray
 from std_srvs.srv import Trigger, TriggerResponse
 from mavros_msgs.msg import State, WaypointReached, Mavlink
@@ -65,6 +65,39 @@ MAV_RESULT_TEMPORARILY_REJECTED = 1
 MAV_RESULT_FAILED = 5
 
 CONFIG_FILE = os.path.expanduser("~/usv_ws/config/sampling_config.json")
+
+SURVEY_GATE_DEFAULTS = {
+    "survey_interval_s": 5.0,
+    "survey_min_distance_m": 0.0,
+    "survey_min_speed_mps": 0.0,
+    "survey_max_speed_mps": 0.0,
+    "survey_require_valid_spectrometer": False,
+    "survey_require_gps": False,
+    "survey_max_position_age_s": 5.0,
+}
+
+
+def _float_or_none(value):
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def _float_or_default(value, default):
+    result = _float_or_none(value)
+    return default if result is None else result
+
+
+def _bool_or_default(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
 
 
 class MissionState(object):
@@ -117,6 +150,39 @@ class MAVLinkTriggerNode(object):
         self.default_on_fail = str(rospy.get_param('~sampling_on_fail', 'HOLD')).strip().upper()
         self.auto_trigger_on_waypoint = bool(rospy.get_param('~auto_trigger_on_waypoint', False))
         self.spectrometer_service_timeout = float(rospy.get_param('~spectrometer_service_timeout', 3.0))
+        self._survey_gate_defaults = {
+            "survey_interval_s": max(1.0, _float_or_default(
+                rospy.get_param('~survey_interval_s', SURVEY_GATE_DEFAULTS["survey_interval_s"]),
+                SURVEY_GATE_DEFAULTS["survey_interval_s"],
+            )),
+            "survey_min_distance_m": max(0.0, _float_or_default(
+                rospy.get_param('~survey_min_distance_m', SURVEY_GATE_DEFAULTS["survey_min_distance_m"]),
+                SURVEY_GATE_DEFAULTS["survey_min_distance_m"],
+            )),
+            "survey_min_speed_mps": max(0.0, _float_or_default(
+                rospy.get_param('~survey_min_speed_mps', SURVEY_GATE_DEFAULTS["survey_min_speed_mps"]),
+                SURVEY_GATE_DEFAULTS["survey_min_speed_mps"],
+            )),
+            "survey_max_speed_mps": max(0.0, _float_or_default(
+                rospy.get_param('~survey_max_speed_mps', SURVEY_GATE_DEFAULTS["survey_max_speed_mps"]),
+                SURVEY_GATE_DEFAULTS["survey_max_speed_mps"],
+            )),
+            "survey_require_valid_spectrometer": _bool_or_default(
+                rospy.get_param(
+                    '~survey_require_valid_spectrometer',
+                    SURVEY_GATE_DEFAULTS["survey_require_valid_spectrometer"],
+                ),
+                SURVEY_GATE_DEFAULTS["survey_require_valid_spectrometer"],
+            ),
+            "survey_require_gps": _bool_or_default(
+                rospy.get_param('~survey_require_gps', SURVEY_GATE_DEFAULTS["survey_require_gps"]),
+                SURVEY_GATE_DEFAULTS["survey_require_gps"],
+            ),
+            "survey_max_position_age_s": max(0.0, _float_or_default(
+                rospy.get_param('~survey_max_position_age_s', SURVEY_GATE_DEFAULTS["survey_max_position_age_s"]),
+                SURVEY_GATE_DEFAULTS["survey_max_position_age_s"],
+            )),
+        }
 
         # 状态
         self.mavros_state = State()
@@ -128,6 +194,8 @@ class MAVLinkTriggerNode(object):
         self.latest_spectrometer_payload = {}
         self.last_linear_speed = 0.0
         self.last_yaw_rate = 0.0
+        self._latest_global_position = None
+        self._last_survey_sample_position = None
         self.waypoint_states = {}
         self.state_lock = threading.Lock()
 
@@ -158,6 +226,7 @@ class MAVLinkTriggerNode(object):
         self.pump_status_sub = rospy.Subscriber('/usv/pump_status', String, self._pump_status_cb)
         self.spectrometer_voltage_sub = rospy.Subscriber('/usv/spectrometer_voltage', String, self._spectrometer_voltage_cb)
         self.velocity_sub = rospy.Subscriber('/mavros/local_position/velocity_local', TwistStamped, self._velocity_cb, queue_size=10)
+        self.global_position_sub = rospy.Subscriber('/mavros/global_position/global', NavSatFix, self._global_position_cb, queue_size=10)
         self.imu_sub = rospy.Subscriber('/mavros/imu/data', Imu, self._imu_cb, queue_size=10)
         self.mavlink_cmd_sub = rospy.Subscriber('/usv/mavlink_cmd_rx', Float32MultiArray, self._mavlink_cmd_rx_cb, queue_size=20)
         self.mavlink_sub = None
@@ -188,6 +257,20 @@ class MAVLinkTriggerNode(object):
             twist.linear.y * twist.linear.y +
             twist.linear.z * twist.linear.z
         )
+
+    def _global_position_cb(self, msg):
+        lat = _float_or_none(getattr(msg, "latitude", None))
+        lon = _float_or_none(getattr(msg, "longitude", None))
+        if lat is None or lon is None:
+            return
+        position = {
+            "lat": lat,
+            "lon": lon,
+            "alt": _float_or_none(getattr(msg, "altitude", None)),
+            "received_at": time.time(),
+        }
+        with self.state_lock:
+            self._latest_global_position = position
 
     def _imu_cb(self, msg):
         """IMU 回调。"""
@@ -1018,6 +1101,166 @@ class MAVLinkTriggerNode(object):
         rospy.loginfo("FCU-triggered sampling started (id=%d, no HOLD, no stable wait)", sample_id)
         return True
 
+    def _survey_gate_config(self, config=None):
+        defaults = dict(getattr(self, "_survey_gate_defaults", SURVEY_GATE_DEFAULTS))
+        config = config if isinstance(config, dict) else {}
+        raw = {}
+        for section_name in ("survey_sampling", "mapping_profile"):
+            section = config.get(section_name)
+            if isinstance(section, dict):
+                raw.update(section)
+
+        return {
+            "survey_interval_s": max(1.0, _float_or_default(
+                raw.get("survey_interval_s", defaults["survey_interval_s"]),
+                defaults["survey_interval_s"],
+            )),
+            "survey_min_distance_m": max(0.0, _float_or_default(
+                raw.get("survey_min_distance_m", defaults["survey_min_distance_m"]),
+                defaults["survey_min_distance_m"],
+            )),
+            "survey_min_speed_mps": max(0.0, _float_or_default(
+                raw.get("survey_min_speed_mps", defaults["survey_min_speed_mps"]),
+                defaults["survey_min_speed_mps"],
+            )),
+            "survey_max_speed_mps": max(0.0, _float_or_default(
+                raw.get("survey_max_speed_mps", defaults["survey_max_speed_mps"]),
+                defaults["survey_max_speed_mps"],
+            )),
+            "survey_require_valid_spectrometer": _bool_or_default(
+                raw.get("survey_require_valid_spectrometer", defaults["survey_require_valid_spectrometer"]),
+                defaults["survey_require_valid_spectrometer"],
+            ),
+            "survey_require_gps": _bool_or_default(
+                raw.get("survey_require_gps", defaults["survey_require_gps"]),
+                defaults["survey_require_gps"],
+            ),
+            "survey_max_position_age_s": max(0.0, _float_or_default(
+                raw.get("survey_max_position_age_s", defaults["survey_max_position_age_s"]),
+                defaults["survey_max_position_age_s"],
+            )),
+        }
+
+    @staticmethod
+    def _haversine_m(lat1, lon1, lat2, lon2):
+        radius_m = 6371000.0
+        lat1_rad = math.radians(float(lat1))
+        lat2_rad = math.radians(float(lat2))
+        d_lat = lat2_rad - lat1_rad
+        d_lon = math.radians(float(lon2) - float(lon1))
+        a = (
+            math.sin(d_lat / 2.0) * math.sin(d_lat / 2.0)
+            + math.cos(lat1_rad) * math.cos(lat2_rad)
+            * math.sin(d_lon / 2.0) * math.sin(d_lon / 2.0)
+        )
+        return radius_m * 2.0 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))
+
+    def _survey_state_snapshot(self):
+        state_lock = getattr(self, "state_lock", None)
+        if state_lock is not None:
+            with state_lock:
+                return {
+                    "position": dict(getattr(self, "_latest_global_position", {}) or {}),
+                    "last_position": dict(getattr(self, "_last_survey_sample_position", {}) or {}),
+                    "spectrometer": dict(getattr(self, "latest_spectrometer_payload", {}) or {}),
+                    "speed": float(getattr(self, "last_linear_speed", 0.0) or 0.0),
+                }
+        return {
+            "position": dict(getattr(self, "_latest_global_position", {}) or {}),
+            "last_position": dict(getattr(self, "_last_survey_sample_position", {}) or {}),
+            "spectrometer": dict(getattr(self, "latest_spectrometer_payload", {}) or {}),
+            "speed": float(getattr(self, "last_linear_speed", 0.0) or 0.0),
+        }
+
+    def _survey_gate_status(self, config=None):
+        gate = self._survey_gate_config(config)
+        snapshot = self._survey_state_snapshot()
+        position = snapshot["position"]
+        last_position = snapshot["last_position"]
+        speed = snapshot["speed"]
+
+        if gate["survey_require_valid_spectrometer"] and not snapshot["spectrometer"].get("valid", False):
+            return False, "spectrometer_invalid"
+
+        position_needed = gate["survey_require_gps"] or gate["survey_min_distance_m"] > 0.0
+        if position_needed:
+            if not position:
+                return False, "no_gps"
+            max_age = gate["survey_max_position_age_s"]
+            if max_age > 0.0 and time.time() - float(position.get("received_at", 0.0) or 0.0) > max_age:
+                return False, "gps_stale"
+
+        if gate["survey_min_speed_mps"] > 0.0 and speed < gate["survey_min_speed_mps"]:
+            return False, "speed_too_low"
+        if gate["survey_max_speed_mps"] > 0.0 and speed > gate["survey_max_speed_mps"]:
+            return False, "speed_too_high"
+
+        if gate["survey_min_distance_m"] > 0.0 and last_position:
+            distance_m = self._haversine_m(
+                last_position["lat"],
+                last_position["lon"],
+                position["lat"],
+                position["lon"],
+            )
+            if distance_m < gate["survey_min_distance_m"]:
+                return False, "distance_too_short"
+        return True, ""
+
+    def _remember_survey_sample_position(self):
+        state_lock = getattr(self, "state_lock", None)
+        if state_lock is not None:
+            with state_lock:
+                position = dict(getattr(self, "_latest_global_position", {}) or {})
+                if position:
+                    self._last_survey_sample_position = position
+            return
+        position = dict(getattr(self, "_latest_global_position", {}) or {})
+        if position:
+            self._last_survey_sample_position = position
+
+    def _set_survey_sampling_flags(self, active):
+        state_lock = getattr(self, "state_lock", None)
+        if state_lock is not None:
+            with state_lock:
+                self.is_sampling = bool(active)
+                self._survey_sample_active = bool(active)
+                self.current_sampling_context = {
+                    "waypoint_seq": int(self.current_waypoint),
+                    "source": "survey",
+                } if active else None
+            return
+        self.is_sampling = bool(active)
+        self._survey_sample_active = bool(active)
+        self.current_sampling_context = {
+            "waypoint_seq": int(self.current_waypoint),
+            "source": "survey",
+        } if active else None
+
+    def _start_survey_sample_once(self, config):
+        gate_ok, gate_reason = self._survey_gate_status(config)
+        if not gate_ok:
+            self._publish_status("survey_gate_skipped:{}".format(gate_reason))
+            return "skipped"
+
+        steps_data = self._build_steps_payload(config, self.current_waypoint)
+        steps_data['loop_count'] = 1
+
+        msg = String()
+        msg.data = json.dumps(steps_data)
+        self.steps_pub.publish(msg)
+
+        self._set_survey_sampling_flags(True)
+        if self._call_automation_service('start'):
+            self._remember_survey_sample_position()
+            self._publish_status("sampling_started")
+            return "started"
+
+        self._set_survey_sampling_flags(False)
+        self._survey_active = False
+        self._set_mission_state(MissionState.FAILED, "survey_sample_start_failed")
+        self._publish_status("survey_stopped")
+        return "failed"
+
     def _start_survey(self, interval=0):
         """启动走航采样：边走边测，不切 HOLD。"""
         if self._survey_active:
@@ -1027,7 +1270,9 @@ class MAVLinkTriggerNode(object):
             rospy.logwarn("Cannot start survey while point sampling is active")
             return False
 
-        self._survey_interval = max(1.0, float(interval) if interval > 0 else 5.0)
+        config = self._load_config() or self._get_default_config()
+        gate = self._survey_gate_config(config)
+        self._survey_interval = max(1.0, float(interval) if interval > 0 else gate["survey_interval_s"])
         self._survey_active = True
         self._survey_thread = threading.Thread(target=self._survey_loop, daemon=True)
         self._survey_thread.start()
@@ -1053,31 +1298,12 @@ class MAVLinkTriggerNode(object):
         while self._survey_active and not rospy.is_shutdown():
             if not self.is_sampling:
                 config = self._load_config() or self._get_default_config()
-                steps_data = self._build_steps_payload(config, self.current_waypoint)
-                # 走航模式强制 loop_count=1，单次采样
-                steps_data['loop_count'] = 1
-
-                msg = String()
-                msg.data = json.dumps(steps_data)
-                self.steps_pub.publish(msg)
-
-                with self.state_lock:
-                    self.is_sampling = True
-                    self._survey_sample_active = True
-                if self._call_automation_service('start'):
-                    self._publish_status("sampling_started")
-                else:
-                    with self.state_lock:
-                        self.is_sampling = False
-                        self._survey_sample_active = False
-                        self._survey_active = False
-                    self._set_mission_state(MissionState.FAILED, "survey_sample_start_failed")
-                    self._publish_status("survey_stopped")
+                result = self._start_survey_sample_once(config)
+                if result == "failed":
                     break
-                # 等待本次采样完成
-                while self.is_sampling and self._survey_active and not rospy.is_shutdown():
-                    rospy.sleep(0.2)
-
+                if result == "started":
+                    while self.is_sampling and self._survey_active and not rospy.is_shutdown():
+                        rospy.sleep(0.2)
             # 采样完成后等待间隔
             wait_end = time.time() + self._survey_interval
             while self._survey_active and not rospy.is_shutdown() and time.time() < wait_end:

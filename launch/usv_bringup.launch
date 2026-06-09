@@ -40,6 +40,13 @@
     <arg name="stable_yaw_rate_threshold" default="0.08" />
     <arg name="sampling_retry_count" default="0" />
     <arg name="sampling_on_fail" default="HOLD" />
+    <arg name="survey_interval_s" default="5.0" />
+    <arg name="survey_min_distance_m" default="0.0" />
+    <arg name="survey_min_speed_mps" default="0.0" />
+    <arg name="survey_max_speed_mps" default="0.0" />
+    <arg name="survey_require_valid_spectrometer" default="false" />
+    <arg name="survey_require_gps" default="false" />
+    <arg name="survey_max_position_age_s" default="5.0" />
     <arg name="enable_mavros" default="true" />
     <arg name="mavros_fcu_url" default="udp://127.0.0.1:14550@" />
     <arg name="mavros_gcs_url" default="" />
@@ -119,6 +126,13 @@
         <param name="stable_yaw_rate_threshold" value="$(arg stable_yaw_rate_threshold)" />
         <param name="sampling_retry_count" value="$(arg sampling_retry_count)" />
         <param name="sampling_on_fail" value="$(arg sampling_on_fail)" />
+        <param name="survey_interval_s" value="$(arg survey_interval_s)" />
+        <param name="survey_min_distance_m" value="$(arg survey_min_distance_m)" />
+        <param name="survey_min_speed_mps" value="$(arg survey_min_speed_mps)" />
+        <param name="survey_max_speed_mps" value="$(arg survey_max_speed_mps)" />
+        <param name="survey_require_valid_spectrometer" value="$(arg survey_require_valid_spectrometer)" />
+        <param name="survey_require_gps" value="$(arg survey_require_gps)" />
+        <param name="survey_max_position_age_s" value="$(arg survey_max_position_age_s)" />
         <param name="source_system_id" value="$(arg mavlink_source_system)" />
         <param name="source_component_id" value="$(arg mavlink_source_component)" />
     </node>
