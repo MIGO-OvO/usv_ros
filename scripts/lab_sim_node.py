@@ -59,8 +59,8 @@ class LabSimulator(object):
         self.configure(config or {})
 
     def configure(self, config):
-        self.start_lat = _float_value(config.get("start_lat", 30.0), 30.0)
-        self.start_lng = _float_value(config.get("start_lng", 120.0), 120.0)
+        self.start_lat = _float_value(config.get("start_lat", 25.314167), 25.314167)
+        self.start_lng = _float_value(config.get("start_lng", 110.412778), 110.412778)
         self.start_heading_deg = _float_value(config.get("heading_deg", 0.0), 0.0) % 360.0
         self.max_speed_mps = max(0.0, _float_value(config.get("max_speed_mps", 1.0), 1.0))
         self.wheel_base_m = max(0.05, _float_value(config.get("wheel_base_m", 0.6), 0.6))
@@ -218,8 +218,8 @@ class LabSimNode(object):
             raise RuntimeError("ROS is required for LabSimNode")
         rospy.init_node("lab_sim_node", anonymous=False)
         config = {
-            "start_lat": rospy.get_param("~start_lat", 30.0),
-            "start_lng": rospy.get_param("~start_lng", 120.0),
+            "start_lat": rospy.get_param("~start_lat", 25.314167),
+            "start_lng": rospy.get_param("~start_lng", 110.412778),
             "heading_deg": rospy.get_param("~heading_deg", 0.0),
             "max_speed_mps": rospy.get_param("~max_speed_mps", 1.0),
             "wheel_base_m": rospy.get_param("~wheel_base_m", 0.6),

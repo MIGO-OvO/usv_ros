@@ -3,6 +3,7 @@ import { resolve } from 'node:path'
 
 const root = resolve(import.meta.dirname, '..')
 const mapSource = readFileSync(resolve(root, 'src/pages/Map.tsx'), 'utf8')
+const labSource = readFileSync(resolve(root, 'src/pages/Lab.tsx'), 'utf8')
 const settingsSource = readFileSync(resolve(root, 'src/pages/Settings.tsx'), 'utf8')
 
 const requiredMapTokens = [
@@ -25,6 +26,29 @@ const requiredMapTokens = [
   '低质量/排除原因',
   'IDW size',
   'calibration_id',
+  'fitToCurrentBounds',
+  'tileLayerRef',
+  '.redraw()',
+  '适配范围',
+]
+
+const forbiddenMapTokens = [
+  '/api/map/offline-mode',
+  'offlineMode',
+  '离线模式',
+]
+
+const requiredLabTokens = [
+  'fitLabBounds',
+  'lab-map-workspace',
+  '适配范围',
+  '110.412778',
+  '25.314167',
+]
+
+const forbiddenLabTokens = [
+  'max-w-7xl',
+  'h-[360px]',
 ]
 
 const requiredSettingsTokens = [
@@ -39,6 +63,24 @@ const requiredSettingsTokens = [
 for (const token of requiredMapTokens) {
   if (!mapSource.includes(token)) {
     throw new Error(`Map smoke failed: missing ${token}`)
+  }
+}
+
+for (const token of forbiddenMapTokens) {
+  if (mapSource.includes(token)) {
+    throw new Error(`Map smoke failed: forbidden ${token}`)
+  }
+}
+
+for (const token of requiredLabTokens) {
+  if (!labSource.includes(token)) {
+    throw new Error(`Lab smoke failed: missing ${token}`)
+  }
+}
+
+for (const token of forbiddenLabTokens) {
+  if (labSource.includes(token)) {
+    throw new Error(`Lab smoke failed: forbidden ${token}`)
   }
 }
 

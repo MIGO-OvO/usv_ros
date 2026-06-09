@@ -681,10 +681,31 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertIn("{style}", payload["data"]["tile_url"])
         self.assertIn("v=2", payload["data"]["tile_url"])
         self.assertIn("satellite", payload["data"]["styles"])
+        self.assertEqual(payload["data"]["default_center"], {"lng": 110.412778, "lat": 25.314167})
         self.assertNotIn("key", payload["data"])
         self.assertNotIn("securityJsCode", payload["data"])
         self.assertEqual(placeholder.headers.get("X-Tile-Source"), "placeholder")
         self.assertIn("no-store", placeholder.headers.get("Cache-Control", ""))
+
+    def test_map_tile_cache_ignores_legacy_offline_state(self):
+        module, _, _ = _load_script(
+            "map_tile_cache_legacy_offline_state_test",
+            "scripts/map_tile_cache.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            Path(tmpdir, ".offline_mode").write_text("1", encoding="utf-8")
+            cache = module.MapTileCache(cache_dir=tmpdir)
+            cache._fetch_remote = lambda style, z, x, y: b"tile"
+
+            data, hit = cache.get_tile("satellite", 13, 6610, 3385)
+            enabled = cache.set_offline_mode(True)
+
+            self.assertEqual(data, b"tile")
+            self.assertEqual(hit, "remote")
+            self.assertFalse(enabled)
+            self.assertFalse(cache.offline_mode)
+            self.assertFalse(Path(tmpdir, ".offline_mode").exists())
 
     def test_web_static_dist_serves_spa_map_route(self):
         module, _, _ = _load_script(

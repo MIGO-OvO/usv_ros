@@ -290,8 +290,11 @@ function sampleRange(features: GeoFeature[]) {
 export default function MapPage() {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const mapRef = useRef<L.Map | null>(null)
+  const tileLayerRef = useRef<L.TileLayer | null>(null)
   const overlaysRef = useRef<L.LayerGroup | null>(null)
   const heatRef = useRef<HeatLayer | null>(null)
+  const currentBoundsRef = useRef<L.LatLngBounds | null>(null)
+  const initialFitDoneRef = useRef(false)
   const socket = useAppStore((state) => state.socket)
   const [mode, setMode] = useState<MapMode>(() => {
     if (typeof window === 'undefined') return 'live'
@@ -313,8 +316,8 @@ export default function MapPage() {
   const [prewarm, setPrewarm] = useState<PrewarmStatus | null>(null)
   const [cacheStats, setCacheStats] = useState<CacheStats | null>(null)
   const [cacheMsg, setCacheMsg] = useState('')
-  const [offlineMode, setOfflineMode] = useState(false)
   const [importing, setImporting] = useState(false)
+  const [hasCurrentBounds, setHasCurrentBounds] = useState(false)
   const fileInputRef = useRef<HTMLInputElement | null>(null)
   const gotoMarkerRef = useRef<L.Marker | null>(null)
   const [gotoLat, setGotoLat] = useState('')
@@ -365,27 +368,23 @@ export default function MapPage() {
       if (json.success) {
         setCacheStats(json.data.cache)
         setPrewarm(json.data.prewarm)
-        if (typeof json.data.offline_mode === 'boolean') setOfflineMode(json.data.offline_mode)
       }
     } catch {
       /* 离线时忽略 */
     }
   }, [])
 
-  const toggleOffline = useCallback(async (enabled: boolean) => {
-    setOfflineMode(enabled)
-    try {
-      const res = await fetch('/api/map/offline-mode', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ enabled }),
-      })
-      const json = await res.json()
-      setCacheMsg(json.message || '')
-    } catch {
-      setCacheMsg('离线模式切换失败')
-    }
+  const redrawMapTiles = useCallback(() => {
+    tileLayerRef.current?.redraw()
   }, [])
+
+  const fitToCurrentBounds = useCallback(() => {
+    const map = mapRef.current
+    const bounds = currentBoundsRef.current
+    if (!map || !bounds?.isValid()) return
+    map.fitBounds(bounds, { padding: [40, 40], maxZoom: mapConfig?.default_zoom ?? 15 })
+    initialFitDoneRef.current = true
+  }, [mapConfig])
 
   const flyToCoordinate = useCallback(() => {
     const map = mapRef.current
@@ -428,6 +427,7 @@ export default function MapPage() {
       if (json.success) {
         setCacheMsg(`导入完成: 新增 ${json.data.added} 张, 跳过 ${json.data.skipped} 张`)
         loadCacheStats()
+        redrawMapTiles()
       } else {
         setCacheMsg(json.message || '导入失败')
       }
@@ -436,7 +436,7 @@ export default function MapPage() {
     } finally {
       setImporting(false)
     }
-  }, [loadCacheStats])
+  }, [loadCacheStats, redrawMapTiles])
 
   const probeOnline = useCallback(async () => {
     try {
@@ -552,8 +552,18 @@ export default function MapPage() {
       )
     }
 
-    if (bounds.isValid()) map.fitBounds(bounds, { padding: [40, 40] })
-  }, [clearOverlays, metric])
+    if (bounds.isValid()) {
+      currentBoundsRef.current = bounds
+      setHasCurrentBounds(true)
+      if (!initialFitDoneRef.current) {
+        map.fitBounds(bounds, { padding: [40, 40], maxZoom: mapConfig?.default_zoom ?? 15 })
+        initialFitDoneRef.current = true
+      }
+    } else {
+      currentBoundsRef.current = null
+      setHasCurrentBounds(false)
+    }
+  }, [clearOverlays, mapConfig, metric])
 
   const loadLive = useCallback(async () => {
     const res = await fetch(`/api/map/live?metric=${metric}&size=${idwSize}&power=${idwPower}`)
@@ -665,7 +675,8 @@ export default function MapPage() {
     const json = await res.json()
     setCacheMsg(json.message || '')
     loadCacheStats()
-  }, [loadCacheStats])
+    redrawMapTiles()
+  }, [loadCacheStats, redrawMapTiles])
 
   useEffect(() => {
     loadConfig()
@@ -687,10 +698,12 @@ export default function MapPage() {
         attributionControl: false,
       })
       const tileTpl = mapConfig.tile_url
-      L.tileLayer(tileTpl.replace('{style}', mapConfig.default_style), {
+      const tileLayer = L.tileLayer(tileTpl.replace('{style}', mapConfig.default_style), {
         minZoom: mapConfig.min_zoom,
         maxZoom: mapConfig.max_zoom,
-      }).addTo(map)
+      })
+      tileLayer.addTo(map)
+      tileLayerRef.current = tileLayer
       overlaysRef.current = L.layerGroup().addTo(map)
       heatRef.current = (L as unknown as { heatLayer: (pts: Array<[number, number, number]>, opts: Record<string, unknown>) => HeatLayer }).heatLayer([], {
         radius: 30,
@@ -711,13 +724,16 @@ export default function MapPage() {
     if (!socket) return
     const onProgress = (status: PrewarmStatus) => {
       setPrewarm(status)
-      if (!status.running) loadCacheStats()
+      if (!status.running) {
+        loadCacheStats()
+        redrawMapTiles()
+      }
     }
     socket.on('map_prewarm_progress', onProgress)
     return () => {
       socket.off('map_prewarm_progress', onProgress)
     }
-  }, [socket, loadCacheStats])
+  }, [socket, loadCacheStats, redrawMapTiles])
 
   useEffect(() => {
     if (mode === 'live') {
@@ -754,6 +770,10 @@ export default function MapPage() {
           <Button variant="outline" size="sm" onClick={() => mode === 'live' ? loadLive() : loadHistory()}>
             <RefreshCw className="w-4 h-4 mr-1" />
             刷新
+          </Button>
+          <Button variant="outline" size="sm" onClick={fitToCurrentBounds} disabled={!hasCurrentBounds}>
+            <MapPinned className="w-4 h-4 mr-1" />
+            适配范围
           </Button>
         </div>
       </header>
@@ -1005,15 +1025,6 @@ export default function MapPage() {
                 <span className="text-muted-foreground">已缓存瓦片</span>
                 <span className="font-medium">{cacheStats ? `${cacheStats.tiles} 张 · ${(cacheStats.bytes / 1048576).toFixed(1)} MB` : '—'}</span>
               </div>
-              <label className="flex items-center justify-between">
-                <span className="text-muted-foreground">离线模式</span>
-                <input
-                  type="checkbox"
-                  className="h-4 w-8 cursor-pointer accent-primary"
-                  checked={offlineMode}
-                  onChange={(e) => toggleOffline(e.target.checked)}
-                />
-              </label>
               {prewarm?.running ? (
                 <div className="space-y-2">
                   <div className="h-2 w-full rounded-full bg-muted overflow-hidden">
@@ -1029,7 +1040,7 @@ export default function MapPage() {
                 </div>
               ) : (
                 <div className="space-y-2">
-                  <Button size="sm" className="w-full" onClick={startPrewarm} disabled={!online || offlineMode}>
+                  <Button size="sm" className="w-full" onClick={startPrewarm} disabled={!online}>
                     <Download className="w-4 h-4 mr-1" />预热当前作业区
                   </Button>
                   <input
@@ -1059,7 +1070,7 @@ export default function MapPage() {
                 </div>
               )}
               {cacheMsg && <div className="rounded-md bg-muted p-2 text-xs">{cacheMsg}</div>}
-              <p className="text-xs text-muted-foreground">联网时预热当前视野; 无网络时可导入离线包(由联网设备 map_pack_export 导出), 并开启离线模式避免弱网卡顿。</p>
+              <p className="text-xs text-muted-foreground">联网时底图按缓存优先自动落盘; 无网络时可导入离线包(由联网设备 map_pack_export 导出)。</p>
             </CardContent>
           </Card>
         </aside>
