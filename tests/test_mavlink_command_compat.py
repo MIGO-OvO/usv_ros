@@ -226,6 +226,21 @@ class FailingOnceNamedValueMav(RecordingMav):
 
 
 class MavlinkCommandCompatibilityTests(unittest.TestCase):
+    def _install_injection_session_recorder(self, node, accepted=True):
+        calls = []
+
+        def start(source, config=None):
+            calls.append(("on", source))
+            return accepted
+
+        def stop(source, reason=""):
+            calls.append(("off", source, reason))
+            return True
+
+        node._start_injection_session = start
+        node._stop_injection_session = stop
+        return calls
+
     def test_trigger_node_constructs_without_auto_trigger_attr_crash(self):
         module = _load_script("mavlink_trigger_node_construct_test", "scripts/mavlink_trigger_node.py")
 
@@ -367,6 +382,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         node._build_steps_payload = lambda config, waypoint: {"steps": []}
         node._call_automation_service = lambda name: False
         node._set_mission_state = lambda state, context=None: states.append((state, context))
+        self._install_injection_session_recorder(node)
 
         accepted = node._do_manual_sample()
 
@@ -386,12 +402,36 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         node._get_default_config = lambda: {"steps": []}
         node._build_steps_payload = lambda config, waypoint: {"steps": []}
         node._set_mission_state = lambda state, context=None: None
-        node._call_automation_service = lambda name: True
+        calls = self._install_injection_session_recorder(node)
+        node._call_automation_service = lambda name: calls.append(("automation", name)) or True
 
         accepted = node._do_manual_sample()
 
         self.assertTrue(accepted)
+        self.assertEqual(calls[:2], [("on", "manual"), ("automation", "start")])
         self.assertEqual([msg.data for msg in node.status_pub.messages], ["sampling_started"])
+
+    def test_manual_sample_rejects_when_injection_start_fails_before_steps_or_automation(self):
+        module = _load_script("mavlink_trigger_node_manual_injection_reject_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.is_sampling = False
+        node.current_waypoint = 0
+        node.steps_pub = RecordingPublisher()
+        node.status_pub = RecordingPublisher()
+        automation_calls = []
+        node._load_config = lambda: {"sampling_sequence": {"steps": [{"name": "sample"}]}}
+        node._get_default_config = lambda: {"sampling_sequence": {"steps": []}}
+        node._build_manual_steps_payload = lambda config: {"steps": [{"name": "sample"}]}
+        node._set_mission_state = lambda state, context=None: None
+        node._call_automation_service = lambda name: automation_calls.append(name) or True
+        self._install_injection_session_recorder(node, accepted=False)
+
+        accepted = node._do_manual_sample()
+
+        self.assertFalse(accepted)
+        self.assertFalse(node.is_sampling)
+        self.assertEqual(node.steps_pub.messages, [])
+        self.assertEqual(automation_calls, [])
 
     def test_manual_sample_uses_global_loop_count_not_waypoint_override(self):
         module = _load_script("mavlink_trigger_node_manual_loop_count_test", "scripts/mavlink_trigger_node.py")
@@ -411,6 +451,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         node._get_default_config = lambda: {"sampling_sequence": {"steps": [], "loop_count": 1}}
         node._set_mission_state = lambda state, context=None: None
         node._call_automation_service = lambda name: True
+        self._install_injection_session_recorder(node)
 
         accepted = node._do_manual_sample()
 
@@ -437,6 +478,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         node._get_default_config = lambda: {"sampling_sequence": {"steps": [], "loop_count": 1}}
         node._set_mission_state = lambda state, context=None: None
         node._call_automation_service = lambda name: True
+        self._install_injection_session_recorder(node)
 
         accepted = node._do_manual_sample()
 
@@ -471,6 +513,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         node._publish_status = lambda status: statuses.append(status)
         node._call_automation_service = lambda name: True
         node._resume_auto_if_mission_exists = lambda: resumed.append(True)
+        injection_calls = self._install_injection_session_recorder(node)
 
         accepted = node._do_manual_sample()
         node._handle_completion(success=True, reason="finished")
@@ -479,6 +522,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         self.assertFalse(node.is_sampling)
         self.assertEqual(states[-1], (module.MissionState.IDLE, "manual_finished"))
         self.assertIn("sampling_stopped", statuses)
+        self.assertIn(("off", "manual", "finished"), injection_calls)
         self.assertEqual(resumed, [])
 
     def test_manual_stop_returns_idle_without_auto_resume(self):
@@ -494,12 +538,14 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         node._set_mission_state = lambda state, context=None: states.append((state, context))
         node._publish_status = lambda status: statuses.append(status)
         node._resume_auto_if_mission_exists = lambda: resumed.append(True)
+        injection_calls = self._install_injection_session_recorder(node)
 
         node._stop_sampling_sequence()
 
         self.assertFalse(node.is_sampling)
         self.assertEqual(states[-1], (module.MissionState.IDLE, "manual_stopped"))
         self.assertEqual(statuses, ["sampling_stopped"])
+        self.assertIn(("off", "manual", "manual_stop"), injection_calls)
         self.assertEqual(resumed, [])
 
     def test_fcu_sample_publishes_sampling_started_after_automation_start_accepts(self):
@@ -513,11 +559,13 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         node._get_default_config = lambda: {"steps": []}
         node._build_steps_payload = lambda config, waypoint: {"steps": []}
         node._set_mission_state = lambda state, context=None: None
-        node._call_automation_service = lambda name: True
+        calls = self._install_injection_session_recorder(node)
+        node._call_automation_service = lambda name: calls.append(("automation", name)) or True
 
         accepted = node._do_fcu_sample(42)
 
         self.assertTrue(accepted)
+        self.assertEqual(calls[:2], [("on", "fcu"), ("automation", "start")])
         self.assertEqual([msg.data for msg in node.status_pub.messages], ["sampling_started"])
 
     def test_nav_sampling_sequence_publishes_sampling_started_after_automation_start_accepts(self):
@@ -542,12 +590,14 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         node._set_mission_state = lambda state, context=None: None
         node.set_mode = lambda mode: True
         node._wait_until_stable = lambda timeout: (True, "stable")
-        node._call_automation_service = lambda name: True
+        calls = self._install_injection_session_recorder(node)
+        node._call_automation_service = lambda name: calls.append(("automation", name)) or True
         node._handle_failure_action = lambda reason: None
 
         accepted = node._start_sampling_sequence(7)
 
         self.assertTrue(accepted)
+        self.assertEqual(calls[:2], [("on", "waypoint"), ("automation", "start")])
         self.assertEqual([msg.data for msg in node.status_pub.messages], ["sampling_started"])
 
     def test_router_bridge_updates_automation_named_values_from_structured_status(self):
@@ -860,6 +910,17 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
     def test_start_survey_keeps_param1_interval_and_default_gates_compatible(self):
         module = _load_script("mavlink_trigger_node_survey_gate_compat_test", "scripts/mavlink_trigger_node.py")
         started_threads = []
+        control_calls = []
+
+        class ControlService:
+            def __call__(self, command_id="", source="", action="", payload_json=""):
+                control_calls.append({
+                    "command_id": command_id,
+                    "source": source,
+                    "action": action,
+                    "payload_json": payload_json,
+                })
+                return types.SimpleNamespace(success=True, message="ok", result_json="{}")
 
         class RecordingThread:
             def __init__(self, target, args=(), kwargs=None, daemon=None):
@@ -872,20 +933,66 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
                 started_threads.append(self)
 
         original_thread = module.threading.Thread
+        original_service_proxy = module.rospy.ServiceProxy
         module.threading.Thread = RecordingThread
+        module.rospy.ServiceProxy = lambda *args, **kwargs: ControlService()
         try:
             node = module.MAVLinkTriggerNode()
             accepted = node.handle_mavlink_command(31015, 5.0, 0.0)
         finally:
             module.threading.Thread = original_thread
+            module.rospy.ServiceProxy = original_service_proxy
 
         self.assertTrue(accepted)
         self.assertTrue(node._survey_active)
         self.assertEqual(node._survey_interval, 5.0)
         self.assertEqual(len(started_threads), 1)
+        self.assertEqual([call["action"] for call in control_calls], ["injection_on"])
         allowed, reason = node._survey_gate_status({})
         self.assertTrue(allowed)
         self.assertEqual(reason, "")
+
+    def test_survey_stop_turns_injection_pump_off_once(self):
+        module = _load_script("mavlink_trigger_node_survey_stop_injection_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node._survey_active = True
+        states = []
+        statuses = []
+        injection_calls = self._install_injection_session_recorder(node)
+        node._set_mission_state = lambda state, context=None: states.append((state, context))
+        node._publish_status = lambda status: statuses.append(status)
+
+        accepted = node._stop_survey()
+
+        self.assertTrue(accepted)
+        self.assertFalse(node._survey_active)
+        self.assertIn(("off", "survey", "survey_stop"), injection_calls)
+        self.assertEqual(statuses, ["survey_stopped"])
+
+    def test_survey_sample_failure_stops_survey_and_injection_pump(self):
+        module = _load_script("mavlink_trigger_node_survey_failure_injection_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.state_lock = threading.Lock()
+        node.is_sampling = True
+        node._survey_active = True
+        node._survey_sample_active = True
+        node.current_sampling_context = {"source": "survey", "waypoint_seq": 3}
+        node.current_waypoint = 3
+        states = []
+        statuses = []
+        injection_calls = self._install_injection_session_recorder(node)
+        node._set_waypoint_state = lambda waypoint, state: None
+        node._set_mission_state = lambda state, context=None: states.append((state, context))
+        node._publish_status = lambda status: statuses.append(status)
+        node._handle_failure_action = lambda reason: statuses.append("failure_action_called")
+
+        node._handle_completion(success=False, reason="automation:error")
+
+        self.assertFalse(node.is_sampling)
+        self.assertFalse(node._survey_sample_active)
+        self.assertFalse(node._survey_active)
+        self.assertIn(("off", "survey", "automation:error"), injection_calls)
+        self.assertEqual(statuses, ["survey_stopped"])
 
     def _make_survey_gate_node(self, module, config):
         node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)

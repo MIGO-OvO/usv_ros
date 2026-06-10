@@ -1820,12 +1820,62 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(json.loads(control_calls[-1]["payload_json"])["speed"], 60)
         self.assertEqual(publishers["/usv/pump_command"].messages, [])
 
+    def test_web_config_migrates_legacy_step_pump_to_global_default_and_strips_steps(self):
+        module, _, _ = _load_script(
+            "web_config_server_legacy_injection_pump_migration_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = module.ConfigManager(str(Path(tmpdir) / "sampling_config.json"))
+            manager.update({
+                "pump_settings": {"pid_mode": True, "pid_precision": 0.1, "default_speed": 0},
+                "sampling_sequence": {
+                    "loop_count": 1,
+                    "steps": [{
+                        "name": "legacy",
+                        "X": {"enable": "D"},
+                        "pump": {"enable": True, "speed": 60, "duration_ms": 3000},
+                        "interval": 1000,
+                    }],
+                },
+            })
+            config = manager.get()
+
+        self.assertEqual(config["pump_settings"]["default_speed"], 60)
+        self.assertNotIn("pump", config["sampling_sequence"]["steps"][0])
+
+    def test_web_config_uses_legacy_step_pump_when_global_default_missing(self):
+        module, _, _ = _load_script(
+            "web_config_server_legacy_missing_default_speed_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = module.ConfigManager(str(Path(tmpdir) / "sampling_config.json"))
+            manager.update({
+                "sampling_sequence": {
+                    "loop_count": 1,
+                    "steps": [{
+                        "name": "legacy",
+                        "X": {"enable": "D"},
+                        "pump": {"enable": True, "speed": 72, "duration_ms": 3000},
+                        "interval": 1000,
+                    }],
+                },
+            })
+            config = manager.get()
+
+        self.assertEqual(config["pump_settings"]["default_speed"], 72)
+        self.assertNotIn("pump", config["sampling_sequence"]["steps"][0])
+
     def test_pump_node_control_command_requires_manual_mode_and_emits_events(self):
         module, publishers, _ = _load_script(
             "pump_control_node_control_command_test",
             "scripts/pump_control_node.py",
         )
         node = module.PumpControlNode()
+        node.inject_pump_speed = 0
         sent = []
         node.send_command = lambda cmd: sent.append(cmd) or True
 
@@ -1904,6 +1954,53 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertFalse(node.pid_mode)
         self.assertFalse(node.automation_engine._pid_mode_enabled)
 
+    def test_pump_node_manual_step_ignores_legacy_injection_pump_config(self):
+        module, _, string_cls = _load_script(
+            "pump_control_node_manual_step_legacy_injection_pump_test",
+            "scripts/pump_control_node.py",
+        )
+        node = module.PumpControlNode()
+        node.inject_pump_speed = 0
+        sent = []
+        node.send_command = lambda cmd: sent.append(cmd) or True
+
+        node._step_callback(string_cls(json.dumps({
+            "name": "legacy",
+            "X": {"enable": "D"},
+            "Y": {"enable": "D"},
+            "Z": {"enable": "D"},
+            "A": {"enable": "D"},
+            "pump": {"enable": True, "speed": 60, "duration_ms": 3000},
+            "interval": 0,
+        })))
+
+        self.assertNotIn("PUMP:SET:60", sent)
+
+    def test_pump_node_automation_step_ignores_legacy_injection_pump_config(self):
+        module, _, _ = _load_script(
+            "pump_control_node_auto_step_legacy_injection_pump_test",
+            "scripts/pump_control_node.py",
+        )
+        node = module.PumpControlNode()
+        node.inject_pump_speed = 0
+        sent = []
+        node.send_command = lambda cmd: sent.append(cmd) or True
+        node.pid_mode = False
+        node._latest_spectro_received_at = 0.0
+
+        accepted = node._send_automation_step({
+            "name": "legacy",
+            "X": {"enable": "D"},
+            "Y": {"enable": "D"},
+            "Z": {"enable": "D"},
+            "A": {"enable": "D"},
+            "pump": {"enable": True, "speed": 60, "duration_ms": 3000},
+            "interval": 0,
+        })
+
+        self.assertTrue(accepted)
+        self.assertNotIn("PUMP:SET:60", sent)
+
     def test_web_manual_routes_use_control_transaction_service(self):
         module, _, _ = _load_script(
             "web_config_server_manual_routes_test",
@@ -1974,6 +2071,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             "scripts/pump_control_node.py",
         )
         node = module.PumpControlNode()
+        node.inject_pump_speed = 0
         sent = []
         node.send_command = lambda cmd: sent.append(cmd) or True
 
@@ -2020,6 +2118,15 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
     def test_frontend_injection_on_passes_current_speed_input(self):
         card_text = (REPO_ROOT / "frontend" / "src" / "components" / "injection-pump-card.tsx").read_text(encoding="utf-8")
         self.assertIn("turnInjectionPumpOn(speed)", card_text)
+
+    def test_frontend_removes_step_injection_pump_editor_and_hardcoded_manual_default(self):
+        automation_text = (REPO_ROOT / "frontend" / "src" / "pages" / "Automation.tsx").read_text(encoding="utf-8")
+        manual_text = (REPO_ROOT / "frontend" / "src" / "pages" / "Manual.tsx").read_text(encoding="utf-8")
+
+        self.assertNotIn("DEFAULT_INJECTION_PUMP", automation_text)
+        self.assertNotIn("duration_ms", automation_text)
+        self.assertNotIn("useState('40')", manual_text)
+        self.assertNotIn("|| 40", manual_text)
 
     def test_frontend_monitor_has_spectrometer_start_stop_controls(self):
         monitor_text = (REPO_ROOT / "frontend" / "src" / "pages" / "Monitor.tsx").read_text(encoding="utf-8")
@@ -2145,6 +2252,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             "scripts/pump_control_node.py",
         )
         node = module.PumpControlNode()
+        node.inject_pump_speed = 0
         sent = []
         node.send_command = lambda cmd: sent.append(cmd) or True
 
@@ -2177,6 +2285,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             "scripts/pump_control_node.py",
         )
         node = module.PumpControlNode()
+        node.inject_pump_speed = 0
         sent = []
         node.send_command = lambda cmd: sent.append(cmd) or True
         node._wait_for_spectro_command_result = lambda timeout=2.0: (True, "ADS_OK:START")
