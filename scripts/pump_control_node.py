@@ -64,6 +64,7 @@ if lib_dir not in sys.path:
 
 from command_generator import CommandGenerator, MOTOR_NAMES, COMMAND_TERMINATOR
 from automation_engine import AutomationEngine
+from injection_pump_worker import InjectionPumpWorker
 
 # 串口协议常量
 HEADER1 = 0x55
@@ -514,10 +515,18 @@ class PumpControlNode(object):
         self.pid_precision_threshold = self.pid_precision
 
         # 进样泵状态
+        default_injection_speed = rospy.get_param(
+            '~default_injection_speed',
+            rospy.get_param('/pump_settings/default_speed', 60),
+        )
         self.inject_pump_enabled = False
-        self.inject_pump_speed = 0
+        try:
+            self.inject_pump_speed = max(0, min(100, int(float(default_injection_speed))))
+        except (TypeError, ValueError):
+            self.inject_pump_speed = 60
         self.inject_pump_last_response = ""
         self.inject_pump_last_error = ""
+        self.injection_pump_worker = None
 
         # 分光状态
         self.latest_spectro = None
@@ -568,6 +577,11 @@ class PumpControlNode(object):
         self.spectro_stop_srv = rospy.Service('/usv/spectrometer_stop', Trigger, self._spectro_stop_callback)
         self.i2c_map_apply_srv = rospy.Service('/usv/i2c_map_apply', Trigger, self._i2c_map_apply_callback)
         self.control_command_srv = rospy.Service('/usv/control_command', ControlCommand, self._control_command_callback)
+        self.injection_pump_worker = InjectionPumpWorker(
+            send_command=lambda command: self.send_command(command),
+            on_success=self._handle_injection_worker_success,
+            on_failure=self._handle_injection_worker_failure,
+        )
 
         rospy.loginfo("Pump Control Node initialized")
         rospy.loginfo("  Serial: %s @ %d", self.serial_port, self.baudrate)
@@ -945,63 +959,58 @@ class PumpControlNode(object):
             self.inject_pump_last_error = error
         self._publish_injection_pump_status()
 
-    def _send_injection_pump_command(self, enabled=None, speed=None):
+    def _handle_injection_worker_success(self, command, enabled=None, speed=None):
+        """Apply a successful worker command to the cached pump state."""
+        if speed is not None:
+            self._update_injection_pump_state(
+                enabled=speed > 0,
+                speed=speed,
+                response=command,
+                error=""
+            )
+            return
+        if enabled is not None:
+            self._update_injection_pump_state(
+                enabled=enabled,
+                speed=0 if not enabled else self.inject_pump_speed,
+                response=command,
+                error=""
+            )
+            return
+        self._update_injection_pump_state(response=command, error="")
+
+    def _handle_injection_worker_failure(self, error):
+        """Publish an injection pump worker failure."""
+        self._update_injection_pump_state(error=error)
+
+    def _send_injection_pump_command(self, enabled=None, speed=None, wait=True):
         """发送进样泵控制指令。"""
         command = self._build_injection_pump_command(enabled=enabled, speed=speed)
-        rospy.loginfo("[InjectionPump] 发送指令: %s", command)
-        success = self.send_command(command)
-        if success:
-            if speed is not None:
-                self._update_injection_pump_state(
-                    enabled=speed > 0,
-                    speed=speed,
-                    response=command,
-                    error=""
-                )
-            elif enabled is not None:
-                self._update_injection_pump_state(
-                    enabled=enabled,
-                    speed=0 if not enabled else self.inject_pump_speed,
-                    response=command,
-                    error=""
-                )
-        else:
-            self._update_injection_pump_state(error="send failed: {}".format(command))
-        return success
+        rospy.loginfo("[InjectionPump] queue command: %s", command)
+        worker = getattr(self, "injection_pump_worker", None)
+        if worker is None:
+            success = self.send_command(command)
+            if success:
+                self._handle_injection_worker_success(command, enabled=enabled, speed=speed)
+            else:
+                self._handle_injection_worker_failure("send failed: {}".format(command))
+            return success
+        return worker.submit(command, enabled=enabled, speed=speed, wait=wait)
+    def _send_injection_pump_raw_command(self, command, wait=False):
+        """Queue a raw PUMP:* command without blocking other command sources."""
+        worker = getattr(self, "injection_pump_worker", None)
+        if worker is None:
+            success = self.send_command(command)
+            if success:
+                self._handle_injection_worker_success(command)
+            else:
+                self._handle_injection_worker_failure("send failed: {}".format(command))
+            return success
+        return worker.submit(command, wait=wait)
 
     def _handle_injection_pump_step(self, step, mode):
-        """处理步骤中的进样泵配置。"""
-        pump_cfg = step.get("pump", {}) or {}
-        if not isinstance(pump_cfg, dict) or "enable" not in pump_cfg:
-            return True
-
-        pump_enabled_raw = pump_cfg.get("enable", False)
-        if isinstance(pump_enabled_raw, str):
-            pump_enabled = pump_enabled_raw.strip().lower() in ("1", "true", "yes", "on", "e", "enable", "enabled")
-        else:
-            pump_enabled = bool(pump_enabled_raw)
-        pump_speed = pump_cfg.get("speed", 0)
-
-        try:
-            pump_speed = int(pump_speed)
-        except (TypeError, ValueError):
-            rospy.logerr("Invalid injection pump speed: %s", str(pump_speed))
-            return False
-
-        rospy.loginfo("[Automation] 进样泵步骤参数: mode=%s, enable=%s, speed=%s", mode, pump_enabled, pump_speed)
-
-        if pump_enabled and pump_speed > 0:
-            success = self._send_injection_pump_command(speed=pump_speed)
-            if success and mode == "auto":
-                rospy.loginfo("[Automation] Injection pump set to %s%%", pump_speed)
-            return success
-
-        if not pump_enabled and mode == "auto":
-            success = self._send_injection_pump_command(enabled=False)
-            if success:
-                rospy.loginfo("[Automation] 进样泵已关闭")
-            return success
-
+        if isinstance(step, dict) and "pump" in step:
+            rospy.loginfo("[InjectionPump] Ignoring legacy step pump config in %s mode", mode)
         return True
 
     def _send_automation_step(self, step):
@@ -1014,8 +1023,8 @@ class PumpControlNode(object):
             motor_cfg = step.get(motor, {}) or {}
             if str(motor_cfg.get("enable", "D")).upper() == "E":
                 enabled_motors.append(motor)
-        pump_cfg = step.get("pump", {}) or {}
-        pump_enabled = bool(pump_cfg.get("enable", False))
+        pump_cfg = {}
+        pump_enabled = False
         rospy.loginfo("[Automation] 开始执行步骤: %s, 电机=%s, 进样泵=%s",
                       step_name,
                       ",".join(enabled_motors) if enabled_motors else "无",
@@ -1126,8 +1135,8 @@ class PumpControlNode(object):
                 if not self._wait_seconds_with_pause(motor_wait_seconds):
                     return False
 
-        pump_cfg = step.get("pump", {}) or {}
-        pump_enabled = bool(pump_cfg.get("enable", False))
+        pump_cfg = {}
+        pump_enabled = False
         try:
             pump_duration_ms = int(float(pump_cfg.get("duration_ms", 0) or 0))
         except (TypeError, ValueError):
@@ -1760,7 +1769,7 @@ class PumpControlNode(object):
             return
 
         if self._is_injection_pump_command(cmd_upper):
-            self.send_command(cmd_upper)
+            self._send_injection_pump_raw_command(cmd_upper, wait=False)
             return
 
         self.send_command(cmd_upper)
@@ -1974,7 +1983,7 @@ class PumpControlNode(object):
 
     def _injection_status_callback(self, req):
         """获取进样泵状态服务。"""
-        success = self.send_command("PUMP:STATUS")
+        success = self._send_injection_pump_raw_command("PUMP:STATUS", wait=True)
         message = json.dumps({
             "enabled": self.inject_pump_enabled,
             "speed": self.inject_pump_speed,
@@ -2129,6 +2138,8 @@ class PumpControlNode(object):
         if self.automation_engine.is_running():
             self.automation_engine.stop()
         self.stop_all_pumps()
+        if self.injection_pump_worker is not None:
+            self.injection_pump_worker.stop()
         self.disconnect()
 
 
