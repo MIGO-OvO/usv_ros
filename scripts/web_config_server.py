@@ -921,7 +921,7 @@ DEFAULT_CONFIG = {
     "pump_settings": {
         "pid_mode": True,
         "pid_precision": 0.1,
-        "default_speed": 5
+        "default_speed": 60
     },
     "sampling_sequence": {
         "loop_count": 1,
@@ -932,7 +932,6 @@ DEFAULT_CONFIG = {
                 "Y": {"enable": "D"},
                 "Z": {"enable": "D"},
                 "A": {"enable": "E", "direction": "F", "speed": "3", "angle": "360"},
-                "pump": {"enable": False, "speed": 0, "duration_ms": 0},
                 "interval": 2000
             },
             {
@@ -941,7 +940,6 @@ DEFAULT_CONFIG = {
                 "Y": {"enable": "E", "direction": "F", "speed": "5", "angle": "90"},
                 "Z": {"enable": "D"},
                 "A": {"enable": "E", "direction": "F", "speed": "3", "angle": "180"},
-                "pump": {"enable": True, "speed": 60, "duration_ms": 3000},
                 "interval": 5000
             },
             {
@@ -950,7 +948,6 @@ DEFAULT_CONFIG = {
                 "Y": {"enable": "D"},
                 "Z": {"enable": "D"},
                 "A": {"enable": "D"},
-                "pump": {"enable": False, "speed": 0, "duration_ms": 0},
                 "interval": 1000
             }
         ]
@@ -1036,29 +1033,31 @@ class ConfigManager(object):
     """配置文件管理器。"""
 
     @staticmethod
+    def _legacy_injection_default_speed(sequence):
+        sequence = sequence or {}
+        raw_steps = sequence.get('steps', [])
+        for raw_step in raw_steps if isinstance(raw_steps, list) else []:
+            step = raw_step if isinstance(raw_step, dict) else {}
+            pump = step.get('pump') if isinstance(step.get('pump'), dict) else {}
+            if not pump.get('enable', False):
+                continue
+            try:
+                speed = int(float(pump.get('speed', 0) or 0))
+            except (TypeError, ValueError):
+                speed = 0
+            speed = max(0, min(100, speed))
+            if speed > 0:
+                return speed
+        return 0
+
+    @staticmethod
     def _normalize_sampling_sequence(sequence):
-        """标准化自动化步骤，补齐旧配置缺失的进样泵字段。"""
         sequence = sequence or {}
         raw_steps = sequence.get('steps', [])
         normalized_steps = []
         for raw_step in raw_steps if isinstance(raw_steps, list) else []:
             step = dict(raw_step or {})
-            pump = step.get('pump') or {}
-            try:
-                pump_speed = int(float(pump.get('speed', 0) or 0))
-            except (TypeError, ValueError):
-                pump_speed = 0
-            try:
-                pump_duration_ms = int(float(pump.get('duration_ms', 0) or 0))
-            except (TypeError, ValueError):
-                pump_duration_ms = 0
-            pump_speed = max(0, min(100, pump_speed))
-            pump_duration_ms = max(0, pump_duration_ms)
-            step['pump'] = {
-                'enable': bool(pump.get('enable', False)),
-                'speed': pump_speed,
-                'duration_ms': pump_duration_ms,
-            }
+            step.pop('pump', None)
             normalized_steps.append(step)
 
         normalized = dict(sequence)
@@ -1164,6 +1163,11 @@ class ConfigManager(object):
 
     def _merge_config(self, loaded):
         """合并加载的配置到默认配置。"""
+        loaded = loaded if isinstance(loaded, dict) else {}
+        loaded_pump_settings = loaded.get('pump_settings') if isinstance(loaded.get('pump_settings'), dict) else {}
+        loaded_has_default_speed = 'default_speed' in loaded_pump_settings
+        loaded_legacy_speed = self._legacy_injection_default_speed(loaded.get('sampling_sequence', {}))
+
         def merge(base, update):
             for key, value in update.items():
                 if key in base and isinstance(base[key], dict) and isinstance(value, dict):
@@ -1172,6 +1176,14 @@ class ConfigManager(object):
                     base[key] = value
         merge(self.config, loaded)
         self._migrate_legacy_hardware_defaults()
+        pump_settings = self.config.setdefault('pump_settings', {})
+        try:
+            default_speed = int(float(pump_settings.get('default_speed', 0) or 0))
+        except (TypeError, ValueError):
+            default_speed = 0
+        legacy_speed = self._legacy_injection_default_speed(self.config.get('sampling_sequence', {}))
+        if (not loaded_has_default_speed and loaded_legacy_speed > 0) or (default_speed <= 0 and legacy_speed > 0):
+            pump_settings['default_speed'] = loaded_legacy_speed if loaded_legacy_speed > 0 else legacy_speed
         self.config['sampling_sequence'] = self._normalize_sampling_sequence(
             self.config.get('sampling_sequence', {})
         )
@@ -3334,7 +3346,7 @@ class WebConfigServer(object):
             if 'pump_settings' in data and isinstance(data['pump_settings'], dict):
                 patch['pump_settings'] = data['pump_settings']
             if 'sampling_sequence' in data and isinstance(data['sampling_sequence'], dict):
-                patch['sampling_sequence'] = ConfigManager._normalize_sampling_sequence(data['sampling_sequence'])
+                patch['sampling_sequence'] = data['sampling_sequence']
             if 'waypoint_sampling' in data and isinstance(data['waypoint_sampling'], dict):
                 patch['waypoint_sampling'] = ConfigManager._normalize_waypoint_sampling(data['waypoint_sampling'])
 

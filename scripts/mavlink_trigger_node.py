@@ -44,6 +44,11 @@ from std_srvs.srv import Trigger, TriggerResponse
 from mavros_msgs.msg import State, WaypointReached, Mavlink
 from mavros_msgs.srv import SetMode, SetModeRequest
 
+try:
+    from usv_ros.srv import ControlCommand
+except ImportError:
+    ControlCommand = object
+
 # 自定义 MAVLink 指令 ID
 CMD_START_SAMPLING = 31010
 CMD_STOP_SAMPLING = 31011
@@ -340,11 +345,19 @@ class MAVLinkTriggerNode(object):
             'on_fail': on_fail if on_fail in ('HOLD', 'SKIP', 'ABORT') else 'HOLD',
         }
 
+    def _steps_without_legacy_pump(self, steps):
+        cleaned = []
+        for raw_step in steps if isinstance(steps, list) else []:
+            step = dict(raw_step or {})
+            step.pop('pump', None)
+            cleaned.append(step)
+        return cleaned
+
     def _build_steps_payload(self, config, waypoint_seq):
         sampling_sequence = dict((config or {}).get('sampling_sequence', {}) or {})
         waypoint_cfg = self._get_waypoint_sampling_config(config, waypoint_seq)
         return {
-            'steps': sampling_sequence.get('steps', []),
+            'steps': self._steps_without_legacy_pump(sampling_sequence.get('steps', [])),
             'loop_count': waypoint_cfg['loop_count'],
             'pid_mode': (config or {}).get('pump_settings', {}).get('pid_mode', True),
             'pid_precision': (config or {}).get('pump_settings', {}).get('pid_precision', 0.1),
@@ -368,7 +381,7 @@ class MAVLinkTriggerNode(object):
         except (TypeError, ValueError):
             loop_count = 1
         return {
-            'steps': sampling_sequence.get('steps', []),
+            'steps': self._steps_without_legacy_pump(sampling_sequence.get('steps', [])),
             'loop_count': max(0, loop_count),
             'pid_mode': pid_mode,
             'pid_precision': config.get('pump_settings', {}).get('pid_precision', 0.1),
@@ -521,12 +534,14 @@ class MAVLinkTriggerNode(object):
                 self._survey_sample_active = False
             sampling_context = dict(getattr(self, "current_sampling_context", {}) or {})
             is_manual_sample = sampling_context.get("source") == "manual"
+            source = str(sampling_context.get("source", "waypoint") or "waypoint")
             self.is_sampling = False
         rospy.loginfo("Handling sampling completion: success=%s reason=%s", success, reason)
         wp_seq = self.current_waypoint
         if success:
             self._set_waypoint_state(wp_seq, WaypointSamplingState.DONE)
             if is_manual_sample:
+                self._stop_injection_session("manual", reason)
                 self.current_sampling_context = None
                 self._set_mission_state(MissionState.IDLE, "manual_finished")
                 self._publish_status("sampling_stopped")
@@ -540,12 +555,19 @@ class MAVLinkTriggerNode(object):
                     self._publish_status("survey_stopped")
                 return
             self._set_mission_state(MissionState.SAMPLING_DONE, str(wp_seq))
+            self._stop_injection_session(source, reason)
             self._publish_status("sampling_stopped")
             rospy.sleep(1.0)
             self._resume_auto_if_mission_exists()
         else:
             self._set_waypoint_state(wp_seq, WaypointSamplingState.FAILED)
             self._set_mission_state(MissionState.FAILED, "{}:{}".format(wp_seq, reason))
+            if was_survey_sample:
+                self._survey_active = False
+                self._stop_injection_session("survey", reason)
+                self._publish_status("survey_stopped")
+                return
+            self._stop_injection_session(source, reason)
             self._publish_status("sampling_stopped")
             self._handle_failure_action(reason)
 
@@ -620,6 +642,11 @@ class MAVLinkTriggerNode(object):
         steps_data = self._build_steps_payload(config, waypoint_seq)
         steps_data['retry_count'] = waypoint_cfg['retry_count']
         steps_data['on_fail'] = waypoint_cfg['on_fail']
+        if not self._start_injection_session("waypoint", config):
+            self._set_waypoint_state(waypoint_seq, WaypointSamplingState.FAILED)
+            self._set_mission_state(MissionState.FAILED, "{}:injection_start_failed".format(waypoint_seq))
+            self._handle_failure_action('injection_start_failed')
+            return False
         msg = String()
         msg.data = json.dumps(steps_data)
         self.steps_pub.publish(msg)
@@ -629,6 +656,7 @@ class MAVLinkTriggerNode(object):
         self.is_sampling = True
         if not self._call_automation_service('start'):
             self.is_sampling = False
+            self._stop_injection_session("waypoint", "automation_start_failed")
             self._set_waypoint_state(waypoint_seq, WaypointSamplingState.FAILED)
             self._set_mission_state(MissionState.FAILED, "{}:automation_start_failed".format(waypoint_seq))
             self._handle_failure_action('automation_start_failed')
@@ -642,6 +670,8 @@ class MAVLinkTriggerNode(object):
         rospy.loginfo("Stopping sampling sequence...")
         sampling_context = dict(getattr(self, "current_sampling_context", {}) or {})
         self._call_automation_service('stop')
+        source = str(sampling_context.get("source", "waypoint") or "waypoint")
+        self._stop_injection_session(source, "{}_stop".format(source))
         self.is_sampling = False
         if sampling_context.get("source") == "manual":
             self.current_sampling_context = None
@@ -910,6 +940,46 @@ class MAVLinkTriggerNode(object):
             rospy.logerr("Automation service error: %s", str(e))
             return False
 
+    def _call_control_command(self, action, payload=None):
+        """Call the pump control transaction service."""
+        payload = payload if isinstance(payload, dict) else {}
+        try:
+            rospy.wait_for_service('/usv/control_command', timeout=2.0)
+            service = rospy.ServiceProxy('/usv/control_command', ControlCommand)
+            resp = service(
+                command_id="mavlink-trigger-{}".format(action),
+                source="mavlink_trigger",
+                action=action,
+                payload_json=json.dumps(payload),
+            )
+            rospy.loginfo("Control command %s: %s", action, getattr(resp, "message", ""))
+            return bool(getattr(resp, "success", False))
+        except Exception as e:
+            rospy.logerr("Control command error: %s", str(e))
+            return False
+
+    def _default_injection_speed(self, config):
+        pump_settings = (config or {}).get('pump_settings', {})
+        try:
+            speed = int(float(pump_settings.get('default_speed', 60)))
+        except (TypeError, ValueError):
+            speed = 60
+        return max(0, min(100, speed))
+
+    def _start_injection_session(self, source, config=None):
+        payload = {
+            "source": source,
+            "speed": self._default_injection_speed(config),
+        }
+        return self._call_control_command("injection_on", payload)
+
+    def _stop_injection_session(self, source, reason=""):
+        payload = {
+            "source": source,
+            "reason": reason,
+        }
+        return self._call_control_command("injection_off", payload)
+
     def _publish_status(self, status):
         """发布状态。"""
         msg = String()
@@ -1045,6 +1115,13 @@ class MAVLinkTriggerNode(object):
 
         config = self._load_config() or self._get_default_config()
         steps_data = self._build_manual_steps_payload(config)
+        if not self._start_injection_session("manual", config):
+            self.is_sampling = False
+            self.current_sampling_context = None
+            self._set_mission_state(MissionState.IDLE, "manual_start_rejected")
+            if getattr(self, 'status_pub', None) is not None:
+                self._publish_status("manual_start_rejected")
+            return False
 
         msg = String()
         msg.data = json.dumps(steps_data)
@@ -1059,6 +1136,7 @@ class MAVLinkTriggerNode(object):
         if not self._call_automation_service('start'):
             self.is_sampling = False
             self.current_sampling_context = None
+            self._stop_injection_session("manual", "automation_start_failed")
             self._set_mission_state(MissionState.IDLE, "manual_start_rejected")
             if getattr(self, 'status_pub', None) is not None:
                 self._publish_status("manual_start_rejected")
@@ -1079,6 +1157,11 @@ class MAVLinkTriggerNode(object):
 
         config = self._load_config() or self._get_default_config()
         steps_data = self._build_steps_payload(config, self.current_waypoint)
+        if not self._start_injection_session("fcu", config):
+            self.is_sampling = False
+            self.current_sampling_context = None
+            self._set_mission_state(MissionState.FAILED, "fcu_injection_start_failed")
+            return False
 
         msg = String()
         msg.data = json.dumps(steps_data)
@@ -1094,6 +1177,7 @@ class MAVLinkTriggerNode(object):
         if not self._call_automation_service('start'):
             self.is_sampling = False
             self.current_sampling_context = None
+            self._stop_injection_session("fcu", "automation_start_failed")
             self._set_mission_state(MissionState.FAILED, "fcu_sample_start_failed")
             return False
 
@@ -1257,6 +1341,7 @@ class MAVLinkTriggerNode(object):
 
         self._set_survey_sampling_flags(False)
         self._survey_active = False
+        self._stop_injection_session("survey", "survey_sample_start_failed")
         self._set_mission_state(MissionState.FAILED, "survey_sample_start_failed")
         self._publish_status("survey_stopped")
         return "failed"
@@ -1272,6 +1357,9 @@ class MAVLinkTriggerNode(object):
 
         config = self._load_config() or self._get_default_config()
         gate = self._survey_gate_config(config)
+        if not self._start_injection_session("survey", config):
+            self._set_mission_state(MissionState.FAILED, "survey_injection_start_failed")
+            return False
         self._survey_interval = max(1.0, float(interval) if interval > 0 else gate["survey_interval_s"])
         self._survey_active = True
         self._survey_thread = threading.Thread(target=self._survey_loop, daemon=True)
@@ -1287,6 +1375,7 @@ class MAVLinkTriggerNode(object):
             rospy.logwarn("Survey not active")
             return True
         self._survey_active = False
+        self._stop_injection_session("survey", "survey_stop")
         rospy.loginfo("Survey stopped")
         self._set_mission_state(MissionState.IDLE)
         self._publish_status("survey_stopped")

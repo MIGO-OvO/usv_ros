@@ -46,14 +46,14 @@ export default function Manual() {
   })
   const [pending, setPending] = useState<string | null>(null)
   const [message, setMessage] = useState('')
-  const [injectionSpeed, setInjectionSpeed] = useState('40')
+  const [injectionSpeed, setInjectionSpeed] = useState('60')
 
   useEffect(() => {
     refreshManualStatus().catch(() => {})
   }, [refreshManualStatus])
 
   useEffect(() => {
-    setInjectionSpeed(String(injectionPump.speed || 40))
+    setInjectionSpeed(String(injectionPump.speed || 60))
   }, [injectionPump.speed])
 
   const latestEvent = controlEvents[controlEvents.length - 1]
