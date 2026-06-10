@@ -97,6 +97,7 @@ if SCRIPT_DIR not in sys.path:
 
 from preset_manager import PresetManager
 import map_tile_cache as mtc
+from mission_plan_service import MAV_CMD_NAV_WAYPOINT, build_mission_plan, upload_mission_plan
 
 # 配置文件路径
 CONFIG_DIR = os.path.expanduser("~/usv_ws/config")
@@ -1911,7 +1912,17 @@ class WebConfigServer(object):
     def _waypoints_cb(self, msg):
         """MAVROS 航点列表回调：缓存航线，用于地图叠加。"""
         waypoints = []
-        for seq, wp in enumerate(getattr(msg, "waypoints", []) or []):
+        raw_waypoints = list(getattr(msg, "waypoints", []) or [])
+        has_non_route_items = any(
+            int(getattr(wp, "command", MAV_CMD_NAV_WAYPOINT) or 0) != MAV_CMD_NAV_WAYPOINT
+            for wp in raw_waypoints[1:]
+        )
+        for raw_seq, wp in enumerate(raw_waypoints):
+            command = int(getattr(wp, "command", MAV_CMD_NAV_WAYPOINT) or 0)
+            if command != MAV_CMD_NAV_WAYPOINT:
+                continue
+            if raw_seq == 0 and has_non_route_items:
+                continue
             lat = getattr(wp, "x_lat", None)
             lng = getattr(wp, "y_long", None)
             alt = getattr(wp, "z_alt", None)
@@ -1919,8 +1930,8 @@ class WebConfigServer(object):
             if not position:
                 continue
             waypoints.append({
-                "seq": seq,
-                "command": getattr(wp, "command", None),
+                "seq": len(waypoints),
+                "command": command,
                 "frame": getattr(wp, "frame", None),
                 "is_current": bool(getattr(wp, "is_current", False)),
                 "autocontinue": bool(getattr(wp, "autocontinue", False)),
@@ -1929,6 +1940,28 @@ class WebConfigServer(object):
         self.route_waypoints = waypoints
         self.route_snapshot_id = self._route_snapshot_id(waypoints)
         self.route_source = "mavros" if waypoints else "none"
+        if self._data_recording_active():
+            self.data_manager.set_route_waypoints(waypoints)
+        if self.socketio:
+            self.socketio.emit("map_route", waypoints)
+
+    def _apply_uploaded_mission_route(self, nav_waypoints):
+        waypoints = []
+        for seq, wp in enumerate(nav_waypoints or []):
+            position = make_position_snapshot(wp.get("lat"), wp.get("lng"), wp.get("alt", 0.0))
+            if not position:
+                continue
+            waypoints.append({
+                "seq": int(wp.get("seq", seq)),
+                "command": MAV_CMD_NAV_WAYPOINT,
+                "frame": 3,
+                "is_current": seq == 0,
+                "autocontinue": True,
+                **position,
+            })
+        self.route_waypoints = waypoints
+        self.route_snapshot_id = self._route_snapshot_id(waypoints)
+        self.route_source = "web_upload" if waypoints else "none"
         if self._data_recording_active():
             self.data_manager.set_route_waypoints(waypoints)
         if self.socketio:
@@ -3109,6 +3142,35 @@ class WebConfigServer(object):
 
         @self.app.route('/api/mission/resume', methods=['POST'])
         def resume_mission(): return self._trigger_mission('resume')
+
+        @self.app.route('/api/mission/plan/validate', methods=['POST'])
+        def validate_mission_plan():
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "request body must be a JSON object"}), 400
+            config = self.config_manager.get()
+            plan = build_mission_plan(data, sampling_config=config.get('waypoint_sampling', {}))
+            status = 200 if plan["valid"] else 400
+            return jsonify({
+                "success": plan["valid"],
+                "message": "mission plan valid" if plan["valid"] else "; ".join(plan["errors"]),
+                "data": plan,
+            }), status
+
+        @self.app.route('/api/mission/plan/upload', methods=['POST'])
+        def upload_mission_plan_route():
+            if self.standalone:
+                return jsonify({"success": False, "message": "standalone mode cannot upload MAVROS missions"}), 400
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "request body must be a JSON object"}), 400
+            config = self.config_manager.get()
+            result = upload_mission_plan(data, sampling_config=config.get('waypoint_sampling', {}))
+            if result.get("success"):
+                self._apply_uploaded_mission_route(result.get("data", {}).get("nav_waypoints", []))
+                return jsonify(result)
+            status = 400 if not result.get("data", {}).get("valid", False) else 500
+            return jsonify(result), status
 
         # 预设管理 API (新)
         @self.app.route('/api/presets/auto', methods=['GET'])

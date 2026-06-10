@@ -168,6 +168,11 @@ interface LivePayload {
   automation_running?: boolean
 }
 
+interface MissionDraftWaypoint extends MapCoordinate {
+  wgs84: MapCoordinate
+  sample: boolean
+}
+
 type HeatLayer = L.Layer & {
   setLatLngs: (latlngs: Array<[number, number, number]>) => void
 }
@@ -272,6 +277,18 @@ function wgs84ToGcj02(lat: number, lng: number): MapCoordinate {
   return { lat: lat + dLat, lng: lng + dLng }
 }
 
+function gcj02ToWgs84(lat: number, lng: number): MapCoordinate {
+  if (outOfChina(lat, lng)) return { lat, lng }
+  let wgsLat = lat
+  let wgsLng = lng
+  for (let i = 0; i < 3; i += 1) {
+    const shifted = wgs84ToGcj02(wgsLat, wgsLng)
+    wgsLat -= shifted.lat - lat
+    wgsLng -= shifted.lng - lng
+  }
+  return { lat: wgsLat, lng: wgsLng }
+}
+
 function colorFor(value: number, min: number, max: number) {
   if (max <= min) return sampleColors[0]
   const idx = Math.max(0, Math.min(sampleColors.length - 1, Math.floor(((value - min) / (max - min)) * sampleColors.length)))
@@ -292,9 +309,12 @@ export default function MapPage() {
   const mapRef = useRef<L.Map | null>(null)
   const tileLayerRef = useRef<L.TileLayer | null>(null)
   const overlaysRef = useRef<L.LayerGroup | null>(null)
+  const draftLayerRef = useRef<L.LayerGroup | null>(null)
   const heatRef = useRef<HeatLayer | null>(null)
   const currentBoundsRef = useRef<L.LatLngBounds | null>(null)
   const initialFitDoneRef = useRef(false)
+  const missionPlanEnabledRef = useRef(false)
+  const draftSampleEnabledRef = useRef(true)
   const socket = useAppStore((state) => state.socket)
   const [mode, setMode] = useState<MapMode>(() => {
     if (typeof window === 'undefined') return 'live'
@@ -324,6 +344,11 @@ export default function MapPage() {
   const [gotoLng, setGotoLng] = useState('')
   const [gotoDatum, setGotoDatum] = useState<CoordinateDatum>('gcj02')
   const [gotoMsg, setGotoMsg] = useState('')
+  const [missionPlanEnabled, setMissionPlanEnabled] = useState(false)
+  const [draftSampleEnabled, setDraftSampleEnabled] = useState(true)
+  const [draftWaypoints, setDraftWaypoints] = useState<MissionDraftWaypoint[]>([])
+  const [missionUploading, setMissionUploading] = useState(false)
+  const [missionPlanMsg, setMissionPlanMsg] = useState('')
 
   const activeSamples = useMemo(
     () => geojson?.features.filter((f) => f.properties?.layer === 'sample') || [],
@@ -353,6 +378,9 @@ export default function MapPage() {
       surface: `/api/data/mission/${mission}/surface?metric=${metricParam}&size=${idwSize}&power=${idwPower}&download=true`,
     }
   }, [idwPower, idwSize, metric, selectedMission])
+
+  useEffect(() => { missionPlanEnabledRef.current = missionPlanEnabled }, [missionPlanEnabled])
+  useEffect(() => { draftSampleEnabledRef.current = draftSampleEnabled }, [draftSampleEnabled])
 
   const loadConfig = useCallback(async () => {
     const res = await fetch('/api/map/config')
@@ -639,6 +667,52 @@ export default function MapPage() {
     setStatusText(surfaceJson.data?.valid ? '历史污染面已生成' : surfaceJson.data?.reason || '历史任务已加载')
   }, [idwPower, idwSize, metric, selectedMission])
 
+  const removeDraftWaypoint = useCallback((index: number) => {
+    setDraftWaypoints((current) => current.filter((_, itemIndex) => itemIndex !== index))
+  }, [])
+
+  const clearDraftWaypoints = useCallback(() => {
+    setDraftWaypoints([])
+    setMissionPlanMsg('')
+  }, [])
+
+  const uploadDraftMission = useCallback(async () => {
+    if (draftWaypoints.length === 0) {
+      setMissionPlanMsg('请先在地图上添加航点')
+      return
+    }
+    setMissionUploading(true)
+    setMissionPlanMsg('')
+    try {
+      const res = await fetch('/api/mission/plan/upload', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          replace: true,
+          waypoints: draftWaypoints.map((wp, index) => ({
+            seq: index,
+            lat: wp.wgs84.lat,
+            lng: wp.wgs84.lng,
+            sample: wp.sample,
+          })),
+        }),
+      })
+      const json = await res.json()
+      if (json.success) {
+        const data = json.data || {}
+        setMissionPlanMsg(`已上传 ${data.nav_waypoint_count || draftWaypoints.length} 个航点，任务项 ${data.mission_items || 0} 个；未启动 AUTO`)
+        setDraftWaypoints([])
+        await loadLive()
+      } else {
+        setMissionPlanMsg(json.message || '上传失败')
+      }
+    } catch {
+      setMissionPlanMsg('上传请求失败')
+    } finally {
+      setMissionUploading(false)
+    }
+  }, [draftWaypoints, loadLive])
+
   const startPrewarm = useCallback(async () => {
     const map = mapRef.current
     let bbox: Record<string, number> | undefined
@@ -705,11 +779,26 @@ export default function MapPage() {
       tileLayer.addTo(map)
       tileLayerRef.current = tileLayer
       overlaysRef.current = L.layerGroup().addTo(map)
+      draftLayerRef.current = L.layerGroup().addTo(map)
       heatRef.current = (L as unknown as { heatLayer: (pts: Array<[number, number, number]>, opts: Record<string, unknown>) => HeatLayer }).heatLayer([], {
         radius: 30,
         blur: 18,
         gradient: { 0.2: '#2f9e44', 0.45: '#74b816', 0.65: '#f59f00', 0.82: '#f08c00', 1.0: '#e03131' },
       }).addTo(map)
+      map.on('click', (event: L.LeafletMouseEvent) => {
+        if (!missionPlanEnabledRef.current) return
+        const point = {
+          lat: event.latlng.lat,
+          lng: event.latlng.lng,
+          wgs84: gcj02ToWgs84(event.latlng.lat, event.latlng.lng),
+          sample: draftSampleEnabledRef.current,
+        }
+        setDraftWaypoints((current) => {
+          const next = [...current, point]
+          setMissionPlanMsg(`已添加 ${next.length} 个航点`)
+          return next
+        })
+      })
       mapRef.current = map
       setMapError('')
     } catch (err) {
@@ -748,8 +837,41 @@ export default function MapPage() {
     renderGeojson(geojson, surface)
   }, [geojson, renderGeojson, surface])
 
+  useEffect(() => {
+    const group = draftLayerRef.current
+    if (!group) return
+    group.clearLayers()
+    if (draftWaypoints.length === 0) return
+    const latlngs = draftWaypoints.map((wp) => [wp.lat, wp.lng] as [number, number])
+    if (latlngs.length > 1) {
+      L.polyline(latlngs, {
+        color: '#dc2626',
+        weight: 3,
+        opacity: 0.85,
+        dashArray: '6 6',
+      }).addTo(group)
+    }
+    draftWaypoints.forEach((wp, index) => {
+      const marker = L.marker([wp.lat, wp.lng], {
+        icon: L.divIcon({
+          className: 'usv-draft-waypoint-icon',
+          html: `<span>${index + 1}${wp.sample ? 'S' : ''}</span>`,
+          iconAnchor: [0, 0],
+        }),
+      })
+      marker.bindPopup(
+        `<div style="min-width:180px;font-size:12px;line-height:1.65">
+          <b>Web 规划航点 #${index + 1}</b><br/>
+          WGS-84: ${wp.wgs84.lat.toFixed(7)}, ${wp.wgs84.lng.toFixed(7)}<br/>
+          采样触发: ${wp.sample ? 'NAV_SCRIPT_TIME' : '无'}
+        </div>`,
+      )
+      marker.addTo(group)
+    })
+  }, [draftWaypoints])
+
   return (
-    <div className="h-[calc(100vh-5rem)] md:h-screen p-3 md:p-5 flex flex-col gap-3 bg-muted/20">
+    <div className="min-h-[calc(100vh-5rem)] xl:h-screen p-3 md:p-5 flex flex-col gap-3 bg-muted/20">
       <header className="flex flex-col md:flex-row md:items-center md:justify-between gap-3 shrink-0">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">水域污染地图</h1>
@@ -778,8 +900,71 @@ export default function MapPage() {
         </div>
       </header>
 
-      <div className="grid grid-cols-1 xl:grid-cols-[320px_minmax(0,1fr)] gap-3 flex-1 min-h-0">
-        <aside className="space-y-3 min-h-0 xl:overflow-auto">
+      <div className="grid grid-cols-1 xl:grid-cols-[320px_minmax(0,1fr)] gap-3 xl:flex-1 xl:min-h-0">
+        <aside className="space-y-3 xl:min-h-0 xl:overflow-auto">
+          {mode === 'live' && (
+            <Card>
+              <CardHeader className="pb-2">
+                <div className="flex items-center justify-between gap-2">
+                  <CardTitle className="text-base flex items-center gap-2"><Route className="w-4 h-4" />Web 航线规划</CardTitle>
+                  <Button
+                    size="sm"
+                    variant={missionPlanEnabled ? 'default' : 'outline'}
+                    onClick={() => setMissionPlanEnabled((value) => !value)}
+                  >
+                    <MapPinned className="w-4 h-4 mr-1" />
+                    {missionPlanEnabled ? '落点中' : '落点'}
+                  </Button>
+                </div>
+              </CardHeader>
+              <CardContent className="space-y-3 text-sm">
+                <label className="flex items-center justify-between rounded-md border bg-background px-3 py-2">
+                  <span className="text-muted-foreground">新航点采样</span>
+                  <input
+                    type="checkbox"
+                    className="h-4 w-4"
+                    checked={draftSampleEnabled}
+                    onChange={(event) => setDraftSampleEnabled(event.target.checked)}
+                  />
+                </label>
+                <div className="grid grid-cols-2 gap-2">
+                  <Button size="sm" onClick={uploadDraftMission} disabled={missionUploading || draftWaypoints.length === 0}>
+                    {missionUploading ? <Loader2 className="w-4 h-4 mr-1 animate-spin" /> : <Upload className="w-4 h-4 mr-1" />}
+                    上传航线
+                  </Button>
+                  <Button size="sm" variant="outline" onClick={clearDraftWaypoints} disabled={draftWaypoints.length === 0}>
+                    <Trash2 className="w-4 h-4 mr-1" />
+                    清空
+                  </Button>
+                </div>
+                <div className="space-y-2">
+                  {draftWaypoints.length === 0 ? (
+                    <div className="rounded-md border border-dashed bg-muted/30 px-3 py-2 text-xs text-muted-foreground">
+                      草案航点 0
+                    </div>
+                  ) : draftWaypoints.map((wp, index) => (
+                    <div key={`${wp.lat}-${wp.lng}-${index}`} className="grid grid-cols-[1fr_auto] gap-2 rounded-md border bg-background px-3 py-2">
+                      <div className="min-w-0">
+                        <div className="flex items-center gap-2">
+                          <span className="font-medium">#{index + 1}</span>
+                          {wp.sample && <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 text-[11px] font-medium text-emerald-700 dark:text-emerald-300">采样</span>}
+                        </div>
+                        <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground">
+                          {wp.wgs84.lat.toFixed(6)}, {wp.wgs84.lng.toFixed(6)}
+                        </div>
+                      </div>
+                      <Button size="icon" variant="ghost" className="h-7 w-7 text-destructive" onClick={() => removeDraftWaypoint(index)}>
+                        <Trash2 className="h-3.5 w-3.5" />
+                      </Button>
+                    </div>
+                  ))}
+                </div>
+                {missionPlanMsg && <div className="rounded-md bg-muted px-3 py-2 text-xs">{missionPlanMsg}</div>}
+                <div className="text-xs text-muted-foreground">仅写入飞控 mission；不解锁、不切 AUTO。</div>
+              </CardContent>
+            </Card>
+          )}
+
           {mode === 'history' && (
             <Card>
               <CardHeader className="pb-2">

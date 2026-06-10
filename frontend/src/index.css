@@ -95,6 +95,21 @@
   transform: translate(-50%, -130%);
   box-shadow: 0 1px 3px rgba(0, 0, 0, 0.4);
 }
+.usv-draft-waypoint-icon span {
+  display: inline-block;
+  min-width: 24px;
+  padding: 1px 6px;
+  font-size: 11px;
+  font-weight: 700;
+  text-align: center;
+  color: #fff;
+  background: #dc2626;
+  border: 2px solid #fff;
+  border-radius: 9999px;
+  white-space: nowrap;
+  transform: translate(-50%, -130%);
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.45);
+}
 .leaflet-container {
   background: #1a1a1a;
   font: inherit;
