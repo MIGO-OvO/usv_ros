@@ -2,6 +2,9 @@
 # 水质监测无人船系统参数配置
 
 # ==================== 泵控制参数 ====================
+pump_settings:
+  default_speed: 60
+
 pump:
   serial_port: "/dev/ttyUSB0"    # ESP32 电机控制板串口
   baudrate: 115200               # 波特率 (与下位机一致)
@@ -48,7 +51,6 @@ automation:
         Y: {enable: "D"}
         Z: {enable: "D"}
         A: {enable: "E", direction: "F", speed: "3", angle: "360", continuous: false}
-        pump: {enable: false, speed: 0, duration_ms: 0}
         interval: 2000
 
       # 步骤2: 启动水样泵和试剂泵
@@ -56,7 +58,6 @@ automation:
         Y: {enable: "E", direction: "F", speed: "5", angle: "90"}
         Z: {enable: "D"}
         A: {enable: "E", direction: "F", speed: "3", angle: "180"}
-        pump: {enable: true, speed: 60, duration_ms: 3000}
         interval: 5000
 
       # 步骤3: 停止所有泵
@@ -64,7 +65,6 @@ automation:
         Y: {enable: "D"}
         Z: {enable: "D"}
         A: {enable: "D"}
-        pump: {enable: false, speed: 0, duration_ms: 0}
         interval: 1000
 
 # ==================== 分光检测器参数 ====================
