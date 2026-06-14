@@ -15,6 +15,7 @@ import math
 import os
 import struct
 import sys
+import time
 import zlib
 
 # 允许从脚本同目录导入兄弟模块
@@ -104,3 +105,149 @@ def _make_solid_png(rgb, size=256):
 
 # 深灰占位瓦片, 与暗色地图风格协调; 模块加载时生成一次
 PLACEHOLDER_TILE = _make_solid_png((42, 42, 42))
+
+
+# ---- T2: 原子写 / PNG 校验 / 孤儿 tmp 清扫 ----
+# 设计要点:
+#   - TileKey 仅承担瓦片标识 + 路径解析, 不读不写, 便于在 PrewarmCoordinator/
+#     journal 等上层结构中安全传递。
+#   - PACK_TILE_PREFIX 自包含 (不引 map_pack_format), 避免循环导入:
+#     map_tile_store <- map_pack_format, 反向引用会成环。
+#   - write_tile_atomic 严格走 tmp -> fsync -> os.replace 路径, 任何 OSError
+#     都清掉半截 *.png.tmp, 不在磁盘留下不可校验的脏数据。
+#   - verify_tile_bytes 仅做 magic + 最小长度判定, 不解析 chunk; 高德错误页
+#     (HTML/JSON) 与传输截断都会被一并拒掉。
+#   - sweep_orphan_tmp 只清 *.png.tmp, 不会误删正常 *.png; max_age_sec 默认
+#     60s, 给当前正在写入的进程留出足够富余。
+
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+PNG_MIN_BYTES = 100  # 任何小于该值的 PNG 都视作不完整
+
+# 包内 relpath 前缀; 与 map_pack_format.TILE_PREFIX 形式保持一致, 但物理
+# 上不引该模块, 避免反向依赖。
+PACK_TILE_PREFIX = "tiles"
+
+
+class TileKey(object):
+    """瓦片标识: style/z/x/y。
+
+    - disk_path(root): 解析为本地缓存绝对路径, 与现有
+      ``{root}/{style}/{z}/{x}/{y}.png`` 布局完全一致。
+    - relpath(): 包内相对路径, 形如 ``tiles/{style}/{z}/{x}/{y}.png``,
+      供 T3/T5 写 manifest/journal 时使用。
+    """
+
+    __slots__ = ("style", "z", "x", "y")
+
+    def __init__(self, style, z, x, y):
+        self.style = style
+        self.z = int(z)
+        self.x = int(x)
+        self.y = int(y)
+
+    def disk_path(self, root):
+        return os.path.join(
+            root, self.style, str(self.z), str(self.x),
+            "%d.png" % self.y)
+
+    def relpath(self):
+        return "%s/%s/%d/%d/%d.png" % (
+            PACK_TILE_PREFIX, self.style, self.z, self.x, self.y)
+
+    def __repr__(self):
+        return "TileKey(%s, %d, %d, %d)" % (
+            self.style, self.z, self.x, self.y)
+
+    def __eq__(self, other):
+        if not isinstance(other, TileKey):
+            return NotImplemented
+        return (self.style == other.style and self.z == other.z
+                and self.x == other.x and self.y == other.y)
+
+    def __hash__(self):
+        return hash((self.style, self.z, self.x, self.y))
+
+
+def tile_disk_path(root, key):
+    """与 ``key.disk_path(root)`` 等价的函数式接口, 便于按需 import。"""
+    return key.disk_path(root)
+
+
+def verify_tile_bytes(data):
+    """PNG 字节合法性快速校验。
+
+    通过判据: 非空 + 以 PNG magic 开头 + 长度 > PNG_MIN_BYTES。
+    用于过滤 HTML 错误页、JSON 错误体、传输截断等非 PNG 响应,
+    避免污染瓦片缓存。
+    """
+    if not data:
+        return False
+    if not data.startswith(PNG_MAGIC):
+        return False
+    return len(data) > PNG_MIN_BYTES
+
+
+def write_tile_atomic(root, key, data):
+    """原子写瓦片字节: 写 ``*.png.tmp`` -> fsync -> ``os.replace``。
+
+    - 不校验 ``data`` 是否为 PNG (调用方决定); 但写入失败必须清理半截
+      tmp, 不能在缓存里留下既不是合法 PNG 也无法 mtime 判定的孤儿。
+    - 任何 OSError 都返回 False, 不抛; 由调用方负责重试或上报。
+    """
+    path = key.disk_path(root)
+    tmp = path + ".tmp"
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return False
+
+
+def read_tile(root, key):
+    """读取瓦片字节; 文件不存在或 IO 失败返回 None。"""
+    path = key.disk_path(root)
+    try:
+        with open(path, "rb") as f:
+            return f.read()
+    except OSError:
+        return None
+
+
+def sweep_orphan_tmp(root, max_age_sec=60):
+    """清理 ``root`` 下超过 ``max_age_sec`` 秒的 ``*.png.tmp`` 孤儿文件。
+
+    用于进程崩溃后回收半截写入。仅删除以 ``.png.tmp`` 结尾的文件,
+    永远不动正常的 ``*.png`` 瓦片。返回删除的文件数量。
+    不存在的目录视为 0, 不抛。
+    """
+    if not os.path.isdir(root):
+        return 0
+    threshold = time.time() - float(max_age_sec)
+    removed = 0
+    for dirpath, _dirs, files in os.walk(root):
+        for name in files:
+            if not name.endswith(".png.tmp"):
+                continue
+            full = os.path.join(dirpath, name)
+            try:
+                mtime = os.path.getmtime(full)
+            except OSError:
+                continue
+            if mtime <= threshold:
+                try:
+                    os.remove(full)
+                    removed += 1
+                except OSError:
+                    # 并发写入或权限拒绝, 跳过即可, 下次再扫
+                    continue
+    return removed
