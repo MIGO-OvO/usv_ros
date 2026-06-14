@@ -96,7 +96,7 @@ class MapTileCachePublicApiTests(unittest.TestCase):
         self.assertEqual(mtc.PACK_PROVIDER, "amap")
         self.assertEqual(mtc.MANIFEST_NAME, "manifest.json")
         self.assertEqual(mtc.TILE_PREFIX, "tiles")
-        self.assertEqual(mtc.PACK_VERSION, 1)
+        self.assertEqual(mtc.PACK_VERSION, 2)
 
     def test_deg2tile_basic(self):
         mtc = _fresh_import("map_tile_cache")

@@ -63,10 +63,12 @@ from map_pack_format import (  # noqa: E402,F401
     PACK_VERSION,
     TILE_PREFIX,
     build_manifest,
+    compute_tile_index_sha256,
     create_pack,
     hash_tiles_root,
     import_pack,
     iter_tiles_root,
+    manifest_kind,
     read_pack_manifest,
 )
 

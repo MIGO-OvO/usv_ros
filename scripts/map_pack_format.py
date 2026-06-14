@@ -33,9 +33,16 @@ from map_tile_store import CACHE_DIR  # noqa: E402
 
 # 离线瓦片包 (导出/导入) 元数据
 PACK_PROVIDER = "amap"        # 底图源标识, 导入时与本机源匹配, 防止导错底图
-PACK_VERSION = 1              # 包格式版本
+PACK_VERSION = 2              # 包格式版本: v2 引入 kind/base_sha256/tile_index_sha256
 MANIFEST_NAME = "manifest.json"
 TILE_PREFIX = "tiles"         # tar 内瓦片根目录
+
+# manifest 类型 (v2 起):
+#   "full"  — 完整包, base_sha256 必为 None
+#   "delta" — 增量包, base_sha256 指向基线包的 sha256
+PACK_KIND_FULL = "full"
+PACK_KIND_DELTA = "delta"
+_VALID_PACK_KINDS = (PACK_KIND_FULL, PACK_KIND_DELTA)
 
 
 def iter_tiles_root(root):
@@ -86,20 +93,65 @@ def hash_tiles_root(root):
     return h.hexdigest(), count
 
 
-def build_manifest(tiles_root, bbox, zoom_min, zoom_max, styles, provider=PACK_PROVIDER):
-    """根据瓦片目录构造 manifest 字典 (含 sha256 与瓦片数)。"""
+def build_manifest(tiles_root, bbox, zoom_min, zoom_max, styles,
+                   provider=PACK_PROVIDER, kind=PACK_KIND_FULL,
+                   base_sha256=None):
+    """根据瓦片目录构造 manifest 字典 (含 sha256 与瓦片数)。
+
+    v2 新增字段:
+      - kind: "full" | "delta" (默认 full, 兼容旧调用方)
+      - base_sha256: delta 包指向的基线 sha256; full 包必为 None
+      - tile_index_sha256: 见 ``compute_tile_index_sha256``
+    """
+    if kind not in _VALID_PACK_KINDS:
+        raise ValueError("非法 pack kind: %r" % (kind,))
     sha, count = hash_tiles_root(tiles_root)
+    index_sha = compute_tile_index_sha256(tiles_root)
     return {
         "provider": provider,
         "version": PACK_VERSION,
+        "kind": kind,
+        "base_sha256": base_sha256 if kind == PACK_KIND_DELTA else None,
         "styles": [s for s in (styles or []) if s in VALID_STYLES] or list(VALID_STYLES),
         "bbox": list(bbox) if bbox else None,
         "zoom_min": int(zoom_min),
         "zoom_max": int(zoom_max),
         "tile_count": count,
         "sha256": sha,
+        "tile_index_sha256": index_sha,
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
+
+
+def compute_tile_index_sha256(tiles_root):
+    """对瓦片集合做轻量索引哈希 (relpath + size, 不读字节)。
+
+    用途: 快速比较两份缓存集合是否一致, 用于 delta 基线校验。同 relpath
+    同 size 的瓦片集合 -> 同哈希; 增删瓦片或改变文件大小 -> 哈希变化。
+    """
+    lines = []
+    for style, z, x, y, path in iter_tiles_root(tiles_root):
+        rel = _tile_relpath(style, z, x, y)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        lines.append("%s\t%d" % (rel, size))
+    lines.sort()
+    h = hashlib.sha256()
+    h.update("\n".join(lines).encode("utf-8"))
+    return h.hexdigest()
+
+
+def manifest_kind(manifest):
+    """读取 manifest 的 kind, v1 (无 kind) 视为 full; 非法值兜底为 full。
+
+    非 dict 输入返回 None, 便于上层区分 "无效 manifest" 与 "v1 full"。
+    """
+    if not isinstance(manifest, dict):
+        return None
+    k = manifest.get("kind")
+    return k if k in _VALID_PACK_KINDS else PACK_KIND_FULL
 
 
 def create_pack(tiles_root, out_path, manifest):
