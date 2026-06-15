@@ -28,6 +28,7 @@ from __future__ import print_function
 import argparse
 import os
 import sys
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 # 允许从脚本同目录导入 map_tile_cache
@@ -47,7 +48,17 @@ def _download_to_root(tiles_root, bbox, zoom_min, zoom_max, styles, workers):
         print("范围过大(%d 张), 请缩小区域或降低层级" % total, file=sys.stderr)
         sys.exit(2)
     print("待下载瓦片: %d 张 (z%d-%d)" % (total, zoom_min, zoom_max))
-    counter = {"ok": 0, "fail": 0, "n": 0}
+    counter = {
+        "cached": 0, "downloaded": 0, "timeout": 0,
+        "invalid": 0, "write_failed": 0, "n": 0, "retried": 0,
+    }
+    sub_state = {"idx": 0}
+    sub_lock = threading.Lock()
+
+    def _next_sub():
+        with sub_lock:
+            sub_state["idx"] = (sub_state["idx"] % 4) + 1
+            return sub_state["idx"]
 
     def _one(task):
         style, z, x, y = task
@@ -56,34 +67,46 @@ def _download_to_root(tiles_root, bbox, zoom_min, zoom_max, styles, workers):
             try:
                 with open(dst, "rb") as f:
                     if mtc.verify_tile_bytes(f.read()):
-                        return True
+                        return "cached", 0
                 os.remove(dst)
             except OSError:
-                return False
-        sub = (counter["n"] % 4) + 1
-        data = mtc.fetch_tile(style, z, x, y, sub)
-        if not mtc.verify_tile_bytes(data):
-            return False
+                return "write_failed", 0
+        result = mtc.fetch_tile_resilient(
+            style, z, x, y, sub_picker=_next_sub, max_attempts=5,
+            base_delay=0.2, max_delay=2.0)
+        if result.status != "ok" or not mtc.verify_tile_bytes(result.data):
+            return result.status, max(0, int(result.attempts) - 1)
         try:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             tmp = dst + ".tmp"
             with open(tmp, "wb") as f:
-                f.write(data)
+                f.write(result.data)
             os.replace(tmp, dst)
-            return True
+            return "downloaded", max(0, int(result.attempts) - 1)
         except OSError:
-            return False
+            return "write_failed", max(0, int(result.attempts) - 1)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for ok in pool.map(_one, tasks):
+        for status, retried in pool.map(_one, tasks):
             counter["n"] += 1
-            counter["ok" if ok else "fail"] += 1
+            counter["retried"] += retried
+            if status in counter:
+                counter[status] += 1
+            else:
+                counter["timeout"] += 1
             if counter["n"] % 200 == 0 or counter["n"] == total:
-                sys.stdout.write("\r进度: %d/%d (失败 %d)" % (
-                    counter["n"], total, counter["fail"]))
+                fail = counter["timeout"] + counter["invalid"] + counter["write_failed"]
+                sys.stdout.write(
+                    "\r进度: %d/%d (缓存 %d 下载 %d 失败 %d 重试 %d)" % (
+                        counter["n"], total, counter["cached"],
+                        counter["downloaded"], fail, counter["retried"]))
                 sys.stdout.flush()
     print()
-    return counter["ok"], counter["fail"]
+    fail = counter["timeout"] + counter["invalid"] + counter["write_failed"]
+    if fail:
+        print("失败分类: timeout=%d invalid=%d write_failed=%d" % (
+            counter["timeout"], counter["invalid"], counter["write_failed"]))
+    return counter["cached"] + counter["downloaded"], fail
 
 
 def _prompt_text(label, default):
@@ -217,7 +240,7 @@ def main(argv=None):
         os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
         mtc.create_pack(tiles_root, out_abs, manifest)
         args.out = out_abs
-        print("下载成功 %d 张, 失败 %d 张" % (ok, fail))
+        print("可用瓦片 %d 张, 本轮失败 %d 张" % (ok, fail))
 
     size_mb = os.path.getsize(args.out) / 1048576.0
     print("已生成包: %s (%d 张, %.1f MB)" % (
