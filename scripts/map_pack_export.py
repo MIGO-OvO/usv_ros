@@ -35,7 +35,7 @@ from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import map_tile_cache as mtc  # noqa: E402
 
-DEFAULT_INTERACTIVE_BBOX = (110.35, 25.25, 110.47, 25.38)
+DEFAULT_INTERACTIVE_BBOX = (110.31, 25.22, 110.51, 25.41)
 DEFAULT_INTERACTIVE_OUT = "guilin_area_map.tar"
 
 

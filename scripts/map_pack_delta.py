@@ -38,7 +38,9 @@ from __future__ import print_function
 import os
 import shutil
 import sys
+import tarfile
 import tempfile
+import uuid
 
 # 允许从脚本同目录导入兄弟模块 (与 map_pack_format / map_tile_cache 一致)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -46,7 +48,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import map_pack_format as mpf  # noqa: E402
 
 
-__all__ = ["build_delta"]
+__all__ = ["build_delta", "diff_pack", "apply_delta"]
 
 
 def _normalize_styles(styles):
@@ -160,9 +162,328 @@ def build_delta(new_root, base_root, out_path,
 
 
 # ---------------------------------------------------------------------------
-# T10 占位区: apply_delta / diff_pack 在 T10 任务中加入。届时:
-#   - apply_delta(pack_path, cache_dir): 校验 kind=="delta",
-#     compute_tile_index_sha256(cache_dir) == manifest["base_sha256"],
-#     再走 import_pack 类似的合并流程。
-#   - diff_pack(pack_path, cache_dir): 给出 added / missing / mismatched 集合。
+# T10: apply / diff 半边
 # ---------------------------------------------------------------------------
+#
+# 设计要点 (与 import_pack 对齐):
+#   - 单一原子合并入口 apply_delta(pack, cache_dir): 同时支持 full / delta 包,
+#     T11 会把 import_pack 的合并部分替换为 apply_delta, 让 full 与 delta 走
+#     同一条 staging + 校验 + 合并路径。
+#   - 校验顺序: provider -> safe members 解包 -> sha256 + tile_count ->
+#     (delta 才有) base_sha256 == compute_tile_index_sha256(cache_dir)。
+#     任何一步失败都不动 cache, staging 立即清理。
+#   - staging 目录: cache_dir/.staging/{uuid4hex}/ , 与 cache_dir 同盘以便
+#     最终走 os.replace (跨盘会退化为 shutil.copy)。
+#   - 合并采用 import_pack 同款 "存在则跳过" 累积语义, 不覆盖现有瓦片。
+#   - diff_pack 只读, 走完整解包 + 校验 (provider/safe/sha/count) 后再做集合
+#     比对; staging 同样在 finally 里清理, 全程不动 cache_dir。
+
+
+_STAGING_DIRNAME = ".staging"
+
+
+def _safe_extract(pack_path, dest_dir):
+    """按 mpf._safe_member 过滤后解包到 dest_dir; 返回 (ok, message)。
+
+    member 列表过滤掉路径穿越/绝对路径成员, 与 import_pack 同款保护
+    (EF-07)。tar 损坏返回 (False, message)。
+    """
+    try:
+        with tarfile.open(pack_path, "r") as tar:
+            members = [m for m in tar.getmembers()
+                       if m.isfile() and mpf._safe_member(m.name)]
+            tar.extractall(dest_dir, members=members)
+    except tarfile.TarError as exc:
+        return False, "解包失败: %s" % str(exc)
+    return True, ""
+
+
+def _validate_pack_payload(staged_root, manifest):
+    """校验 staged 目录与 manifest 的 sha256 / tile_count 一致 (EF-06)。
+
+    staged_root 指向 staging 内的 ``tiles/`` 目录 (与 hash_tiles_root 同口径)。
+    返回 (ok, message)。
+    """
+    sha, count = mpf.hash_tiles_root(staged_root)
+    expected_count = manifest.get("tile_count")
+    try:
+        expected_count_i = int(expected_count)
+    except (TypeError, ValueError):
+        return False, "瓦片数字段非法: %r" % (expected_count,)
+    if count != expected_count_i:
+        return False, "瓦片数校验失败: 实际 %d, 期望 %d" % (count, expected_count_i)
+    if sha != manifest.get("sha256"):
+        return False, "校验和不匹配, 包可能损坏"
+    return True, ""
+
+
+def _merge_staged_tiles(staged_tiles_root, cache_dir):
+    """把 staged_tiles_root 下的瓦片按 import_pack 风格合并到 cache_dir。
+
+    存在即跳过, 不覆盖 (累积语义)。返回 (added, skipped, errors[list])。
+    """
+    added = skipped = 0
+    errors = []
+    for style, z, x, y, src in mpf.iter_tiles_root(staged_tiles_root):
+        dst = os.path.join(cache_dir, style, str(z), str(x), "%d.png" % y)
+        if os.path.isfile(dst):
+            skipped += 1
+            continue
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            shutil.copy2(src, dst)
+            added += 1
+        except OSError as exc:
+            errors.append("合并瓦片失败 %s: %s" % (dst, str(exc)))
+    return added, skipped, errors
+
+
+def _make_staging_dir(cache_dir):
+    """在 cache_dir/.staging/{uuid4hex}/ 建临时 staging 目录。
+
+    放在 cache_dir 内是为了与 cache 同盘, 后续合并阶段瓦片复制不跨盘;
+    .staging 前缀不在 VALID_STYLES 中, ``iter_tiles_root`` / hash 会自动忽略,
+    不会被当成瓦片目录扫描。
+    """
+    base = os.path.join(cache_dir, _STAGING_DIRNAME)
+    os.makedirs(base, exist_ok=True)
+    stage = os.path.join(base, uuid.uuid4().hex)
+    os.makedirs(stage, exist_ok=False)
+    return stage
+
+
+def _enumerate_pack_tiles(pack_path):
+    """只读扫描 tar 内 tiles/ 成员, 解析回 (style,z,x,y) 集合 + 元数据。
+
+    用于 diff_pack 不解包就能给出 would_add/would_skip 估算。返回:
+      keys: set of (style,z,x,y)
+      sizes: dict (style,z,x,y) -> tarfile member size
+    损坏 tar 返回 (None, message)。
+    """
+    keys = set()
+    sizes = {}
+    prefix = mpf.TILE_PREFIX + "/"
+    try:
+        with tarfile.open(pack_path, "r") as tar:
+            for m in tar.getmembers():
+                if not m.isfile():
+                    continue
+                if not mpf._safe_member(m.name):
+                    continue
+                if not m.name.startswith(prefix):
+                    continue
+                rest = m.name[len(prefix):]
+                parts = rest.split("/")
+                if len(parts) != 4 or not parts[3].endswith(".png"):
+                    continue
+                style = parts[0]
+                try:
+                    z = int(parts[1])
+                    x = int(parts[2])
+                    y = int(parts[3][:-4])
+                except (TypeError, ValueError):
+                    continue
+                key = (style, z, x, y)
+                keys.add(key)
+                sizes[key] = m.size
+    except tarfile.TarError as exc:
+        return None, "解包失败: %s" % str(exc)
+    return keys, sizes
+
+
+def _enumerate_cache_tiles(cache_dir):
+    """枚举 cache_dir 下瓦片, 返回 {(style,z,x,y): size}。
+
+    cache 不存在视为空集合。
+    """
+    out = {}
+    if not os.path.isdir(cache_dir):
+        return out
+    for style, z, x, y, path in mpf.iter_tiles_root(cache_dir):
+        try:
+            out[(style, z, x, y)] = os.path.getsize(path)
+        except OSError:
+            continue
+    return out
+
+
+def diff_pack(pack_path, cache_dir):
+    """只读分析: 不写任何文件, 评估把 pack_path 应用到 cache_dir 的影响。
+
+    返回 dict 字段:
+      ok (bool): 整体是否可解析 (manifest 合法 / tar 可读)。
+      kind (str|None): "full" / "delta" / None (无效 manifest)。
+      base_sha256 (str|None): 仅 delta 包有意义。
+      base_match (bool|None): 仅 delta 包有意义, 包内 base_sha256 是否等于
+        当前 cache 的 tile_index_sha256; full 包恒为 None。
+      would_add (int): 包内有、cache 内没有的瓦片数。
+      would_skip (int): 包内有、cache 内已有的瓦片数 (apply 时会被跳过)。
+      conflicts (int): 包内有、cache 内已有但字节大小不同的瓦片数 (信息性,
+        当前合并语义会跳过, 不覆盖)。
+      tile_count (int|None): 包内 manifest 声明的瓦片数 (信息性)。
+      message (str): 简要说明。
+    """
+    manifest = mpf.read_pack_manifest(pack_path)
+    if not isinstance(manifest, dict):
+        return {
+            "ok": False,
+            "kind": None,
+            "base_sha256": None,
+            "base_match": None,
+            "would_add": 0,
+            "would_skip": 0,
+            "conflicts": 0,
+            "tile_count": None,
+            "message": "无效包: 缺少或损坏的 manifest",
+        }
+    kind = mpf.manifest_kind(manifest)
+    if manifest.get("provider") != mpf.PACK_PROVIDER:
+        return {
+            "ok": False,
+            "kind": kind,
+            "base_sha256": manifest.get("base_sha256"),
+            "base_match": None,
+            "would_add": 0,
+            "would_skip": 0,
+            "conflicts": 0,
+            "tile_count": manifest.get("tile_count"),
+            "message": "底图源不匹配: 包为 %s, 本机为 %s" % (
+                manifest.get("provider"), mpf.PACK_PROVIDER),
+        }
+    verify_tmp = tempfile.mkdtemp(prefix="usv_mappack_diff_")
+    try:
+        ok, msg = _safe_extract(pack_path, verify_tmp)
+        if not ok:
+            return {
+                "ok": False,
+                "kind": kind,
+                "base_sha256": manifest.get("base_sha256"),
+                "base_match": None,
+                "would_add": 0,
+                "would_skip": 0,
+                "conflicts": 0,
+                "tile_count": manifest.get("tile_count"),
+                "message": msg,
+            }
+        ok, msg = _validate_pack_payload(
+            os.path.join(verify_tmp, mpf.TILE_PREFIX), manifest)
+        if not ok:
+            return {
+                "ok": False,
+                "kind": kind,
+                "base_sha256": manifest.get("base_sha256"),
+                "base_match": None,
+                "would_add": 0,
+                "would_skip": 0,
+                "conflicts": 0,
+                "tile_count": manifest.get("tile_count"),
+                "message": msg,
+            }
+    finally:
+        shutil.rmtree(verify_tmp, ignore_errors=True)
+    pack_keys, pack_sizes = _enumerate_pack_tiles(pack_path)
+    if pack_keys is None:
+        return {
+            "ok": False,
+            "kind": kind,
+            "base_sha256": manifest.get("base_sha256"),
+            "base_match": None,
+            "would_add": 0,
+            "would_skip": 0,
+            "conflicts": 0,
+            "tile_count": manifest.get("tile_count"),
+            "message": pack_sizes,  # message string from _enumerate_pack_tiles
+        }
+    cache_sizes = _enumerate_cache_tiles(cache_dir)
+    would_add = would_skip = conflicts = 0
+    for key in pack_keys:
+        if key in cache_sizes:
+            would_skip += 1
+            if cache_sizes[key] != pack_sizes.get(key):
+                conflicts += 1
+        else:
+            would_add += 1
+    base_sha = manifest.get("base_sha256")
+    base_match = None
+    if kind == mpf.PACK_KIND_DELTA:
+        actual_base = mpf.compute_tile_index_sha256(cache_dir)
+        base_match = bool(base_sha) and (actual_base == base_sha)
+    return {
+        "ok": True,
+        "kind": kind,
+        "base_sha256": base_sha,
+        "base_match": base_match,
+        "would_add": would_add,
+        "would_skip": would_skip,
+        "conflicts": conflicts,
+        "tile_count": manifest.get("tile_count"),
+        "message": "干跑分析完成",
+    }
+
+
+def apply_delta(pack_path, cache_dir):
+    """校验并原子合并 (full 或 delta) 瓦片包到 cache_dir。
+
+    返回 (ok: bool, summary: dict)。失败时 cache_dir 不被修改, staging 清理。
+
+    校验顺序:
+      1. provider 必须等于 mpf.PACK_PROVIDER。
+      2. tar 解包到 staging 时仅允许 mpf._safe_member (EF-07 防穿越)。
+      3. staged tiles 的 sha256 与 tile_count 必须等于 manifest 声明 (EF-06)。
+      4. 仅 delta: manifest.base_sha256 必须等于
+         compute_tile_index_sha256(cache_dir) (EF-08)。
+      5. 校验全部通过后, 逐瓦片 copy2 到 cache_dir (存在则跳过, 累积语义)。
+
+    staging 目录: cache_dir/.staging/{uuid4hex}/ , finally 清理。
+    """
+    manifest = mpf.read_pack_manifest(pack_path)
+    if not isinstance(manifest, dict):
+        return False, {"message": "无效包: 缺少或损坏的 manifest"}
+    if manifest.get("provider") != mpf.PACK_PROVIDER:
+        return False, {"message": "底图源不匹配: 包为 %s, 本机为 %s" % (
+            manifest.get("provider"), mpf.PACK_PROVIDER)}
+    kind = mpf.manifest_kind(manifest)
+
+    # cache_dir 必须存在 (即使 base 为空也应是已存在的目录)
+    os.makedirs(cache_dir, exist_ok=True)
+    stage = _make_staging_dir(cache_dir)
+    try:
+        ok, msg = _safe_extract(pack_path, stage)
+        if not ok:
+            return False, {"message": msg}
+        staged_tiles_root = os.path.join(stage, mpf.TILE_PREFIX)
+        ok, msg = _validate_pack_payload(staged_tiles_root, manifest)
+        if not ok:
+            return False, {"message": msg}
+        if kind == mpf.PACK_KIND_DELTA:
+            expected_base = manifest.get("base_sha256")
+            actual_base = mpf.compute_tile_index_sha256(cache_dir)
+            if not expected_base or expected_base != actual_base:
+                return False, {
+                    "message": ("增量包基线不匹配, 拒绝合并: 包期望 base "
+                                "tile_index_sha256=%s, 本地缓存为 %s" % (
+                                    expected_base, actual_base)),
+                    "expected_base": expected_base,
+                    "actual_base": actual_base,
+                }
+        added, skipped, errors = _merge_staged_tiles(staged_tiles_root, cache_dir)
+        return True, {
+            "message": "应用完成",
+            "kind": kind,
+            "added": added,
+            "skipped": skipped,
+            "errors": errors,
+            "tile_count": manifest.get("tile_count"),
+            "bbox": manifest.get("bbox"),
+            "zoom_min": manifest.get("zoom_min"),
+            "zoom_max": manifest.get("zoom_max"),
+        }
+    finally:
+        shutil.rmtree(stage, ignore_errors=True)
+        # 清空 .staging 父目录中遗留的空目录 (best-effort, 失败忽略)
+        staging_root = os.path.join(cache_dir, _STAGING_DIRNAME)
+        try:
+            if os.path.isdir(staging_root) and not os.listdir(staging_root):
+                os.rmdir(staging_root)
+        except OSError:
+            pass
