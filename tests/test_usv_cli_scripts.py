@@ -74,7 +74,7 @@ class UsvCliScriptTests(unittest.TestCase):
         text = self._read_script("usvctl.sh")
 
         self.assertIn("ensure_scripts_executable()", text)
-        self.assertIn('chmod +x "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/*.py', text)
+        self.assertIn('chmod +x "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/*.py "$SCRIPT_DIR"/map_resources/*.sh "$SCRIPT_DIR"/map_resources/*.py', text)
 
     def test_build_uses_ros_setup_and_catkin_make(self):
         text = self._read_script("usvctl.sh")

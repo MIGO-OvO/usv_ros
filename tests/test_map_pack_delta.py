@@ -31,6 +31,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
+MAP_RESOURCES_DIR = SCRIPTS_DIR / "map_resources"
 
 # 与 test_map_pack_format_v2.py 保持同样的最小 PNG 头, 便于 hash_tiles_root
 # 等内容哈希函数与索引哈希函数都能识别为合法 tile。
@@ -38,9 +39,10 @@ _PNG_HEAD = b"\x89PNG\r\n\x1a\n"
 
 
 def _ensure_scripts_on_path():
-    p = str(SCRIPTS_DIR)
-    if p not in sys.path:
-        sys.path.insert(0, p)
+    for path in (SCRIPTS_DIR, MAP_RESOURCES_DIR):
+        p = str(path)
+        if p not in sys.path:
+            sys.path.insert(0, p)
 
 
 def _fresh_import(name):

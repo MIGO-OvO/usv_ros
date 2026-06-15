@@ -754,7 +754,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
     def test_map_tile_cache_ignores_legacy_offline_state(self):
         module, _, _ = _load_script(
             "map_tile_cache_legacy_offline_state_test",
-            "scripts/map_tile_cache.py",
+            "scripts/map_resources/map_tile_cache.py",
         )
 
         with tempfile.TemporaryDirectory() as tmpdir:

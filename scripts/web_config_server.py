@@ -90,10 +90,12 @@ except ImportError:
     class ControlCommand:
         pass
 
-# 确保脚本目录在路径中
+# 确保脚本目录与地图资源子目录在路径中
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-if SCRIPT_DIR not in sys.path:
-    sys.path.append(SCRIPT_DIR)
+MAP_RESOURCES_DIR = os.path.join(SCRIPT_DIR, "map_resources")
+for _path in (SCRIPT_DIR, MAP_RESOURCES_DIR):
+    if _path not in sys.path:
+        sys.path.append(_path)
 
 from preset_manager import PresetManager
 import map_tile_cache as mtc

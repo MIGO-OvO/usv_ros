@@ -5,7 +5,7 @@ REM Interactive offline map resource helper for Windows.
 REM Actions: download/export, inspect, import. Packs auto-detected from common dirs.
 
 set "SCRIPT_DIR=%~dp0"
-for %%I in ("%SCRIPT_DIR%..") do set "REPO_DIR=%%~fI"
+for %%I in ("%SCRIPT_DIR%..\..") do set "REPO_DIR=%%~fI"
 set "PACK_DIR=%REPO_DIR%\.map_packs"
 set "DEFAULT_CACHE=%USERPROFILE%\usv_ws\map_cache"
 if not exist "%PACK_DIR%" mkdir "%PACK_DIR%" >nul 2>nul

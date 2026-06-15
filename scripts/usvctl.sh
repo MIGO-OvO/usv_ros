@@ -129,8 +129,8 @@ addr_system() {
 }
 
 ensure_scripts_executable() {
-    ctl_log "ensure script permissions: $SCRIPT_DIR/*.sh $SCRIPT_DIR/*.py"
-    chmod +x "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/*.py
+    ctl_log "ensure script permissions: $SCRIPT_DIR/*.sh $SCRIPT_DIR/*.py $SCRIPT_DIR/map_resources/*"
+    chmod +x "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/*.py "$SCRIPT_DIR"/map_resources/*.sh "$SCRIPT_DIR"/map_resources/*.py
 }
 
 update_system() {

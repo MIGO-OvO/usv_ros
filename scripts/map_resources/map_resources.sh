@@ -5,7 +5,7 @@ set -euo pipefail
 # Actions: download/export, inspect, import. Packs auto-detected from common dirs.
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+REPO_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 PACK_DIR="${USV_MAP_PACK_DIR:-$REPO_DIR/.map_packs}"
 DEFAULT_CACHE="${USV_MAP_CACHE:-$HOME/usv_ws/map_cache}"
 PYTHON_BIN="${PYTHON:-python3}"
