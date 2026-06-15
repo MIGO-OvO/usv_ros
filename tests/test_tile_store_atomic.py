@@ -160,7 +160,7 @@ class SweepOrphanTmpTests(unittest.TestCase):
 
 
 class VerifyTileBytesTests(unittest.TestCase):
-    """EF-04 + EF-14: verify_tile_bytes 必须拒绝非 PNG / 截断, 接受真实 PNG。"""
+    """EF-04 + EF-14: verify_tile_bytes 拒绝非图片/截断, 接受 PNG/JPEG。"""
 
     def setUp(self):
         self.mts = _fresh_import("map_tile_store")
@@ -185,6 +185,10 @@ class VerifyTileBytesTests(unittest.TestCase):
         png = self.mts.PLACEHOLDER_TILE
         self.assertTrue(self.mts.verify_tile_bytes(png))
         self.assertGreater(len(png), 100)
+
+    def test_accepts_real_jpeg(self):
+        jpeg = b"\xff\xd8\xff" + b"0" * 200
+        self.assertTrue(self.mts.verify_tile_bytes(jpeg))
 
     def test_rejects_long_non_png_blob(self):
         # 长度 >100 但 magic 错: 仍必须拒
