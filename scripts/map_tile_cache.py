@@ -12,157 +12,428 @@
 底图: 高德卫星影像 (style=6) + 注记叠加层 (style=8), GCJ-02, 国内水域。
 瓦片端点公开, 无需 Key/签名。仅供比赛/演示用途, 长期商用需评估正规授权。
 
-不依赖 ROS / Flask, 便于独立测试与复用。
+不依赖 ROS / Flask, 便于独立测试与复用。本文件仅承载 ``MapTileCache`` 运行时
+对象; 纯函数/常量已迁出到三个兄弟模块, 这里通过再导出保持原有 ``import
+map_tile_cache as mtc`` 形式调用方零成本兼容:
+
+  - ``map_network_fetch``  端点、UA/Referer、``fetch_tile``
+  - ``map_tile_store``     缓存目录、瓦片编号、缩放约束、占位 PNG
+  - ``map_pack_format``    manifest schema、哈希、tar 打包/导入
+
 Python: 3.8
 """
 
 from __future__ import print_function
 
-import hashlib
-import json
-import math
 import os
 import shutil
-import struct
-import tarfile
-import tempfile
+import sys
 import threading
 import time
-import zlib
-from concurrent.futures import ThreadPoolExecutor
+import uuid
+from collections import deque
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 
-try:
-    from urllib.request import Request, urlopen
-    from urllib.error import URLError
-except ImportError:  # pragma: no cover - py2 兜底, 实际运行为 py3
-    from urllib2 import Request, urlopen, URLError
+# 允许从脚本同目录导入兄弟模块 (脚本/测试两种入口都能解析)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-# 缓存根目录, 与 ~/usv_ws/config 平级, 不随代码更新被覆盖
-CACHE_DIR = os.path.expanduser("~/usv_ws/map_cache")
+# ---- 再导出: 保持 map_tile_cache.X 完整公共表面 ----
+from map_network_fetch import (  # noqa: E402,F401
+    Request,
+    URLError,
+    FETCH_TIMEOUT,
+    PREWARM_WORKERS,
+    TILE_ENDPOINTS,
+    VALID_STYLES,
+    FetchResult,
+    fetch_tile,
+    fetch_tile_resilient,
+)
+from map_pack_journal import (  # noqa: E402,F401
+    Journal,
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+    STATUS_PAUSED,
+    STATUS_RUNNING,
+    STATUS_STOPPED,
+)
+from map_tile_store import (  # noqa: E402,F401
+    CACHE_DIR,
+    DEFAULT_ZOOM_MAX,
+    DEFAULT_ZOOM_MIN,
+    MAX_PREWARM_TILES,
+    PACK_TILE_PREFIX,
+    PLACEHOLDER_TILE,
+    PNG_MAGIC,
+    PNG_MIN_BYTES,
+    TileKey,
+    ZOOM_HARD_MAX,
+    ZOOM_HARD_MIN,
+    clamp_zoom,
+    deg2tile,
+    enumerate_tiles,
+    read_tile,
+    sweep_orphan_tmp,
+    tile_disk_path,
+    verify_tile_bytes,
+    write_tile_atomic,
+)
+from map_pack_format import (  # noqa: E402,F401
+    MANIFEST_NAME,
+    PACK_PROVIDER,
+    PACK_VERSION,
+    TILE_PREFIX,
+    build_manifest,
+    compute_tile_index_sha256,
+    create_pack,
+    hash_tiles_root,
+    iter_tiles_root,
+    manifest_kind,
+    read_pack_manifest,
+)
+from map_pack_delta import apply_delta as import_pack  # noqa: E402,F401
+from map_pack_delta import diff_pack  # noqa: E402,F401
 
-# 高德规则栅格瓦片端点 (z/x/y, 子域 1..4 负载均衡)
-TILE_ENDPOINTS = {
-    "satellite": "https://webst0{s}.is.autonavi.com/appmaptile?style=6&x={x}&y={y}&z={z}",
-    "annotation": "https://webrd0{s}.is.autonavi.com/appmaptile"
-                  "?lang=zh_cn&size=1&scale=1&style=8&x={x}&y={y}&z={z}",
-}
-VALID_STYLES = tuple(TILE_ENDPOINTS.keys())
 
-# 预热缩放级别默认上下限 (可被请求参数覆盖)
-DEFAULT_ZOOM_MIN = 13
-DEFAULT_ZOOM_MAX = 18
-ZOOM_HARD_MIN = 3
-ZOOM_HARD_MAX = 20
-
-# 单次预热瓦片总数安全阀, 防止误选超大范围炸盘
-MAX_PREWARM_TILES = 200000
-
-# 离线瓦片包 (导出/导入) 元数据
-PACK_PROVIDER = "amap"        # 底图源标识, 导入时与本机源匹配, 防止导错底图
-PACK_VERSION = 1              # 包格式版本
-MANIFEST_NAME = "manifest.json"
-TILE_PREFIX = "tiles"         # tar 内瓦片根目录
-
-# 回源网络参数
-FETCH_TIMEOUT = 8.0
-PREWARM_WORKERS = 6
-_USER_AGENT = "Mozilla/5.0 (X11; Linux aarch64) USV-OfflineMap/1.0"
-_REFERER = "https://www.amap.com/"
+MASS_FAILURE_MIN_ATTEMPTS = 20
+MASS_FAILURE_RATIO = 0.30
+PROGRESS_EMIT_INTERVAL_SEC = 0.5
+_EPSILON = 0.001
 
 
-def fetch_tile(style, z, x, y, sub=1):
-    """从高德回源单张瓦片字节, 失败返回 None。供缓存代理与导出 CLI 复用。"""
-    if style not in TILE_ENDPOINTS:
+def _empty_prewarm_state():
+    return {
+        "running": False,
+        "total": 0,
+        "done": 0,
+        "failed": 0,
+        "zoom": 0,
+        "started_at": 0.0,
+        "finished_at": 0.0,
+        "stopped": False,
+        "job_id": None,
+        "status": "idle",
+        "reason": "",
+        "retried": 0,
+        "updated_at": 0.0,
+        "rate_tiles_per_sec": 0.0,
+        "eta_seconds": 0.0,
+    }
+
+
+class PrewarmCoordinator(object):
+    def __init__(self, cache_dir, logger=None, sub_picker=None,
+                 fetch_impl=None, workers=PREWARM_WORKERS):
+        self.cache_dir = cache_dir
+        self._log = logger or (lambda *a, **k: None)
+        self._sub_picker = sub_picker
+        self._fetch_impl = fetch_impl
+        self.workers = int(workers or PREWARM_WORKERS)
+        self._lock = threading.RLock()
+        self._active = {}
+
+    def start(self, bbox, zoom_min, zoom_max, styles, progress_cb=None):
+        with self._lock:
+            running = self._running_job_locked()
+            if running:
+                return False, {"message": "预热任务进行中", "job_id": running["job_id"]}
+        tasks, total = enumerate_tiles(bbox, zoom_min, zoom_max, styles)
+        if total == 0:
+            return False, {"message": "范围内无瓦片"}
+        if total > MAX_PREWARM_TILES:
+            return False, {"message": "范围过大(%d 张), 请缩小区域或降低层级" % total}
+        job_id = uuid.uuid4().hex
+        spec = {
+            "job_id": job_id,
+            "kind": "prewarm",
+            "bbox": list(bbox),
+            "zoom_min": int(zoom_min),
+            "zoom_max": int(zoom_max),
+            "styles": list(styles),
+            "workers": self.workers,
+            "created_at": time.time(),
+        }
+        journal = Journal.create(self.cache_dir, spec)
+        journal.write_state(
+            total=total, done=0, failed=0, retried=0, zoom=int(zoom_min),
+            status=STATUS_RUNNING, reason="", started_at=spec["created_at"],
+            finished_at=0.0, rate_tiles_per_sec=0.0, eta_seconds=0.0)
+        return self._launch(job_id, spec, journal, tasks, progress_cb)
+
+    def resume(self, job_id, progress_cb=None):
+        with self._lock:
+            running = self._running_job_locked()
+            if running:
+                return False, {"message": "预热任务进行中", "job_id": running["job_id"]}
+        existing = Journal.open_existing(self.cache_dir, job_id)
+        spec = existing.load_spec()
+        existing.release_lock()
+        tasks, total = enumerate_tiles(
+            spec.get("bbox"), spec.get("zoom_min"), spec.get("zoom_max"),
+            spec.get("styles") or VALID_STYLES)
+        journal = Journal.create(self.cache_dir, spec, steal_stale=True)
+        done_count = len(journal.load_done())
+        state = journal.load_state()
+        journal.write_state(
+            total=total, done=done_count, failed=int(state.get("failed", 0)),
+            retried=int(state.get("retried", 0)), status=STATUS_RUNNING,
+            reason="", finished_at=0.0)
+        return self._launch(job_id, spec, journal, tasks, progress_cb,
+                            message="预热已恢复")
+
+    def stop(self, job_id):
+        with self._lock:
+            job = self._active.get(job_id)
+            if job:
+                job["stop"].set()
+        return self.status(job_id)
+
+    def pause(self, job_id):
+        with self._lock:
+            job = self._active.get(job_id)
+            if job:
+                job["reason"] = "paused"
+                job["stop"].set()
+        return self.status(job_id)
+
+    def list_jobs(self):
+        items = []
+        seen = set()
+        for it in Journal.list_resumable(self.cache_dir):
+            seen.add(it["job_id"])
+            payload = dict(it.get("state") or {})
+            payload.update(it.get("spec") or {})
+            payload["job_id"] = it["job_id"]
+            items.append(payload)
+        base = os.path.join(self.cache_dir, ".journal")
+        if os.path.isdir(base):
+            for name in sorted(os.listdir(base)):
+                if name in seen:
+                    continue
+                try:
+                    j = Journal.open_existing(self.cache_dir, name)
+                    payload = j.load_state()
+                    spec = j.load_spec()
+                    payload.update(spec)
+                    payload["job_id"] = name
+                    items.append(payload)
+                except Exception:
+                    continue
+        return items
+
+    def status(self, job_id):
+        with self._lock:
+            job = self._active.get(job_id)
+            if job:
+                return dict(job["status"])
+        try:
+            j = Journal.open_existing(self.cache_dir, job_id)
+            spec = j.load_spec()
+            state = j.load_state()
+            return self._status_from_state(spec, state)
+        except Exception:
+            st = _empty_prewarm_state()
+            st.update({"job_id": job_id, "status": "missing", "reason": "not_found"})
+            return st
+
+    def active_status(self):
+        with self._lock:
+            running = self._running_job_locked()
+            if running:
+                return dict(running["status"])
+        resumable = Journal.list_resumable(self.cache_dir)
+        if resumable:
+            it = resumable[-1]
+            return self._status_from_state(it["spec"], it["state"])
+        jobs = self.list_jobs()
+        if jobs:
+            latest = sorted(jobs, key=lambda x: x.get("updated_at", 0))[-1]
+            return self._status_from_state(latest, latest)
+        return _empty_prewarm_state()
+
+    def _launch(self, job_id, spec, journal, tasks, progress_cb, message="预热已开始"):
+        stop_event = threading.Event()
+        status = self._status_from_state(spec, journal.load_state())
+        status.update({"running": True, "stopped": False, "job_id": job_id,
+                       "status": STATUS_RUNNING, "finished_at": 0.0})
+        job = {"job_id": job_id, "spec": spec, "journal": journal,
+               "tasks": list(tasks), "stop": stop_event, "status": status,
+               "reason": ""}
+        with self._lock:
+            self._active[job_id] = job
+        worker = threading.Thread(
+            target=self._run, args=(job, progress_cb), daemon=True)
+        job["thread"] = worker
+        worker.start()
+        return True, {"message": message, "total": len(tasks),
+                      "zoom_min": spec.get("zoom_min"),
+                      "zoom_max": spec.get("zoom_max"), "job_id": job_id}
+
+    def _run(self, job, progress_cb):
+        journal = job["journal"]
+        stop_event = job["stop"]
+        spec = job["spec"]
+        started_at = job["status"].get("started_at") or time.time()
+        done = len(journal.load_done())
+        failed = int(job["status"].get("failed", 0) or 0)
+        retried = int(job["status"].get("retried", 0) or 0)
+        total = len(job["tasks"])
+        window = deque(maxlen=max(1, int(MASS_FAILURE_MIN_ATTEMPTS)))
+        final_status = STATUS_COMPLETED
+        reason = ""
+        last_emit = 0.0
+        pending = set()
+        remaining_tasks = list(self._remaining_without_valid_disk(journal, job["tasks"]))
+        done = len(journal.load_done())
+        iterator = iter(remaining_tasks)
+        sweep_orphan_tmp(self.cache_dir)
+        try:
+            with ThreadPoolExecutor(max_workers=max(1, self.workers)) as pool:
+                while not stop_event.is_set() and len(pending) < max(1, self.workers):
+                    task = next(iterator, None)
+                    if task is None:
+                        break
+                    pending.add(pool.submit(self._download_one, task, stop_event))
+                while pending:
+                    done_futures, pending = wait(pending, return_when=FIRST_COMPLETED)
+                    for fut in done_futures:
+                        task, ok, attempts, err, aborted = fut.result()
+                        if aborted:
+                            stop_event.set()
+                            continue
+                        style, z, x, y = task
+                        retried += max(0, int(attempts) - 1)
+                        if ok:
+                            journal.append_done(style, z, x, y)
+                            done += 1
+                            window.append(True)
+                        else:
+                            failed += 1
+                            journal.append_failure(style, z, x, y, attempts, err)
+                            window.append(False)
+                        status = self._write_status(
+                            job, journal, total, done, failed, retried, z,
+                            started_at, STATUS_RUNNING, reason)
+                        now = time.time()
+                        if progress_cb and now - last_emit >= PROGRESS_EMIT_INTERVAL_SEC:
+                            last_emit = now
+                            progress_cb(status)
+                        if self._mass_failure(window):
+                            final_status = STATUS_PAUSED
+                            reason = "mass_failure"
+                            stop_event.set()
+                            break
+                    while not stop_event.is_set() and len(pending) < max(1, self.workers):
+                        task = next(iterator, None)
+                        if task is None:
+                            break
+                        pending.add(pool.submit(self._download_one, task, stop_event))
+                    if stop_event.is_set():
+                        for fut in pending:
+                            fut.cancel()
+                        break
+            if final_status == STATUS_COMPLETED:
+                if stop_event.is_set():
+                    final_status = STATUS_STOPPED
+                    reason = job.get("reason") or reason
+                elif failed > 0 and done < total:
+                    final_status = STATUS_FAILED
+        finally:
+            status = self._write_status(
+                job, journal, total, done, failed, retried,
+                job["status"].get("zoom", spec.get("zoom_min", 0)),
+                started_at, final_status, reason, finished=True)
+            journal.release_lock()
+            with self._lock:
+                self._active.pop(job["job_id"], None)
+            if progress_cb:
+                progress_cb(status)
+
+    def _remaining_without_valid_disk(self, journal, tasks):
+        done_on_disk = set(journal.load_done())
+        for task in tasks:
+            style, z, x, y = task
+            key = (style, int(z), int(x), int(y))
+            tile_key = TileKey(style, z, x, y)
+            if key in done_on_disk:
+                continue
+            data = read_tile(self.cache_dir, tile_key)
+            if verify_tile_bytes(data):
+                journal.append_done(style, z, x, y)
+                continue
+            yield task
+
+    def _download_one(self, task, stop_event):
+        style, z, x, y = task
+        result = fetch_tile_resilient(
+            style, z, x, y, sub_picker=self._sub_picker, abort=stop_event,
+            base_delay=0.001, max_delay=0.001, _fetch=self._fetch_impl)
+        if result.status == "aborted":
+            return task, False, result.attempts, "aborted", True
+        if result.status == "ok" and verify_tile_bytes(result.data):
+            if write_tile_atomic(self.cache_dir, TileKey(style, z, x, y), result.data):
+                return task, True, result.attempts, "", False
+            return task, False, result.attempts, "write_failed", False
+        return task, False, result.attempts, result.status, False
+
+    def _write_status(self, job, journal, total, done, failed, retried, zoom,
+                      started_at, status, reason, finished=False):
+        now = time.time()
+        elapsed = max(now - float(started_at or now), _EPSILON)
+        rate = float(done) / elapsed
+        remaining = max(0, int(total) - int(done) - int(failed))
+        eta = float(remaining) / max(rate, _EPSILON)
+        payload = {
+            "running": status == STATUS_RUNNING,
+            "total": int(total),
+            "done": int(done),
+            "failed": int(failed),
+            "zoom": int(zoom or 0),
+            "started_at": float(started_at or 0.0),
+            "finished_at": now if finished else 0.0,
+            "stopped": status == STATUS_STOPPED,
+            "job_id": job["job_id"],
+            "status": status,
+            "reason": reason or "",
+            "retried": int(retried),
+            "updated_at": now,
+            "rate_tiles_per_sec": rate,
+            "eta_seconds": eta,
+        }
+        journal.write_state(**payload)
+        with self._lock:
+            job["status"] = dict(payload)
+        return dict(payload)
+
+    def _status_from_state(self, spec, state):
+        st = _empty_prewarm_state()
+        if isinstance(state, dict):
+            st.update(state)
+        st["job_id"] = st.get("job_id") or (spec or {}).get("job_id")
+        st["running"] = st.get("status") == STATUS_RUNNING
+        st["stopped"] = st.get("status") == STATUS_STOPPED
+        return st
+
+    def _running_job_locked(self):
+        for job in self._active.values():
+            if job["status"].get("running"):
+                return job
         return None
-    url = TILE_ENDPOINTS[style].format(s=sub, x=x, y=y, z=z)
-    req = Request(url, headers={"User-Agent": _USER_AGENT, "Referer": _REFERER})
-    try:
-        resp = urlopen(req, timeout=FETCH_TIMEOUT)
-        data = resp.read()
-        if data and len(data) > 100:
-            return data
-    except (URLError, OSError, ValueError):
-        return None
-    return None
 
-
-def _make_solid_png(rgb, size=256):
-    """生成纯色 PNG 字节, 作为离线未命中占位瓦片 (避免破图)。"""
-    r, g, b = rgb
-
-    def _chunk(tag, data):
-        return (struct.pack(">I", len(data)) + tag + data +
-                struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF))
-
-    raw = bytearray()
-    row = bytes([r, g, b]) * size
-    for _ in range(size):
-        raw.append(0)          # 每行过滤器类型 0
-        raw.extend(row)
-    ihdr = struct.pack(">IIBBBBB", size, size, 8, 2, 0, 0, 0)  # 8bit RGB
-    idat = zlib.compress(bytes(raw), 9)
-    return (b"\x89PNG\r\n\x1a\n" +
-            _chunk(b"IHDR", ihdr) +
-            _chunk(b"IDAT", idat) +
-            _chunk(b"IEND", b""))
-
-
-# 深灰占位瓦片, 与暗色地图风格协调; 模块加载时生成一次
-PLACEHOLDER_TILE = _make_solid_png((42, 42, 42))
-
-
-def deg2tile(lat, lng, zoom):
-    """经纬度 (度) -> 瓦片 x/y 编号 (与 OSM/高德一致的 Web Mercator 方案)。"""
-    n = 2 ** zoom
-    x = int((lng + 180.0) / 360.0 * n)
-    lat = max(-85.05112878, min(85.05112878, lat))
-    lat_rad = math.radians(lat)
-    y = int((1.0 - math.asinh(math.tan(lat_rad)) / math.pi) / 2.0 * n)
-    x = max(0, min(n - 1, x))
-    y = max(0, min(n - 1, y))
-    return x, y
-
-
-def clamp_zoom(value, default):
-    try:
-        z = int(value)
-    except (TypeError, ValueError):
-        return default
-    return max(ZOOM_HARD_MIN, min(ZOOM_HARD_MAX, z))
-
-
-def enumerate_tiles(bbox, zoom_min, zoom_max, styles):
-    """按 bbox(min_lng,min_lat,max_lng,max_lat) 与缩放范围枚举瓦片任务。
-
-    返回 (tasks, total)，tasks 为 (style, z, x, y) 列表。
-    """
-    min_lng, min_lat, max_lng, max_lat = bbox
-    if min_lng > max_lng:
-        min_lng, max_lng = max_lng, min_lng
-    if min_lat > max_lat:
-        min_lat, max_lat = max_lat, min_lat
-    styles = [s for s in styles if s in VALID_STYLES] or list(VALID_STYLES)
-
-    tasks = []
-    for z in range(int(zoom_min), int(zoom_max) + 1):
-        # 西北角 -> (较小 x, 较小 y), 东南角 -> (较大 x, 较大 y)
-        x0, y0 = deg2tile(max_lat, min_lng, z)
-        x1, y1 = deg2tile(min_lat, max_lng, z)
-        x_lo, x_hi = min(x0, x1), max(x0, x1)
-        y_lo, y_hi = min(y0, y1), max(y0, y1)
-        for x in range(x_lo, x_hi + 1):
-            for y in range(y_lo, y_hi + 1):
-                for style in styles:
-                    tasks.append((style, z, x, y))
-    return tasks, len(tasks)
+    def _mass_failure(self, window):
+        if len(window) < int(MASS_FAILURE_MIN_ATTEMPTS):
+            return False
+        failures = len([ok for ok in window if not ok])
+        return (float(failures) / float(len(window))) > float(MASS_FAILURE_RATIO)
 
 
 class MapTileCache(object):
     """瓦片缓存代理 + 预热管理 (线程安全, 单实例)。"""
 
-    def __init__(self, cache_dir=CACHE_DIR, logger=None, offline_mode=False):
+    def __init__(self, cache_dir=CACHE_DIR, logger=None, offline_mode=False, _fetch=None):
         self.cache_dir = cache_dir
         self._log = logger or (lambda *a, **k: None)
+        self._resilient_fetch = _fetch
         self._sub_idx = 0
         self._sub_lock = threading.Lock()
         self._state_path = os.path.join(cache_dir, ".offline_mode")
@@ -172,16 +443,10 @@ class MapTileCache(object):
         # 预热任务状态
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
-        self.prewarm = {
-            "running": False,
-            "total": 0,
-            "done": 0,
-            "failed": 0,
-            "zoom": 0,
-            "started_at": 0.0,
-            "finished_at": 0.0,
-            "stopped": False,
-        }
+        self.prewarm = _empty_prewarm_state()
+        self._prewarm = PrewarmCoordinator(
+            self.cache_dir, logger=self._log, sub_picker=self._next_sub,
+            fetch_impl=self._resilient_fetch, workers=PREWARM_WORKERS)
         try:
             os.makedirs(self.cache_dir, exist_ok=True)
         except OSError as exc:
@@ -253,39 +518,55 @@ class MapTileCache(object):
 
     # ---- 预热 ----
     def prewarm_status(self):
+        status = self._prewarm.active_status()
         with self._lock:
+            self.prewarm.update(status)
             return dict(self.prewarm)
 
     def stop_prewarm(self):
-        self._stop_event.set()
+        job_id = self.prewarm_status().get("job_id")
+        if job_id:
+            status = self._prewarm.stop(job_id)
+            with self._lock:
+                self.prewarm.update(status)
         return self.prewarm_status()
 
     def start_prewarm(self, bbox, zoom_min, zoom_max, styles, progress_cb=None):
         """启动后台预热。已有任务运行时拒绝。返回 (ok, info)。"""
         with self._lock:
             if self.prewarm["running"]:
-                return False, {"message": "预热任务进行中"}
+                return False, {"message": "预热任务进行中",
+                               "job_id": self.prewarm.get("job_id")}
         zoom_min = clamp_zoom(zoom_min, DEFAULT_ZOOM_MIN)
         zoom_max = clamp_zoom(zoom_max, DEFAULT_ZOOM_MAX)
         if zoom_min > zoom_max:
             zoom_min, zoom_max = zoom_max, zoom_min
-        tasks, total = enumerate_tiles(bbox, zoom_min, zoom_max, styles)
-        if total == 0:
-            return False, {"message": "范围内无瓦片"}
-        if total > MAX_PREWARM_TILES:
-            return False, {"message": "范围过大(%d 张), 请缩小区域或降低层级" % total}
-        self._stop_event.clear()
-        with self._lock:
-            self.prewarm.update({
-                "running": True, "total": total, "done": 0, "failed": 0,
-                "zoom": zoom_min, "started_at": time.time(),
-                "finished_at": 0.0, "stopped": False,
-            })
-        worker = threading.Thread(
-            target=self._run_prewarm, args=(tasks, progress_cb), daemon=True)
-        worker.start()
-        return True, {"message": "预热已开始", "total": total,
-                      "zoom_min": zoom_min, "zoom_max": zoom_max}
+        ok, info = self._prewarm.start(bbox, zoom_min, zoom_max, styles, progress_cb)
+        if ok:
+            status = self._prewarm.status(info.get("job_id"))
+            with self._lock:
+                self.prewarm.update(status)
+        return ok, info
+
+    def list_jobs(self):
+        return self._prewarm.list_jobs()
+
+    def job_status(self, job_id):
+        return self._prewarm.status(job_id)
+
+    def pause_job(self, job_id):
+        return self._prewarm.pause(job_id)
+
+    def resume_job(self, job_id, progress_cb=None):
+        ok, info = self._prewarm.resume(job_id, progress_cb=progress_cb)
+        if ok:
+            status = self._prewarm.status(info.get("job_id"))
+            with self._lock:
+                self.prewarm.update(status)
+        return ok, info
+
+    def stop_job(self, job_id):
+        return self._prewarm.stop(job_id)
 
     def _run_prewarm(self, tasks, progress_cb):
         def _one(task):
@@ -347,163 +628,3 @@ class MapTileCache(object):
             return True, "缓存已清空"
         except OSError as exc:
             return False, "清空失败: %s" % str(exc)
-
-
-# ============================================================
-# 离线瓦片包: 导出/导入 (供 CLI 与 Web 复用)
-# 包为单个 tar 文件, 内含 manifest.json + tiles/{style}/{z}/{x}/{y}.png
-# ============================================================
-
-def iter_tiles_root(root):
-    """遍历瓦片目录, 产出 (style, z, x, y, abs_path)。非法路径跳过。"""
-    if not os.path.isdir(root):
-        return
-    for style in sorted(os.listdir(root)):
-        sdir = os.path.join(root, style)
-        if style not in VALID_STYLES or not os.path.isdir(sdir):
-            continue
-        for z in sorted(os.listdir(sdir)):
-            zdir = os.path.join(sdir, z)
-            if not os.path.isdir(zdir):
-                continue
-            for x in sorted(os.listdir(zdir)):
-                xdir = os.path.join(zdir, x)
-                if not os.path.isdir(xdir):
-                    continue
-                for name in sorted(os.listdir(xdir)):
-                    if not name.endswith(".png"):
-                        continue
-                    y = name[:-4]
-                    try:
-                        yield style, int(z), int(x), int(y), os.path.join(xdir, name)
-                    except (TypeError, ValueError):
-                        continue
-
-
-def _tile_relpath(style, z, x, y):
-    return "%s/%s/%d/%d/%d.png" % (TILE_PREFIX, style, z, x, y)
-
-
-def hash_tiles_root(root):
-    """对瓦片目录内容做确定性 sha256 (按相对路径排序, 路径+字节)。"""
-    h = hashlib.sha256()
-    items = sorted(
-        (_tile_relpath(s, z, x, y), p) for s, z, x, y, p in iter_tiles_root(root))
-    count = 0
-    for rel, path in items:
-        try:
-            with open(path, "rb") as f:
-                data = f.read()
-        except OSError:
-            continue
-        h.update(rel.encode("utf-8"))
-        h.update(data)
-        count += 1
-    return h.hexdigest(), count
-
-
-def build_manifest(tiles_root, bbox, zoom_min, zoom_max, styles, provider=PACK_PROVIDER):
-    """根据瓦片目录构造 manifest 字典 (含 sha256 与瓦片数)。"""
-    sha, count = hash_tiles_root(tiles_root)
-    return {
-        "provider": provider,
-        "version": PACK_VERSION,
-        "styles": [s for s in (styles or []) if s in VALID_STYLES] or list(VALID_STYLES),
-        "bbox": list(bbox) if bbox else None,
-        "zoom_min": int(zoom_min),
-        "zoom_max": int(zoom_max),
-        "tile_count": count,
-        "sha256": sha,
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
-    }
-
-
-def create_pack(tiles_root, out_path, manifest):
-    """把 tiles_root 与 manifest 打包成单个 tar 文件。"""
-    manifest_bytes = json.dumps(manifest, ensure_ascii=False, indent=2).encode("utf-8")
-    with tarfile.open(out_path, "w") as tar:
-        info = tarfile.TarInfo(MANIFEST_NAME)
-        info.size = len(manifest_bytes)
-        info.mtime = int(time.time())
-        from io import BytesIO
-        tar.addfile(info, BytesIO(manifest_bytes))
-        for style, z, x, y, path in iter_tiles_root(tiles_root):
-            tar.add(path, arcname=_tile_relpath(style, z, x, y))
-    return out_path
-
-
-def read_pack_manifest(pack_path):
-    """从包中读取 manifest, 失败返回 None。"""
-    try:
-        with tarfile.open(pack_path, "r") as tar:
-            member = tar.getmember(MANIFEST_NAME)
-            fobj = tar.extractfile(member)
-            if fobj is None:
-                return None
-            return json.loads(fobj.read().decode("utf-8"))
-    except (tarfile.TarError, KeyError, OSError, ValueError):
-        return None
-
-
-def _safe_member(name):
-    """拒绝路径穿越/绝对路径; 仅允许 manifest 与 tiles/ 下的相对路径。"""
-    if name == MANIFEST_NAME:
-        return True
-    if not name.startswith(TILE_PREFIX + "/"):
-        return False
-    norm = os.path.normpath(name)
-    return not (norm.startswith("..") or os.path.isabs(norm) or ".." in norm.split("/"))
-
-
-def import_pack(pack_path, cache_dir=CACHE_DIR, provider=PACK_PROVIDER, logger=None):
-    """校验并合并瓦片包到缓存。返回 (ok, summary_dict)。
-
-    校验: provider 匹配 / 解压后 sha256 与瓦片数一致 / 防损坏 / 防路径穿越。
-    合并: 同路径已存在则跳过(增量累积), 失败不动现有缓存。
-    """
-    log = logger or (lambda *a, **k: None)
-    manifest = read_pack_manifest(pack_path)
-    if not isinstance(manifest, dict):
-        return False, {"message": "无效包: 缺少或损坏的 manifest"}
-    if manifest.get("provider") != provider:
-        return False, {"message": "底图源不匹配: 包为 %s, 本机为 %s" % (
-            manifest.get("provider"), provider)}
-    tmp = tempfile.mkdtemp(prefix="usv_mappack_")
-    try:
-        try:
-            with tarfile.open(pack_path, "r") as tar:
-                members = [m for m in tar.getmembers()
-                           if m.isfile() and _safe_member(m.name)]
-                tar.extractall(tmp, members=members)
-        except tarfile.TarError as exc:
-            return False, {"message": "解包失败: %s" % str(exc)}
-        tiles_root = os.path.join(tmp, TILE_PREFIX)
-        sha, count = hash_tiles_root(tiles_root)
-        if count != int(manifest.get("tile_count", -1)):
-            return False, {"message": "瓦片数校验失败: 实际 %d, 期望 %s" % (
-                count, manifest.get("tile_count"))}
-        if sha != manifest.get("sha256"):
-            return False, {"message": "校验和不匹配, 包可能损坏"}
-        added = skipped = 0
-        for style, z, x, y, src in iter_tiles_root(tiles_root):
-            dst = os.path.join(cache_dir, style, str(z), str(x), "%d.png" % y)
-            if os.path.isfile(dst):
-                skipped += 1
-                continue
-            try:
-                os.makedirs(os.path.dirname(dst), exist_ok=True)
-                shutil.copy2(src, dst)
-                added += 1
-            except OSError as exc:
-                log("合并瓦片失败 %s: %s", dst, str(exc))
-        return True, {
-            "message": "导入完成",
-            "added": added,
-            "skipped": skipped,
-            "tile_count": count,
-            "bbox": manifest.get("bbox"),
-            "zoom_min": manifest.get("zoom_min"),
-            "zoom_max": manifest.get("zoom_max"),
-        }
-    finally:
-        shutil.rmtree(tmp, ignore_errors=True)

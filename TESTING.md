@@ -305,6 +305,37 @@ rostopic echo /usv/trigger_status
 | 航线采样 | QGC Plan 使用 `MAV_CMD_NAV_SCRIPT_TIME(param1=1)`；执行时 bridge 收到 `USV_SMPL`，完成后发 `USV_DONE` |
 | 数据记录 | `sampling_started` 后 Web 数据中心出现任务记录；有效分光数据到达时数据点数量增长 |
 
+### 5.4.1 Web 航线上传合同
+
+Web 地图页的航线规划只写入飞控 mission，不解锁、不切 `AUTO`。后端接口必须走 MAVROS mission 服务并做回读比对：
+
+```bash
+curl -X POST http://127.0.0.1:5000/api/mission/plan/validate \
+  -H 'Content-Type: application/json' \
+  -d '{"waypoints":[{"lat":30.0,"lng":120.0,"sample":true},{"lat":30.001,"lng":120.002,"sample":false}]}'
+
+curl -X POST http://127.0.0.1:5000/api/mission/plan/upload \
+  -H 'Content-Type: application/json' \
+  -d '{"replace":true,"waypoints":[{"lat":30.0,"lng":120.0,"sample":true},{"lat":30.001,"lng":120.002,"sample":false}]}'
+```
+
+通过判据：
+
+| 项 | 判据 |
+|---|---|
+| 上传链路 | 依次调用 `/mavros/mission/clear`、`/mavros/mission/push`、`/mavros/mission/pull`；push 列表首项为 ArduPilot home 占位，避免真实首航点被 index 0 机制覆盖 |
+| 采样任务项 | 采样航点后插入 `MAV_CMD_NAV_SCRIPT_TIME(42702)`，`param1=1`，`param2=1..255` |
+| 安全边界 | 不调用 `/mavros/cmd/arming`，不调用 `/mavros/set_mode` |
+| 回读验证 | `/mavros/mission/waypoints` 跳过 ArduPilot home 后的 command/坐标与上传计划一致，响应 `data.verified=true` |
+| 地图反馈 | 上传成功后 `/api/map/live` 的 `route_waypoints` 立即反映 Web 航线 |
+
+离线回归命令：
+
+```bash
+cd ~/usv_ws/src/usv_ros
+python -m pytest tests/test_mission_plan_service.py tests/test_hardware_runtime_sync.py -q -k "mission_plan"
+```
+
 <a id="system-health-flow"></a>
 
 ### 5.5 系统健康监测

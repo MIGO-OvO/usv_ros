@@ -96,6 +96,7 @@ class RecordingDataManager:
 
 def _install_fake_ros_modules():
     publishers = {}
+    mavros_state = types.SimpleNamespace(cleared=0, pushed=[], pulled=0)
 
     class String:
         def __init__(self, data=""):
@@ -110,7 +111,27 @@ def _install_fake_ros_modules():
     rospy.Publisher = lambda topic, *args, **kwargs: publishers.setdefault(topic, RecordingPublisher(topic))
     rospy.Subscriber = lambda *args, **kwargs: None
     rospy.Service = lambda *args, **kwargs: None
-    rospy.ServiceProxy = lambda *args, **kwargs: FakeTriggerService()
+    def service_proxy(name, *args, **kwargs):
+        if name == "/mavros/mission/clear":
+            def clear_call():
+                mavros_state.cleared += 1
+                return types.SimpleNamespace(success=True)
+            return clear_call
+        if name == "/mavros/mission/push":
+            def push_call(**call_kwargs):
+                waypoints = list(call_kwargs.get("waypoints") or [])
+                mavros_state.pushed.append(waypoints)
+                return types.SimpleNamespace(success=True, wp_transfered=len(waypoints))
+            return push_call
+        if name == "/mavros/mission/pull":
+            def pull_call():
+                mavros_state.pulled += 1
+                count = len(mavros_state.pushed[-1]) if mavros_state.pushed else 0
+                return types.SimpleNamespace(success=True, wp_received=count)
+            return pull_call
+        return FakeTriggerService()
+
+    rospy.ServiceProxy = service_proxy
     rospy.init_node = lambda *args, **kwargs: None
     rospy.get_param = lambda name, default=None: default
     rospy.set_param = lambda *args, **kwargs: None
@@ -123,6 +144,7 @@ def _install_fake_ros_modules():
     rospy.sleep = lambda *args, **kwargs: None
     rospy.is_shutdown = lambda: True
     rospy.Rate = lambda hz: types.SimpleNamespace(sleep=lambda: None)
+    rospy._mavros_state = mavros_state
 
     std_msgs = types.ModuleType("std_msgs")
     std_msgs_msg = types.ModuleType("std_msgs.msg")
@@ -148,6 +170,45 @@ def _install_fake_ros_modules():
     usv_ros_srv.ControlCommandResponse = ControlCommandResponse
     usv_ros.srv = usv_ros_srv
 
+    mavros_msgs = types.ModuleType("mavros_msgs")
+    mavros_msgs_msg = types.ModuleType("mavros_msgs.msg")
+    mavros_msgs_srv = types.ModuleType("mavros_msgs.srv")
+
+    class Waypoint:
+        pass
+
+    class WaypointList:
+        def __init__(self, waypoints=None):
+            self.waypoints = list(waypoints or [])
+
+    def ardupilot_readback_waypoints():
+        if not mavros_state.pushed:
+            return []
+        home = Waypoint()
+        home.frame = 3
+        home.command = 16
+        home.is_current = False
+        home.autocontinue = True
+        home.param1 = 0.0
+        home.param2 = 0.0
+        home.param3 = 0.0
+        home.param4 = 0.0
+        home.x_lat = 25.0
+        home.y_long = 110.0
+        home.z_alt = 0.0
+        return [home] + list(mavros_state.pushed[-1][1:])
+
+    rospy.wait_for_message = (
+        lambda *args, **kwargs: WaypointList(ardupilot_readback_waypoints())
+    )
+    mavros_msgs_msg.Waypoint = Waypoint
+    mavros_msgs_msg.WaypointList = WaypointList
+    mavros_msgs_srv.WaypointPush = object
+    mavros_msgs_srv.WaypointPull = object
+    mavros_msgs_srv.WaypointClear = object
+    mavros_msgs.msg = mavros_msgs_msg
+    mavros_msgs.srv = mavros_msgs_srv
+
     sys.modules["rospy"] = rospy
     sys.modules["std_msgs"] = std_msgs
     sys.modules["std_msgs.msg"] = std_msgs_msg
@@ -155,6 +216,9 @@ def _install_fake_ros_modules():
     sys.modules["std_srvs.srv"] = std_srvs_srv
     sys.modules["usv_ros"] = usv_ros
     sys.modules["usv_ros.srv"] = usv_ros_srv
+    sys.modules["mavros_msgs"] = mavros_msgs
+    sys.modules["mavros_msgs.msg"] = mavros_msgs_msg
+    sys.modules["mavros_msgs.srv"] = mavros_msgs_srv
     return publishers, String
 
 
@@ -944,6 +1008,107 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         server._waypoints_cb(types.SimpleNamespace(waypoints=[]))
         self.assertIsNone(server.route_snapshot_id)
         self.assertEqual(server.route_source, "none")
+
+    def test_web_route_waypoints_cb_ignores_home_and_script_items(self):
+        module, _, _ = _load_script(
+            "web_config_server_route_filter_test",
+            "scripts/web_config_server.py",
+        )
+
+        server = module.WebConfigServer(standalone=True)
+
+        def waypoint(command, lat, lng):
+            return types.SimpleNamespace(
+                x_lat=lat,
+                y_long=lng,
+                z_alt=0.0,
+                command=command,
+                frame=3,
+                is_current=False,
+                autocontinue=True,
+            )
+
+        server._waypoints_cb(types.SimpleNamespace(waypoints=[
+            waypoint(16, 25.0, 110.0),
+            waypoint(16, 30.0, 120.0),
+            waypoint(42702, 0.0, 0.0),
+            waypoint(16, 30.001, 120.002),
+        ]))
+
+        self.assertEqual(len(server.route_waypoints), 2)
+        self.assertEqual([wp["seq"] for wp in server.route_waypoints], [0, 1])
+        self.assertEqual(server.route_waypoints[0]["wgs84"]["lat"], 30.0)
+        self.assertEqual(server.route_waypoints[1]["wgs84"]["lng"], 120.002)
+
+    def test_web_mission_plan_upload_pushes_mavros_and_updates_live_route(self):
+        module, _, _ = _load_script(
+            "web_config_server_mission_plan_upload_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            server.socketio = RecordingSocket()
+            client = server.app.test_client()
+
+            response = client.post("/api/mission/plan/upload", json={
+                "replace": True,
+                "waypoints": [
+                    {"lat": 30.0, "lng": 120.0, "sample": True},
+                    {"lat": 30.001, "lng": 120.002, "sample": False},
+                ],
+            })
+
+            payload = response.get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(payload["success"])
+        self.assertTrue(payload["data"]["verified"])
+        self.assertFalse(payload["data"]["start_auto"])
+        self.assertEqual(payload["data"]["commands"], [16, 42702, 16])
+        self.assertEqual(module.rospy._mavros_state.cleared, 1)
+        self.assertEqual(module.rospy._mavros_state.pulled, 1)
+        self.assertEqual(len(module.rospy._mavros_state.pushed[0]), 4)
+        self.assertEqual(server.route_source, "web_upload")
+        self.assertEqual(len(server.route_waypoints), 2)
+        self.assertEqual(server.route_waypoints[0]["wgs84"]["lat"], 30.0)
+        self.assertIn(("map_route", server.route_waypoints), server.socketio.events)
+
+    def test_web_mission_plan_validate_rejects_bad_coordinate(self):
+        module, _, _ = _load_script(
+            "web_config_server_mission_plan_validate_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            client = server.app.test_client()
+            response = client.post("/api/mission/plan/validate", json={
+                "waypoints": [
+                    {"lat": 91.0, "lng": 120.0},
+                    {"lat": 30.001, "lng": 120.002},
+                ],
+            })
+            payload = response.get_json()
+
+        self.assertEqual(response.status_code, 400)
+        self.assertFalse(payload["success"])
+        self.assertFalse(payload["data"]["valid"])
+        self.assertIn("waypoints[0].lat", payload["data"]["errors"][0])
 
     def test_web_pollution_metric_clamps_negative_only_when_enabled(self):
         module, _, _ = _load_script(
