@@ -28,6 +28,20 @@ interface Step {
   A: PumpConfig
 }
 
+interface InjectionPumpPolicy {
+  mode: 'manual' | 'automation' | 'survey'
+  speed: number
+  lead_time_s: number
+  stop_on_finish: boolean
+}
+
+interface PumpSettings {
+  pid_mode?: boolean
+  pid_precision?: number
+  default_speed: number
+  injection_pump_policy: InjectionPumpPolicy
+}
+
 const DEFAULT_PUMP: PumpConfig = { enable: 'D', direction: 'F', speed: '5', angle: '0' }
 const DEFAULT_STEP: Step = {
   name: '新步骤',
@@ -36,6 +50,15 @@ const DEFAULT_STEP: Step = {
   Y: { ...DEFAULT_PUMP },
   Z: { ...DEFAULT_PUMP },
   A: { ...DEFAULT_PUMP },
+}
+const DEFAULT_PUMP_SETTINGS: PumpSettings = {
+  default_speed: 60,
+  injection_pump_policy: {
+    mode: 'manual',
+    speed: 60,
+    lead_time_s: 0,
+    stop_on_finish: true,
+  },
 }
 
 const normalizeStep = (step?: Partial<Step>): Step => ({
@@ -54,6 +77,7 @@ export default function Automation() {
   const { automationRunning } = useAppStore()
   const [steps, setSteps] = useState<Step[]>([])
   const [loopCount, setLoopCount] = useState(1)
+  const [pumpSettings, setPumpSettings] = useState<PumpSettings>({ ...DEFAULT_PUMP_SETTINGS })
   const [presetName, setPresetName] = useState('')
 
   useEffect(() => {
@@ -66,7 +90,23 @@ export default function Automation() {
       const data = await res.json()
       if (data.sampling_sequence) {
         setSteps(normalizeSteps(data.sampling_sequence.steps))
-        setLoopCount(data.sampling_sequence.loop_count || 1)
+        setLoopCount(data.sampling_sequence.loop_count ?? 1)
+      }
+      if (data.pump_settings) {
+        const policy = data.pump_settings.injection_pump_policy || {}
+        const defaultSpeed = Number(data.pump_settings.default_speed ?? DEFAULT_PUMP_SETTINGS.default_speed) || 0
+        setPumpSettings({
+          ...DEFAULT_PUMP_SETTINGS,
+          ...data.pump_settings,
+          default_speed: defaultSpeed,
+          injection_pump_policy: {
+            ...DEFAULT_PUMP_SETTINGS.injection_pump_policy,
+            ...policy,
+            speed: Number(policy.speed ?? defaultSpeed) || 0,
+            lead_time_s: Number(policy.lead_time_s ?? 0) || 0,
+            stop_on_finish: policy.stop_on_finish ?? true,
+          },
+        })
       }
     } catch (error) {
       console.error(error)
@@ -83,6 +123,7 @@ export default function Automation() {
             steps,
             loop_count: loopCount,
           },
+          pump_settings: pumpSettings,
         }),
       })
     } catch (error) {
@@ -105,6 +146,7 @@ export default function Automation() {
 
       const body: Record<string, unknown> = {
         sampling_sequence: { steps, loop_count: loopCount },
+        pump_settings: pumpSettings,
       }
       if (wpSampling !== null) body.waypoint_sampling = wpSampling
 
@@ -199,6 +241,22 @@ export default function Automation() {
     setSteps([...steps, JSON.parse(JSON.stringify(DEFAULT_STEP))])
   }
 
+  const updateInjectionPolicy = (patch: Partial<InjectionPumpPolicy>) => {
+    setPumpSettings((current) => ({
+      ...current,
+      injection_pump_policy: {
+        ...current.injection_pump_policy,
+        ...patch,
+      },
+    }))
+  }
+
+  const handleInjectionPolicyModeChange = (value: string) => {
+    if (value === 'manual' || value === 'automation' || value === 'survey') {
+      updateInjectionPolicy({ mode: value })
+    }
+  }
+
   const updateStep = (index: number, field: string, value: any) => {
     const newSteps = [...steps]
     if (field.includes('.')) {
@@ -242,7 +300,69 @@ export default function Automation() {
             <CardContent className="space-y-4">
               <div className="space-y-2">
                 <Label>循环次数 (0 = 无限循环)</Label>
-                <NumericInput value={loopCount} onValueChange={setLoopCount} integer className="h-9" />
+                <NumericInput value={loopCount} onValueChange={(v) => setLoopCount(Math.max(0, v))} integer min={0} className="h-9" />
+              </div>
+              <div className="space-y-2">
+                <Label>进样泵联动</Label>
+                <select
+                  value={pumpSettings.injection_pump_policy.mode}
+                  onChange={(e) => handleInjectionPolicyModeChange(e.target.value)}
+                  className="flex h-9 w-full rounded-md border border-input bg-background px-3 text-sm"
+                >
+                  <option value="manual">手动控制</option>
+                  <option value="automation">随采样任务</option>
+                  <option value="survey">随走航任务</option>
+                </select>
+              </div>
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-2">
+                  <Label>联动转速 (%)</Label>
+                  <NumericInput
+                    value={pumpSettings.injection_pump_policy.speed}
+                    onValueChange={(v) => updateInjectionPolicy({ speed: Math.max(0, Math.min(100, v)) })}
+                    integer
+                    min={0}
+                    max={100}
+                    className="h-9"
+                  />
+                </div>
+                <div className="space-y-2">
+                  <Label>提前启动 (s)</Label>
+                  <NumericInput
+                    value={pumpSettings.injection_pump_policy.lead_time_s}
+                    onValueChange={(v) => updateInjectionPolicy({ lead_time_s: Math.max(0, v) })}
+                    min={0}
+                    className="h-9"
+                  />
+                </div>
+              </div>
+              <label className="flex items-center justify-between gap-3 text-sm">
+                <span className="font-medium">任务结束关闭进样泵</span>
+                <Switch
+                  checked={pumpSettings.injection_pump_policy.stop_on_finish}
+                  onCheckedChange={(v) => updateInjectionPolicy({ stop_on_finish: v })}
+                />
+              </label>
+              <div className="space-y-2">
+                <Label>默认转速 (%)</Label>
+                <NumericInput
+                  value={pumpSettings.default_speed}
+                  onValueChange={(v) => {
+                    const speed = Math.max(0, Math.min(100, v))
+                    setPumpSettings((current) => ({
+                      ...current,
+                      default_speed: speed,
+                      injection_pump_policy: {
+                        ...current.injection_pump_policy,
+                        speed,
+                      },
+                    }))
+                  }}
+                  integer
+                  min={0}
+                  max={100}
+                  className="h-9"
+                />
               </div>
               <div className="space-y-2">
                 <Label>预设名称</Label>

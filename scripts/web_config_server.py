@@ -924,7 +924,12 @@ DEFAULT_CONFIG = {
     "pump_settings": {
         "pid_mode": True,
         "pid_precision": 0.1,
-        "default_speed": 60
+        "default_speed": 60,
+        "injection_pump_policy": {
+            "mode": "manual",
+            "lead_time_s": 0.0,
+            "stop_on_finish": True
+        }
     },
     "sampling_sequence": {
         "loop_count": 1,
@@ -1066,9 +1071,11 @@ class ConfigManager(object):
         normalized = dict(sequence)
         normalized['steps'] = normalized_steps
         try:
-            normalized['loop_count'] = int(sequence.get('loop_count', 1) or 1)
+            raw_loop_count = sequence.get('loop_count', 1)
+            normalized['loop_count'] = int(raw_loop_count if raw_loop_count not in (None, '') else 1)
         except (TypeError, ValueError):
             normalized['loop_count'] = 1
+        normalized['loop_count'] = max(0, normalized['loop_count'])
         return normalized
 
     @staticmethod
@@ -1082,7 +1089,8 @@ class ConfigManager(object):
                 continue
             item = dict(value or {}) if isinstance(value, dict) else {}
             try:
-                loop_count = int(item.get('loop_count', 1) or 1)
+                raw_loop_count = item.get('loop_count', 1)
+                loop_count = int(raw_loop_count if raw_loop_count not in (None, '') else 1)
             except (TypeError, ValueError):
                 loop_count = 1
             try:
@@ -1102,6 +1110,56 @@ class ConfigManager(object):
                 'on_fail': on_fail if on_fail in ('HOLD', 'SKIP', 'ABORT') else 'HOLD',
             }
         return normalized
+
+    @staticmethod
+    def _normalize_injection_pump_policy(data, default_speed=60):
+        raw = data if isinstance(data, dict) else {}
+        mode = str(raw.get('mode', 'manual') or 'manual').strip().lower()
+        aliases = {
+            'off': 'manual',
+            'disabled': 'manual',
+            'sample': 'automation',
+            'sampling': 'automation',
+            'task': 'automation',
+            'auto': 'automation',
+        }
+        mode = aliases.get(mode, mode)
+        if mode not in ('manual', 'automation', 'survey'):
+            mode = 'manual'
+        try:
+            speed = int(float(raw.get('speed', default_speed) if raw.get('speed', None) not in (None, '') else default_speed))
+        except (TypeError, ValueError):
+            speed = int(default_speed or 0)
+        try:
+            lead_time_s = float(raw.get('lead_time_s', 0.0) if raw.get('lead_time_s', None) not in (None, '') else 0.0)
+        except (TypeError, ValueError):
+            lead_time_s = 0.0
+        return {
+            'mode': mode,
+            'speed': max(0, min(100, speed)),
+            'lead_time_s': max(0.0, min(600.0, lead_time_s)),
+            'stop_on_finish': bool(raw.get('stop_on_finish', True)),
+        }
+
+    @classmethod
+    def _normalize_pump_settings(cls, data):
+        base = copy.deepcopy(DEFAULT_CONFIG.get('pump_settings', {}))
+        raw = data if isinstance(data, dict) else {}
+        base.update(raw)
+        try:
+            base['default_speed'] = max(0, min(100, int(float(base.get('default_speed', 60) or 0))))
+        except (TypeError, ValueError):
+            base['default_speed'] = 60
+        try:
+            base['pid_precision'] = max(0.001, float(base.get('pid_precision', 0.1) or 0.1))
+        except (TypeError, ValueError):
+            base['pid_precision'] = 0.1
+        base['pid_mode'] = bool(base.get('pid_mode', True))
+        base['injection_pump_policy'] = cls._normalize_injection_pump_policy(
+            base.get('injection_pump_policy', {}),
+            default_speed=base.get('default_speed', 60),
+        )
+        return base
 
     @staticmethod
     def _normalize_pollution_metric(data):
@@ -1143,6 +1201,9 @@ class ConfigManager(object):
         try:
             self.config['sampling_sequence'] = self._normalize_sampling_sequence(
                 self.config.get('sampling_sequence', {})
+            )
+            self.config['pump_settings'] = self._normalize_pump_settings(
+                self.config.get('pump_settings', {})
             )
             self.config['waypoint_sampling'] = self._normalize_waypoint_sampling(
                 self.config.get('waypoint_sampling', {})
@@ -1187,6 +1248,9 @@ class ConfigManager(object):
         legacy_speed = self._legacy_injection_default_speed(self.config.get('sampling_sequence', {}))
         if (not loaded_has_default_speed and loaded_legacy_speed > 0) or (default_speed <= 0 and legacy_speed > 0):
             pump_settings['default_speed'] = loaded_legacy_speed if loaded_legacy_speed > 0 else legacy_speed
+        self.config['pump_settings'] = self._normalize_pump_settings(
+            self.config.get('pump_settings', {})
+        )
         self.config['sampling_sequence'] = self._normalize_sampling_sequence(
             self.config.get('sampling_sequence', {})
         )
@@ -1222,6 +1286,9 @@ class ConfigManager(object):
         self.config['sampling_sequence'] = self._normalize_sampling_sequence(
             self.config.get('sampling_sequence', {})
         )
+        self.config['pump_settings'] = self._normalize_pump_settings(
+            self.config.get('pump_settings', {})
+        )
         self.config['waypoint_sampling'] = self._normalize_waypoint_sampling(
             self.config.get('waypoint_sampling', {})
         )
@@ -1241,6 +1308,9 @@ class ConfigManager(object):
         config = self.config.copy()
         config['sampling_sequence'] = self._normalize_sampling_sequence(
             config.get('sampling_sequence', {})
+        )
+        config['pump_settings'] = self._normalize_pump_settings(
+            config.get('pump_settings', {})
         )
         config['waypoint_sampling'] = self._normalize_waypoint_sampling(
             config.get('waypoint_sampling', {})
@@ -1474,6 +1544,32 @@ class WebConfigServer(object):
             self.data_manager.stop_mission()
         self.data_recording_source = None
 
+    def _current_injection_pump_policy(self):
+        config = self.config_manager.get()
+        pump_settings = config.get('pump_settings', {}) if isinstance(config.get('pump_settings'), dict) else {}
+        return ConfigManager._normalize_injection_pump_policy(
+            pump_settings.get('injection_pump_policy', {}),
+            default_speed=pump_settings.get('default_speed', 60),
+        )
+
+    def _apply_survey_injection_pump_policy(self, running):
+        policy = self._current_injection_pump_policy()
+        if policy.get('mode') != 'survey':
+            return
+        if running:
+            speed = int(policy.get('speed', 0) or 0)
+            if speed <= 0:
+                self._add_log("走航进样泵联动跳过：转速为 0", "warning")
+                return
+            ok, message, result = self._call_control_command("injection_on", {"speed": speed}, source="survey")
+        elif policy.get('stop_on_finish', True):
+            ok, message, result = self._call_control_command("injection_off", {}, source="survey")
+        else:
+            return
+        if result:
+            self.injection_pump_status.update(result)
+        self._add_log("走航进样泵联动: %s" % message, "success" if ok else "error")
+
     def _status_cb(self, msg):
         """泵状态回调。"""
         status_raw = msg.data or ""
@@ -1545,6 +1641,8 @@ class WebConfigServer(object):
             }
         elif "survey_sample_done" in status:
             self.latest_survey_sample_done_at = received_at
+        if 'survey_started' in status:
+            self._apply_survey_injection_pump_policy(running=True)
         if 'sampling_started' in status:
             self.automation_running = True
             self._start_data_recording_if_needed(source="trigger")
@@ -1556,6 +1654,8 @@ class WebConfigServer(object):
         ):
             self.automation_running = False
             self._stop_data_recording_if_active()
+            if 'survey_stopped' in status:
+                self._apply_survey_injection_pump_policy(running=False)
         if self.socketio:
             self.socketio.emit("survey_status", self._survey_status_snapshot())
 
@@ -3346,7 +3446,11 @@ class WebConfigServer(object):
                 wp_cfg = dict(config.get('waypoint_sampling', {}))
                 default_item = {
                     'enabled': True,
-                    'loop_count': int(config.get('sampling_sequence', {}).get('loop_count', 1) or 1),
+                    'loop_count': int(
+                        config.get('sampling_sequence', {}).get('loop_count', 1)
+                        if config.get('sampling_sequence', {}).get('loop_count', 1) not in (None, '')
+                        else 1
+                    ),
                     'retry_count': 0,
                     'hold_before_sampling_s': 3.0,
                     'on_fail': 'HOLD',
@@ -4369,6 +4473,10 @@ class WebConfigServer(object):
             "loop_count": config.get('sampling_sequence', {}).get('loop_count', 1),
             "pid_mode": pid_mode,
             "pid_precision": config.get('pump_settings', {}).get('pid_precision', 0.1),
+            "injection_pump_policy": ConfigManager._normalize_injection_pump_policy(
+                config.get('pump_settings', {}).get('injection_pump_policy', {}),
+                default_speed=config.get('pump_settings', {}).get('default_speed', 60),
+            ),
             "waypoint_sampling": config.get('waypoint_sampling', {}),
             "lab_mode": bool(lab_config.get("enabled", False)),
             "position_source": lab_config.get("position_source", "lab_sim") if lab_config.get("enabled") else "real",

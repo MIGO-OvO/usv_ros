@@ -24,7 +24,7 @@ export function SystemHealthCard() {
   }))
 
   return (
-    <Card className="bg-card/50 backdrop-blur-sm">
+    <Card className="min-w-0 overflow-hidden bg-card/50 backdrop-blur-sm">
       <CardHeader className="pb-2">
         <CardTitle className="text-sm font-medium flex items-center justify-between gap-2">
           <span className="flex items-center gap-2">
@@ -40,7 +40,7 @@ export function SystemHealthCard() {
           </span>
         </CardTitle>
       </CardHeader>
-      <CardContent className="space-y-4 text-sm">
+      <CardContent className="min-w-0 space-y-4 text-sm">
         <div className="grid grid-cols-2 gap-3">
           <Metric icon={Thermometer} label="Jetson 温度" value={fmt(health?.jetson?.temperature_c, '°C')} />
           <Metric icon={Thermometer} label="ESP32 温度" value={fmt(health?.detector?.temperature_c, '°C')} />
@@ -50,7 +50,7 @@ export function SystemHealthCard() {
           <Metric icon={Activity} label="ROS 节点" value={nodes.length ? `${aliveNodes}/${nodes.length}` : '--'} />
         </div>
 
-        <div className="h-28">
+        <div className="h-28 min-w-0 overflow-hidden">
           <ResponsiveContainer width="100%" height="100%">
             <LineChart data={trend}>
               <XAxis dataKey="time" hide />

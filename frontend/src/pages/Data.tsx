@@ -116,7 +116,7 @@ export default function Data() {
   }
 
   const formatVoltage = (v: number | undefined) =>
-    typeof v === 'number' ? v.toPrecision(6) : String(v ?? '')
+    typeof v === 'number' ? Number.parseFloat(v.toPrecision(4)).toString() : String(v ?? '')
 
   const exportMission = (e: React.MouseEvent, id: string) => {
       e.stopPropagation()

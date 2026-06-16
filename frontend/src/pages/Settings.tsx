@@ -313,13 +313,13 @@ export default function Settings() {
   }
 
   return (
-    <div className="p-4 md:p-8 space-y-6 max-w-7xl mx-auto">
+    <div className="settings-page px-3 pb-28 pt-4 sm:px-4 md:px-6 lg:px-8 lg:pb-8 space-y-5 sm:space-y-6 max-w-7xl mx-auto">
       <header>
-          <h1 className="text-3xl font-bold tracking-tight">系统设置</h1>
-          <p className="text-muted-foreground">底层控制参数与校准。</p>
+          <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">系统设置</h1>
+          <p className="text-sm text-muted-foreground sm:text-base">底层控制参数与校准。</p>
       </header>
 
-      <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-2 xl:gap-6">
         <Card>
             <CardHeader>
                 <CardTitle className="flex items-center gap-2">
@@ -328,7 +328,7 @@ export default function Settings() {
                 </CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
-                <div className="grid grid-cols-3 gap-4">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-3 sm:gap-4">
                     <div className="space-y-2">
                         <Label>Kp (比例)</Label>
                         <Input type="number" step="0.001" value={config.Kp} onChange={(e) => handleChange('Kp', e.target.value)} />
@@ -343,7 +343,7 @@ export default function Settings() {
                     </div>
                 </div>
 
-                <div className="grid grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4">
                      <div className="space-y-2">
                         <Label>最小输出 (V)</Label>
                         <Input type="number" step="0.1" value={config.output_min} onChange={(e) => handleChange('output_min', e.target.value)} />
@@ -354,9 +354,9 @@ export default function Settings() {
                     </div>
                 </div>
 
-                <div className="flex gap-2 pt-4">
+                <div className="flex flex-col gap-2 pt-4 sm:flex-row">
                     <Button className="flex-1" onClick={saveConfig}><Save className="w-4 h-4 mr-2" /> 保存参数</Button>
-                    <Button variant="outline" onClick={fetchConfig}><RefreshCw className="w-4 h-4" /></Button>
+                    <Button variant="outline" className="w-full sm:w-11" onClick={fetchConfig}><RefreshCw className="w-4 h-4" /></Button>
                 </div>
             </CardContent>
         </Card>
@@ -369,14 +369,14 @@ export default function Settings() {
                 </CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
-                <label className="flex items-center justify-between gap-3 text-sm">
+                <label className="flex items-center justify-between gap-3 rounded-md border bg-background/60 p-3 text-sm sm:border-0 sm:bg-transparent sm:p-0">
                     <span>
                       <span className="font-medium block">启用浓度工作曲线</span>
                       <span className="text-xs text-muted-foreground">未启用时地图自动使用吸光度。</span>
                     </span>
                     <Switch checked={pollutionMetric.enabled} onCheckedChange={v => setPollutionMetric(p => ({ ...p, enabled: v }))} />
                 </label>
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4">
                     <div className="space-y-2">
                         <Label>污染物名称</Label>
                         <Input value={pollutionMetric.pollutant_name} onChange={e => setPollutionMetric(p => ({ ...p, pollutant_name: e.target.value }))} />
@@ -409,7 +409,7 @@ export default function Settings() {
                         <Label>校准编号</Label>
                         <Input value={pollutionMetric.calibration_id} onChange={e => setPollutionMetric(p => ({ ...p, calibration_id: e.target.value }))} />
                     </div>
-                    <div className="space-y-2 md:col-span-2">
+                    <div className="space-y-2 sm:col-span-2">
                         <Label>校准时间</Label>
                         <Input value={pollutionMetric.calibrated_at} onChange={e => setPollutionMetric(p => ({ ...p, calibrated_at: e.target.value }))} />
                     </div>
@@ -429,7 +429,7 @@ export default function Settings() {
                         <Label>定量限 LOQ</Label>
                         <Input type="number" step="0.0001" value={pollutionMetric.loq ?? ''} onChange={e => setMetricOptionalNumber('loq', e.target.value)} />
                     </div>
-                    <label className="md:col-span-2 flex items-center justify-between gap-3 text-sm">
+                    <label className="flex items-center justify-between gap-3 rounded-md border bg-background/60 p-3 text-sm sm:col-span-2 sm:border-0 sm:bg-transparent sm:p-0">
                         <span>
                           <span className="font-medium block">负浓度钳制为 0</span>
                           <span className="text-xs text-muted-foreground">仅在线性公式计算出负值时生效。</span>
@@ -440,9 +440,9 @@ export default function Settings() {
                 <div className="rounded-md bg-muted/50 p-3 text-xs text-muted-foreground">
                   当前公式：{pollutionMetric.display_name || '浓度'} = {pollutionMetric.slope || 0} × 吸光度 + {pollutionMetric.intercept || 0}
                 </div>
-                <div className="flex gap-2">
+                <div className="flex flex-col gap-2 sm:flex-row">
                     <Button className="flex-1" onClick={savePollutionMetric}><Save className="w-4 h-4 mr-2" /> 保存指标</Button>
-                    <Button variant="outline" onClick={fetchPollutionConfig}><RefreshCw className="w-4 h-4" /></Button>
+                    <Button variant="outline" className="w-full sm:w-11" onClick={fetchPollutionConfig}><RefreshCw className="w-4 h-4" /></Button>
                 </div>
             </CardContent>
         </Card>
@@ -455,7 +455,7 @@ export default function Settings() {
                 </CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
-                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4">
                     <div className="space-y-2">
                         <Label>最小距离 (m)</Label>
                         <Input type="number" min="0" step="0.1" value={mappingProfile.survey_min_distance_m} onChange={e => setMappingNumber('survey_min_distance_m', e.target.value)} />
@@ -472,14 +472,14 @@ export default function Settings() {
                         <Label>最大速度 (m/s)</Label>
                         <Input type="number" min="0" step="0.1" value={mappingProfile.survey_max_speed_mps} onChange={e => setMappingNumber('survey_max_speed_mps', e.target.value)} />
                     </div>
-                    <label className="flex items-center justify-between gap-3 text-sm">
+                    <label className="flex items-center justify-between gap-3 rounded-md border bg-background/60 p-3 text-sm sm:border-0 sm:bg-transparent sm:p-0">
                         <span>
                           <span className="font-medium block">需要 GPS</span>
                           <span className="text-xs text-muted-foreground">缺少或过期位置时跳过本次走航采样。</span>
                         </span>
                         <Switch checked={mappingProfile.survey_require_gps} onCheckedChange={v => setMappingProfile(p => ({ ...p, survey_require_gps: v }))} />
                     </label>
-                    <label className="flex items-center justify-between gap-3 text-sm">
+                    <label className="flex items-center justify-between gap-3 rounded-md border bg-background/60 p-3 text-sm sm:border-0 sm:bg-transparent sm:p-0">
                         <span>
                           <span className="font-medium block">需要有效分光</span>
                           <span className="text-xs text-muted-foreground">分光状态无效时只记录跳过原因。</span>
@@ -490,9 +490,9 @@ export default function Settings() {
                 <div className="rounded-md bg-muted/50 p-3 text-xs text-muted-foreground">
                   门控发生在采样启动前；跳过只发布原因，不结束走航任务。
                 </div>
-                <div className="flex gap-2">
+                <div className="flex flex-col gap-2 sm:flex-row">
                     <Button className="flex-1" onClick={saveMappingProfile}><Save className="w-4 h-4 mr-2" /> 保存门控</Button>
-                    <Button variant="outline" onClick={fetchPollutionConfig}><RefreshCw className="w-4 h-4" /></Button>
+                    <Button variant="outline" className="w-full sm:w-11" onClick={fetchPollutionConfig}><RefreshCw className="w-4 h-4" /></Button>
                 </div>
             </CardContent>
         </Card>
@@ -505,7 +505,7 @@ export default function Settings() {
                 </CardTitle>
             </CardHeader>
             <CardContent className="space-y-6">
-                <div className="grid grid-cols-4 gap-4 text-center text-sm font-medium text-muted-foreground mb-2">
+                <div className="mb-2 hidden grid-cols-4 gap-4 text-center text-sm font-medium text-muted-foreground sm:grid">
                     <div>轴</div>
                     <div>原始角度</div>
                     <div>校准角度</div>
@@ -513,22 +513,28 @@ export default function Settings() {
                 </div>
 
                 {(['X', 'Y', 'Z', 'A'] as const).map((axis) => (
-                    <div key={axis} className="grid grid-cols-4 gap-4 items-center text-sm">
-                        <div className="font-bold text-center bg-muted/30 py-2 rounded">{axis}</div>
-                        <div className="text-center font-mono text-muted-foreground">{rawAngles[axis]?.toFixed(2)}°</div>
-                        <div className="text-center font-mono font-bold text-primary">{pumpAngles[axis]?.toFixed(2)}°</div>
-                        <div className="flex gap-1 justify-center">
-                            <Button size="icon" variant="outline" className="h-8 w-8" onClick={() => setZero(axis)} title="设为零点">
-                                <Target className="w-3 h-3" />
+                    <div key={axis} className="grid grid-cols-[3rem_minmax(0,1fr)_minmax(0,1fr)] gap-3 rounded-md border bg-background/70 p-3 text-sm sm:grid-cols-4 sm:items-center sm:border-0 sm:bg-transparent sm:p-0">
+                        <div className="self-stretch rounded bg-muted/30 py-2 text-center font-bold sm:self-auto">{axis}</div>
+                        <div className="min-w-0 text-center font-mono text-muted-foreground">
+                            <span className="block text-[11px] font-sans text-muted-foreground sm:hidden">原始</span>
+                            {rawAngles[axis]?.toFixed(2)}°
+                        </div>
+                        <div className="min-w-0 text-center font-mono font-bold text-primary">
+                            <span className="block text-[11px] font-sans font-normal text-muted-foreground sm:hidden">校准</span>
+                            {pumpAngles[axis]?.toFixed(2)}°
+                        </div>
+                        <div className="col-span-3 flex gap-2 sm:col-span-1 sm:justify-center">
+                            <Button size="icon" variant="outline" className="h-11 w-full sm:w-12" onClick={() => setZero(axis)} title="设为零点">
+                                <Target className="w-4 h-4 sm:w-3 sm:h-3" />
                             </Button>
-                            <Button size="icon" variant="ghost" className="h-8 w-8 text-muted-foreground" onClick={() => resetZero(axis)} title="重置">
-                                <RotateCcw className="w-3 h-3" />
+                            <Button size="icon" variant="ghost" className="h-11 w-full text-muted-foreground sm:w-12" onClick={() => resetZero(axis)} title="重置">
+                                <RotateCcw className="w-4 h-4 sm:w-3 sm:h-3" />
                             </Button>
                         </div>
                     </div>
                 ))}
 
-                <div className="pt-4 border-t flex gap-2">
+                <div className="flex flex-col gap-2 border-t pt-4 sm:flex-row">
                      <Button variant="secondary" className="flex-1" onClick={() => setZero()}>全部设为零点</Button>
                      <Button variant="ghost" className="flex-1" onClick={() => resetZero()}>全部重置</Button>
                 </div>
@@ -549,15 +555,15 @@ export default function Settings() {
             硬件连接设置
           </CardTitle>
         </CardHeader>
-        <CardContent className="space-y-6">
-          <div className="flex gap-2 mb-2">
-            <Button variant="outline" size="sm" onClick={refreshDevices}><RefreshCw className="w-4 h-4 mr-1" />刷新设备</Button>
+        <CardContent className="space-y-5 sm:space-y-6">
+          <div className="mb-2 flex flex-col gap-2 sm:flex-row sm:items-center">
+            <Button variant="outline" size="sm" className="w-full sm:w-auto" onClick={refreshDevices}><RefreshCw className="w-4 h-4 mr-1" />刷新设备</Button>
           </div>
 
           {/* 泵控板串口 */}
           <div className="space-y-3">
             <h4 className="font-medium text-sm">泵控板串口</h4>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4 xl:grid-cols-3">
               <div className="space-y-2">
                 <Label>串口路径</Label>
                 <select className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" value={hw.pump_serial_port} onChange={e => setHw(p => ({ ...p, pump_serial_port: e.target.value }))}>
@@ -576,12 +582,12 @@ export default function Settings() {
                 <Input type="number" step="0.1" value={hw.pump_timeout} onChange={e => setHw(p => ({ ...p, pump_timeout: parseFloat(e.target.value) || 1.0 }))} />
               </div>
             </div>
-            <Button variant="outline" size="sm" onClick={testPumpPort}><Activity className="w-4 h-4 mr-1" />测试泵控连接</Button>
+            <Button variant="outline" size="sm" className="w-full sm:w-auto" onClick={testPumpPort}><Activity className="w-4 h-4 mr-1" />测试泵控连接</Button>
           </div>
 
           <div className="space-y-3">
             <h4 className="font-medium text-sm">ADS122C04 分光参数</h4>
-            <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4 xl:grid-cols-3">
               <div className="space-y-2"><Label>ADS 地址</Label><Input value={hw.ads_address} onChange={e => setHw(p => ({ ...p, ads_address: e.target.value }))} /></div>
               <div className="space-y-2"><Label>TCA 分光通道</Label><Input type="number" min="0" max="7" value={hw.spectro_channel} onChange={e => setHw(p => ({ ...p, spectro_channel: parseInt(e.target.value) || 0 }))} /></div>
               <div className="space-y-2"><Label>AIN 通道</Label><select className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" value={hw.mux} onChange={e => setHw(p => ({ ...p, mux: e.target.value }))}><option value="AIN0">AIN0</option><option value="AIN1">AIN1</option><option value="AIN2">AIN2</option><option value="AIN3">AIN3</option></select></div>
@@ -592,15 +598,15 @@ export default function Settings() {
               <div className="space-y-2"><Label>基线参考电压</Label><Input type="number" step="0.001" value={hw.reference_voltage} readOnly /></div>
               <div className="space-y-2"><Label>基线电压</Label><Input type="number" step="0.001" value={hw.baseline_voltage} onChange={e => setHw(p => ({ ...p, baseline_voltage: parseFloat(e.target.value) || 0 }))} /></div>
             </div>
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-              <label className="flex items-center justify-between gap-2 text-sm"><span>连续采样模式</span><Switch checked={hw.continuous_mode} onCheckedChange={v => setHw(p => ({ ...p, continuous_mode: v }))} /></label>
-              <label className="flex items-center justify-between gap-2 text-sm"><span>启动后自动开启分光</span><Switch checked={hw.auto_start} onCheckedChange={v => setHw(p => ({ ...p, auto_start: v }))} /></label>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4">
+              <label className="flex items-center justify-between gap-3 rounded-md border bg-background/60 p-3 text-sm"><span>连续采样模式</span><Switch checked={hw.continuous_mode} onCheckedChange={v => setHw(p => ({ ...p, continuous_mode: v }))} /></label>
+              <label className="flex items-center justify-between gap-3 rounded-md border bg-background/60 p-3 text-sm"><span>启动后自动开启分光</span><Switch checked={hw.auto_start} onCheckedChange={v => setHw(p => ({ ...p, auto_start: v }))} /></label>
             </div>
           </div>
 
           <div className="space-y-3">
             <h4 className="font-medium text-sm">角度 / 分光 TCA 通道映射</h4>
-            <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4 xl:grid-cols-5">
               {(['X', 'Y', 'Z', 'A'] as const).map(axis => (
                 <div key={axis} className="space-y-2">
                   <Label>{axis} 轴通道</Label>
@@ -616,16 +622,16 @@ export default function Settings() {
 
           {hwMsg && (
             <div className={cn(
-              "text-sm p-3 rounded",
+              "break-words rounded p-3 text-sm",
               hwMsg.includes('失败') || hwMsg.includes('error') || hwMsg.includes('Error')
                 ? "bg-red-500/10 text-red-700 dark:text-red-400"
                 : "bg-emerald-500/10 text-emerald-700 dark:text-emerald-400"
             )}>{hwMsg}</div>
           )}
 
-          <div className="flex gap-2">
-            <Button onClick={saveHardwareOnly} variant="outline"><Save className="w-4 h-4 mr-1" />仅保存</Button>
-            <Button onClick={saveAndApplyHardware} disabled={hwLoading}>
+          <div className="flex flex-col gap-2 sm:flex-row">
+            <Button onClick={saveHardwareOnly} variant="outline" className="w-full sm:w-auto"><Save className="w-4 h-4 mr-1" />仅保存</Button>
+            <Button onClick={saveAndApplyHardware} disabled={hwLoading} className="w-full sm:w-auto">
               {hwLoading ? <RefreshCw className="w-4 h-4 mr-1 animate-spin" /> : <Zap className="w-4 h-4 mr-1" />}
               保存并应用
             </Button>

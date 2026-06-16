@@ -115,6 +115,13 @@ DEFAULT_ANGLE_STREAM = {
     "auto_start": True,
 }
 
+DEFAULT_INJECTION_PUMP_POLICY = {
+    "mode": "manual",
+    "speed": 60,
+    "lead_time_s": 0.0,
+    "stop_on_finish": True,
+}
+
 ANGLE_TELEMETRY_STALE_AFTER_MS = 1000
 
 
@@ -527,6 +534,8 @@ class PumpControlNode(object):
         self.inject_pump_last_response = ""
         self.inject_pump_last_error = ""
         self.injection_pump_worker = None
+        self.injection_pump_policy = dict(DEFAULT_INJECTION_PUMP_POLICY)
+        self.injection_pump_policy["speed"] = self.inject_pump_speed
 
         # 分光状态
         self.latest_spectro = None
@@ -1013,6 +1022,63 @@ class PumpControlNode(object):
             rospy.loginfo("[InjectionPump] Ignoring legacy step pump config in %s mode", mode)
         return True
 
+    def _normalize_injection_pump_policy(self, raw):
+        policy = dict(DEFAULT_INJECTION_PUMP_POLICY)
+        if isinstance(raw, dict):
+            policy.update(raw)
+        mode = str(policy.get("mode", "manual") or "manual").strip().lower()
+        mode_aliases = {
+            "auto": "automation",
+            "sample": "automation",
+            "sampling": "automation",
+            "task": "automation",
+            "off": "manual",
+            "disabled": "manual",
+        }
+        mode = mode_aliases.get(mode, mode)
+        if mode not in ("manual", "automation", "survey"):
+            mode = "manual"
+        try:
+            speed = int(float(policy.get("speed", self.inject_pump_speed) or 0))
+        except (TypeError, ValueError):
+            speed = self.inject_pump_speed
+        try:
+            lead_time_s = float(policy.get("lead_time_s", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            lead_time_s = 0.0
+        return {
+            "mode": mode,
+            "speed": max(0, min(100, speed)),
+            "lead_time_s": max(0.0, min(600.0, lead_time_s)),
+            "stop_on_finish": bool(policy.get("stop_on_finish", True)),
+        }
+
+    def _injection_policy_for_automation(self):
+        policy = self._normalize_injection_pump_policy(self.injection_pump_policy)
+        return policy if policy.get("mode") == "automation" else None
+
+    def _start_injection_for_automation_policy(self):
+        policy = self._injection_policy_for_automation()
+        if not policy:
+            return True
+        speed = int(policy.get("speed", 0) or 0)
+        if speed <= 0:
+            self._update_injection_pump_state(enabled=False, error="Injection pump policy speed is 0")
+            return False
+        if not self._send_injection_pump_command(speed=speed):
+            return False
+        lead_time_s = float(policy.get("lead_time_s", 0.0) or 0.0)
+        if lead_time_s > 0:
+            rospy.loginfo("[InjectionPump] automation lead time: %.2fs", lead_time_s)
+            return self._wait_seconds_with_pause(lead_time_s)
+        return True
+
+    def _stop_injection_for_automation_policy(self):
+        policy = self._injection_policy_for_automation()
+        if policy and policy.get("stop_on_finish", True):
+            return self._send_injection_pump_command(enabled=False)
+        return True
+
     def _send_automation_step(self, step):
         """自动化引擎步骤发送钩子。"""
         self._current_auto_step = dict(step or {})
@@ -1029,6 +1095,10 @@ class PumpControlNode(object):
                       step_name,
                       ",".join(enabled_motors) if enabled_motors else "无",
                       "启用" if pump_enabled else "关闭")
+
+        if not self._start_injection_for_automation_policy():
+            rospy.logerr("[Automation] 进样泵任务策略启动失败: %s", step_name)
+            return False
 
         command = self.command_generator.generate_command(step, mode="auto")
         if command and not self.send_command(command):
@@ -1595,8 +1665,6 @@ class PumpControlNode(object):
         enabled = bool(enabled)
         if enabled and self._automation_is_active():
             return False, "Cannot enter manual mode while automation is active"
-        if enabled and self._spectrometer_is_active():
-            return False, "Cannot enter manual mode while spectrometer is acquiring"
         self.manual_mode_enabled = enabled
         self._publish_manual_status()
         return True, "Manual mode enabled" if enabled else "Manual mode disabled"
@@ -1672,8 +1740,8 @@ class PumpControlNode(object):
         if action == "manual_step":
             if not self.manual_mode_enabled:
                 return False, "Manual mode is not enabled", self._manual_status_payload()
-            if self._automation_is_active() or self._spectrometer_is_active():
-                return False, "Manual command rejected by active automation or spectrometer", self._manual_status_payload()
+            if self._automation_is_active():
+                return False, "Manual command rejected by active automation", self._manual_status_payload()
             step, error = self._build_manual_step(payload)
             if error:
                 return False, error, {}
@@ -1729,8 +1797,6 @@ class PumpControlNode(object):
             return success, "Spectrometer configured" if success else "Spectrometer config failed", {"spectrometer": self.spectro_config}
 
         if action == "spectrometer_start":
-            if self.manual_mode_enabled:
-                return False, "Spectrometer start rejected: manual mode is enabled", self._manual_status_payload()
             success, message = self._spectro_start()
             return success, message, {}
 
@@ -1851,9 +1917,6 @@ class PumpControlNode(object):
             rospy.logwarn("Unknown spectrometer command: %s", cmd)
 
     def _spectro_start_callback(self, req):
-        rejected = self._reject_if_manual_mode("Spectrometer start")
-        if rejected:
-            return rejected
         success, message = self._spectro_start()
         return TriggerResponse(success=success, message=message)
 
@@ -1894,6 +1957,9 @@ class PumpControlNode(object):
             self.automation_engine.set_steps(steps)
             self.automation_engine.set_loop_count(loop_count)
             self.automation_engine.set_pid_mode(pid_mode)
+            self.injection_pump_policy = self._normalize_injection_pump_policy(
+                data.get("injection_pump_policy", {})
+            )
 
             step_names = [step.get("name", "未命名步骤") for step in steps[:5] if isinstance(step, dict)]
             rospy.loginfo("Automation steps loaded: %d steps, %s loops, pid_mode=%s, pid_precision=%.3f, preview=%s",
@@ -1956,6 +2022,7 @@ class PumpControlNode(object):
         if self.automation_engine.is_running() or self.automation_engine.is_paused():
             self.automation_engine.stop()
         success = self.stop_all_pumps()
+        self._stop_injection_for_automation_policy()
         message = "Automation stopped and pumps halted" if success else "Automation stopped but pump halt failed"
         self._publish_automation_status("stopped")
         return TriggerResponse(success=success, message=message)
@@ -2003,6 +2070,15 @@ class PumpControlNode(object):
         rospy.loginfo("[Automation] 状态更新: %s", status)
         self._publish_status("automation: " + status)
         self._publish_automation_status(status)
+        status_lower = str(status or "").lower()
+        if (
+            "finish" in status_lower
+            or "done" in status_lower
+            or "stop" in status_lower
+            or "error" in status_lower
+            or "fail" in status_lower
+        ):
+            self._stop_injection_for_automation_policy()
 
     def _on_automation_error(self, error):
         """自动化错误回调。"""

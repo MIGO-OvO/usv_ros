@@ -352,7 +352,7 @@ export default function Lab() {
     : '就绪'
 
   return (
-    <div className="h-[calc(100vh-5rem)] md:h-screen p-3 md:p-5 flex flex-col gap-3 bg-muted/20">
+    <div className="min-h-[calc(100vh-5rem)] px-3 pb-24 pt-3 md:p-5 xl:h-screen xl:min-h-0 flex flex-col gap-3 bg-muted/20">
       <header className="flex flex-col md:flex-row md:items-center justify-between gap-3 shrink-0">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">实验室测试</h1>
@@ -377,7 +377,7 @@ export default function Lab() {
       {message && <div className="rounded-md border bg-card px-4 py-3 text-sm">{message}</div>}
 
       {/* 当前阶段引导横幅 */}
-      <div className="flex items-center gap-3 rounded-md border bg-background px-4 py-3 text-sm shadow-sm shrink-0">
+      <div className="flex items-start gap-3 rounded-md border bg-background px-4 py-3 text-sm shadow-sm shrink-0 sm:items-center">
         <Activity className="h-4 w-4 text-primary shrink-0" />
         <span className="font-medium">当前阶段: {stage}</span>
         <span className="text-muted-foreground">
@@ -389,7 +389,7 @@ export default function Lab() {
         </span>
       </div>
 
-      <div className="grid grid-cols-1 xl:grid-cols-[360px_minmax(0,1fr)] gap-3 flex-1 min-h-0 overflow-auto xl:overflow-hidden lab-map-workspace">
+      <div className="grid grid-cols-1 gap-3 overflow-visible xl:grid-cols-[360px_minmax(0,1fr)] xl:flex-1 xl:min-h-0 xl:overflow-hidden lab-map-workspace">
         <aside className="space-y-3 min-h-0 xl:overflow-auto xl:pr-1">
           <Card>
             <CardHeader className="pb-2">
@@ -430,7 +430,7 @@ export default function Lab() {
               <CardTitle className="text-base">模拟参数与污染源</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
-              <div className="grid grid-cols-2 gap-3">
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 {([
                   ['start_lat', '起始纬度'],
                   ['start_lng', '起始经度'],
@@ -445,7 +445,7 @@ export default function Lab() {
                   </div>
                 ))}
               </div>
-              <div className="grid grid-cols-2 gap-3 border-t pt-4">
+              <div className="grid grid-cols-1 gap-3 border-t pt-4 sm:grid-cols-2">
                 <div className="col-span-2 space-y-2">
                   <Label>污染源模式</Label>
                   <div className="grid grid-cols-2 rounded-md border bg-background p-1">
@@ -522,7 +522,7 @@ export default function Lab() {
         </aside>
 
         {/* 虚拟航线编辑地图 */}
-        <Card className="flex min-h-[520px] flex-col overflow-hidden xl:min-h-0">
+        <Card className="flex min-h-[440px] flex-col overflow-hidden sm:min-h-[520px] xl:min-h-0">
           <CardHeader className="pb-2">
             <CardTitle className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <span className="flex items-center gap-2"><MapPin className="h-5 w-5" />虚拟航线</span>

@@ -114,3 +114,18 @@
   background: #1a1a1a;
   font: inherit;
 }
+
+.settings-page input,
+.settings-page select {
+  min-height: 2.75rem;
+}
+
+.settings-page button:not([role="switch"]) {
+  min-height: 2.75rem;
+  min-width: 44px;
+}
+
+main input:not([type="checkbox"]),
+main select {
+  min-height: 2.75rem;
+}

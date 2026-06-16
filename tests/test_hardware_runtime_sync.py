@@ -2010,6 +2010,104 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(config["pump_settings"]["default_speed"], 60)
         self.assertNotIn("pump", config["sampling_sequence"]["steps"][0])
 
+    def test_web_config_preserves_zero_loop_count_for_infinite_sampling(self):
+        module, _, _ = _load_script(
+            "web_config_server_zero_loop_count_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            manager = module.ConfigManager(str(Path(tmpdir) / "sampling_config.json"))
+            manager.update({
+                "sampling_sequence": {
+                    "loop_count": 0,
+                    "steps": [{"name": "continuous", "X": {"enable": "D"}, "interval": 0}],
+                },
+            })
+            config = manager.get()
+
+        self.assertEqual(config["sampling_sequence"]["loop_count"], 0)
+
+    def test_web_publish_steps_includes_injection_pump_policy_and_zero_loop_count(self):
+        module, publishers, _ = _load_script(
+            "web_config_server_injection_policy_publish_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            server.config_manager.update({
+                "pump_settings": {
+                    "default_speed": 55,
+                    "injection_pump_policy": {
+                        "mode": "automation",
+                        "lead_time_s": 2.5,
+                        "stop_on_finish": True,
+                    },
+                },
+                "sampling_sequence": {
+                    "loop_count": 0,
+                    "steps": [{"name": "flush", "X": {"enable": "E", "speed": "5", "angle": "90"}, "interval": 0}],
+                },
+            })
+
+            server._publish_steps()
+
+        payload = json.loads(publishers["/usv/automation_steps"].messages[-1].data)
+        self.assertEqual(payload["loop_count"], 0)
+        self.assertEqual(payload["injection_pump_policy"], {
+            "mode": "automation",
+            "speed": 55,
+            "lead_time_s": 2.5,
+            "stop_on_finish": True,
+        })
+
+    def test_web_survey_trigger_status_applies_injection_pump_policy(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_survey_injection_policy_test",
+            "scripts/web_config_server.py",
+        )
+        control_calls = []
+        module.rospy.ServiceProxy = lambda name, *args, **kwargs: (
+            FakeControlCommandService(control_calls)
+            if name == "/usv/control_command"
+            else FakeTriggerService()
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            server.config_manager.update({
+                "pump_settings": {
+                    "default_speed": 55,
+                    "injection_pump_policy": {
+                        "mode": "survey",
+                        "speed": 55,
+                        "lead_time_s": 0.0,
+                        "stop_on_finish": True,
+                    },
+                },
+            })
+
+            server._trigger_status_cb(string_cls("survey_started"))
+            server._trigger_status_cb(string_cls("survey_stopped"))
+
+        self.assertEqual([call["action"] for call in control_calls], ["injection_on", "injection_off"])
+        self.assertEqual(json.loads(control_calls[0]["payload_json"])["speed"], 55)
+
     def test_web_config_uses_legacy_step_pump_when_global_default_missing(self):
         module, _, _ = _load_script(
             "web_config_server_legacy_missing_default_speed_test",
@@ -2078,7 +2176,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertIn("failed", [event["state"] for event in events])
         self.assertIn("succeeded", [event["state"] for event in events])
 
-    def test_pump_node_manual_mode_blocks_automation_and_spectrometer_start(self):
+    def test_pump_node_manual_mode_blocks_automation_but_allows_spectrometer_start(self):
         module, _, _ = _load_script(
             "pump_control_node_manual_interlock_test",
             "scripts/pump_control_node.py",
@@ -2086,14 +2184,48 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         node = module.PumpControlNode()
         node.manual_mode_enabled = True
         node.automation_engine.steps = [{"name": "step"}]
+        node.send_command = lambda cmd: True
+        node._wait_for_spectro_command_result = lambda timeout=2.0: (True, "ADS_OK:START")
 
         auto_response = node._auto_start_callback(None)
         spectro_response = node._spectro_start_callback(None)
 
         self.assertFalse(auto_response.success)
-        self.assertFalse(spectro_response.success)
+        self.assertTrue(spectro_response.success)
         self.assertIn("manual", auto_response.message.lower())
-        self.assertIn("manual", spectro_response.message.lower())
+
+    def test_pump_node_injection_policy_starts_before_automation_step(self):
+        module, _, string_cls = _load_script(
+            "pump_control_node_injection_policy_step_test",
+            "scripts/pump_control_node.py",
+        )
+        node = module.PumpControlNode()
+        sent = []
+        node.send_command = lambda cmd: sent.append(cmd) or True
+        node.pid_mode = False
+        node._latest_spectro_received_at = 0.0
+        node._steps_callback(string_cls(json.dumps({
+            "steps": [{
+                "name": "sample",
+                "X": {"enable": "E", "direction": "F", "speed": "5", "angle": "90"},
+                "interval": 0,
+            }],
+            "loop_count": 0,
+            "pid_mode": False,
+            "injection_pump_policy": {
+                "mode": "automation",
+                "speed": 55,
+                "lead_time_s": 0.0,
+                "stop_on_finish": True,
+            },
+        })))
+
+        accepted = node._send_automation_step(node.automation_engine.steps[0])
+
+        self.assertTrue(accepted)
+        self.assertEqual(node.automation_engine.loop_count, 0)
+        self.assertEqual(sent[0], "PUMP:SET:55")
+        self.assertIn("XEF", sent[1])
 
     def test_pump_node_lab_steps_disable_pid_wait_but_keep_real_serial_failures(self):
         module, _, string_cls = _load_script(
@@ -2298,6 +2430,19 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertIn("/api/spectrometer/start", monitor_text)
         self.assertIn("/api/spectrometer/stop", monitor_text)
         self.assertIn("/api/spectrometer/baseline", monitor_text)
+
+    def test_frontend_spectrometer_charts_limit_axis_and_tooltip_precision(self):
+        monitor_text = (REPO_ROOT / "frontend" / "src" / "pages" / "Monitor.tsx").read_text(encoding="utf-8")
+        data_text = (REPO_ROOT / "frontend" / "src" / "pages" / "Data.tsx").read_text(encoding="utf-8")
+        manual_text = (REPO_ROOT / "frontend" / "src" / "pages" / "Manual.tsx").read_text(encoding="utf-8")
+
+        self.assertIn("formatChartNumber", monitor_text)
+        self.assertIn("tickFormatter={formatChartNumber}", monitor_text)
+        self.assertIn("formatter={formatChartTooltip}", monitor_text)
+        self.assertNotIn("toPrecision(6)", data_text)
+        self.assertIn("toPrecision(4)", data_text)
+        self.assertIn("const interlockActive = manualStatus.automation_active", manual_text)
+        self.assertNotIn("manualStatus.automation_active || manualStatus.spectrometer_active", manual_text)
 
     def test_frontend_declares_angle_telemetry_state_and_stale_status(self):
         store_text = (REPO_ROOT / "frontend" / "src" / "store.ts").read_text(encoding="utf-8")

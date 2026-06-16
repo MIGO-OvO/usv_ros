@@ -57,7 +57,7 @@ export default function Manual() {
   }, [injectionPump.speed])
 
   const latestEvent = controlEvents[controlEvents.length - 1]
-  const interlockActive = manualStatus.automation_active || manualStatus.spectrometer_active
+  const interlockActive = manualStatus.automation_active
 
   const runAction = async (key: string, action: () => Promise<{ success: boolean; message: string }>) => {
     if (pending) return
@@ -138,7 +138,7 @@ export default function Manual() {
         <Card className="border-amber-500/30 bg-amber-500/10">
           <CardContent className="py-4 flex items-center gap-3 text-amber-600">
             <AlertTriangle className="w-5 h-5" />
-            自动采样或分光采集正在运行，手动模式会被后端拒绝。
+            自动采样正在运行，手动模式会被后端拒绝。
           </CardContent>
         </Card>
       )}
