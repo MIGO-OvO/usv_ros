@@ -1,96 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
-import { Activity, Crosshair, Download, FlaskConical, MapPin, Play, RotateCcw, Save, Square, Trash2 } from 'lucide-react'
+import { Activity, Crosshair, Download, FlaskConical, Gauge, MapPin, Navigation, Play, RotateCcw, Save, Square, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
+import { boatIcon, isFiniteLatLng, moveBoatMarker, speedPercent, startIcon } from '@/lib/lab-map'
+import type { LabConfig, LabMission, LabPollution, LabStatus, LatLng, MapConfigLite } from '@/lib/lab-types'
+import { fallbackConfig, fallbackStatus } from '@/lib/lab-types'
 
-interface LatLng { lat: number; lng: number }
-interface Waypoint extends LatLng { seq: number }
-
-interface LabMission {
-  waypoints: Waypoint[]
-  center: LatLng | null
-}
-
-interface LabPollution {
-  mode: 'center' | 'manual'
-  source: LatLng | null
-  strength: number
-  radius_m: number
-  reference_voltage: number
-}
-
-interface LabConfig {
-  enabled: boolean
-  profile: string
-  position_source: string
-  data_source: 'simulated' | 'real'
-  allow_no_gps: boolean
-  bypass_pid_wait: boolean
-  include_lab_data_by_default: boolean
-  sim: {
-    start_lat: number
-    start_lng: number
-    heading_deg: number
-    max_speed_mps: number
-    wheel_base_m: number
-    arrival_radius_m: number
-  }
-  mission: LabMission
-  pollution: LabPollution
-}
-
-interface LabStatus {
-  enabled: boolean
-  running: boolean
-  speed_mps: number
-  heading_deg: number
-  mission?: { active: boolean; total: number; target_seq: number | null; reached_count: number }
-  virtual_propulsion: { left: number; right: number; real_output_enabled: boolean }
-}
-
-interface MapConfigLite {
-  tile_url: string
-  default_style: string
-  min_zoom: number
-  max_zoom: number
-  default_center: { lng: number; lat: number }
-  default_zoom: number
-}
-
-const fallbackConfig: LabConfig = {
-  enabled: false,
-  profile: 'semi_hardware',
-  position_source: 'lab_sim',
-  data_source: 'simulated',
-  allow_no_gps: true,
-  bypass_pid_wait: true,
-  include_lab_data_by_default: false,
-  sim: { start_lat: 25.314167, start_lng: 110.412778, heading_deg: 0, max_speed_mps: 1, wheel_base_m: 0.6, arrival_radius_m: 3 },
-  mission: { waypoints: [], center: null },
-  pollution: { mode: 'center', source: null, strength: 0.8, radius_m: 150, reference_voltage: 3 },
-}
-
-const fallbackStatus: LabStatus = {
-  enabled: false,
-  running: false,
-  speed_mps: 0,
-  heading_deg: 0,
-  mission: { active: false, total: 0, target_seq: null, reached_count: 0 },
-  virtual_propulsion: { left: 0, right: 0, real_output_enabled: false },
-}
+type DrawMode = '' | 'start' | 'waypoint' | 'source'
 
 export default function Lab() {
   const [config, setConfig] = useState<LabConfig>(fallbackConfig)
   const [status, setStatus] = useState<LabStatus>(fallbackStatus)
   const [pending, setPending] = useState('')
   const [message, setMessage] = useState('')
-  // 地图绘制状态: 'waypoint' 点击落航点, 'source' 点击放置污染源, '' 不绘制
-  const [drawMode, setDrawMode] = useState<'' | 'waypoint' | 'source'>('')
+  const [drawMode, setDrawMode] = useState<DrawMode>('')
 
   const containerRef = useRef<HTMLDivElement | null>(null)
   const mapRef = useRef<L.Map | null>(null)
@@ -117,7 +45,15 @@ export default function Lab() {
     labInitialFitDoneRef.current = true
   }, [])
 
-  const persistMission = async (mission: LabMission) => {
+  const setBoatToStart = useCallback((simConfig: LabConfig['sim']) => {
+    moveBoatMarker(
+      boatRef.current,
+      { lat: Number(simConfig.start_lat), lng: Number(simConfig.start_lng) },
+      Number(simConfig.heading_deg) || 0,
+    )
+  }, [])
+
+  const persistMission = useCallback(async (mission: LabMission) => {
     try {
       const res = await fetch('/api/lab/mission', {
         method: 'POST',
@@ -135,9 +71,9 @@ export default function Lab() {
       setMessage('实验航线保存失败')
     }
     return false
-  }
+  }, [])
 
-  const persistConfig = async (nextConfig: LabConfig) => {
+  const persistConfig = useCallback(async (nextConfig: LabConfig) => {
     try {
       const res = await fetch('/api/lab/config', {
         method: 'POST',
@@ -155,7 +91,23 @@ export default function Lab() {
       setMessage('配置保存失败')
     }
     return false
-  }
+  }, [])
+
+  const setStartPosition = useCallback((position: LatLng) => {
+    if (!isFiniteLatLng(position)) return
+    const nextConfig = {
+      ...configRef.current,
+      sim: {
+        ...configRef.current.sim,
+        start_lat: position.lat,
+        start_lng: position.lng,
+      },
+    }
+    dirtyRef.current = true
+    setConfig(nextConfig)
+    setBoatToStart(nextConfig.sim)
+    persistConfig(nextConfig).catch(() => {})
+  }, [persistConfig, setBoatToStart])
 
   const refresh = async () => {
     const res = await fetch('/api/lab/status')
@@ -163,7 +115,7 @@ export default function Lab() {
     if (json.data?.config && !drawModeRef.current && !pendingRef.current && !dirtyRef.current) setConfig(json.data.config)
     if (json.data?.status) setStatus({ ...fallbackStatus, ...json.data.status })
     if (json.data?.position?.gcj02 && boatRef.current) {
-      boatRef.current.setLatLng([json.data.position.gcj02.lat, json.data.position.gcj02.lng])
+      moveBoatMarker(boatRef.current, json.data.position.gcj02, Number(json.data.position.heading_deg || json.data.status?.heading_deg || 0))
     }
   }
 
@@ -184,11 +136,14 @@ export default function Lab() {
       }).addTo(map)
       layerRef.current = L.layerGroup().addTo(map)
       boatRef.current = L.marker([cfg.default_center.lat, cfg.default_center.lng], {
-        icon: L.divIcon({ className: 'usv-boat-icon', html: '<span>船</span>', iconAnchor: [10, 10] }),
+        icon: boatIcon(configRef.current.sim.heading_deg),
       }).addTo(map)
+      setBoatToStart(configRef.current.sim)
       map.on('click', (e: L.LeafletMouseEvent) => {
         const mode = drawModeRef.current
-        if (mode === 'waypoint') {
+        if (mode === 'start') {
+          setStartPosition({ lat: e.latlng.lat, lng: e.latlng.lng })
+        } else if (mode === 'waypoint') {
           const current = configRef.current
           const waypoints = [
             ...current.mission.waypoints,
@@ -229,7 +184,7 @@ export default function Lab() {
       boatRef.current = null
       setMapReady(false)
     }
-  }, [])
+  }, [persistConfig, persistMission, setBoatToStart, setStartPosition])
 
   // 重绘航线/航点/污染源
   useEffect(() => {
@@ -241,6 +196,7 @@ export default function Lab() {
     const startLat = Number(config.sim.start_lat)
     const startLng = Number(config.sim.start_lng)
     if (Number.isFinite(startLat) && Number.isFinite(startLng)) {
+      L.marker([startLat, startLng], { icon: startIcon() }).addTo(group)
       bounds.extend([startLat, startLng])
     }
     if (pts.length > 1) {
@@ -346,6 +302,8 @@ export default function Lab() {
 
   const propulsion = status.virtual_propulsion || fallbackStatus.virtual_propulsion
   const mission = status.mission || fallbackStatus.mission!
+  const speedLimitMps = Math.max(0, Number(config.sim.max_speed_mps) || 0)
+  const liveSpeedPercent = speedPercent(status.speed_mps || 0, speedLimitMps)
   const stage = !config.mission.waypoints.length ? '未配置航点'
     : status.running ? (mission.active ? `航行中 · 目标 #${mission.target_seq ?? '-'}` : '采样中')
     : mission.reached_count >= config.mission.waypoints.length && config.mission.waypoints.length > 0 ? '已完成'
@@ -430,20 +388,47 @@ export default function Lab() {
               <CardTitle className="text-base">模拟参数与污染源</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
-              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
-                {([
-                  ['start_lat', '起始纬度'],
-                  ['start_lng', '起始经度'],
-                  ['heading_deg', '航向'],
-                  ['max_speed_mps', '最大航速'],
-                  ['wheel_base_m', '差速轴距'],
-                  ['arrival_radius_m', '到点半径(m)'],
-                ] as const).map(([key, label]) => (
-                  <div key={key} className="space-y-2">
-                    <Label>{label}</Label>
-                    <Input type="number" value={config.sim[key]} onChange={(e) => updateSim(key, e.target.value)} />
+              <div className="rounded-md border bg-muted/30 p-3">
+                <div className="mb-3 flex items-center justify-between gap-3">
+                  <div>
+                    <div className="text-sm font-medium">起始位置</div>
+                    <div className="text-xs text-muted-foreground">可输入经纬度，也可在右侧地图点选。</div>
                   </div>
-                ))}
+                  <Button size="sm" variant={drawMode === 'start' ? 'default' : 'outline'}
+                    onClick={() => setDrawMode((m) => (m === 'start' ? '' : 'start'))}>
+                    <Navigation className="w-4 h-4 mr-1" />放起点
+                  </Button>
+                </div>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label>起始纬度</Label>
+                    <Input type="number" step="0.000001" value={config.sim.start_lat} onChange={(e) => updateSim('start_lat', e.target.value)} />
+                  </div>
+                  <div className="space-y-2">
+                    <Label>起始经度</Label>
+                    <Input type="number" step="0.000001" value={config.sim.start_lng} onChange={(e) => updateSim('start_lng', e.target.value)} />
+                  </div>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label>航向</Label>
+                  <Input type="number" min={0} max={360} step={1} value={config.sim.heading_deg} onChange={(e) => updateSim('heading_deg', e.target.value)} />
+                </div>
+                <div className="space-y-2">
+                  <Label className="flex items-center gap-2"><Gauge className="h-4 w-4" />速度上限</Label>
+                  <Input type="number" min={0} max={20} step={0.1} value={config.sim.max_speed_mps} onChange={(e) => updateSim('max_speed_mps', e.target.value)} />
+                  <div className="text-xs text-muted-foreground">仿真器按该 m/s 上限换算左右推进输出，不再按 0-1 显示为船速。</div>
+                </div>
+                <div className="space-y-2">
+                  <Label>差速轴距</Label>
+                  <Input type="number" min={0.05} step={0.05} value={config.sim.wheel_base_m} onChange={(e) => updateSim('wheel_base_m', e.target.value)} />
+                </div>
+                <div className="space-y-2">
+                  <Label>到点半径(m)</Label>
+                  <Input type="number" min={0.5} step={0.5} value={config.sim.arrival_radius_m} onChange={(e) => updateSim('arrival_radius_m', e.target.value)} />
+                </div>
               </div>
               <div className="grid grid-cols-1 gap-3 border-t pt-4 sm:grid-cols-2">
                 <div className="col-span-2 space-y-2">
@@ -486,7 +471,10 @@ export default function Lab() {
                 </div>
                 <div className="rounded-md border p-3">
                   <div className="text-muted-foreground">航速</div>
-                  <div className="font-medium">{(status.speed_mps || 0).toFixed(2)} m/s</div>
+                  <div className="font-medium">{(status.speed_mps || 0).toFixed(2)} / {speedLimitMps.toFixed(1)} m/s</div>
+                  <div className="mt-2 h-1.5 rounded bg-muted">
+                    <div className="h-1.5 rounded bg-emerald-500" style={{ width: `${liveSpeedPercent}%` }} />
+                  </div>
                 </div>
                 <div className="rounded-md border p-3">
                   <div className="text-muted-foreground">航向</div>
@@ -527,6 +515,10 @@ export default function Lab() {
             <CardTitle className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
               <span className="flex items-center gap-2"><MapPin className="h-5 w-5" />虚拟航线</span>
               <div className="flex flex-wrap items-center gap-2">
+                <Button size="sm" variant={drawMode === 'start' ? 'default' : 'outline'}
+                  onClick={() => setDrawMode((m) => (m === 'start' ? '' : 'start'))}>
+                  <Navigation className="w-4 h-4 mr-1" />放起点
+                </Button>
                 <Button size="sm" variant={drawMode === 'waypoint' ? 'default' : 'outline'}
                   onClick={() => setDrawMode((m) => (m === 'waypoint' ? '' : 'waypoint'))}>
                   <MapPin className="w-4 h-4 mr-1" />画航点
@@ -550,9 +542,10 @@ export default function Lab() {
           <CardContent className="flex flex-1 min-h-0 flex-col p-3 pt-0">
             <div ref={containerRef} className="min-h-0 flex-1 w-full rounded-md border overflow-hidden" />
             <p className="mt-2 text-xs text-muted-foreground">
-              {drawMode === 'waypoint' ? '点击地图添加航点。'
+              {drawMode === 'start' ? '点击地图放置模拟起点，船标会立即移动到该位置。'
+                : drawMode === 'waypoint' ? '点击地图添加航点。'
                 : drawMode === 'source' ? '点击地图放置污染源 (切换为手动模式)。'
-                : `已配置 ${config.mission.waypoints.length} 个航点。`}
+                : `起点 ${Number(config.sim.start_lat).toFixed(6)}, ${Number(config.sim.start_lng).toFixed(6)}；已配置 ${config.mission.waypoints.length} 个航点。`}
             </p>
           </CardContent>
         </Card>
