@@ -38,16 +38,17 @@ PREWARM_WORKERS = 6
 _USER_AGENT = "Mozilla/5.0 (X11; Linux aarch64) USV-OfflineMap/1.0"
 _REFERER = "https://www.amap.com/"
 
-# 瓦片字节合法性: 必须以 PNG magic 开头且长度 >100, 拒 HTML 错误页/截断包。
+# 瓦片字节合法性: 接受 PNG/JPEG magic 且长度 >100, 拒 HTML 错误页/截断包。
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+JPEG_MAGIC = b"\xff\xd8\xff"
 _MIN_TILE_BYTES = 100
 
 
 def _is_valid_tile(data):
-    """严格 PNG 校验: magic 头 + len>100。HTML 错误页虽可能 >100 但 magic 不对必拒。"""
+    """严格图片校验: PNG/JPEG magic + len>100。HTML 错误页虽可能 >100 但 magic 不对必拒。"""
     if not data:
         return False
-    return data.startswith(PNG_MAGIC) and len(data) > _MIN_TILE_BYTES
+    return (data.startswith(PNG_MAGIC) or data.startswith(JPEG_MAGIC)) and len(data) > _MIN_TILE_BYTES
 
 
 def _raw_fetch(style, z, x, y, sub, timeout):

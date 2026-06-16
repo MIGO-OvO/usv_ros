@@ -421,7 +421,7 @@ def diff_pack(pack_path, cache_dir):
     }
 
 
-def apply_delta(pack_path, cache_dir):
+def apply_delta(pack_path, cache_dir, provider=mpf.PACK_PROVIDER, logger=None):
     """校验并原子合并 (full 或 delta) 瓦片包到 cache_dir。
 
     返回 (ok: bool, summary: dict)。失败时 cache_dir 不被修改, staging 清理。
@@ -439,9 +439,9 @@ def apply_delta(pack_path, cache_dir):
     manifest = mpf.read_pack_manifest(pack_path)
     if not isinstance(manifest, dict):
         return False, {"message": "无效包: 缺少或损坏的 manifest"}
-    if manifest.get("provider") != mpf.PACK_PROVIDER:
+    if manifest.get("provider") != provider:
         return False, {"message": "底图源不匹配: 包为 %s, 本机为 %s" % (
-            manifest.get("provider"), mpf.PACK_PROVIDER)}
+            manifest.get("provider"), provider)}
     kind = mpf.manifest_kind(manifest)
 
     # cache_dir 必须存在 (即使 base 为空也应是已存在的目录)

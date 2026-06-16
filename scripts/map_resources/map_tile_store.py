@@ -121,7 +121,8 @@ PLACEHOLDER_TILE = _make_solid_png((42, 42, 42))
 #     60s, 给当前正在写入的进程留出足够富余。
 
 PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
-PNG_MIN_BYTES = 100  # 任何小于该值的 PNG 都视作不完整
+JPEG_MAGIC = b"\xff\xd8\xff"
+PNG_MIN_BYTES = 100  # 任何小于该值的瓦片图片都视作不完整
 
 # 包内 relpath 前缀; 与 map_pack_format.TILE_PREFIX 形式保持一致, 但物理
 # 上不引该模块, 避免反向依赖。
@@ -174,15 +175,15 @@ def tile_disk_path(root, key):
 
 
 def verify_tile_bytes(data):
-    """PNG 字节合法性快速校验。
+    """瓦片图片字节合法性快速校验。
 
-    通过判据: 非空 + 以 PNG magic 开头 + 长度 > PNG_MIN_BYTES。
-    用于过滤 HTML 错误页、JSON 错误体、传输截断等非 PNG 响应,
+    通过判据: 非空 + 以 PNG/JPEG magic 开头 + 长度 > PNG_MIN_BYTES。
+    用于过滤 HTML 错误页、JSON 错误体、传输截断等非图片响应,
     避免污染瓦片缓存。
     """
     if not data:
         return False
-    if not data.startswith(PNG_MAGIC):
+    if not (data.startswith(PNG_MAGIC) or data.startswith(JPEG_MAGIC)):
         return False
     return len(data) > PNG_MIN_BYTES
 

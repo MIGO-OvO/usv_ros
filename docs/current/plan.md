@@ -18,9 +18,9 @@ Updated: 2026-05-31T06:30:00+08:00
 - 运行时降级: 新增手动"离线模式"开关, 开启后 `get_tile(allow_remote=False)` 跳过回源, 消除弱网 8s 超时卡顿; 状态持久化到 map 配置。
 
 ### 影响文件 (估算)
-- `scripts/map_pack_export.py` (新增, ~120 行): 复用 `map_tile_cache.py` 的 `enumerate_tiles`/端点/下载; 默认下载, `--from-cache` 导出现有缓存; 产出 tar+manifest。
-- `scripts/map_pack_import.py` (新增, ~100 行): 校验 manifest -> 临时解压 -> 原子合并 -> 摘要。
-- `scripts/map_tile_cache.py` (改, ~+30 行): 抽出可复用的下载/枚举供 CLI 调用; `get_tile` 接入离线模式; 新增 import_pack/export_pack 辅助(供 Web 复用)。
+- `scripts/map_resources/map_pack_export.py` (新增, ~120 行): 复用 `map_tile_cache.py` 的 `enumerate_tiles`/端点/下载; 默认下载, `--from-cache` 导出现有缓存; 产出 tar+manifest。
+- `scripts/map_resources/map_pack_import.py` (新增, ~100 行): 校验 manifest -> 临时解压 -> 原子合并 -> 摘要。
+- `scripts/map_resources/map_tile_cache.py` (改, ~+30 行): 抽出可复用的下载/枚举供 CLI 调用; `get_tile` 接入离线模式; 新增 import_pack/export_pack 辅助(供 Web 复用)。
 - `scripts/web_config_server.py` (改, ~+60 行): `/api/map/cache/import`(上传包) + `/api/map/offline-mode`(读写开关); map 配置新增 `offline_mode` 字段。
 - `frontend/src/pages/Map.tsx` (改, ~+50 行): "导入离线包"上传按钮 + 摘要展示; "离线模式"开关。
 

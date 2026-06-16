@@ -28,12 +28,14 @@ from unittest import mock
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
+MAP_RESOURCES_DIR = SCRIPTS_DIR / "map_resources"
 
 
 def _ensure_scripts_on_path():
-    p = str(SCRIPTS_DIR)
-    if p not in sys.path:
-        sys.path.insert(0, p)
+    for path in (SCRIPTS_DIR, MAP_RESOURCES_DIR):
+        p = str(path)
+        if p not in sys.path:
+            sys.path.insert(0, p)
 
 
 def _fresh_import(name):
@@ -158,7 +160,7 @@ class SweepOrphanTmpTests(unittest.TestCase):
 
 
 class VerifyTileBytesTests(unittest.TestCase):
-    """EF-04 + EF-14: verify_tile_bytes 必须拒绝非 PNG / 截断, 接受真实 PNG。"""
+    """EF-04 + EF-14: verify_tile_bytes 拒绝非图片/截断, 接受 PNG/JPEG。"""
 
     def setUp(self):
         self.mts = _fresh_import("map_tile_store")
@@ -183,6 +185,10 @@ class VerifyTileBytesTests(unittest.TestCase):
         png = self.mts.PLACEHOLDER_TILE
         self.assertTrue(self.mts.verify_tile_bytes(png))
         self.assertGreater(len(png), 100)
+
+    def test_accepts_real_jpeg(self):
+        jpeg = b"\xff\xd8\xff" + b"0" * 200
+        self.assertTrue(self.mts.verify_tile_bytes(jpeg))
 
     def test_rejects_long_non_png_blob(self):
         # 长度 >100 但 magic 错: 仍必须拒

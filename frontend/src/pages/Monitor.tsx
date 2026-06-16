@@ -57,6 +57,13 @@ function computeAdaptiveDomain(values: number[], fallback: [number, number], min
   return [min, max]
 }
 
+function formatChartNumber(value: number | string | undefined): string {
+  const numeric = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(numeric) ? Number.parseFloat(numeric.toPrecision(4)).toString() : String(value ?? '')
+}
+
+const formatChartTooltip = (value: number | string | undefined) => formatChartNumber(value)
+
 export default function Monitor() {
   const socket = useAppStore((state) => state.socket)
   const connected = useAppStore((state) => state.connected)
@@ -159,14 +166,15 @@ export default function Monitor() {
       : 'text-emerald-500'
 
   return (
-    <div className="p-4 md:p-8 space-y-6 max-w-7xl mx-auto">
+    <div className="max-w-7xl mx-auto space-y-6 overflow-x-hidden p-4 md:p-8">
       <header className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
-            <h1 className="text-3xl font-bold tracking-tight">系统监控</h1>
+            <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">系统监控</h1>
             <p className="text-muted-foreground">实时遥测数据与系统状态</p>
         </div>
-        <div className="flex items-center gap-3">
+        <div className="flex w-full min-w-0 flex-wrap items-center gap-2 sm:gap-3 md:w-auto md:justify-end">
              <Button
+               className="shrink-0"
                size="sm"
                variant="outline"
                onClick={() => handleSpectrometerCommand('start')}
@@ -175,6 +183,7 @@ export default function Monitor() {
                <Play className="w-4 h-4 mr-2" />开始分光
              </Button>
              <Button
+               className="shrink-0"
                size="sm"
                variant="secondary"
                onClick={() => handleSpectrometerCommand('stop')}
@@ -183,6 +192,7 @@ export default function Monitor() {
                <Square className="w-4 h-4 mr-2" />停止分光
              </Button>
              <Button
+               className="shrink-0"
                size="sm"
                variant="outline"
                onClick={handleSetSpectrometerBaseline}
@@ -190,12 +200,12 @@ export default function Monitor() {
              >
                <Target className="w-4 h-4 mr-2" />设定基线
              </Button>
-             <div className={cn("px-3 py-1 rounded-full text-xs font-medium border flex items-center gap-2",
+             <div className={cn("flex shrink-0 items-center gap-2 rounded-full border px-3 py-1 text-xs font-medium whitespace-nowrap",
                 connected ? "bg-emerald-500/10 text-emerald-500 border-emerald-500/20" : "bg-red-500/10 text-red-500 border-red-500/20")}>
                 <div className={cn("w-2 h-2 rounded-full", connected ? "bg-emerald-500" : "bg-red-500")} />
                 {connected ? "已连接" : "未连接"}
              </div>
-             <div className={cn("px-3 py-1 rounded-full text-xs font-medium border flex items-center gap-2",
+             <div className={cn("flex shrink-0 items-center gap-2 rounded-full border px-3 py-1 text-xs font-medium whitespace-nowrap",
                 pumpConnected ? "bg-blue-500/10 text-blue-500 border-blue-500/20" : "bg-orange-500/10 text-orange-500 border-orange-500/20")}>
                 <Zap className="w-3 h-3" />
                 {pumpConnected ? "泵组在线" : "泵组离线"}
@@ -204,8 +214,8 @@ export default function Monitor() {
       </header>
 
       {/* Status Summary Cards */}
-      <div className="grid grid-cols-2 lg:grid-cols-4 gap-4">
-        <Card className="bg-card/50 backdrop-blur-sm">
+      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-4">
+        <Card className="min-w-0 bg-card/50 backdrop-blur-sm">
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                 <CardTitle className="text-sm font-medium">分光计电压</CardTitle>
                 <Activity className="h-4 w-4 text-muted-foreground" />
@@ -220,7 +230,7 @@ export default function Monitor() {
             </CardContent>
         </Card>
 
-        <Card className="bg-card/50 backdrop-blur-sm">
+        <Card className="min-w-0 bg-card/50 backdrop-blur-sm">
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                 <CardTitle className="text-sm font-medium">吸光度</CardTitle>
                 <Activity className="h-4 w-4 text-muted-foreground" />
@@ -236,7 +246,7 @@ export default function Monitor() {
           const info = MISSION_STATUS_MAP[parsed.state] ?? { label: parsed.state, color: 'text-muted-foreground', icon: Square }
           const StatusIcon = info.icon
           return (
-            <Card className="bg-card/50 backdrop-blur-sm">
+            <Card className="min-w-0 bg-card/50 backdrop-blur-sm">
               <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                 <CardTitle className="text-sm font-medium">任务阶段</CardTitle>
                 <StatusIcon className={cn("h-4 w-4", info.color)} />
@@ -251,7 +261,7 @@ export default function Monitor() {
           )
         })()}
 
-        <Card className="bg-card/50 backdrop-blur-sm">
+        <Card className="min-w-0 bg-card/50 backdrop-blur-sm">
             <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                  <CardTitle className="text-sm font-medium">泵组角度</CardTitle>
             </CardHeader>
@@ -259,9 +269,9 @@ export default function Monitor() {
               <div className={cn("mb-2 text-xs font-medium", angleStatusClass)}>{angleStatusLabel}</div>
               <div className="grid grid-cols-4 gap-1">
                 {Object.entries(pumpAngles).map(([axis, angle]) => (
-                    <div key={axis} className="text-center">
+                    <div key={axis} className="min-w-0 text-center">
                         <div className="text-xs text-muted-foreground">{axis}</div>
-                        <div className="text-sm font-mono font-semibold">{angle.toFixed(1)}°</div>
+                        <div className="font-mono text-xs font-semibold sm:text-sm">{angle.toFixed(1)}°</div>
                     </div>
                 ))}
               </div>
@@ -274,22 +284,23 @@ export default function Monitor() {
       </div>
 
       {/* Charts Row */}
-      <div className="grid grid-cols-1 xl:grid-cols-3 gap-6">
-        <div className="xl:col-span-2 space-y-6">
+      <div className="grid min-w-0 grid-cols-1 gap-6 xl:grid-cols-3">
+        <div className="min-w-0 space-y-6 xl:col-span-2">
           {/* Voltage Chart */}
-          <Card className="h-[280px] flex flex-col">
+          <Card className="flex h-[280px] min-w-0 flex-col overflow-hidden">
              <CardHeader className="pb-2">
                 <CardTitle className="text-base">分光计电压</CardTitle>
              </CardHeader>
-             <CardContent className="flex-1 min-h-0">
+             <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden">
                 <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={voltageHistory}>
                         <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" opacity={0.4} />
                         <XAxis dataKey="time" stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} />
                         <YAxis stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} domain={voltageDomain}
                                allowDataOverflow
+                               tickFormatter={formatChartNumber}
                                label={{ value: 'V', angle: -90, position: 'insideLeft', style: { fill: 'hsl(var(--muted-foreground))', fontSize: 11 } }} />
-                        <Tooltip contentStyle={tooltipStyle} />
+                        <Tooltip contentStyle={tooltipStyle} formatter={formatChartTooltip} />
                         <Line type="monotone" dataKey="voltage" name="电压" stroke="hsl(var(--chart-1))" strokeWidth={2} dot={false} isAnimationActive={false} />
                     </LineChart>
                 </ResponsiveContainer>
@@ -297,19 +308,20 @@ export default function Monitor() {
           </Card>
 
           {/* Absorbance Chart */}
-          <Card className="h-[280px] flex flex-col">
+          <Card className="flex h-[280px] min-w-0 flex-col overflow-hidden">
              <CardHeader className="pb-2">
                 <CardTitle className="text-base">吸光度曲线</CardTitle>
              </CardHeader>
-             <CardContent className="flex-1 min-h-0">
+             <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden">
                 <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={voltageHistory}>
                         <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" opacity={0.4} />
                         <XAxis dataKey="time" stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} />
                         <YAxis stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} domain={absorbanceDomain}
                                allowDataOverflow
+                               tickFormatter={formatChartNumber}
                                label={{ value: 'Abs', angle: -90, position: 'insideLeft', style: { fill: 'hsl(var(--muted-foreground))', fontSize: 11 } }} />
-                        <Tooltip contentStyle={tooltipStyle} />
+                        <Tooltip contentStyle={tooltipStyle} formatter={formatChartTooltip} />
                         <Line type="monotone" dataKey="absorbance" name="吸光度" stroke="hsl(var(--chart-2))" strokeWidth={2} dot={false} isAnimationActive={false} />
                     </LineChart>
                 </ResponsiveContainer>
@@ -317,12 +329,12 @@ export default function Monitor() {
           </Card>
 
           {/* PID Errors as Text */}
-          <Card>
+          <Card className="min-w-0">
              <CardHeader className="pb-2">
                 <CardTitle className="text-base">PID 误差</CardTitle>
              </CardHeader>
              <CardContent>
-                <div className="grid grid-cols-4 gap-4">
+                <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 sm:gap-4">
                   {(['X', 'Y', 'Z', 'A'] as const).map((axis) => {
                     const err = pidErrors[axis] ?? 0
                     const absErr = Math.abs(err)
@@ -349,7 +361,7 @@ export default function Monitor() {
           </Card>
         </div>
 
-        <div className="xl:col-span-1 space-y-6">
+        <div className="min-w-0 space-y-6 xl:col-span-1">
           <InjectionPumpCard />
           <SystemHealthCard />
           <LinkDiagnosticsCard />

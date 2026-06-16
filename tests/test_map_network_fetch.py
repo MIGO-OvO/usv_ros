@@ -25,12 +25,14 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
+MAP_RESOURCES_DIR = SCRIPTS_DIR / "map_resources"
 
 
 def _ensure_scripts_on_path():
-    p = str(SCRIPTS_DIR)
-    if p not in sys.path:
-        sys.path.insert(0, p)
+    for path in (SCRIPTS_DIR, MAP_RESOURCES_DIR):
+        p = str(path)
+        if p not in sys.path:
+            sys.path.insert(0, p)
 
 
 def _fresh_import(name):
@@ -40,19 +42,25 @@ def _fresh_import(name):
     return importlib.import_module(name)
 
 
-# 与 map_tile_store.PNG_MAGIC 保持一致, 测试不依赖具体模块导入顺序
+# 与 map_tile_store magic 常量保持一致, 测试不依赖具体模块导入顺序
 _PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+_JPEG_MAGIC = b"\xff\xd8\xff"
 _VALID_PNG = _PNG_MAGIC + b"0" * 200
+_VALID_JPEG = _JPEG_MAGIC + b"0" * 200
 
 
 class IsValidTileTests(unittest.TestCase):
-    """_is_valid_tile 必须严格按 PNG magic + 最小长度判定。"""
+    """_is_valid_tile 必须按 PNG/JPEG magic + 最小长度判定。"""
 
     def setUp(self):
         self.mnf = _fresh_import("map_network_fetch")
 
     def test_accepts_real_png(self):
         self.assertTrue(self.mnf._is_valid_tile(_VALID_PNG))
+
+    def test_accepts_real_jpeg(self):
+        self.assertTrue(self.mnf._is_valid_tile(_VALID_JPEG))
+
 
     def test_rejects_html_blob(self):
         html = b"<html><head><title>err</title></head>" + b"x" * 200

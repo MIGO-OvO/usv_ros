@@ -24,15 +24,17 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS_DIR = REPO_ROOT / "scripts"
+MAP_RESOURCES_DIR = SCRIPTS_DIR / "map_resources"
 
 # 一字节 PNG 头 + 占位字节, 便于哈希时区分内容
 _PNG_HEAD = b"\x89PNG\r\n\x1a\n"
 
 
 def _ensure_scripts_on_path():
-    p = str(SCRIPTS_DIR)
-    if p not in sys.path:
-        sys.path.insert(0, p)
+    for path in (SCRIPTS_DIR, MAP_RESOURCES_DIR):
+        p = str(path)
+        if p not in sys.path:
+            sys.path.insert(0, p)
 
 
 def _fresh_import(name):

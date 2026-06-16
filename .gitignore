@@ -28,5 +28,10 @@ yarn-error.log
 *.swp
 *.swo
 
+
+# Offline map resources
+.map_packs/
+*.work/
+
 # Exceptions (Allow static dist for deployment)
 !static/dist/

@@ -28,7 +28,7 @@ from __future__ import print_function
 import argparse
 import os
 import sys
-import tempfile
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 # 允许从脚本同目录导入 map_tile_cache
@@ -48,35 +48,65 @@ def _download_to_root(tiles_root, bbox, zoom_min, zoom_max, styles, workers):
         print("范围过大(%d 张), 请缩小区域或降低层级" % total, file=sys.stderr)
         sys.exit(2)
     print("待下载瓦片: %d 张 (z%d-%d)" % (total, zoom_min, zoom_max))
-    counter = {"ok": 0, "fail": 0, "n": 0}
+    counter = {
+        "cached": 0, "downloaded": 0, "timeout": 0,
+        "invalid": 0, "write_failed": 0, "n": 0, "retried": 0,
+    }
+    sub_state = {"idx": 0}
+    sub_lock = threading.Lock()
+
+    def _next_sub():
+        with sub_lock:
+            sub_state["idx"] = (sub_state["idx"] % 4) + 1
+            return sub_state["idx"]
 
     def _one(task):
         style, z, x, y = task
         dst = os.path.join(tiles_root, style, str(z), str(x), "%d.png" % y)
         if os.path.isfile(dst):
-            return True
-        sub = (counter["n"] % 4) + 1
-        data = mtc.fetch_tile(style, z, x, y, sub)
-        if not data:
-            return False
+            try:
+                with open(dst, "rb") as f:
+                    if mtc.verify_tile_bytes(f.read()):
+                        return "cached", 0
+                os.remove(dst)
+            except OSError:
+                return "write_failed", 0
+        result = mtc.fetch_tile_resilient(
+            style, z, x, y, sub_picker=_next_sub, max_attempts=5,
+            base_delay=0.2, max_delay=2.0)
+        if result.status != "ok" or not mtc.verify_tile_bytes(result.data):
+            return result.status, max(0, int(result.attempts) - 1)
         try:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
-            with open(dst, "wb") as f:
-                f.write(data)
-            return True
+            tmp = dst + ".tmp"
+            with open(tmp, "wb") as f:
+                f.write(result.data)
+            os.replace(tmp, dst)
+            return "downloaded", max(0, int(result.attempts) - 1)
         except OSError:
-            return False
+            return "write_failed", max(0, int(result.attempts) - 1)
 
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        for ok in pool.map(_one, tasks):
+        for status, retried in pool.map(_one, tasks):
             counter["n"] += 1
-            counter["ok" if ok else "fail"] += 1
+            counter["retried"] += retried
+            if status in counter:
+                counter[status] += 1
+            else:
+                counter["timeout"] += 1
             if counter["n"] % 200 == 0 or counter["n"] == total:
-                sys.stdout.write("\r进度: %d/%d (失败 %d)" % (
-                    counter["n"], total, counter["fail"]))
+                fail = counter["timeout"] + counter["invalid"] + counter["write_failed"]
+                sys.stdout.write(
+                    "\r进度: %d/%d (缓存 %d 下载 %d 失败 %d 重试 %d)" % (
+                        counter["n"], total, counter["cached"],
+                        counter["downloaded"], fail, counter["retried"]))
                 sys.stdout.flush()
     print()
-    return counter["ok"], counter["fail"]
+    fail = counter["timeout"] + counter["invalid"] + counter["write_failed"]
+    if fail:
+        print("失败分类: timeout=%d invalid=%d write_failed=%d" % (
+            counter["timeout"], counter["invalid"], counter["write_failed"]))
+    return counter["cached"] + counter["downloaded"], fail
 
 
 def _prompt_text(label, default):
@@ -141,7 +171,7 @@ def _fill_interactive_args(args):
     if not args.from_cache:
         args.bbox = args.bbox or _prompt_bbox(DEFAULT_INTERACTIVE_BBOX)
         bbox = (args.bbox[0], args.bbox[1], args.bbox[2], args.bbox[3])
-        _tasks, total = mtc.enumerate_tiles(bbox, args.zoom_min, args.zoom_max, args.styles)
+        _, total = mtc.enumerate_tiles(bbox, args.zoom_min, args.zoom_max, args.styles)
         print("预计下载瓦片: %d 张 (z%d-z%d)" % (total, args.zoom_min, args.zoom_max))
         confirm = _prompt_text("开始下载并打包? y/n", "y").lower()
         if confirm not in ("y", "yes"):
@@ -161,6 +191,8 @@ def main(argv=None):
     parser.add_argument("--workers", type=int, default=mtc.PREWARM_WORKERS)
     parser.add_argument("--from-cache", metavar="DIR",
                         help="跳过下载, 直接打包该缓存目录")
+    parser.add_argument("--work-dir", metavar="DIR",
+                        help="下载模式断点缓存目录; 默认 <out去后缀>.work")
     parser.add_argument("-i", "--interactive", action="store_true",
                         help="交互式问询输出路径、经纬度范围和缩放级别")
     args = parser.parse_args(argv)
@@ -193,21 +225,22 @@ def main(argv=None):
             print("下载模式需提供 --bbox W S E N", file=sys.stderr)
             return 2
         bbox = (args.bbox[0], args.bbox[1], args.bbox[2], args.bbox[3])
-        tmp = tempfile.mkdtemp(prefix="usv_mapexport_")
-        try:
-            tiles_root = os.path.join(tmp, mtc.TILE_PREFIX)
-            os.makedirs(tiles_root, exist_ok=True)
-            ok, fail = _download_to_root(
-                tiles_root, bbox, zoom_min, zoom_max, args.styles, args.workers)
-            if ok == 0:
-                print("未下载到任何瓦片, 中止打包", file=sys.stderr)
-                return 1
-            manifest = mtc.build_manifest(tiles_root, bbox, zoom_min, zoom_max, args.styles)
-            mtc.create_pack(tiles_root, args.out, manifest)
-            print("下载成功 %d 张, 失败 %d 张" % (ok, fail))
-        finally:
-            import shutil
-            shutil.rmtree(tmp, ignore_errors=True)
+        out_abs = os.path.abspath(os.path.expanduser(args.out))
+        work_root = os.path.abspath(os.path.expanduser(
+            args.work_dir or (os.path.splitext(out_abs)[0] + ".work")))
+        tiles_root = os.path.join(work_root, mtc.TILE_PREFIX)
+        os.makedirs(tiles_root, exist_ok=True)
+        print("断点缓存目录: %s" % work_root)
+        ok, fail = _download_to_root(
+            tiles_root, bbox, zoom_min, zoom_max, args.styles, args.workers)
+        if ok == 0:
+            print("未下载到任何瓦片, 中止打包", file=sys.stderr)
+            return 1
+        manifest = mtc.build_manifest(tiles_root, bbox, zoom_min, zoom_max, args.styles)
+        os.makedirs(os.path.dirname(out_abs) or ".", exist_ok=True)
+        mtc.create_pack(tiles_root, out_abs, manifest)
+        args.out = out_abs
+        print("可用瓦片 %d 张, 本轮失败 %d 张" % (ok, fail))
 
     size_mb = os.path.getsize(args.out) / 1048576.0
     print("已生成包: %s (%d 张, %.1f MB)" % (

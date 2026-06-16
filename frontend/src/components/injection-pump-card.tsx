@@ -55,9 +55,9 @@ export function InjectionPumpCard() {
   }
 
   return (
-    <Card className="bg-card/50 backdrop-blur-sm border-border/60 shadow-sm">
+    <Card className="min-w-0 bg-card/50 backdrop-blur-sm border-border/60 shadow-sm">
       <CardHeader className="pb-3">
-        <CardTitle className="flex items-center justify-between gap-3 text-base">
+        <CardTitle className="flex flex-wrap items-center justify-between gap-3 text-base">
           <span className="flex items-center gap-2">
             <Droplets className="w-4 h-4 text-cyan-500" />
             进样泵控制
@@ -68,7 +68,7 @@ export function InjectionPumpCard() {
         </CardTitle>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
           <div className="rounded-lg border border-border/60 bg-background/60 p-3">
             <div className="flex items-center gap-2 text-xs text-muted-foreground mb-1">
               <Gauge className="w-3.5 h-3.5" /> 当前转速
@@ -85,7 +85,7 @@ export function InjectionPumpCard() {
 
         <div className="space-y-2">
           <Label htmlFor="injection-pump-speed">目标转速 (%)</Label>
-          <div className="flex gap-2">
+          <div className="flex flex-col gap-2 sm:flex-row">
             <Input
               id="injection-pump-speed"
               type="number"
@@ -95,13 +95,13 @@ export function InjectionPumpCard() {
               onChange={(e) => setSpeedInput(e.target.value)}
               className="font-mono"
             />
-            <Button variant="outline" onClick={handleSetSpeed} disabled={submitting}>
+            <Button className="w-full sm:w-auto" variant="outline" onClick={handleSetSpeed} disabled={submitting}>
               设置转速
             </Button>
           </div>
         </div>
 
-        <div className="grid grid-cols-3 gap-2">
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
           <Button onClick={handleTurnOn} disabled={submitting}>
             开启
           </Button>

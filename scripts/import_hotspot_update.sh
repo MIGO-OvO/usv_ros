@@ -96,7 +96,7 @@ git -C "$PKG_DIR" fetch "$BUNDLE_PATH" "+HEAD:$REMOTE_REF"
 log_import "merge --ff-only $REMOTE_REF"
 git -C "$PKG_DIR" merge --ff-only "$REMOTE_REF"
 
-chmod +x "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/*.py || true
+chmod +x "$SCRIPT_DIR"/*.sh "$SCRIPT_DIR"/*.py "$SCRIPT_DIR"/map_resources/*.sh "$SCRIPT_DIR"/map_resources/*.py || true
 
 if [[ "$DO_BUILD" == "true" ]]; then
     ensure_file "$ROS_SETUP" "Install ROS Noetic before building."
