@@ -221,6 +221,7 @@ class MAVLinkTriggerNode(object):
         self.spectrometer_command_pub = rospy.Publisher('/usv/spectrometer_command', String, queue_size=10)
         # 实验模拟数据源: 伪造分光电压注入真实通路, 与真实设备数据格式一致
         self.spectrometer_voltage_pub = rospy.Publisher('/usv/spectrometer_voltage', String, queue_size=10)
+        self.lab_command_pub = rospy.Publisher('/usv/lab_sim/command', String, queue_size=5)
         self.cmd_ack_pub = rospy.Publisher('/usv/mavlink_cmd_ack', Float32MultiArray, queue_size=10)
 
         # Subscribers
@@ -473,20 +474,24 @@ class MAVLinkTriggerNode(object):
             center = (lab.get('mission', {}) or {}).get('center', {})
             if isinstance(center, dict) and center.get('lat') is not None:
                 src = (float(center['lat']), float(center['lng']))
-        ref_v = float(pollution.get('reference_voltage', 3.0) or 3.0)
-        radius = max(1.0, float(pollution.get('radius_m', 150.0) or 150.0))
-        strength = min(1.0, max(0.0, float(pollution.get('strength', 0.8) or 0.8)))
-        ratio = 0.0
+        ref_v = _float_or_default(pollution.get('reference_voltage', 3.0), 3.0)
+        radius = max(1.0, _float_or_default(pollution.get('radius_m', 150.0), 150.0))
+        strength = min(1.0, max(0.0, _float_or_default(pollution.get('strength', 0.8), 0.8)))
+        value_min = _float_or_default(pollution.get('value_min', 0.0), 0.0)
+        value_max = _float_or_default(pollution.get('value_max', 1.0), 1.0)
+        intensity = 0.0
         if src is not None and lat is not None and lng is not None:
             north = (float(lat) - src[0]) * 110540.0
             cos_lat = max(0.01, math.cos(math.radians(float(lat))))
             east = (float(lng) - src[1]) * 111320.0 * cos_lat
             dist = math.hypot(north, east)
-            ratio = strength * math.exp(-(dist * dist) / (2.0 * radius * radius))
-        ratio = min(0.95, max(0.0, ratio + random.uniform(-0.03, 0.03)))
-        voltage = max(0.05, ref_v * (1.0 - ratio))
+            intensity = strength * max(0.0, 1.0 - dist / radius)
+        intensity = min(1.0, max(0.0, intensity))
+        value = value_min + (value_max - value_min) * intensity
+        voltage_ratio = min(0.95, max(0.0, intensity + random.uniform(-0.03, 0.03)))
+        voltage = max(0.05, ref_v * (1.0 - voltage_ratio))
         absorbance = max(0.0, math.log10(ref_v / max(voltage, 1e-6)))
-        return round(voltage, 4), round(absorbance, 4)
+        return round(voltage, 4), round(absorbance, 4), round(value, 6)
 
     def _run_lab_sampling(self, seq, lat, lng, lab):
         """实验模式采样: 真实数据源走 automation 服务; 模拟数据源伪造电压注入。"""
@@ -510,20 +515,28 @@ class MAVLinkTriggerNode(object):
                 self._publish_status("sampling_stopped")
             return
         # 模拟数据源: 生成电压并发布到真实通路, 由 web 落入 data_points
-        voltage, absorbance = self._simulated_voltage(lat, lng, lab)
+        sim_cfg = lab.get('sim', {}) if isinstance(lab.get('sim'), dict) else {}
+        dwell_s = max(0.0, _float_or_default(sim_cfg.get('sample_dwell_s', 3.0), 3.0))
+        rospy.sleep(dwell_s)
+        voltage, absorbance, value = self._simulated_voltage(lat, lng, lab)
         payload = {
             "voltage": voltage,
             "absorbance": absorbance,
+            "value": value,
             "status": "ok",
             "waypoint_seq": seq,
             "lab_mode": True,
             "simulated": True,
+            "valid": True,
             "timestamp": time.time(),
         }
         self.spectrometer_voltage_pub.publish(String(json.dumps(payload)))
-        rospy.loginfo("Lab simulated sample wp %d: V=%.3f A=%.3f", seq, voltage, absorbance)
+        rospy.loginfo("Lab simulated sample wp %d: V=%.3f A=%.3f value=%.3f", seq, voltage, absorbance, value)
         self._set_mission_state(MissionState.SAMPLING_DONE, str(seq))
         self._publish_status("sampling_stopped")
+        if hasattr(self, "lab_command_pub"):
+            command = {"cmd": "mission_complete", "waypoint_seq": int(seq)}
+            self.lab_command_pub.publish(String(json.dumps(command)))
 
     def _handle_completion(self, success=True, reason='finished'):
         with self.state_lock:
