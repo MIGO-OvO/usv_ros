@@ -165,8 +165,10 @@ export default function Lab() {
   const mission = status.mission || fallbackStatus.mission!
   const speedLimitMps = Math.max(0, Number(config.sim.max_speed_mps) || 0)
   const liveSpeedPercent = speedPercent(status.speed_mps || 0, speedLimitMps)
+  const isCompleted = mission.completed;
   const stage = !config.mission.waypoints.length ? '未配置航点'
     : status.running ? (mission.active ? `航行中 · 目标 #${mission.target_seq ?? '-'}` : '采样中')
+    : isCompleted ? '已完成'
     : mission.reached_count >= config.mission.waypoints.length && config.mission.waypoints.length > 0 ? '已完成'
     : '就绪'
 
@@ -234,6 +236,27 @@ export default function Lab() {
                 </div>
               </div>
               <label className="flex items-center justify-between gap-3 rounded-md border p-3">
+                <span>限制水域范围 (剔除界外)</span>
+                <Switch checked={config.water_area.enabled} onCheckedChange={(enabled) => {
+                  const nextConfig = {
+                    ...config,
+                    water_area: {
+                      ...config.water_area,
+                      enabled,
+                    },
+                  }
+                  updateConfig(nextConfig)
+                  void fetch('/api/lab/water-area', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                      enabled,
+                      polygon: config.water_area.polygon,
+                    }),
+                  })
+                }} />
+              </label>
+              <label className="flex items-center justify-between gap-3 rounded-md border p-3">
                 <span>跳过 PID 角度等待</span>
                 <Switch checked={config.bypass_pid_wait} onCheckedChange={(bypass_pid_wait) => updateConfig({ bypass_pid_wait })} />
               </label>
@@ -274,6 +297,10 @@ export default function Lab() {
 
               <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
                 <div className="space-y-2">
+                  <Label>采样停留(秒)</Label>
+                  <Input type="number" min={0} max={600} step={0.5} value={config.sim.sample_dwell_s} onChange={(e) => updateSim('sample_dwell_s', e.target.value)} />
+                </div>
+                <div className="space-y-2">
                   <Label>航向</Label>
                   <Input type="number" min={0} max={360} step={1} value={config.sim.heading_deg} onChange={(e) => updateSim('heading_deg', e.target.value)} />
                 </div>
@@ -302,6 +329,16 @@ export default function Lab() {
                       </Button>
                     ))}
                   </div>
+                </div>
+                <div className="space-y-2">
+                  <Label>模拟污染下限</Label>
+                  <Input type="number" step="0.1" value={config.pollution.value_min}
+                    onChange={(e) => updatePollution({ value_min: Number(e.target.value) || 0 })} />
+                </div>
+                <div className="space-y-2">
+                  <Label>模拟污染上限</Label>
+                  <Input type="number" step="0.1" value={config.pollution.value_max}
+                    onChange={(e) => updatePollution({ value_max: Number(e.target.value) || 0 })} />
                 </div>
                 <div className="space-y-2">
                   <Label>扩散半径(m)</Label>
@@ -345,6 +382,24 @@ export default function Lab() {
                   <div className="text-muted-foreground">到达进度</div>
                   <div className="font-medium">{mission.reached_count}/{config.mission.waypoints.length}</div>
                 </div>
+                <div className="rounded-md border p-3">
+                  <div className="text-muted-foreground">任务状态</div>
+                  <div className="font-medium">
+                    {isCompleted ? (
+                      <span className="inline-flex items-center rounded-full bg-emerald-50 px-2 py-1 text-xs font-medium text-emerald-700 ring-1 ring-inset ring-emerald-600/20">
+                        已完成
+                      </span>
+                    ) : status.running ? (
+                      <span className="inline-flex items-center rounded-full bg-blue-50 px-2 py-1 text-xs font-medium text-blue-700 ring-1 ring-inset ring-blue-700/10 animate-pulse">
+                        进行中
+                      </span>
+                    ) : (
+                      <span className="inline-flex items-center rounded-full bg-gray-50 px-2 py-1 text-xs font-medium text-gray-600 ring-1 ring-inset ring-gray-500/10">
+                        未开始
+                      </span>
+                    )}
+                  </div>
+                </div>
               </div>
               <div className="rounded-md border p-3 space-y-2">
                 <div className="flex justify-between text-sm">
@@ -384,6 +439,10 @@ export default function Lab() {
                   onClick={() => setDrawMode((m) => (m === 'waypoint' ? '' : 'waypoint'))}>
                   <MapPin className="w-4 h-4 mr-1" />画航点
                 </Button>
+                <Button size="sm" variant={drawMode === 'water_area' ? 'default' : 'outline'}
+                  onClick={() => setDrawMode((m) => (m === 'water_area' ? '' : 'water_area'))}>
+                  <MapPin className="w-4 h-4 mr-1 text-emerald-500" />画水域
+                </Button>
                 <Button size="sm" variant={drawMode === 'source' ? 'default' : 'outline'}
                   onClick={() => setDrawMode((m) => (m === 'source' ? '' : 'source'))}>
                   <Crosshair className="w-4 h-4 mr-1" />放污染源
@@ -394,8 +453,32 @@ export default function Lab() {
                 <Button size="sm" variant="outline" onClick={() => run('import', importQgc)} disabled={!!pending}>
                   <Download className="w-4 h-4 mr-1" />导入QGC
                 </Button>
+                <Button size="sm" variant="outline" onClick={async () => {
+                  const nextConfig = {
+                    ...config,
+                    water_area: {
+                      enabled: config.water_area.enabled,
+                      polygon: [],
+                    },
+                  }
+                  setConfig(nextConfig)
+                  try {
+                    await fetch('/api/lab/water-area', {
+                      method: 'POST',
+                      headers: { 'Content-Type': 'application/json' },
+                      body: JSON.stringify({
+                        enabled: config.water_area.enabled,
+                        polygon: [],
+                      }),
+                    })
+                  } catch (e) {
+                    console.error(e)
+                  }
+                }}>
+                  <Trash2 className="w-4 h-4 mr-1 text-emerald-500" />清空水域
+                </Button>
                 <Button size="sm" variant="outline" onClick={clearWaypoints}>
-                  <Trash2 className="w-4 h-4 mr-1" />清空
+                  <Trash2 className="w-4 h-4 mr-1" />清空航点
                 </Button>
               </div>
             </CardTitle>
