@@ -151,6 +151,8 @@ class LabSimulator(object):
             return self.snapshot()
         self._mission_completed = bool(self.waypoints and self.target_idx >= len(self.waypoints))
         self.mission_active = False
+        if self._mission_completed:
+            self.running = False
         self.speed_mps = 0.0
         self.left_output = self.right_output = 0.0
         return self.snapshot()

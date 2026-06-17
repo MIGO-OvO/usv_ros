@@ -2049,6 +2049,66 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertAlmostEqual(live["position"]["gcj02"]["lat"], 25.314167)
         self.assertEqual(live["lab_status"]["mission"]["target_seq"], 1)
 
+    def test_web_lab_status_exposes_completion_sampling_progress_and_signal(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_lab_visibility_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=True)
+            client = server.app.test_client()
+            client.post("/api/lab/config", json={
+                "enabled": True,
+                "data_source": "simulated",
+                "sim": {"sample_dwell_s": 4.5},
+            })
+
+            server._lab_sim_status_cb(string_cls(json.dumps({
+                "running": False,
+                "lat": 25.314167,
+                "lng": 110.412778,
+                "mission": {
+                    "active": False,
+                    "total": 2,
+                    "target_seq": None,
+                    "reached_count": 2,
+                    "completed": True,
+                    "waiting_sampling_done": False,
+                },
+            })))
+            server._mission_status_cb(string_cls("SAMPLING_DONE:2"))
+            server._trigger_status_cb(string_cls("sampling_started"))
+            active_resp = client.get("/api/lab/status")
+            server._voltage_cb(string_cls(json.dumps({
+                "voltage": 1.2,
+                "absorbance": 0.3,
+                "value": 0.8,
+                "waypoint_seq": 2,
+                "lab_mode": True,
+                "simulated": True,
+                "valid": True,
+            })))
+            server._trigger_status_cb(string_cls("sampling_stopped"))
+            done_resp = client.get("/api/lab/status")
+
+        active_status = active_resp.get_json()["data"]["status"]
+        done_status = done_resp.get_json()["data"]["status"]
+        self.assertTrue(active_status["sampling"]["active"])
+        self.assertEqual(active_status["sampling"]["duration_s"], 4.5)
+        self.assertTrue(done_status["mission"]["completed"])
+        self.assertFalse(done_status["sampling"]["active"])
+        self.assertEqual(done_status["sampling"]["progress_percent"], 100.0)
+        self.assertEqual(done_status["signal"]["value"], 1.2)
+        self.assertEqual(done_status["signal"]["raw"]["waypoint_seq"], 2)
+
     def test_web_lab_start_publishes_atomic_reset_and_mission_start_command(self):
         module, publishers, _ = _load_script(
             "web_config_server_lab_start_command_test",

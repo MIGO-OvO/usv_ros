@@ -1511,7 +1511,14 @@ class WebConfigServer(object):
             "position_source": "lab_sim",
             "speed_mps": 0.0,
             "heading_deg": 0.0,
-            "mission": {"active": False, "total": 0, "target_seq": None, "reached_count": 0},
+            "mission": {
+                "active": False,
+                "total": 0,
+                "target_seq": None,
+                "reached_count": 0,
+                "completed": False,
+                "waiting_sampling_done": False,
+            },
             "virtual_propulsion": {"left": 0.0, "right": 0.0, "real_output_enabled": False},
         }
         self.data_recording_source = None
@@ -1991,6 +1998,56 @@ class WebConfigServer(object):
     def _current_lab_config(self):
         return normalize_lab_config(self.config_manager.get().get("lab_mode", {}))
 
+    def _lab_sampling_snapshot(self, lab_config):
+        raw_status = str(self.latest_trigger_status.get("status", "") or "")
+        status_lower = raw_status.lower()
+        started_at = self.latest_trigger_status.get("received_at")
+        sim_cfg = lab_config.get("sim", {}) if isinstance(lab_config.get("sim"), dict) else {}
+        duration_s = max(0.0, float(sim_cfg.get("sample_dwell_s", 0.0) or 0.0))
+        active = "sampling_started" in status_lower and self.automation_running
+        elapsed_s = 0.0
+        if active and started_at:
+            try:
+                elapsed_s = max(0.0, (datetime.now() - datetime.fromisoformat(started_at)).total_seconds())
+            except ValueError:
+                elapsed_s = 0.0
+        progress = 100.0 if "sampling_stopped" in status_lower else 0.0
+        if active and duration_s > 0:
+            progress = min(99.0, max(0.0, (elapsed_s / duration_s) * 100.0))
+        remaining_s = max(0.0, duration_s - elapsed_s) if active and duration_s > 0 else 0.0
+        return {
+            "active": bool(active),
+            "status": raw_status,
+            "mission_status": self.mission_status,
+            "started_at": started_at,
+            "duration_s": duration_s,
+            "elapsed_s": round(elapsed_s, 3),
+            "remaining_s": round(remaining_s, 3),
+            "progress_percent": round(progress, 1),
+        }
+
+    def _lab_signal_snapshot(self):
+        raw = self.latest_spectrometer_payload if isinstance(self.latest_spectrometer_payload, dict) else {}
+        return {
+            "value": self.current_voltage,
+            "absorbance": self.current_absorbance,
+            "status": self.spectrometer_status,
+            "simulated": bool(raw.get("simulated", False)),
+            "valid": bool(raw.get("valid", False)),
+            "pollution_value": raw.get("value"),
+            "waypoint_seq": raw.get("waypoint_seq"),
+            "timestamp": raw.get("timestamp"),
+            "raw": raw,
+        }
+
+    def _lab_status_snapshot(self):
+        lab_config = self._current_lab_config()
+        status = copy.deepcopy(self.lab_status)
+        status["sampling"] = self._lab_sampling_snapshot(lab_config)
+        status["signal"] = self._lab_signal_snapshot()
+        status["trigger_status"] = dict(self.latest_trigger_status)
+        return status
+
     def _push_lab_mission(self, lab_config):
         """把实验虚拟航线下发给 lab_sim 节点 (mission 指令)。"""
         if not self.lab_sim_command_pub:
@@ -2026,6 +2083,8 @@ class WebConfigServer(object):
                 "total": int(mission.get("total", 0) or 0),
                 "target_seq": mission.get("target_seq"),
                 "reached_count": int(mission.get("reached_count", 0) or 0),
+                "completed": bool(mission.get("completed", False)),
+                "waiting_sampling_done": bool(mission.get("waiting_sampling_done", False)),
             },
             "virtual_propulsion": {
                 "left": float(virtual_propulsion.get("left", 0.0) or 0.0),
@@ -2052,7 +2111,7 @@ class WebConfigServer(object):
             if self.socketio:
                 self.socketio.emit("map_position", position)
         if self.socketio:
-            self.socketio.emit("lab_status", self.lab_status)
+            self.socketio.emit("lab_status", self._lab_status_snapshot())
 
     def _gps_cb(self, msg):
         """GPS 回调：缓存 WGS84 船位，并生成高德展示用 GCJ-02 坐标。
@@ -3230,7 +3289,7 @@ class WebConfigServer(object):
                     "mission_status": self.mission_status,
                     "automation_running": self.automation_running,
                     "lab_config": self._current_lab_config(),
-                    "lab_status": self.lab_status,
+                    "lab_status": self._lab_status_snapshot(),
                 },
             })
 
@@ -3250,7 +3309,7 @@ class WebConfigServer(object):
             return jsonify({
                 "success": True,
                 "data": self._current_lab_config(),
-                "status": self.lab_status,
+                "status": self._lab_status_snapshot(),
             })
 
         @self.app.route('/api/lab/config', methods=['POST'])
@@ -3286,7 +3345,7 @@ class WebConfigServer(object):
                 "running": True,
                 "position_source": lab_config.get("position_source", "lab_sim"),
             })
-            return jsonify({"success": True, "message": "lab simulation started", "data": self.lab_status})
+            return jsonify({"success": True, "message": "lab simulation started", "data": self._lab_status_snapshot()})
 
         @self.app.route('/api/lab/stop', methods=['POST'])
         def stop_lab_sim():
@@ -3296,7 +3355,7 @@ class WebConfigServer(object):
                 self.lab_sim_command_pub.publish(msg)
             self.lab_status["running"] = False
             self.lab_status["virtual_propulsion"] = {"left": 0.0, "right": 0.0, "real_output_enabled": False}
-            return jsonify({"success": True, "message": "lab simulation stopped", "data": self.lab_status})
+            return jsonify({"success": True, "message": "lab simulation stopped", "data": self._lab_status_snapshot()})
 
         @self.app.route('/api/lab/status', methods=['GET'])
         def get_lab_status():
@@ -3304,7 +3363,7 @@ class WebConfigServer(object):
                 "success": True,
                 "data": {
                     "config": self._current_lab_config(),
-                    "status": self.lab_status,
+                    "status": self._lab_status_snapshot(),
                     "position": self.current_position,
                     "track_points": self.live_track_points[-MAX_LIVE_TRACK_POINTS:],
                 },
