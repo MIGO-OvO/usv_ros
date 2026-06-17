@@ -1145,6 +1145,114 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(server.route_waypoints[0]["wgs84"]["lat"], 30.0)
         self.assertIn(("map_route", server.route_waypoints), server.socketio.events)
 
+    def test_web_mission_plan_upload_persists_sample_timeout(self):
+        module, _, _ = _load_script(
+            "web_config_server_mission_sample_timeout_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            client = server.app.test_client()
+
+            response = client.post("/api/mission/plan/upload", json={
+                "replace": True,
+                "sample_timeout_s": "7200",
+                "waypoints": [
+                    {"lat": 30.0, "lng": 120.0, "sample": True},
+                    {"lat": 30.001, "lng": 120.002, "sample": False},
+                ],
+            })
+            saved_config = client.get("/api/config").get_json()
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(saved_config["sampling"]["sample_timeout_s"], 3600.0)
+
+    def test_web_lab_config_round_trips_bounds_dwell_and_water_area(self):
+        module, _, _ = _load_script(
+            "web_config_server_lab_schema_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=True)
+            client = server.app.test_client()
+
+            default_lab = client.get("/api/lab/config").get_json()["data"]
+            save_resp = client.post("/api/lab/config", json={
+                "enabled": True,
+                "sim": {"sample_dwell_s": "700"},
+                "pollution": {"value_min": "-2", "value_max": "-1"},
+                "water_area": {
+                    "enabled": True,
+                    "polygon": [
+                        {"lat": 30.0, "lng": 120.0},
+                        {"lat": 30.0, "lng": 120.1},
+                        {"lat": 30.1, "lng": 120.1},
+                    ],
+                },
+            })
+            water_resp = client.get("/api/lab/water-area")
+
+        saved = save_resp.get_json()["data"]
+        self.assertEqual(default_lab["pollution"]["value_min"], 0.0)
+        self.assertEqual(default_lab["pollution"]["value_max"], 1.0)
+        self.assertEqual(default_lab["sim"]["sample_dwell_s"], 3.0)
+        self.assertEqual(default_lab["water_area"], {"enabled": False, "polygon": []})
+        self.assertEqual(save_resp.status_code, 200)
+        self.assertEqual(saved["pollution"]["value_min"], 0.0)
+        self.assertGreater(saved["pollution"]["value_max"], saved["pollution"]["value_min"])
+        self.assertEqual(saved["sim"]["sample_dwell_s"], 600.0)
+        self.assertEqual(water_resp.get_json()["data"], saved["water_area"])
+
+    def test_web_lab_simulated_voltage_records_lab_mode_and_saves_immediately(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_lab_voltage_recording_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=True)
+            server.data_manager = module.MissionDataManager(str(Path(tmpdir) / "missions"))
+            server._start_data_recording_if_needed(source="trigger")
+            mission_file = Path(server.data_manager.current_mission_file)
+
+            server.current_position = module.make_lab_position_snapshot(30.0, 120.0)
+            server.automation_running = True
+            server._voltage_cb(string_cls(json.dumps({
+                "voltage": 1.2,
+                "absorbance": 0.4,
+                "valid": True,
+                "baseline_set": True,
+            })))
+            persisted = json.loads(mission_file.read_text(encoding="utf-8"))
+
+        point = persisted["data_points"][-1]
+        self.assertTrue(point["lab_mode"])
+        self.assertEqual(point["position_source"], "lab_sim")
+        self.assertEqual(point["quality"]["position_source"], "lab_sim")
+
     def test_web_mission_plan_validate_rejects_bad_coordinate(self):
         module, _, _ = _load_script(
             "web_config_server_mission_plan_validate_test",

@@ -58,6 +58,44 @@ class PollutionMapFixtureTests(unittest.TestCase):
         self.assertEqual(surface["metric_label"], "COD")
         self.assertEqual(surface["unit"], "mg/L")
 
+    def test_water_area_masks_surface_cells_outside_polygon(self):
+        module = _load_script("web_config_server_water_area_surface_test", "scripts/web_config_server.py")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            fixture = pollution_map_fixtures.create_pollution_map_fixture(module, tmpdir)
+            server = module.WebConfigServer(standalone=True)
+            server.data_manager = module.MissionDataManager(fixture["missions_dir"])
+            client = server.app.test_client()
+            water_area = {
+                "enabled": True,
+                "polygon": [
+                    {"lat": 30.0, "lng": 120.0},
+                    {"lat": 30.0, "lng": 120.001},
+                    {"lat": 30.001, "lng": 120.0},
+                ],
+            }
+            save_resp = client.post("/api/lab/water-area", json=water_area)
+            surface_resp = client.get(
+                f"/api/data/mission/{fixture['mission_id']}/surface?metric=concentration&size=3"
+            )
+
+        surface = surface_resp.get_json()["data"]
+        kept_centers = {(round(cell["lat"], 6), round(cell["lng"], 6)) for cell in surface["grid"]}
+        self.assertEqual(save_resp.status_code, 200)
+        self.assertTrue(surface["valid"])
+        self.assertEqual(surface["water_area"], water_area)
+        self.assertEqual(surface["masked_count"], 3)
+        self.assertEqual(len(surface["grid"]), 6)
+        self.assertIn((30.0, 120.0), kept_centers)
+        self.assertNotIn((30.001, 120.001), kept_centers)
+
     def test_frontend_declares_runnable_map_smoke_script(self):
         package_path = REPO_ROOT / "frontend" / "package.json"
         package = json.loads(package_path.read_text(encoding="utf-8"))
