@@ -213,6 +213,22 @@ def make_position_snapshot(lat, lng, alt=None, timestamp=None, source="real", la
     return position
 
 
+def make_lab_position_snapshot(lat, lng, alt=None, timestamp=None):
+    lat = _to_float_or_none(lat)
+    lng = _to_float_or_none(lng)
+    if lat is None or lng is None:
+        return None
+    alt_value = _to_float_or_none(alt)
+    coord = {"lat": lat, "lng": lng, "alt": alt_value}
+    return {
+        "timestamp": timestamp or datetime.now().isoformat(),
+        "wgs84": dict(coord),
+        "gcj02": dict(coord),
+        "position_source": "lab_sim",
+        "lab_mode": True,
+    }
+
+
 def normalize_lab_config(config):
     raw = config if isinstance(config, dict) else {}
     sim_raw = raw.get("sim", {}) if isinstance(raw.get("sim", {}), dict) else {}
@@ -1418,6 +1434,7 @@ class WebConfigServer(object):
             "position_source": "lab_sim",
             "speed_mps": 0.0,
             "heading_deg": 0.0,
+            "mission": {"active": False, "total": 0, "target_seq": None, "reached_count": 0},
             "virtual_propulsion": {"left": 0.0, "right": 0.0, "real_output_enabled": False},
         }
         self.data_recording_source = None
@@ -1901,7 +1918,7 @@ class WebConfigServer(object):
             return
         waypoints = (lab_config.get("mission", {}) or {}).get("waypoints", [])
         msg = String()
-        msg.data = json.dumps({"cmd": "mission", "waypoints": waypoints}, ensure_ascii=False)
+        msg.data = json.dumps({"cmd": "mission", "waypoints": waypoints, "start": False}, ensure_ascii=False)
         self.lab_sim_command_pub.publish(msg)
 
     def _lab_sim_status_cb(self, msg):
@@ -1916,25 +1933,32 @@ class WebConfigServer(object):
         virtual_propulsion = data.get("virtual_propulsion", {})
         if not isinstance(virtual_propulsion, dict):
             virtual_propulsion = {}
+        mission = data.get("mission", {})
+        if not isinstance(mission, dict):
+            mission = {}
         self.lab_status = {
             "enabled": True,
             "running": bool(data.get("running", False)),
             "position_source": "lab_sim",
             "speed_mps": float(data.get("speed_mps", 0.0) or 0.0),
             "heading_deg": float(data.get("heading_deg", 0.0) or 0.0),
+            "mission": {
+                "active": bool(mission.get("active", False)),
+                "total": int(mission.get("total", 0) or 0),
+                "target_seq": mission.get("target_seq"),
+                "reached_count": int(mission.get("reached_count", 0) or 0),
+            },
             "virtual_propulsion": {
                 "left": float(virtual_propulsion.get("left", 0.0) or 0.0),
                 "right": float(virtual_propulsion.get("right", 0.0) or 0.0),
                 "real_output_enabled": bool(virtual_propulsion.get("real_output_enabled", False)),
             },
         }
-        position = make_position_snapshot(
+        position = make_lab_position_snapshot(
             data.get("lat"),
             data.get("lng"),
             data.get("alt"),
             timestamp=data.get("timestamp"),
-            source="lab_sim",
-            lab_mode=True,
         )
         if position:
             position["speed_mps"] = self.lab_status["speed_mps"]
@@ -3161,7 +3185,7 @@ class WebConfigServer(object):
                 self.config_manager.update({"lab_mode": lab_config})
             if self.lab_sim_command_pub:
                 waypoints = (lab_config.get("mission", {}) or {}).get("waypoints", [])
-                payload = {"cmd": "start", "config": lab_config}
+                payload = {"cmd": "start", "config": lab_config, "reset_to_start": True}
                 if waypoints:
                     payload["waypoints"] = waypoints
                 msg = String()

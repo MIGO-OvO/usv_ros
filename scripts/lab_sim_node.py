@@ -80,6 +80,7 @@ class LabSimulator(object):
         # 航线制导状态: 航点列表与当前目标索引
         self.waypoints = []
         self.target_idx = 0
+        self._arrivals = []
         self.mission_active = False
         self.track = [self._track_point()]
         return self.snapshot()
@@ -99,8 +100,7 @@ class LabSimulator(object):
         self.left_output = _clamp(_float_value(left, 0.0), -1.0, 1.0)
         self.right_output = _clamp(_float_value(right, 0.0), -1.0, 1.0)
 
-    def set_mission(self, waypoints):
-        """载入虚拟航线并进入自动制导。waypoints: [{lat,lng,seq?}, ...]。"""
+    def _clean_waypoints(self, waypoints):
         cleaned = []
         for i, wp in enumerate(waypoints or []):
             lat = _float_value((wp or {}).get("lat"), None) if isinstance(wp, dict) else None
@@ -110,13 +110,36 @@ class LabSimulator(object):
             seq = (wp.get("seq") if isinstance(wp, dict) else None)
             cleaned.append({"lat": lat, "lng": lng,
                             "seq": int(seq) if seq is not None else len(cleaned)})
+        return cleaned
+
+    def load_mission(self, waypoints):
+        cleaned = self._clean_waypoints(waypoints)
         self.waypoints = cleaned
         self.target_idx = 0
         self._arrivals = []
-        self.mission_active = len(cleaned) > 0
-        if self.mission_active:
-            self.running = True
+        self.mission_active = False
+        self.left_output = self.right_output = 0.0
+        self.speed_mps = 0.0
         return self.snapshot()
+
+    def start_mission(self, waypoints=None):
+        if waypoints is not None:
+            self.load_mission(waypoints)
+        self.lat = self.start_lat
+        self.lng = self.start_lng
+        self.heading_deg = self.start_heading_deg
+        self.speed_mps = 0.0
+        self.left_output = self.right_output = 0.0
+        self.target_idx = 0
+        self._arrivals = []
+        self.track = [self._track_point()]
+        self.mission_active = len(self.waypoints) > 0
+        self.running = True
+        return self.snapshot()
+
+    def set_mission(self, waypoints):
+        self.load_mission(waypoints)
+        return self.start_mission()
 
     def drain_arrivals(self):
         """取出并清空待发布的到达事件 (seq 列表)。"""
@@ -154,9 +177,8 @@ class LabSimulator(object):
 
     def step(self, dt):
         dt = max(0.0, _float_value(dt, 0.0))
-        # 航线制导: 自动设定 left/right 输出, 朝目标航点行进并记录到达
         if self.mission_active:
-            self._steer_toward_target()
+            return self._step_mission(dt)
         linear = self.max_speed_mps * (self.left_output + self.right_output) / 2.0
         yaw_rate = self.max_speed_mps * (self.right_output - self.left_output) / self.wheel_base_m
         if not self.running:
@@ -165,8 +187,9 @@ class LabSimulator(object):
         if not self.running:
             linear = 0.0
             yaw_rate = 0.0
-        heading_rad = math.radians(self.heading_deg)
-        self.heading_deg = (self.heading_deg + math.degrees(yaw_rate * dt)) % 360.0
+        next_heading = (self.heading_deg + math.degrees(yaw_rate * dt)) % 360.0
+        heading_rad = math.radians((self.heading_deg + math.degrees(yaw_rate * dt) / 2.0) % 360.0)
+        self.heading_deg = next_heading
         self.speed_mps = abs(linear)
         distance = linear * dt
         north_m = distance * math.cos(heading_rad)
@@ -174,6 +197,54 @@ class LabSimulator(object):
         self.lat += north_m / 110540.0
         cos_lat = max(0.01, math.cos(math.radians(self.lat)))
         self.lng += east_m / (111320.0 * cos_lat)
+        self.track.append(self._track_point())
+        return self.snapshot()
+
+    def _step_mission(self, dt):
+        if not self.running:
+            self.speed_mps = 0.0
+            self.left_output = self.right_output = 0.0
+            self.track.append(self._track_point())
+            return self.snapshot()
+
+        while self.target_idx < len(self.waypoints):
+            target = self.waypoints[self.target_idx]
+            dist = _distance_m(self.lat, self.lng, target["lat"], target["lng"])
+            if dist > self.arrival_radius_m:
+                break
+            self.lat = target["lat"]
+            self.lng = target["lng"]
+            self._arrivals.append({"seq": target["seq"], "lat": self.lat, "lng": self.lng})
+            self.target_idx += 1
+
+        if self.target_idx >= len(self.waypoints):
+            self.mission_active = False
+            self.speed_mps = 0.0
+            self.left_output = self.right_output = 0.0
+            self.track.append(self._track_point())
+            return self.snapshot()
+
+        target = self.waypoints[self.target_idx]
+        north, east = _local_offset_m(self.lat, self.lng, target["lat"], target["lng"])
+        dist = math.hypot(north, east)
+        if dist <= 1e-6 or dt <= 0.0 or self.max_speed_mps <= 0.0:
+            self.speed_mps = 0.0
+            self.left_output = self.right_output = 0.0
+            self.track.append(self._track_point())
+            return self.snapshot()
+
+        bearing = math.degrees(math.atan2(east, north)) % 360.0
+        heading_error = _wrap180(bearing - self.heading_deg)
+        turn = _clamp(heading_error / 45.0, -1.0, 1.0)
+        self.left_output = _clamp(1.0 - turn, -1.0, 1.0)
+        self.right_output = _clamp(1.0 + turn, -1.0, 1.0)
+        self.heading_deg = bearing
+
+        distance = min(self.max_speed_mps * dt, dist)
+        self.speed_mps = distance / dt
+        self.lat += (distance * math.cos(math.radians(bearing))) / 110540.0
+        cos_lat = max(0.01, math.cos(math.radians(self.lat)))
+        self.lng += (distance * math.sin(math.radians(bearing))) / (111320.0 * cos_lat)
         self.track.append(self._track_point())
         return self.snapshot()
 
@@ -255,15 +326,17 @@ class LabSimNode(object):
                     sim_cfg = dict(cfg["sim"])
                     sim_cfg["real_propulsion_enabled"] = bool(cfg.get("real_propulsion_enabled", False))
                     self.sim.configure(sim_cfg)
-                # start 可携带航线, 携带则进入自动制导, 否则仅置 running
+                elif bool(data.get("reset_to_start", False)):
+                    self.sim.reset()
                 waypoints = data.get("waypoints")
                 if isinstance(waypoints, list) and waypoints:
-                    self.sim.set_mission(waypoints)
+                    self.sim.start_mission(waypoints)
                 else:
                     self.sim.start()
             elif cmd == "mission":
-                # 载入/更新虚拟航线并进入自动制导
-                self.sim.set_mission(data.get("waypoints", []))
+                self.sim.load_mission(data.get("waypoints", []))
+                if bool(data.get("start", False)):
+                    self.sim.start_mission()
             elif cmd == "stop":
                 self.sim.stop()
             elif cmd == "reset":

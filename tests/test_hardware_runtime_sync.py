@@ -715,6 +715,70 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(reset["virtual_propulsion"]["left"], 0.0)
         self.assertFalse(reset["virtual_propulsion"]["real_output_enabled"])
 
+    def test_lab_simulator_loads_mission_without_starting_and_starts_from_origin(self):
+        module = _load_script(
+            "lab_sim_node_start_origin_test",
+            "scripts/lab_sim_node.py",
+        )[0]
+
+        sim = module.LabSimulator({
+            "start_lat": 30.0,
+            "start_lng": 120.0,
+            "heading_deg": 0.0,
+            "max_speed_mps": 1.0,
+            "arrival_radius_m": 3.0,
+        })
+        loaded = sim.load_mission([
+            {"lat": 30.0, "lng": 120.0, "seq": 0},
+            {"lat": 30.0, "lng": 120.0002, "seq": 1},
+        ])
+        started = sim.start_mission()
+        after_step = sim.step(0.2)
+        arrivals = sim.drain_arrivals()
+
+        self.assertFalse(loaded["running"])
+        self.assertFalse(loaded["mission"]["active"])
+        self.assertAlmostEqual(started["lat"], 30.0)
+        self.assertAlmostEqual(started["lng"], 120.0)
+        self.assertTrue(after_step["mission"]["active"])
+        self.assertEqual(arrivals[0]["seq"], 0)
+        self.assertEqual(after_step["mission"]["target_seq"], 1)
+
+    def test_lab_simulator_guidance_heading_matches_east_and_north_motion(self):
+        module = _load_script(
+            "lab_sim_node_guidance_heading_test",
+            "scripts/lab_sim_node.py",
+        )[0]
+
+        east = module.LabSimulator({
+            "start_lat": 30.0,
+            "start_lng": 120.0,
+            "heading_deg": 90.0,
+            "max_speed_mps": 2.0,
+            "arrival_radius_m": 0.5,
+        })
+        east.load_mission([{"lat": 30.0, "lng": 120.001, "seq": 0}])
+        east.start_mission()
+        east_snapshot = east.step(1.0)
+
+        north = module.LabSimulator({
+            "start_lat": 30.0,
+            "start_lng": 120.0,
+            "heading_deg": 0.0,
+            "max_speed_mps": 2.0,
+            "arrival_radius_m": 0.5,
+        })
+        north.load_mission([{"lat": 30.001, "lng": 120.0, "seq": 0}])
+        north.start_mission()
+        north_snapshot = north.step(1.0)
+
+        self.assertGreater(east_snapshot["lng"], 120.0)
+        self.assertAlmostEqual(east_snapshot["lat"], 30.0, places=5)
+        self.assertAlmostEqual(east_snapshot["heading_deg"], 90.0, delta=1.0)
+        self.assertGreater(north_snapshot["lat"], 30.0)
+        self.assertAlmostEqual(north_snapshot["lng"], 120.0, places=5)
+        self.assertAlmostEqual(north_snapshot["heading_deg"], 0.0, delta=1.0)
+
     def test_web_map_config_serves_offline_tile_proxy_without_amap_key(self):
         module, _, _ = _load_script(
             "web_config_server_map_config_test",
@@ -1842,6 +1906,81 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(live["lab_status"]["virtual_propulsion"]["left"], 0.5)
         self.assertTrue(stop_resp.get_json()["success"])
 
+    def test_web_lab_sim_status_keeps_gcj02_coordinates_exact_for_lab_mode(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_lab_gcj_status_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=True)
+            client = server.app.test_client()
+
+            server._lab_sim_status_cb(string_cls(json.dumps({
+                "running": True,
+                "lat": 25.314167,
+                "lng": 110.412778,
+                "heading_deg": 45.0,
+                "speed_mps": 0.8,
+                "mission": {"active": True, "total": 2, "target_seq": 1, "reached_count": 1},
+            })))
+            lab_resp = client.get("/api/lab/status")
+            live_resp = client.get("/api/map/live")
+
+        lab_position = lab_resp.get_json()["data"]["position"]
+        live = live_resp.get_json()["data"]
+        self.assertAlmostEqual(lab_position["gcj02"]["lat"], 25.314167)
+        self.assertAlmostEqual(lab_position["gcj02"]["lng"], 110.412778)
+        self.assertAlmostEqual(live["position"]["gcj02"]["lat"], 25.314167)
+        self.assertEqual(live["lab_status"]["mission"]["target_seq"], 1)
+
+    def test_web_lab_start_publishes_atomic_reset_and_mission_start_command(self):
+        module, publishers, _ = _load_script(
+            "web_config_server_lab_start_command_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            client = server.app.test_client()
+            save_resp = client.post("/api/lab/config", json={
+                "enabled": True,
+                "position_source": "lab_sim",
+                "sim": {"start_lat": 30.1, "start_lng": 120.2, "heading_deg": 30.0},
+                "mission": {"waypoints": [{"lat": 30.1, "lng": 120.2}]},
+            })
+            mission_resp = client.post("/api/lab/mission", json={
+                "waypoints": [{"lat": 30.1, "lng": 120.2}],
+            })
+            start_resp = client.post("/api/lab/start")
+
+        commands = [
+            json.loads(msg.data)
+            for msg in publishers["/usv/lab_sim/command"].messages
+        ]
+        self.assertTrue(save_resp.get_json()["success"])
+        self.assertTrue(mission_resp.get_json()["success"])
+        self.assertTrue(start_resp.get_json()["success"])
+        self.assertEqual(commands[-2]["cmd"], "mission")
+        self.assertFalse(commands[-2].get("start", True))
+        self.assertEqual(commands[-1]["cmd"], "start")
+        self.assertTrue(commands[-1]["reset_to_start"])
+        self.assertEqual(commands[-1]["waypoints"][0]["lat"], 30.1)
+
     def test_web_lab_import_qgc_reads_nested_gcj02_route_waypoints(self):
         module, _, _ = _load_script(
             "web_config_server_lab_import_qgc_test",
@@ -2483,11 +2622,13 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertIn('href: "/lab"', mobile_nav_text)
         self.assertTrue(lab_page.exists())
         lab_text = lab_page.read_text(encoding="utf-8")
+        hook_text = (REPO_ROOT / "frontend" / "src" / "hooks" / "use-lab-map.ts").read_text(encoding="utf-8")
         self.assertIn("/api/lab/config", lab_text)
         self.assertIn("/api/lab/start", lab_text)
         self.assertIn("/api/lab/mission", lab_text)
         self.assertIn("persistMission", lab_text)
-        self.assertIn("drawModeRef.current && !pendingRef.current", lab_text)
+        self.assertIn("canAcceptRemoteConfig", lab_text)
+        self.assertIn("!drawModeRef.current && !pendingRef.current", hook_text)
 
     def test_web_apply_publishes_i2c_ads_and_start_commands(self):
         module, publishers, _ = _load_script(

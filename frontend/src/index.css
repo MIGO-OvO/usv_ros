@@ -129,9 +129,6 @@
   font: inherit;
   transform: rotate(45deg);
 }
-.usv-boat-icon {
-  transition: transform 900ms linear;
-}
 .usv-boat-glyph {
   position: relative;
   display: grid;

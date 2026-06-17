@@ -1,58 +1,20 @@
-import { useCallback, useEffect, useRef, useState } from 'react'
-import L from 'leaflet'
-import 'leaflet/dist/leaflet.css'
+import { useCallback, useEffect, useState } from 'react'
 import { Activity, Crosshair, Download, FlaskConical, Gauge, MapPin, Navigation, Play, RotateCcw, Save, Square, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
-import { boatIcon, isFiniteLatLng, moveBoatMarker, speedPercent, startIcon } from '@/lib/lab-map'
-import type { LabConfig, LabMission, LabPollution, LabStatus, LatLng, MapConfigLite } from '@/lib/lab-types'
+import { useLabMap } from '@/hooks/use-lab-map'
+import { speedPercent } from '@/lib/lab-map'
+import type { LabConfig, LabMission, LabPollution, LabStatus } from '@/lib/lab-types'
 import { fallbackConfig, fallbackStatus } from '@/lib/lab-types'
-
-type DrawMode = '' | 'start' | 'waypoint' | 'source'
 
 export default function Lab() {
   const [config, setConfig] = useState<LabConfig>(fallbackConfig)
   const [status, setStatus] = useState<LabStatus>(fallbackStatus)
   const [pending, setPending] = useState('')
   const [message, setMessage] = useState('')
-  const [drawMode, setDrawMode] = useState<DrawMode>('')
-
-  const containerRef = useRef<HTMLDivElement | null>(null)
-  const mapRef = useRef<L.Map | null>(null)
-  const layerRef = useRef<L.LayerGroup | null>(null)
-  const boatRef = useRef<L.Marker | null>(null)
-  const labBoundsRef = useRef<L.LatLngBounds | null>(null)
-  const labInitialFitDoneRef = useRef(false)
-  const configRef = useRef(config)
-  const drawModeRef = useRef(drawMode)
-  const pendingRef = useRef(pending)
-  const dirtyRef = useRef(false)
-  const [mapReady, setMapReady] = useState(false)
-  const [hasLabBounds, setHasLabBounds] = useState(false)
-  configRef.current = config
-  drawModeRef.current = drawMode
-  pendingRef.current = pending
-
-  const fitLabBounds = useCallback(() => {
-    const map = mapRef.current
-    const bounds = labBoundsRef.current
-    if (!map || !bounds?.isValid()) return
-    map.invalidateSize()
-    map.fitBounds(bounds, { padding: [36, 36], maxZoom: 15 })
-    labInitialFitDoneRef.current = true
-  }, [])
-
-  const setBoatToStart = useCallback((simConfig: LabConfig['sim']) => {
-    moveBoatMarker(
-      boatRef.current,
-      { lat: Number(simConfig.start_lat), lng: Number(simConfig.start_lng) },
-      Number(simConfig.heading_deg) || 0,
-    )
-  }, [])
-
   const persistMission = useCallback(async (mission: LabMission) => {
     try {
       const res = await fetch('/api/lab/mission', {
@@ -62,7 +24,6 @@ export default function Lab() {
       })
       const json = await res.json()
       if (json.success && json.data) {
-        dirtyRef.current = false
         setConfig((c) => ({ ...c, mission: json.data }))
         return true
       }
@@ -82,7 +43,6 @@ export default function Lab() {
       })
       const json = await res.json()
       if (json.success && json.data) {
-        dirtyRef.current = false
         setConfig(json.data)
         return true
       }
@@ -93,159 +53,60 @@ export default function Lab() {
     return false
   }, [])
 
-  const setStartPosition = useCallback((position: LatLng) => {
-    if (!isFiniteLatLng(position)) return
-    const nextConfig = {
-      ...configRef.current,
-      sim: {
-        ...configRef.current.sim,
-        start_lat: position.lat,
-        start_lng: position.lng,
-      },
-    }
-    dirtyRef.current = true
-    setConfig(nextConfig)
-    setBoatToStart(nextConfig.sim)
-    persistConfig(nextConfig).catch(() => {})
-  }, [persistConfig, setBoatToStart])
+  const {
+    containerRef,
+    drawMode,
+    setDrawMode,
+    hasLabBounds,
+    fitLabBounds,
+    updateBoatPosition,
+    markDirty,
+    clearDirty,
+    canAcceptRemoteConfig,
+  } = useLabMap({
+    config,
+    pending,
+    setConfig,
+    setMessage,
+    persistConfig,
+    persistMission,
+  })
 
   const refresh = async () => {
     const res = await fetch('/api/lab/status')
     const json = await res.json()
-    if (json.data?.config && !drawModeRef.current && !pendingRef.current && !dirtyRef.current) setConfig(json.data.config)
+    if (json.data?.config && canAcceptRemoteConfig()) setConfig(json.data.config)
     if (json.data?.status) setStatus({ ...fallbackStatus, ...json.data.status })
-    if (json.data?.position?.gcj02 && boatRef.current) {
-      moveBoatMarker(boatRef.current, json.data.position.gcj02, Number(json.data.position.heading_deg || json.data.status?.heading_deg || 0))
+    if (json.data?.position?.gcj02) {
+      updateBoatPosition(json.data.position.gcj02, Number(json.data.position.heading_deg || json.data.status?.heading_deg || 0))
     }
   }
-
-  // 初始化编辑地图 (复用 /api/map/config 的瓦片代理)
-  useEffect(() => {
-    let cancelled = false
-    let resizeObserver: ResizeObserver | null = null
-    fetch('/api/map/config').then((r) => r.json()).then((json) => {
-      const cfg = json.data as MapConfigLite | undefined
-      if (cancelled || !cfg || !containerRef.current || mapRef.current) return
-      const map = L.map(containerRef.current, {
-        center: [cfg.default_center.lat, cfg.default_center.lng],
-        zoom: cfg.default_zoom,
-        attributionControl: false,
-      })
-      L.tileLayer(cfg.tile_url.replace('{style}', cfg.default_style), {
-        minZoom: cfg.min_zoom, maxZoom: cfg.max_zoom,
-      }).addTo(map)
-      layerRef.current = L.layerGroup().addTo(map)
-      boatRef.current = L.marker([cfg.default_center.lat, cfg.default_center.lng], {
-        icon: boatIcon(configRef.current.sim.heading_deg),
-      }).addTo(map)
-      setBoatToStart(configRef.current.sim)
-      map.on('click', (e: L.LeafletMouseEvent) => {
-        const mode = drawModeRef.current
-        if (mode === 'start') {
-          setStartPosition({ lat: e.latlng.lat, lng: e.latlng.lng })
-        } else if (mode === 'waypoint') {
-          const current = configRef.current
-          const waypoints = [
-            ...current.mission.waypoints,
-            { lat: e.latlng.lat, lng: e.latlng.lng, seq: current.mission.waypoints.length },
-          ]
-          const nextMission = { waypoints, center: null }
-          dirtyRef.current = true
-          setConfig((c) => ({ ...c, mission: nextMission }))
-          persistMission(nextMission).catch(() => {})
-        } else if (mode === 'source') {
-          const nextConfig = {
-            ...configRef.current,
-            pollution: {
-              ...configRef.current.pollution,
-              mode: 'manual' as const,
-              source: { lat: e.latlng.lat, lng: e.latlng.lng },
-            },
-          }
-          dirtyRef.current = true
-          setConfig(nextConfig)
-          persistConfig(nextConfig).catch(() => {})
-        }
-      })
-      if (typeof ResizeObserver !== 'undefined') {
-        resizeObserver = new ResizeObserver(() => map.invalidateSize())
-        resizeObserver.observe(containerRef.current)
+  const refreshQuietly = () => {
+    void refresh().catch((error: unknown) => {
+      if (error instanceof Error) {
+        setMessage('状态刷新失败')
+        return
       }
-      mapRef.current = map
-      setMapReady(true)
-      window.setTimeout(() => map.invalidateSize(), 0)
-    }).catch(() => {})
-    return () => {
-      cancelled = true
-      resizeObserver?.disconnect()
-      mapRef.current?.remove()
-      mapRef.current = null
-      layerRef.current = null
-      boatRef.current = null
-      setMapReady(false)
-    }
-  }, [persistConfig, persistMission, setBoatToStart, setStartPosition])
-
-  // 重绘航线/航点/污染源
-  useEffect(() => {
-    const group = layerRef.current
-    if (!mapReady || !group) return
-    group.clearLayers()
-    const pts = config.mission.waypoints.map((w) => [w.lat, w.lng] as [number, number])
-    const bounds = L.latLngBounds([])
-    const startLat = Number(config.sim.start_lat)
-    const startLng = Number(config.sim.start_lng)
-    if (Number.isFinite(startLat) && Number.isFinite(startLng)) {
-      L.marker([startLat, startLng], { icon: startIcon() }).addTo(group)
-      bounds.extend([startLat, startLng])
-    }
-    if (pts.length > 1) {
-      L.polyline(pts, { color: '#2563eb', weight: 3, opacity: 0.7 }).addTo(group)
-    }
-    config.mission.waypoints.forEach((w, i) => {
-      L.marker([w.lat, w.lng], {
-        icon: L.divIcon({ className: 'usv-waypoint-icon', html: `<span>#${i}</span>`, iconAnchor: [0, 0] }),
-      }).addTo(group)
-      bounds.extend([w.lat, w.lng])
+      throw error
     })
-    const src = config.pollution.mode === 'manual' ? config.pollution.source : config.mission.center
-    if (src) {
-      L.circle([src.lat, src.lng], {
-        radius: config.pollution.radius_m, color: '#e03131', fillColor: '#e03131', fillOpacity: 0.12, weight: 1,
-      }).addTo(group)
-      bounds.extend([src.lat, src.lng])
-    }
-    if (bounds.isValid()) {
-      labBoundsRef.current = bounds
-      setHasLabBounds(true)
-      if (!labInitialFitDoneRef.current) {
-        const map = mapRef.current
-        map?.invalidateSize()
-        map?.fitBounds(bounds, { padding: [36, 36], maxZoom: 15 })
-        labInitialFitDoneRef.current = true
-      }
-    } else {
-      labBoundsRef.current = null
-      setHasLabBounds(false)
-    }
-  }, [config.mission, config.pollution, config.sim.start_lat, config.sim.start_lng, mapReady])
+  }
 
   useEffect(() => {
-    refresh().catch(() => {})
-    const timer = window.setInterval(() => refresh().catch(() => {}), 1000)
+    refreshQuietly()
+    const timer = window.setInterval(refreshQuietly, 1000)
     return () => window.clearInterval(timer)
   }, [])
 
   const updateConfig = (patch: Partial<LabConfig>) => {
-    dirtyRef.current = true
+    markDirty()
     setConfig((c) => ({ ...c, ...patch }))
   }
   const updateSim = (key: keyof LabConfig['sim'], value: string) => {
-    dirtyRef.current = true
+    markDirty()
     setConfig((c) => ({ ...c, sim: { ...c.sim, [key]: Number(value) || 0 } }))
   }
   const updatePollution = (patch: Partial<LabPollution>) => {
-    dirtyRef.current = true
+    markDirty()
     setConfig((c) => ({ ...c, pollution: { ...c.pollution, ...patch } }))
   }
 
@@ -263,14 +124,14 @@ export default function Lab() {
     const json = await res.json()
     setMessage(json.message || (json.success ? '已保存' : '保存失败'))
     if (json.data) {
-      dirtyRef.current = false
+      clearDirty()
       setConfig(json.data)
     }
   }
 
   const clearWaypoints = async () => {
     const nextMission = { waypoints: [], center: null }
-    dirtyRef.current = true
+    markDirty()
     setConfig((c) => ({ ...c, mission: nextMission }))
     await persistMission(nextMission)
   }
@@ -280,7 +141,7 @@ export default function Lab() {
     const json = await res.json()
     setMessage(json.message || (json.success ? '已导入' : '导入失败'))
     if (json.success && json.data) {
-      dirtyRef.current = false
+      clearDirty()
       setConfig((c) => ({ ...c, mission: json.data }))
     }
   }
@@ -501,7 +362,7 @@ export default function Lab() {
                   <div className="h-2 rounded bg-primary" style={{ width: `${Math.abs(propulsion.right || 0) * 100}%` }} />
                 </div>
               </div>
-              <Button variant="outline" className="w-full" onClick={() => refresh().catch(() => {})}>
+              <Button variant="outline" className="w-full" onClick={refreshQuietly}>
                 <RotateCcw className="w-4 h-4 mr-2" />
                 刷新
               </Button>
