@@ -88,6 +88,10 @@ interface SurfacePayload {
   size?: number
   power?: number
   meta?: MapMeta
+  water_area?: {
+    enabled: boolean
+    polygon: Array<{ lat: number; lng: number }>
+  }
 }
 
 interface MappingProfileConfig {
@@ -326,6 +330,7 @@ export default function MapPage() {
   const [loadingMap, setLoadingMap] = useState(false)
   const [missions, setMissions] = useState<MissionMeta[]>([])
   const [selectedMission, setSelectedMission] = useState('')
+  const [includeLab, setIncludeLab] = useState(false)
   const [geojson, setGeojson] = useState<GeoJsonPayload | null>(null)
   const [surface, setSurface] = useState<SurfacePayload | null>(null)
   const [surveyStatus, setSurveyStatus] = useState<SurveyStatus | null>(null)
@@ -346,6 +351,7 @@ export default function MapPage() {
   const [gotoMsg, setGotoMsg] = useState('')
   const [missionPlanEnabled, setMissionPlanEnabled] = useState(false)
   const [draftSampleEnabled, setDraftSampleEnabled] = useState(true)
+  const [sampleTimeoutS, setSampleTimeoutS] = useState(0)
   const [draftWaypoints, setDraftWaypoints] = useState<MissionDraftWaypoint[]>([])
   const [missionUploading, setMissionUploading] = useState(false)
   const [missionPlanMsg, setMissionPlanMsg] = useState('')
@@ -374,10 +380,10 @@ export default function MapPage() {
     const metricParam = encodeURIComponent(metric)
     return {
       csv: `/api/data/mission/${mission}/csv`,
-      geojson: `/api/data/mission/${mission}/geojson?metric=${metricParam}&download=true`,
-      surface: `/api/data/mission/${mission}/surface?metric=${metricParam}&size=${idwSize}&power=${idwPower}&download=true`,
+      geojson: `/api/data/mission/${mission}/geojson?metric=${metricParam}&include_lab=${includeLab}&download=true`,
+      surface: `/api/data/mission/${mission}/surface?metric=${metricParam}&size=${idwSize}&power=${idwPower}&include_lab=${includeLab}&download=true`,
     }
-  }, [idwPower, idwSize, metric, selectedMission])
+  }, [idwPower, idwSize, metric, selectedMission, includeLab])
 
   useEffect(() => { missionPlanEnabledRef.current = missionPlanEnabled }, [missionPlanEnabled])
   useEffect(() => { draftSampleEnabledRef.current = draftSampleEnabled }, [draftSampleEnabled])
@@ -580,6 +586,17 @@ export default function MapPage() {
       )
     }
 
+    if (surfacePayload?.water_area?.enabled && surfacePayload.water_area.polygon && surfacePayload.water_area.polygon.length >= 3) {
+      const wpts: Array<[number, number]> = surfacePayload.water_area.polygon.map((p: { lat: number; lng: number }) => [p.lat, p.lng])
+      L.polygon(wpts, {
+        color: '#16a34a',
+        fillColor: '#16a34a',
+        fillOpacity: 0.1,
+        weight: 1.5,
+        dashArray: '4, 4',
+      }).addTo(group)
+    }
+
     if (bounds.isValid()) {
       currentBoundsRef.current = bounds
       setHasCurrentBounds(true)
@@ -594,7 +611,7 @@ export default function MapPage() {
   }, [clearOverlays, mapConfig, metric])
 
   const loadLive = useCallback(async () => {
-    const res = await fetch(`/api/map/live?metric=${metric}&size=${idwSize}&power=${idwPower}`)
+    const res = await fetch(`/api/map/live?metric=${metric}&size=${idwSize}&power=${idwPower}&include_lab=${includeLab}`)
     const json = await res.json()
     const live = (json.data || {}) as LivePayload
     const liveSurface = live.surface || null
@@ -652,20 +669,20 @@ export default function MapPage() {
       const positionText = live.position ? `实时船位 ${live.position.gcj02.lat.toFixed(6)}, ${live.position.gcj02.lng.toFixed(6)}` : '等待 GPS 船位'
       setStatusText(gateText ? `${positionText} · 走航门控: ${gateText}` : positionText)
     }
-  }, [idwPower, idwSize, metric])
+  }, [idwPower, idwSize, metric, includeLab])
 
   const loadHistory = useCallback(async () => {
     if (!selectedMission) return
     const [geoRes, surfaceRes] = await Promise.all([
-      fetch(`/api/data/mission/${selectedMission}/geojson?metric=${metric}`),
-      fetch(`/api/data/mission/${selectedMission}/surface?metric=${metric}&size=${idwSize}&power=${idwPower}`),
+      fetch(`/api/data/mission/${selectedMission}/geojson?metric=${metric}&include_lab=${includeLab}`),
+      fetch(`/api/data/mission/${selectedMission}/surface?metric=${metric}&size=${idwSize}&power=${idwPower}&include_lab=${includeLab}`),
     ])
     const geo = await geoRes.json()
     const surfaceJson = await surfaceRes.json()
     setGeojson(geo.data)
     setSurface(surfaceJson.data)
     setStatusText(surfaceJson.data?.valid ? '历史污染面已生成' : surfaceJson.data?.reason || '历史任务已加载')
-  }, [idwPower, idwSize, metric, selectedMission])
+  }, [idwPower, idwSize, metric, selectedMission, includeLab])
 
   const removeDraftWaypoint = useCallback((index: number) => {
     setDraftWaypoints((current) => current.filter((_, itemIndex) => itemIndex !== index))
@@ -689,6 +706,7 @@ export default function MapPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           replace: true,
+          sample_timeout_s: sampleTimeoutS,
           waypoints: draftWaypoints.map((wp, index) => ({
             seq: index,
             lat: wp.wgs84.lat,
@@ -711,7 +729,7 @@ export default function MapPage() {
     } finally {
       setMissionUploading(false)
     }
-  }, [draftWaypoints, loadLive])
+  }, [draftWaypoints, loadLive, sampleTimeoutS])
 
   const startPrewarm = useCallback(async () => {
     const map = mapRef.current
@@ -886,6 +904,10 @@ export default function MapPage() {
               </Button>
             ))}
           </div>
+          <label className="flex items-center gap-2 text-sm bg-background border px-3 h-9 rounded-md select-none cursor-pointer">
+            <input type="checkbox" checked={includeLab} onChange={(e) => setIncludeLab(e.target.checked)} />
+            <span>包含实验室数据</span>
+          </label>
           <select className="h-9 rounded-md border border-input bg-background px-3 text-sm" value={metric} onChange={(e) => setMetric(e.target.value as MetricMode)}>
             {Object.entries(metricLabels).map(([key, label]) => <option key={key} value={key}>{label}</option>)}
           </select>
@@ -927,6 +949,17 @@ export default function MapPage() {
                     onChange={(event) => setDraftSampleEnabled(event.target.checked)}
                   />
                 </label>
+                <div className="space-y-2">
+                  <span className="text-muted-foreground block text-xs">采样超时(秒，0代表禁用)</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={3600}
+                    className="w-full h-9 rounded-md border border-input bg-background px-3 py-1 text-sm font-medium"
+                    value={sampleTimeoutS}
+                    onChange={(event) => setSampleTimeoutS(Number(event.target.value) || 0)}
+                  />
+                </div>
                 <div className="grid grid-cols-2 gap-2">
                   <Button size="sm" onClick={uploadDraftMission} disabled={missionUploading || draftWaypoints.length === 0}>
                     {missionUploading ? <Loader2 className="w-4 h-4 mr-1 animate-spin" /> : <Upload className="w-4 h-4 mr-1" />}

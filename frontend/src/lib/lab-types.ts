@@ -18,6 +18,13 @@ export interface LabPollution {
   readonly strength: number
   readonly radius_m: number
   readonly reference_voltage: number
+  readonly value_min: number
+  readonly value_max: number
+}
+
+export interface WaterArea {
+  readonly enabled: boolean
+  readonly polygon: readonly LatLng[]
 }
 
 export interface LabConfig {
@@ -35,9 +42,11 @@ export interface LabConfig {
     readonly max_speed_mps: number
     readonly wheel_base_m: number
     readonly arrival_radius_m: number
+    readonly sample_dwell_s: number
   }
   readonly mission: LabMission
   readonly pollution: LabPollution
+  readonly water_area: WaterArea
 }
 
 export interface LabStatus {
@@ -50,6 +59,7 @@ export interface LabStatus {
     readonly total: number
     readonly target_seq: number | null
     readonly reached_count: number
+    readonly completed: boolean
   }
   readonly virtual_propulsion: {
     readonly left: number
@@ -75,9 +85,10 @@ export const fallbackConfig: LabConfig = {
   allow_no_gps: true,
   bypass_pid_wait: true,
   include_lab_data_by_default: false,
-  sim: { start_lat: 25.314167, start_lng: 110.412778, heading_deg: 0, max_speed_mps: 1, wheel_base_m: 0.6, arrival_radius_m: 3 },
+  sim: { start_lat: 25.314167, start_lng: 110.412778, heading_deg: 0, max_speed_mps: 1, wheel_base_m: 0.6, arrival_radius_m: 3, sample_dwell_s: 3 },
   mission: { waypoints: [], center: null },
-  pollution: { mode: 'center', source: null, strength: 0.8, radius_m: 150, reference_voltage: 3 },
+  pollution: { mode: 'center', source: null, strength: 0.8, radius_m: 150, reference_voltage: 3, value_min: 0, value_max: 1 },
+  water_area: { enabled: false, polygon: [] },
 }
 
 export const fallbackStatus: LabStatus = {
@@ -85,6 +96,6 @@ export const fallbackStatus: LabStatus = {
   running: false,
   speed_mps: 0,
   heading_deg: 0,
-  mission: { active: false, total: 0, target_seq: null, reached_count: 0 },
+  mission: { active: false, total: 0, target_seq: null, reached_count: 0, completed: false },
   virtual_propulsion: { left: 0, right: 0, real_output_enabled: false },
 }

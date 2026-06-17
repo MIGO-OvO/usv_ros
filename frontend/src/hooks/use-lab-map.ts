@@ -5,7 +5,7 @@ import 'leaflet/dist/leaflet.css'
 import { boatIcon, isFiniteLatLng, moveBoatMarker, startIcon } from '@/lib/lab-map'
 import type { LabConfig, LabMission, LabPollution, LatLng, MapConfigLite } from '@/lib/lab-types'
 
-type DrawMode = '' | 'start' | 'waypoint' | 'source'
+type DrawMode = '' | 'start' | 'waypoint' | 'source' | 'water_area'
 
 interface UseLabMapArgs {
   readonly config: LabConfig
@@ -81,9 +81,17 @@ export function useLabMap({
   const [mapReady, setMapReady] = useState(false)
   const [hasLabBounds, setHasLabBounds] = useState(false)
 
-  configRef.current = config
-  drawModeRef.current = drawMode
-  pendingRef.current = pending
+  useEffect(() => {
+    configRef.current = config
+  }, [config])
+
+  useEffect(() => {
+    drawModeRef.current = drawMode
+  }, [drawMode])
+
+  useEffect(() => {
+    pendingRef.current = pending
+  }, [pending])
 
   const markDirty = useCallback(() => {
     dirtyRef.current = true
@@ -157,6 +165,24 @@ export function useLabMap({
         icon: boatIcon(configRef.current.sim.heading_deg),
       }).addTo(map)
       setBoatToStart(configRef.current.sim)
+
+      // Fetch existing water area polygon first to sync it
+      try {
+        const waterAreaRes = await fetch('/api/lab/water-area')
+        const waterAreaJson = await waterAreaRes.json()
+        if (waterAreaJson.success && waterAreaJson.data) {
+          setConfig((c) => ({
+            ...c,
+            water_area: {
+              enabled: waterAreaJson.data.enabled ?? c.water_area.enabled,
+              polygon: waterAreaJson.data.polygon ?? c.water_area.polygon,
+            },
+          }))
+        }
+      } catch (err) {
+        console.error('Failed to load water-area config:', err)
+      }
+
       map.on('click', (event: L.LeafletMouseEvent) => {
         const mode = drawModeRef.current
         if (mode === 'start') {
@@ -188,6 +214,40 @@ export function useLabMap({
           setConfig(nextConfig)
           void persistConfig(nextConfig).then((saved) => {
             if (saved) dirtyRef.current = false
+          })
+          return
+        }
+        if (mode === 'water_area') {
+          const current = configRef.current
+          const polygon = [
+            ...current.water_area.polygon,
+            { lat: event.latlng.lat, lng: event.latlng.lng },
+          ]
+          const nextConfig = {
+            ...current,
+            water_area: {
+              ...current.water_area,
+              polygon,
+            },
+          }
+          dirtyRef.current = true
+          setConfig(nextConfig)
+          void fetch('/api/lab/water-area', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              enabled: current.water_area.enabled,
+              polygon,
+            }),
+          }).then(async (res) => {
+            const json = await res.json()
+            if (json.success) {
+              dirtyRef.current = false
+            } else {
+              setMessage(json.message || '水域范围保存失败')
+            }
+          }).catch(() => {
+            setMessage('水域范围保存失败')
           })
         }
       })
@@ -249,20 +309,37 @@ export function useLabMap({
       }).addTo(group)
       bounds.extend([source.lat, source.lng])
     }
+    if (config.water_area.polygon && config.water_area.polygon.length >= 2) {
+      const wpts: Array<[number, number]> = config.water_area.polygon.map((p) => [p.lat, p.lng])
+      L.polygon(wpts, {
+        color: '#2b8a3e',
+        fillColor: '#2b8a3e',
+        fillOpacity: 0.15,
+        weight: 2,
+        dashArray: '5, 5',
+      }).addTo(group)
+      config.water_area.polygon.forEach((p) => {
+        bounds.extend([p.lat, p.lng])
+      })
+    }
+    let validBounds = false
     if (bounds.isValid()) {
       labBoundsRef.current = bounds
-      setHasLabBounds(true)
+      validBounds = true
       if (!labInitialFitDoneRef.current) {
         const map = mapRef.current
         map?.invalidateSize()
         map?.fitBounds(bounds, { padding: [36, 36], maxZoom: 15 })
         labInitialFitDoneRef.current = true
       }
-      return
+    } else {
+      labBoundsRef.current = null
     }
-    labBoundsRef.current = null
-    setHasLabBounds(false)
-  }, [config.mission, config.pollution, config.sim.start_lat, config.sim.start_lng, mapReady])
+    const timer = setTimeout(() => {
+      setHasLabBounds(validBounds)
+    }, 0)
+    return () => clearTimeout(timer)
+  }, [config.mission, config.pollution, config.sim.start_lat, config.sim.start_lng, config.water_area.polygon, mapReady])
 
   return {
     containerRef,

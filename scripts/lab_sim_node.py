@@ -81,6 +81,8 @@ class LabSimulator(object):
         self.waypoints = []
         self.target_idx = 0
         self._arrivals = []
+        self._mission_completed = False
+        self._waiting_sampling_done = False
         self.mission_active = False
         self.track = [self._track_point()]
         return self.snapshot()
@@ -117,6 +119,8 @@ class LabSimulator(object):
         self.waypoints = cleaned
         self.target_idx = 0
         self._arrivals = []
+        self._mission_completed = False
+        self._waiting_sampling_done = False
         self.mission_active = False
         self.left_output = self.right_output = 0.0
         self.speed_mps = 0.0
@@ -132,9 +136,23 @@ class LabSimulator(object):
         self.left_output = self.right_output = 0.0
         self.target_idx = 0
         self._arrivals = []
+        self._mission_completed = False
+        self._waiting_sampling_done = False
         self.track = [self._track_point()]
         self.mission_active = len(self.waypoints) > 0
         self.running = True
+        return self.snapshot()
+
+    def complete_mission(self):
+        self._waiting_sampling_done = False
+        if self.waypoints and self.target_idx < len(self.waypoints):
+            self.mission_active = True
+            self.running = True
+            return self.snapshot()
+        self._mission_completed = bool(self.waypoints and self.target_idx >= len(self.waypoints))
+        self.mission_active = False
+        self.speed_mps = 0.0
+        self.left_output = self.right_output = 0.0
         return self.snapshot()
 
     def set_mission(self, waypoints):
@@ -206,6 +224,11 @@ class LabSimulator(object):
             self.left_output = self.right_output = 0.0
             self.track.append(self._track_point())
             return self.snapshot()
+        if self._waiting_sampling_done:
+            self.speed_mps = 0.0
+            self.left_output = self.right_output = 0.0
+            self.track.append(self._track_point())
+            return self.snapshot()
 
         while self.target_idx < len(self.waypoints):
             target = self.waypoints[self.target_idx]
@@ -216,6 +239,12 @@ class LabSimulator(object):
             self.lng = target["lng"]
             self._arrivals.append({"seq": target["seq"], "lat": self.lat, "lng": self.lng})
             self.target_idx += 1
+            self.mission_active = self.target_idx < len(self.waypoints)
+            self._waiting_sampling_done = True
+            self.speed_mps = 0.0
+            self.left_output = self.right_output = 0.0
+            self.track.append(self._track_point())
+            return self.snapshot()
 
         if self.target_idx >= len(self.waypoints):
             self.mission_active = False
@@ -274,6 +303,8 @@ class LabSimulator(object):
                 "total": len(self.waypoints),
                 "target_seq": target_seq,
                 "reached_count": self.target_idx,
+                "completed": bool(self._mission_completed),
+                "waiting_sampling_done": bool(self._waiting_sampling_done),
             },
             "virtual_propulsion": {
                 "left": self.left_output,
@@ -298,6 +329,7 @@ class LabSimNode(object):
             "real_propulsion_enabled": rospy.get_param("~real_propulsion_enabled", False),
         }
         self.sim = LabSimulator(config)
+        self._completed_status_emitted = False
         self._lock = threading.Lock()
         self._last_step = time.time()
         self._status_pub = rospy.Publisher("/usv/lab_sim/status", String, queue_size=10, latch=True)
@@ -321,6 +353,7 @@ class LabSimNode(object):
                 sim_cfg["real_propulsion_enabled"] = bool((cfg or {}).get("real_propulsion_enabled", False))
                 self.sim.configure(sim_cfg)
             elif cmd == "start":
+                self._completed_status_emitted = False
                 cfg = data.get("config", {})
                 if isinstance(cfg, dict) and isinstance(cfg.get("sim"), dict):
                     sim_cfg = dict(cfg["sim"])
@@ -334,12 +367,16 @@ class LabSimNode(object):
                 else:
                     self.sim.start()
             elif cmd == "mission":
+                self._completed_status_emitted = False
                 self.sim.load_mission(data.get("waypoints", []))
                 if bool(data.get("start", False)):
                     self.sim.start_mission()
             elif cmd == "stop":
                 self.sim.stop()
+            elif cmd == "mission_complete":
+                self.sim.complete_mission()
             elif cmd == "reset":
+                self._completed_status_emitted = False
                 self.sim.reset()
             elif cmd == "propulsion":
                 self.sim.set_virtual_propulsion(data.get("left", 0.0), data.get("right", 0.0))
@@ -360,7 +397,13 @@ class LabSimNode(object):
             self._reached_pub.publish(String(json.dumps(payload, ensure_ascii=False)))
 
     def _publish_status(self):
-        self._status_pub.publish(String(json.dumps(self.sim.snapshot(), ensure_ascii=False)))
+        snapshot = self.sim.snapshot()
+        mission = snapshot.get("mission", {})
+        if bool(mission.get("completed", False)):
+            if self._completed_status_emitted:
+                return
+            self._completed_status_emitted = True
+        self._status_pub.publish(String(json.dumps(snapshot, ensure_ascii=False)))
 
     def run(self):
         rate = rospy.Rate(float(rospy.get_param("~rate", 5.0)))
