@@ -275,9 +275,11 @@ def normalize_lab_config(config):
             "max_speed_mps": sim_float("max_speed_mps", 1.0, 0.0, 20.0),
             "wheel_base_m": sim_float("wheel_base_m", 0.6, 0.05, 10.0),
             "arrival_radius_m": sim_float("arrival_radius_m", 3.0, 0.5, 100.0),
+            "sample_dwell_s": sim_float("sample_dwell_s", 3.0, 0.0, 600.0),
         },
         "mission": normalize_lab_mission(raw.get("mission")),
         "pollution": normalize_lab_pollution(raw.get("pollution")),
+        "water_area": normalize_lab_water_area(raw.get("water_area")),
     }
 
 
@@ -324,13 +326,66 @@ def normalize_lab_pollution(config):
             v = default
         return max(lo, min(hi, v))
 
+    value_min = fnum("value_min", 0.0, 0.0, float("inf"))
+    value_max = _to_float_or_none(raw.get("value_max", 1.0))
+    if value_max is None:
+        value_max = 1.0
+    if value_max <= value_min:
+        value_max = value_min + 0.000001
+
     return {
         "mode": mode,
         "source": _coord_or_none(raw.get("source")),
         "strength": fnum("strength", 0.8, 0.0, 1.0),
         "radius_m": fnum("radius_m", 150.0, 1.0, 100000.0),
         "reference_voltage": fnum("reference_voltage", 3.0, 0.1, 10.0),
+        "value_min": value_min,
+        "value_max": value_max,
     }
+
+
+def normalize_lab_water_area(config):
+    raw = config if isinstance(config, dict) else {}
+    polygon = []
+    for point in raw.get("polygon", []) or []:
+        coord = _coord_or_none(point)
+        if coord is not None:
+            polygon.append(coord)
+    enabled = raw.get("enabled", False)
+    if isinstance(enabled, str):
+        enabled = enabled.strip().lower() in ("1", "true", "yes", "on")
+    return {"enabled": bool(enabled), "polygon": polygon}
+
+
+def normalize_sampling_config(config):
+    raw = config if isinstance(config, dict) else {}
+    sample_timeout_s = _to_float_or_none(raw.get("sample_timeout_s", 0.0))
+    if sample_timeout_s is None:
+        sample_timeout_s = 0.0
+    return {"sample_timeout_s": max(0.0, min(3600.0, sample_timeout_s))}
+
+
+def _point_in_polygon(lat, lng, polygon):
+    inside = False
+    count = len(polygon)
+    previous = polygon[-1]
+    for current in polygon:
+        curr_lat = current["lat"]
+        curr_lng = current["lng"]
+        prev_lat = previous["lat"]
+        prev_lng = previous["lng"]
+        cross = (lng - curr_lng) * (prev_lat - curr_lat) - (lat - curr_lat) * (prev_lng - curr_lng)
+        if abs(cross) < 1e-12:
+            within_lat = min(curr_lat, prev_lat) - 1e-12 <= lat <= max(curr_lat, prev_lat) + 1e-12
+            within_lng = min(curr_lng, prev_lng) - 1e-12 <= lng <= max(curr_lng, prev_lng) + 1e-12
+            if within_lat and within_lng:
+                return True
+        if (curr_lat > lat) != (prev_lat > lat):
+            crossing_lng = (prev_lng - curr_lng) * (lat - curr_lat) / (prev_lat - curr_lat) + curr_lng
+            if lng <= crossing_lng:
+                inside = not inside
+        previous = current
+    return inside if count >= 3 else False
 
 
 def normalize_pollution_metric_config(config):
@@ -854,8 +909,7 @@ class MissionDataManager(object):
             if spectrometer_raw is not None:
                 point["raw"] = spectrometer_raw
             self.current_mission_data["data_points"].append(point)
-            # 每 10 个点保存一次，防止数据丢失
-            if len(self.current_mission_data["data_points"]) % 10 == 0:
+            if point.get("lab_mode") or len(self.current_mission_data["data_points"]) % 10 == 0:
                 self._save_current()
 
     def _save_current(self):
@@ -985,6 +1039,9 @@ DEFAULT_CONFIG = {
             "on_fail": "HOLD"
         }
     },
+    "sampling": {
+        "sample_timeout_s": 0.0
+    },
     "mapping_profile": copy.deepcopy(DEFAULT_MAPPING_PROFILE),
     "detection_settings": {
         "duration": 5.0,
@@ -1039,7 +1096,8 @@ DEFAULT_CONFIG = {
             "heading_deg": 0.0,
             "max_speed_mps": 1.0,
             "wheel_base_m": 0.6,
-            "arrival_radius_m": 3.0
+            "arrival_radius_m": 3.0,
+            "sample_dwell_s": 3.0
         },
         "mission": {"waypoints": [], "center": None},
         "pollution": {
@@ -1047,8 +1105,11 @@ DEFAULT_CONFIG = {
             "source": None,
             "strength": 0.8,
             "radius_m": 150.0,
-            "reference_voltage": 3.0
-        }
+            "reference_voltage": 3.0,
+            "value_min": 0.0,
+            "value_max": 1.0
+        },
+        "water_area": {"enabled": False, "polygon": []}
     }
 }
 
@@ -1189,6 +1250,10 @@ class ConfigManager(object):
     def _normalize_lab_mode(data):
         return normalize_lab_config(data)
 
+    @staticmethod
+    def _normalize_sampling(data):
+        return normalize_sampling_config(data)
+
     def __init__(self, config_file=CONFIG_FILE):
         self.config_file = config_file
         self.config = copy.deepcopy(DEFAULT_CONFIG)
@@ -1223,6 +1288,9 @@ class ConfigManager(object):
             )
             self.config['waypoint_sampling'] = self._normalize_waypoint_sampling(
                 self.config.get('waypoint_sampling', {})
+            )
+            self.config['sampling'] = self._normalize_sampling(
+                self.config.get('sampling', {})
             )
             self.config['pollution_metric'] = self._normalize_pollution_metric(
                 self.config.get('pollution_metric', {})
@@ -1273,6 +1341,9 @@ class ConfigManager(object):
         self.config['waypoint_sampling'] = self._normalize_waypoint_sampling(
             self.config.get('waypoint_sampling', {})
         )
+        self.config['sampling'] = self._normalize_sampling(
+            self.config.get('sampling', {})
+        )
         self.config['pollution_metric'] = self._normalize_pollution_metric(
             self.config.get('pollution_metric', {})
         )
@@ -1308,6 +1379,9 @@ class ConfigManager(object):
         self.config['waypoint_sampling'] = self._normalize_waypoint_sampling(
             self.config.get('waypoint_sampling', {})
         )
+        self.config['sampling'] = self._normalize_sampling(
+            self.config.get('sampling', {})
+        )
         self.config['pollution_metric'] = self._normalize_pollution_metric(
             self.config.get('pollution_metric', {})
         )
@@ -1330,6 +1404,9 @@ class ConfigManager(object):
         )
         config['waypoint_sampling'] = self._normalize_waypoint_sampling(
             config.get('waypoint_sampling', {})
+        )
+        config['sampling'] = self._normalize_sampling(
+            config.get('sampling', {})
         )
         config['pollution_metric'] = self._normalize_pollution_metric(
             config.get('pollution_metric', {})
@@ -1822,17 +1899,19 @@ class WebConfigServer(object):
 
         if self.automation_running:
             automation = self.latest_automation_status if isinstance(self.latest_automation_status, dict) else {}
+            position = self.current_position if isinstance(self.current_position, dict) else None
             try:
                 self.data_manager.add_data_point(
                     self.current_voltage,
                     self.current_absorbance,
-                    position=self.current_position,
+                    position=position,
                     waypoint_seq=self.current_waypoint_seq,
                     step_index=automation.get("step_index", automation.get("current_step")),
                     loop_index=automation.get("loop_index", automation.get("current_loop")),
                     sample_id=automation.get("sample_id"),
                     spectrometer_raw=data,
                     pollution_metric=self._current_metric_config(),
+                    lab_mode=bool(position.get("lab_mode", False)) if position else False,
                     system_health=self.latest_system_health,
                     mission_status=self.mission_status,
                     route_snapshot_id=self.route_snapshot_id,
@@ -2467,6 +2546,9 @@ class WebConfigServer(object):
         except (TypeError, ValueError):
             power = 2.0
         power = max(0.5, min(5.0, power))
+        water_area = normalize_lab_water_area(self.config_manager.get().get("lab_mode", {}).get("water_area", {}))
+        polygon = water_area.get("polygon", [])
+        mask_enabled = bool(water_area.get("enabled")) and len(polygon) >= 3
 
         valid_points = []
         excluded_reasons = {}
@@ -2509,6 +2591,8 @@ class WebConfigServer(object):
                 "point_count": len(valid_points),
                 "excluded_count": sum(excluded_reasons.values()),
                 "excluded_reasons": excluded_reasons,
+                "masked_count": 0,
+                "water_area": water_area,
                 "metric_label": metric_label,
                 "unit": unit,
                 "size": size,
@@ -2530,10 +2614,14 @@ class WebConfigServer(object):
         lng_span = max(max_lng - min_lng, 0.00001)
         lat_span = max(max_lat - min_lat, 0.00001)
         grid = []
+        masked_count = 0
         for yi in range(size):
             lat = min_lat + lat_span * yi / float(size - 1)
             for xi in range(size):
                 lng = min_lng + lng_span * xi / float(size - 1)
+                if mask_enabled and not _point_in_polygon(lat, lng, polygon):
+                    masked_count += 1
+                    continue
                 exact = None
                 weighted_sum = 0.0
                 weight_total = 0.0
@@ -2561,6 +2649,8 @@ class WebConfigServer(object):
             "point_count": len(valid_points),
             "excluded_count": sum(excluded_reasons.values()),
             "excluded_reasons": excluded_reasons,
+            "masked_count": masked_count,
+            "water_area": water_area,
             "metric_label": metric_label,
             "unit": unit,
             "size": size,
@@ -3220,6 +3310,24 @@ class WebConfigServer(object):
                 },
             })
 
+        @self.app.route('/api/lab/water-area', methods=['GET'])
+        def get_lab_water_area():
+            return jsonify({
+                "success": True,
+                "data": self._current_lab_config().get("water_area", {"enabled": False, "polygon": []}),
+            })
+
+        @self.app.route('/api/lab/water-area', methods=['POST'])
+        def save_lab_water_area():
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "request body must be a JSON object"}), 400
+            lab = self._current_lab_config()
+            lab["water_area"] = normalize_lab_water_area(data)
+            if self.config_manager.update({"lab_mode": lab}):
+                return jsonify({"success": True, "message": "water area saved", "data": lab["water_area"]})
+            return jsonify({"success": False, "message": "save failed"}), 500
+
         @self.app.route('/api/lab/mission', methods=['POST'])
         def save_lab_mission():
             """保存实验虚拟航线 (Web 绘制)。整体覆盖 lab_mode.mission。"""
@@ -3290,8 +3398,12 @@ class WebConfigServer(object):
             data = json_object()
             if data is None:
                 return jsonify({"success": False, "message": "request body must be a JSON object"}), 400
+            if "sample_timeout_s" in data:
+                self.config_manager.update({"sampling": {"sample_timeout_s": data.get("sample_timeout_s")}})
             config = self.config_manager.get()
-            result = upload_mission_plan(data, sampling_config=config.get('waypoint_sampling', {}))
+            plan_payload = dict(data)
+            plan_payload.pop("sample_timeout_s", None)
+            result = upload_mission_plan(plan_payload, sampling_config=config.get('waypoint_sampling', {}))
             if result.get("success"):
                 self._apply_uploaded_mission_route(result.get("data", {}).get("nav_waypoints", []))
                 return jsonify(result)
