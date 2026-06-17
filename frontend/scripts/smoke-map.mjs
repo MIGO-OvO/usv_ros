@@ -4,6 +4,7 @@ import { resolve } from 'node:path'
 const root = resolve(import.meta.dirname, '..')
 const mapSource = readFileSync(resolve(root, 'src/pages/Map.tsx'), 'utf8')
 const labSource = readFileSync(resolve(root, 'src/pages/Lab.tsx'), 'utf8')
+const labTypesSource = readFileSync(resolve(root, 'src/lib/lab-types.ts'), 'utf8')
 const settingsSource = readFileSync(resolve(root, 'src/pages/Settings.tsx'), 'utf8')
 
 const requiredMapTokens = [
@@ -38,10 +39,13 @@ const forbiddenMapTokens = [
   '离线模式',
 ]
 
-const requiredLabTokens = [
+const requiredLabPageTokens = [
   'fitLabBounds',
   'lab-map-workspace',
   '适配范围',
+]
+
+const requiredLabTypesTokens = [
   '110.412778',
   '25.314167',
 ]
@@ -72,8 +76,14 @@ for (const token of forbiddenMapTokens) {
   }
 }
 
-for (const token of requiredLabTokens) {
+for (const token of requiredLabPageTokens) {
   if (!labSource.includes(token)) {
+    throw new Error(`Lab smoke failed: missing ${token}`)
+  }
+}
+
+for (const token of requiredLabTypesTokens) {
+  if (!labTypesSource.includes(token)) {
     throw new Error(`Lab smoke failed: missing ${token}`)
   }
 }
