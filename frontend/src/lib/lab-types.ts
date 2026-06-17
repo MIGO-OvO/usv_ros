@@ -60,6 +60,32 @@ export interface LabStatus {
     readonly target_seq: number | null
     readonly reached_count: number
     readonly completed: boolean
+    readonly waiting_sampling_done: boolean
+  }
+  readonly sampling?: {
+    readonly active: boolean
+    readonly status: string
+    readonly mission_status: string
+    readonly started_at: string | null
+    readonly duration_s: number
+    readonly elapsed_s: number
+    readonly remaining_s: number
+    readonly progress_percent: number
+  }
+  readonly signal?: {
+    readonly value: number
+    readonly absorbance: number
+    readonly status: string
+    readonly simulated: boolean
+    readonly valid: boolean
+    readonly pollution_value: number | null
+    readonly waypoint_seq: number | null
+    readonly timestamp: number | string | null
+    readonly raw: Record<string, unknown>
+  }
+  readonly trigger_status?: {
+    readonly status: string
+    readonly received_at: string | null
   }
   readonly virtual_propulsion: {
     readonly left: number
@@ -96,6 +122,35 @@ export const fallbackStatus: LabStatus = {
   running: false,
   speed_mps: 0,
   heading_deg: 0,
-  mission: { active: false, total: 0, target_seq: null, reached_count: 0, completed: false },
+  mission: {
+    active: false,
+    total: 0,
+    target_seq: null,
+    reached_count: 0,
+    completed: false,
+    waiting_sampling_done: false,
+  },
+  sampling: {
+    active: false,
+    status: '',
+    mission_status: 'IDLE',
+    started_at: null,
+    duration_s: 0,
+    elapsed_s: 0,
+    remaining_s: 0,
+    progress_percent: 0,
+  },
+  signal: {
+    value: 0,
+    absorbance: 0,
+    status: 'idle',
+    simulated: false,
+    valid: false,
+    pollution_value: null,
+    waypoint_seq: null,
+    timestamp: null,
+    raw: {},
+  },
+  trigger_status: { status: '', received_at: null },
   virtual_propulsion: { left: 0, right: 0, real_output_enabled: false },
 }

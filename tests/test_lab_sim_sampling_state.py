@@ -193,6 +193,9 @@ class LabSimSamplingStateTests(unittest.TestCase):
         self.assertFalse(snapshot["mission"]["completed"])
         self.assertTrue(snapshot["mission"]["waiting_sampling_done"])
         sim.complete_mission()
+        completed_snapshot = sim.snapshot()
+        self.assertFalse(completed_snapshot["running"])
+        self.assertTrue(completed_snapshot["mission"]["completed"])
 
         node = module.LabSimNode.__new__(module.LabSimNode)
         node.sim = sim

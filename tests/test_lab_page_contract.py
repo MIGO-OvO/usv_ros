@@ -31,6 +31,22 @@ class LabPageContractTest(unittest.TestCase):
             r"\.usv-boat-icon\s*\{[^}]*transition\s*:\s*transform",
         )
 
+    def test_lab_page_exposes_sampling_progress_duration_and_virtual_signal(self):
+        page_text = (REPO_ROOT / "frontend" / "src" / "pages" / "Lab.tsx").read_text(
+            encoding="utf-8"
+        )
+        types_text = (REPO_ROOT / "frontend" / "src" / "lib" / "lab-types.ts").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("sampling.progress_percent", page_text)
+        self.assertIn("sampling.duration_s", page_text)
+        self.assertIn("signal.pollution_value", page_text)
+        self.assertIn("虚拟信号", page_text)
+        self.assertIn("采样进度", page_text)
+        self.assertIn("duration_s", types_text)
+        self.assertIn("pollution_value", types_text)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -163,14 +163,23 @@ export default function Lab() {
 
   const propulsion = status.virtual_propulsion || fallbackStatus.virtual_propulsion
   const mission = status.mission || fallbackStatus.mission!
+  const sampling = status.sampling || fallbackStatus.sampling!
+  const signal = status.signal || fallbackStatus.signal!
   const speedLimitMps = Math.max(0, Number(config.sim.max_speed_mps) || 0)
   const liveSpeedPercent = speedPercent(status.speed_mps || 0, speedLimitMps)
-  const isCompleted = mission.completed;
-  const stage = !config.mission.waypoints.length ? '未配置航点'
-    : status.running ? (mission.active ? `航行中 · 目标 #${mission.target_seq ?? '-'}` : '采样中')
+  const waypointTotal = Math.max(config.mission.waypoints.length, mission.total || 0)
+  const isCompleted = Boolean(mission.completed)
+    || (waypointTotal > 0 && mission.reached_count >= waypointTotal && !mission.active && !mission.waiting_sampling_done)
+  const stage = !waypointTotal ? '未配置航点'
     : isCompleted ? '已完成'
-    : mission.reached_count >= config.mission.waypoints.length && config.mission.waypoints.length > 0 ? '已完成'
+    : status.running ? (mission.active ? `航行中 · 目标 #${mission.target_seq ?? '-'}` : '采样中')
+    : sampling.active || mission.waiting_sampling_done ? '采样中'
     : '就绪'
+  const samplingProgress = Math.max(0, Math.min(100, Number(sampling.progress_percent) || 0))
+  const samplingDuration = Number(sampling.duration_s) || Number(config.sim.sample_dwell_s) || 0
+  const signalValue = Number(signal.value || 0).toFixed(3)
+  const absorbanceValue = Number(signal.absorbance || 0).toFixed(3)
+  const pollutionValue = signal.pollution_value == null ? '--' : Number(signal.pollution_value).toFixed(3)
 
   return (
     <div className="min-h-[calc(100vh-5rem)] px-3 pb-24 pt-3 md:p-5 xl:h-screen xl:min-h-0 flex flex-col gap-3 bg-muted/20">
@@ -204,8 +213,8 @@ export default function Lab() {
         <span className="text-muted-foreground">
           {stage === '未配置航点' && '在地图点击"画航点"放置虚拟航点, 或从 QGC 导入, 再点启动。'}
           {stage === '就绪' && '已配置航线, 点"启动"让虚拟船自动巡航并到点采样。'}
-          {stage.startsWith('航行中') && `虚拟船自动巡航中, 已到达 ${mission.reached_count}/${config.mission.waypoints.length} 点。`}
-          {stage === '采样中' && '到达航点, 正在按数据源采集 (模拟生成或真实设备)。'}
+          {stage.startsWith('航行中') && `虚拟船自动巡航中, 已到达 ${mission.reached_count}/${waypointTotal} 点。`}
+          {stage === '采样中' && `到达航点, 采样进度 ${samplingProgress.toFixed(0)}%, 预计 ${samplingDuration.toFixed(1)} 秒。`}
           {stage === '已完成' && '航线已跑完, 切到地图页查看采样点与污染热力图。'}
         </span>
       </div>
@@ -380,7 +389,7 @@ export default function Lab() {
                 </div>
                 <div className="rounded-md border p-3">
                   <div className="text-muted-foreground">到达进度</div>
-                  <div className="font-medium">{mission.reached_count}/{config.mission.waypoints.length}</div>
+                  <div className="font-medium">{mission.reached_count}/{waypointTotal}</div>
                 </div>
                 <div className="rounded-md border p-3">
                   <div className="text-muted-foreground">任务状态</div>
@@ -398,6 +407,49 @@ export default function Lab() {
                         未开始
                       </span>
                     )}
+                  </div>
+                </div>
+              </div>
+              <div className="rounded-md border p-3 space-y-3">
+                <div className="flex items-center justify-between gap-3 text-sm">
+                  <span className="font-medium">采样进度</span>
+                  <span className="font-mono text-xs text-muted-foreground">
+                    {sampling.progress_percent.toFixed(1)}%
+                  </span>
+                </div>
+                <div className="h-2 rounded bg-muted">
+                  <div className="h-2 rounded bg-sky-500" style={{ width: `${samplingProgress}%` }} />
+                </div>
+                <div className="grid grid-cols-3 gap-2 text-xs text-muted-foreground">
+                  <span>用时 {sampling.elapsed_s.toFixed(1)}s</span>
+                  <span>剩余 {sampling.remaining_s.toFixed(1)}s</span>
+                  <span>采样停留 {sampling.duration_s.toFixed(1)}s</span>
+                </div>
+                <div className="text-xs text-muted-foreground">任务阶段 {sampling.mission_status || 'IDLE'}</div>
+              </div>
+              <div className="rounded-md border p-3 space-y-3">
+                <div className="flex items-center justify-between gap-3 text-sm">
+                  <span className="font-medium">虚拟信号</span>
+                  <span className="text-xs text-muted-foreground">
+                    {signal.simulated ? '模拟生成' : '真实/未标记'}
+                  </span>
+                </div>
+                <div className="grid grid-cols-2 gap-3 text-sm">
+                  <div>
+                    <div className="text-muted-foreground">电压</div>
+                    <div className="font-mono font-medium">{signalValue} V</div>
+                  </div>
+                  <div>
+                    <div className="text-muted-foreground">吸光度</div>
+                    <div className="font-mono font-medium">{absorbanceValue}</div>
+                  </div>
+                  <div>
+                    <div className="text-muted-foreground">污染值</div>
+                    <div className="font-mono font-medium">{signal.pollution_value == null ? '--' : pollutionValue}</div>
+                  </div>
+                  <div>
+                    <div className="text-muted-foreground">航点</div>
+                    <div className="font-mono font-medium">#{signal.waypoint_seq ?? '-'}</div>
                   </div>
                 </div>
               </div>
