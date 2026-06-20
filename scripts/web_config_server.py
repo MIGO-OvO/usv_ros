@@ -832,10 +832,30 @@ def _first_text_value(*values):
     return None
 
 
-def _point_summary_surface_reason(point):
+def _mission_has_only_lab_sim_sampling_points(mission_data):
+    data = mission_data if isinstance(mission_data, dict) else {}
+    points = [point for point in data.get("data_points", []) or [] if isinstance(point, dict)]
+    if not points:
+        return False
+    return all(
+        bool(point.get("lab_mode")) and point.get("method_name") == "lab_sim_sampling_event"
+        for point in points
+    )
+
+
+def _include_lab_from_request(mission_data, raw_value):
+    value = "" if raw_value is None else str(raw_value).strip().lower()
+    if value in ("1", "true", "yes", "on"):
+        return True
+    if value in ("0", "false", "no", "off"):
+        return False
+    return _mission_has_only_lab_sim_sampling_points(mission_data)
+
+
+def _point_summary_surface_reason(point, include_lab=False):
     if not isinstance(point, dict):
         return "invalid_point"
-    if point.get("lab_mode"):
+    if point.get("lab_mode") and not include_lab:
         return "lab_excluded"
     if _point_coord_for_summary(point) is None:
         return "missing_gps"
@@ -878,6 +898,7 @@ def build_mission_summary(mission_data):
     data = mission_data if isinstance(mission_data, dict) else {}
     points = data.get("data_points", [])
     points = points if isinstance(points, list) else []
+    include_lab = _mission_has_only_lab_sim_sampling_points(data)
     excluded_reasons = {}
     concentration_values = []
     valid_surface_point_count = 0
@@ -904,7 +925,7 @@ def build_mission_summary(mission_data):
         if concentration is not None:
             concentration_values.append(concentration)
 
-        reason = _point_summary_surface_reason(point)
+        reason = _point_summary_surface_reason(point, include_lab=include_lab)
         if reason:
             count(reason)
         else:
@@ -2051,6 +2072,7 @@ class WebConfigServer(object):
         elif "survey_sample_done" in status:
             self.latest_survey_sample_done_at = received_at
         if 'survey_started' in status:
+            self._start_data_recording_if_needed(source="survey")
             self._apply_survey_injection_pump_policy(running=True)
         if 'sampling_started' in status:
             self.automation_running = True
@@ -2062,7 +2084,8 @@ class WebConfigServer(object):
             or 'start_failed' in status
         ):
             self.automation_running = False
-            self._stop_data_recording_if_active()
+            if 'sampling_stopped' not in status or self.data_recording_source != "survey":
+                self._stop_data_recording_if_active()
             if 'survey_stopped' in status:
                 self._apply_survey_injection_pump_policy(running=False)
         if self.socketio:
@@ -4522,7 +4545,7 @@ class WebConfigServer(object):
             if not data:
                 return jsonify({"success": False, "message": "任务不存在"}), 404
             metric = request.args.get("metric", "auto")
-            include_lab = str(request.args.get("include_lab", "")).strip().lower() in ("1", "true", "yes", "on")
+            include_lab = _include_lab_from_request(data, request.args.get("include_lab"))
             payload = {
                 "success": True,
                 "data": self._build_mission_geojson(data, metric, include_lab=include_lab),
@@ -4539,7 +4562,7 @@ class WebConfigServer(object):
             metric = request.args.get("metric", "auto")
             size = request.args.get("size", DEFAULT_SURFACE_SIZE)
             power = request.args.get("power", 2.0)
-            include_lab = str(request.args.get("include_lab", "")).strip().lower() in ("1", "true", "yes", "on")
+            include_lab = _include_lab_from_request(data, request.args.get("include_lab"))
             payload = {
                 "success": True,
                 "data": self._build_idw_surface(data, metric, size=size, power=power, include_lab=include_lab),

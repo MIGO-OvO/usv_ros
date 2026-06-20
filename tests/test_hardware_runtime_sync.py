@@ -549,6 +549,41 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(len(server.data_manager.started), 1)
         self.assertEqual(server.data_manager.stopped, 1)
 
+    def test_survey_simulated_samples_stay_in_one_lab_surface_mission(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_survey_lab_surface_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            server.data_manager = module.MissionDataManager(str(Path(tmpdir) / "missions"))
+
+            server._trigger_status_cb(string_cls("survey_started"))
+            for index, (lat, lng) in enumerate([(30.0, 120.0), (30.001, 120.0), (30.0, 120.001)]):
+                payload = _sample_event_payload("survey-%d" % index, droplet_count=12)
+                payload["mode"] = "survey"
+                payload["route_ref"] = {"route_id": "survey-route", "segment_index": index}
+                payload["position"]["wgs84"] = {"lat": lat, "lng": lng, "alt": None}
+                payload["position"]["gcj02"] = {"lat": lat, "lng": lng, "alt": None}
+                server._trigger_status_cb(string_cls("sampling_started"))
+                server._lab_sample_event_cb(string_cls(json.dumps(payload)))
+                server._trigger_status_cb(string_cls("sampling_stopped"))
+            server._trigger_status_cb(string_cls("survey_stopped"))
+            missions = server.data_manager.list_missions()
+
+        self.assertEqual(len(missions), 1)
+        self.assertEqual(missions[0]["point_count"], 3)
+        self.assertEqual(missions[0]["valid_surface_point_count"], 3)
+        self.assertTrue(missions[0]["surface_ready"])
+
     def test_web_live_map_exposes_survey_gate_status(self):
         module, _, string_cls = _load_script(
             "web_config_server_survey_gate_status_test",
