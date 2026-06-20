@@ -281,7 +281,7 @@ export default function MapPage() {
   const [loadingMap, setLoadingMap] = useState(false)
   const [missions, setMissions] = useState<MissionMeta[]>([])
   const [selectedMission, setSelectedMission] = useState('')
-  const [includeLab, setIncludeLab] = useState(false)
+  const [includeLab, setIncludeLab] = useState(true)
   const [geojson, setGeojson] = useState<GeoJsonPayload | null>(null)
   const [surface, setSurface] = useState<SurfacePayload | null>(null)
   const [surveyStatus, setSurveyStatus] = useState<SurveyStatus | null>(null)
