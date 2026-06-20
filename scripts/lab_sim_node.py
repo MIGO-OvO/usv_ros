@@ -5,9 +5,17 @@
 from __future__ import print_function
 
 import json
+import os
+import sys
 import threading
 import time
 from datetime import datetime
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+for _path in (REPO_ROOT, SCRIPT_DIR):
+    if _path not in sys.path:
+        sys.path.insert(0, _path)
 
 from scripts.lib.lab_sim.vessel_model import VesselSimulator as LabSimulator
 
