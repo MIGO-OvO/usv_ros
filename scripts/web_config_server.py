@@ -1956,6 +1956,22 @@ class WebConfigServer(object):
             return bool(is_recording())
         return bool(getattr(self.data_manager, "current_mission_file", None))
 
+    def _lab_mission_recording_active(self):
+        mission = self.lab_status.get("mission", {}) if isinstance(self.lab_status, dict) else {}
+        if not isinstance(mission, dict):
+            return False
+        try:
+            total = int(mission.get("total", 0) or 0)
+        except (TypeError, ValueError):
+            total = 0
+        if total <= 0 or bool(mission.get("completed", False)):
+            return False
+        return bool(
+            self.lab_status.get("running", False)
+            or mission.get("active", False)
+            or mission.get("waiting_sampling_done", False)
+        )
+
     def _start_data_recording_if_needed(self, source="unknown"):
         if self._data_recording_active():
             if not self.data_recording_source:
@@ -2076,7 +2092,8 @@ class WebConfigServer(object):
             self._apply_survey_injection_pump_policy(running=True)
         if 'sampling_started' in status:
             self.automation_running = True
-            self._start_data_recording_if_needed(source="trigger")
+            source = "lab" if self._lab_mission_recording_active() else "trigger"
+            self._start_data_recording_if_needed(source=source)
         elif (
             'sampling_stopped' in status
             or 'survey_stopped' in status
@@ -2084,7 +2101,11 @@ class WebConfigServer(object):
             or 'start_failed' in status
         ):
             self.automation_running = False
-            if 'sampling_stopped' not in status or self.data_recording_source != "survey":
+            keep_recording = (
+                'sampling_stopped' in status
+                and self.data_recording_source in ("survey", "lab")
+            )
+            if not keep_recording:
                 self._stop_data_recording_if_active()
             if 'survey_stopped' in status:
                 self._apply_survey_injection_pump_policy(running=False)
@@ -2576,6 +2597,8 @@ class WebConfigServer(object):
                 self.data_manager.add_track_point(position)
             if self.socketio:
                 self.socketio.emit("map_position", position)
+        if self.data_recording_source == "lab" and not self._lab_mission_recording_active():
+            self._stop_data_recording_if_active()
         if self.socketio:
             self.socketio.emit("lab_status", self._lab_status_snapshot())
 

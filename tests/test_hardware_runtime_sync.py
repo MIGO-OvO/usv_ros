@@ -584,6 +584,70 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(missions[0]["valid_surface_point_count"], 3)
         self.assertTrue(missions[0]["surface_ready"])
 
+    def test_lab_virtual_waypoint_samples_stay_in_one_mission_until_lab_complete(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_lab_virtual_recording_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            server.data_manager = module.MissionDataManager(str(Path(tmpdir) / "missions"))
+            server._lab_sim_status_cb(string_cls(json.dumps({
+                "running": True,
+                "lat": 30.0,
+                "lng": 120.0,
+                "mission": {
+                    "active": False,
+                    "total": 3,
+                    "target_seq": 0,
+                    "reached_count": 1,
+                    "completed": False,
+                    "waiting_sampling_done": True,
+                },
+            })))
+
+            for index, (lat, lng) in enumerate([(30.0, 120.0), (30.001, 120.0), (30.0, 120.001)]):
+                payload = _sample_event_payload("lab-wp-%d" % index, droplet_count=12)
+                payload["route_ref"] = {"route_id": "lab-route", "waypoint_index": index}
+                payload["position"]["wgs84"] = {"lat": lat, "lng": lng, "alt": None}
+                payload["position"]["gcj02"] = {"lat": lat, "lng": lng, "alt": None}
+                server._trigger_status_cb(string_cls("sampling_started"))
+                server._lab_sample_event_cb(string_cls(json.dumps(payload)))
+                server._trigger_status_cb(string_cls("sampling_stopped"))
+                server.lab_status["mission"].update({
+                    "active": index < 2,
+                    "reached_count": index + 1,
+                    "waiting_sampling_done": index < 2,
+                })
+
+            self.assertTrue(server._data_recording_active())
+            server._lab_sim_status_cb(string_cls(json.dumps({
+                "running": False,
+                "lat": 30.0,
+                "lng": 120.001,
+                "mission": {
+                    "active": False,
+                    "total": 3,
+                    "target_seq": None,
+                    "reached_count": 3,
+                    "completed": True,
+                    "waiting_sampling_done": False,
+                },
+            })))
+            missions = server.data_manager.list_missions()
+
+        self.assertEqual(len(missions), 1)
+        self.assertEqual(missions[0]["point_count"], 3)
+        self.assertEqual(missions[0]["valid_surface_point_count"], 3)
+
     def test_web_live_map_exposes_survey_gate_status(self):
         module, _, string_cls = _load_script(
             "web_config_server_survey_gate_status_test",
