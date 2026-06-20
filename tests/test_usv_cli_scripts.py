@@ -15,6 +15,29 @@ class UsvCliScriptTests(unittest.TestCase):
         self.assertIn("set -euo pipefail", text)
         return text
 
+    def test_web_server_bootstraps_package_root_before_lab_imports(self):
+        path = SCRIPTS_DIR / "web_config_server.py"
+        text = path.read_text(encoding="utf-8")
+
+        package_root_index = text.index("REPO_ROOT = os.path.dirname(SCRIPT_DIR)")
+        lab_import_index = text.index("from scripts.lib.lab_sim.coordinates import")
+
+        self.assertLess(package_root_index, lab_import_index)
+        self.assertIn("for _path in (REPO_ROOT, SCRIPT_DIR, MAP_RESOURCES_DIR):", text[:lab_import_index])
+        self.assertIn("sys.path.insert(0, _path)", text[:lab_import_index])
+
+    def test_lab_sim_node_bootstraps_package_root_before_lab_imports(self):
+        path = SCRIPTS_DIR / "lab_sim_node.py"
+        text = path.read_text(encoding="utf-8")
+
+        package_root_index = text.index("REPO_ROOT = os.path.dirname(SCRIPT_DIR)")
+        lab_import_index = text.index("from scripts.lib.lab_sim.vessel_model import")
+
+        self.assertLess(package_root_index, lab_import_index)
+        self.assertIn("for _path in (REPO_ROOT, SCRIPT_DIR):", text[:lab_import_index])
+        self.assertIn("sys.path.insert(0, _path)", text[:lab_import_index])
+
+
     def test_cli_and_installer_scripts_exist(self):
         self._read_script("usvctl.sh")
         self._read_script("install_usv_commands.sh")

@@ -92,10 +92,11 @@ except ImportError:
 
 # 确保脚本目录与地图资源子目录在路径中
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
 MAP_RESOURCES_DIR = os.path.join(SCRIPT_DIR, "map_resources")
-for _path in (SCRIPT_DIR, MAP_RESOURCES_DIR):
+for _path in (REPO_ROOT, SCRIPT_DIR, MAP_RESOURCES_DIR):
     if _path not in sys.path:
-        sys.path.append(_path)
+        sys.path.insert(0, _path)
 
 from preset_manager import PresetManager
 import map_tile_cache as mtc
