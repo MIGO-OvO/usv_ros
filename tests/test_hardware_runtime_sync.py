@@ -231,6 +231,47 @@ def _load_script(module_name, relative_path):
     return module, publishers, string_cls
 
 
+def _coord_pair(lat, lng):
+    return {
+        "wgs84": {"lat": lat, "lng": lng},
+        "gcj02": {"lat": lat, "lng": lng},
+    }
+
+
+def _sample_event_payload(event_id="sample-t15", droplet_count=12):
+    droplets = []
+    for index in range(droplet_count):
+        droplets.append({
+            "droplet_index": index,
+            "offset_ms": index * 25,
+            "voltage": 2.5 + index * 0.01,
+            "absorbance": 0.12 + index * 0.001,
+            "truth_concentration": 1.7,
+            "estimated_concentration": 1.8,
+            "valid": True,
+            "saturated": False,
+            "noise_flags": [],
+        })
+    return {
+        "schema_version": 2,
+        "event_id": event_id,
+        "mode": "waypoint",
+        "route_ref": {"route_id": "route-t15", "waypoint_index": 2},
+        "position": {
+            "wgs84": {"lat": 30.0, "lng": 120.0, "alt": None},
+            "gcj02": {"lat": 30.0, "lng": 120.0, "alt": None},
+        },
+        "analyte_id": "nh3n",
+        "droplets": droplets,
+        "mean": 1.8,
+        "median": 1.8,
+        "standard_deviation": 0.03,
+        "valid_count": droplet_count,
+        "quality_flags": [],
+        "config_snapshot": {"schema_version": 2, "droplet_count": droplet_count},
+    }
+
+
 class HardwareRuntimeSyncTests(unittest.TestCase):
     def test_detector_default_i2c_mapping_matches_validated_firmware_defaults(self):
         pump_module, _, _ = _load_script(
@@ -1200,9 +1241,9 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
                 "water_area": {
                     "enabled": True,
                     "polygon": [
-                        {"lat": 30.0, "lng": 120.0},
-                        {"lat": 30.0, "lng": 120.1},
-                        {"lat": 30.1, "lng": 120.1},
+                        _coord_pair(30.0, 120.0),
+                        _coord_pair(30.0, 120.1),
+                        _coord_pair(30.1, 120.1),
                     ],
                 },
             })
@@ -2014,11 +2055,14 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(live["lab_status"]["virtual_propulsion"]["left"], 0.5)
         self.assertTrue(stop_resp.get_json()["success"])
 
-    def test_web_lab_sim_status_keeps_gcj02_coordinates_exact_for_lab_mode(self):
+    def test_web_lab_sim_status_converts_wgs84_position_to_gcj02(self):
         module, _, string_cls = _load_script(
             "web_config_server_lab_gcj_status_test",
             "scripts/web_config_server.py",
         )
+        wgs_lat = 25.314167
+        wgs_lng = 110.412778
+        expected_gcj = module.wgs84_to_gcj02(wgs_lat, wgs_lng)
 
         with tempfile.TemporaryDirectory() as tmpdir:
             config_file = str(Path(tmpdir) / "sampling_config.json")
@@ -2029,24 +2073,39 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
 
             module.ConfigManager = TempConfigManager
             server = module.WebConfigServer(standalone=True)
+            server.data_manager = module.MissionDataManager(str(Path(tmpdir) / "missions"))
+            server.data_manager.start_mission("lab")
             client = server.app.test_client()
 
             server._lab_sim_status_cb(string_cls(json.dumps({
                 "running": True,
-                "lat": 25.314167,
-                "lng": 110.412778,
+                "lat": wgs_lat,
+                "lng": wgs_lng,
                 "heading_deg": 45.0,
                 "speed_mps": 0.8,
                 "mission": {"active": True, "total": 2, "target_seq": 1, "reached_count": 1},
             })))
+            server.data_manager.add_data_point(
+                1.2,
+                0.3,
+                position=server.current_position,
+                lab_mode=True,
+            )
             lab_resp = client.get("/api/lab/status")
             live_resp = client.get("/api/map/live")
 
         lab_position = lab_resp.get_json()["data"]["position"]
         live = live_resp.get_json()["data"]
-        self.assertAlmostEqual(lab_position["gcj02"]["lat"], 25.314167)
-        self.assertAlmostEqual(lab_position["gcj02"]["lng"], 110.412778)
-        self.assertAlmostEqual(live["position"]["gcj02"]["lat"], 25.314167)
+        live_position = live["position"]
+        track_position = live["track_points"][-1]
+        sample_point = live["data_points"][-1]
+        for position in (lab_position, live_position, track_position, sample_point):
+            self.assertAlmostEqual(position["wgs84"]["lat"], wgs_lat)
+            self.assertAlmostEqual(position["wgs84"]["lng"], wgs_lng)
+            self.assertAlmostEqual(position["gcj02"]["lat"], expected_gcj["lat"])
+            self.assertAlmostEqual(position["gcj02"]["lng"], expected_gcj["lng"])
+            self.assertNotAlmostEqual(position["gcj02"]["lat"], wgs_lat, places=5)
+            self.assertNotAlmostEqual(position["gcj02"]["lng"], wgs_lng, places=5)
         self.assertEqual(live["lab_status"]["mission"]["target_seq"], 1)
 
     def test_web_lab_status_exposes_completion_sampling_progress_and_signal(self):
@@ -2109,6 +2168,137 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(done_status["signal"]["value"], 1.2)
         self.assertEqual(done_status["signal"]["raw"]["waypoint_seq"], 2)
 
+    def test_web_lab_sample_event_callback_exposes_bounded_status_and_one_map_point(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_lab_sample_event_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=True)
+            server.data_manager = module.MissionDataManager(str(Path(tmpdir) / "missions"))
+            server.data_manager.start_mission("t15-sample-event")
+            mission_id = server.data_manager.current_mission_data["mission_id"]
+            client = server.app.test_client()
+
+            event = _sample_event_payload()
+            server._lab_sample_event_cb(string_cls(json.dumps(event)))
+            server.automation_running = True
+            server._voltage_cb(string_cls(json.dumps({
+                "sample_event_id": event["event_id"],
+                "sample_event_mode": event["mode"],
+                "droplet_count": 12,
+                "valid_count": 12,
+                "voltage": 2.55,
+                "absorbance": 0.125,
+                "value": 1.8,
+                "simulated": True,
+                "valid": True,
+            })))
+            live_resp = client.get("/api/map/live")
+            status_resp = client.get("/api/lab/status")
+            mission_resp = client.get("/api/data/mission/%s" % mission_id)
+
+        mission = mission_resp.get_json()["data"]
+        live = live_resp.get_json()["data"]
+        status = status_resp.get_json()["data"]["status"]
+        latest_event = status["sampling"]["latest_event"]
+
+        self.assertEqual(len(mission["sampling_events"]), 1)
+        self.assertEqual(len(mission["sampling_events"][0]["droplets"]), 12)
+        self.assertEqual(len(mission["data_points"]), 1)
+        self.assertEqual(len(live["data_points"]), 1)
+        self.assertEqual(live["data_points"][0]["sample_event_id"], "sample-t15")
+        self.assertNotIn("droplets", live["data_points"][0])
+        self.assertEqual(latest_event["event_id"], "sample-t15")
+        self.assertEqual(latest_event["droplet_count"], 12)
+        self.assertEqual(latest_event["valid_count"], 12)
+        self.assertEqual(latest_event["mean"], 1.8)
+        self.assertEqual(latest_event["progress_percent"], 100.0)
+        self.assertNotIn("droplets", latest_event)
+        self.assertEqual(status["signal"]["raw"]["sample_event_id"], "sample-t15")
+        self.assertNotIn("droplets", status["signal"]["raw"])
+
+    def test_web_voltage_history_is_bounded_and_omits_large_raw_payload(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_voltage_history_bound_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=True)
+            server.automation_running = True
+            client = server.app.test_client()
+
+            for index in range(305):
+                server._voltage_cb(string_cls(json.dumps({
+                    "sample_event_id": "sample-%03d" % index,
+                    "droplets": [{"droplet_index": droplet} for droplet in range(64)],
+                    "voltage": 2.0 + index,
+                    "absorbance": 0.1,
+                    "valid": True,
+                })))
+            response = client.get("/api/data/voltage")
+
+        payload = response.get_json()["data"]
+        self.assertEqual(len(payload), 300)
+        self.assertEqual(payload[0]["raw"]["sample_event_id"], "sample-005")
+        self.assertEqual(payload[-1]["raw"]["sample_event_id"], "sample-304")
+        self.assertNotIn("droplets", payload[-1]["raw"])
+        self.assertEqual(payload[-1]["raw"]["droplets_omitted"], 64)
+
+    def test_web_live_map_samples_are_bounded_and_summarize_raw_payload(self):
+        module, _, _ = _load_script(
+            "web_config_server_live_samples_bound_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=True)
+            server.data_manager = module.MissionDataManager(str(Path(tmpdir) / "missions"))
+            server.data_manager.start_mission("bounded-live")
+            server.data_manager.current_mission_data["data_points"] = [
+                {
+                    "timestamp": "t-%03d" % index,
+                    "voltage": float(index),
+                    "raw": {
+                        "sample_event_id": "sample-%03d" % index,
+                        "droplets": [{"droplet_index": droplet} for droplet in range(64)],
+                    },
+                }
+                for index in range(505)
+            ]
+            client = server.app.test_client()
+            response = client.get("/api/map/live")
+
+        points = response.get_json()["data"]["data_points"]
+        self.assertEqual(len(points), 500)
+        self.assertEqual(points[0]["timestamp"], "t-005")
+        self.assertEqual(points[-1]["timestamp"], "t-504")
+        self.assertNotIn("droplets", points[-1]["raw"])
+        self.assertEqual(points[-1]["raw"]["droplets_omitted"], 64)
+
     def test_web_lab_start_publishes_atomic_reset_and_mission_start_command(self):
         module, publishers, _ = _load_script(
             "web_config_server_lab_start_command_test",
@@ -2128,11 +2318,11 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             save_resp = client.post("/api/lab/config", json={
                 "enabled": True,
                 "position_source": "lab_sim",
-                "sim": {"start_lat": 30.1, "start_lng": 120.2, "heading_deg": 30.0},
-                "mission": {"waypoints": [{"lat": 30.1, "lng": 120.2}]},
+                "sim": {"start": _coord_pair(30.1, 120.2), "heading_deg": 30.0},
+                "mission": {"waypoints": [_coord_pair(30.1, 120.2)]},
             })
             mission_resp = client.post("/api/lab/mission", json={
-                "waypoints": [{"lat": 30.1, "lng": 120.2}],
+                "waypoints": [_coord_pair(30.1, 120.2)],
             })
             start_resp = client.post("/api/lab/start")
 
@@ -2149,11 +2339,74 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertTrue(commands[-1]["reset_to_start"])
         self.assertEqual(commands[-1]["waypoints"][0]["lat"], 30.1)
 
-    def test_web_lab_import_qgc_reads_nested_gcj02_route_waypoints(self):
+    def test_web_lab_start_command_uses_wgs84_runtime_coordinates_for_gcj02_clicks(self):
+        module, publishers, _ = _load_script(
+            "web_config_server_lab_start_wgs84_command_test",
+            "scripts/web_config_server.py",
+        )
+        start_click = {"lat": 25.314167, "lng": 110.412778}
+        waypoint_click = {"lat": 25.315, "lng": 110.413}
+        expected_start = module.CoordinatePair.from_gcj02(
+            module.parse_coordinate(start_click["lat"], start_click["lng"])
+        )
+        expected_waypoint = module.CoordinatePair.from_gcj02(
+            module.parse_coordinate(waypoint_click["lat"], waypoint_click["lng"])
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            client = server.app.test_client()
+
+            save_resp = client.post("/api/lab/config", json={
+                "enabled": True,
+                "position_source": "lab_sim",
+                "sim": {
+                    "start": {"input_crs": "GCJ02", "gcj02": start_click},
+                    "heading_deg": 30.0,
+                },
+                "mission": {
+                    "waypoints": [
+                        {"input_crs": "GCJ02", "gcj02": waypoint_click},
+                    ]
+                },
+            })
+            start_resp = client.post("/api/lab/start")
+
+        saved = save_resp.get_json()["data"]
+        commands = [
+            json.loads(msg.data)
+            for msg in publishers["/usv/lab_sim/command"].messages
+        ]
+        start_command = commands[-1]
+
+        self.assertEqual(save_resp.status_code, 200)
+        self.assertTrue(start_resp.get_json()["success"])
+        self.assertAlmostEqual(saved["sim"]["start_lat"], start_click["lat"], places=9)
+        self.assertAlmostEqual(saved["sim"]["start_lng"], start_click["lng"], places=9)
+        self.assertAlmostEqual(start_command["config"]["sim"]["start_lat"], expected_start.wgs84.lat, places=8)
+        self.assertAlmostEqual(start_command["config"]["sim"]["start_lng"], expected_start.wgs84.lng, places=8)
+        self.assertAlmostEqual(start_command["waypoints"][0]["lat"], expected_waypoint.wgs84.lat, places=8)
+        self.assertAlmostEqual(start_command["waypoints"][0]["lng"], expected_waypoint.wgs84.lng, places=8)
+        self.assertNotAlmostEqual(start_command["config"]["sim"]["start_lat"], start_click["lat"], places=6)
+        self.assertNotAlmostEqual(start_command["waypoints"][0]["lat"], waypoint_click["lat"], places=6)
+
+    def test_web_lab_import_qgc_reads_nested_wgs84_route_waypoints(self):
         module, _, _ = _load_script(
             "web_config_server_lab_import_qgc_test",
             "scripts/web_config_server.py",
         )
+        first_wgs = {"lat": 30.0, "lng": 120.0}
+        second_wgs = {"lat": 30.001, "lng": 120.002}
+        expected_first_gcj = module.wgs84_to_gcj02(first_wgs["lat"], first_wgs["lng"])
+        stale_first_gcj = {"lat": expected_first_gcj["lat"] + 0.01, "lng": expected_first_gcj["lng"] + 0.01}
+        second_gcj = module.wgs84_to_gcj02(second_wgs["lat"], second_wgs["lng"])
 
         with tempfile.TemporaryDirectory() as tmpdir:
             config_file = str(Path(tmpdir) / "sampling_config.json")
@@ -2165,8 +2418,8 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             module.ConfigManager = TempConfigManager
             server = module.WebConfigServer(standalone=True)
             server.route_waypoints = [
-                {"seq": 0, "gcj02": {"lat": 30.0, "lng": 120.0}},
-                {"seq": 1, "gcj02": {"lat": 30.001, "lng": 120.002}},
+                {"seq": 0, "wgs84": first_wgs, "gcj02": stale_first_gcj},
+                {"seq": 1, "wgs84": second_wgs, "gcj02": second_gcj},
             ]
             client = server.app.test_client()
 
@@ -2175,8 +2428,17 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertTrue(response.get_json()["success"])
-        self.assertEqual(len(response.get_json()["data"]["waypoints"]), 2)
-        self.assertEqual(len(config_resp.get_json()["data"]["mission"]["waypoints"]), 2)
+        imported = response.get_json()["data"]["waypoints"]
+        saved = config_resp.get_json()["data"]["mission"]["waypoints"]
+        self.assertEqual(len(imported), 2)
+        self.assertEqual(len(saved), 2)
+        self.assertAlmostEqual(imported[0]["wgs84"]["lat"], first_wgs["lat"])
+        self.assertAlmostEqual(imported[0]["wgs84"]["lng"], first_wgs["lng"])
+        self.assertAlmostEqual(imported[0]["gcj02"]["lat"], expected_first_gcj["lat"])
+        self.assertAlmostEqual(imported[0]["gcj02"]["lng"], expected_first_gcj["lng"])
+        self.assertNotAlmostEqual(imported[0]["gcj02"]["lat"], first_wgs["lat"], places=5)
+        self.assertNotAlmostEqual(imported[0]["gcj02"]["lng"], first_wgs["lng"], places=5)
+        self.assertEqual(saved, imported)
 
     def test_mission_data_marks_lab_samples_and_geojson_excludes_by_default(self):
         module, _, _ = _load_script(

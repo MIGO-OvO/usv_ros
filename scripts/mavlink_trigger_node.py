@@ -31,10 +31,15 @@ from __future__ import print_function
 import json
 import math
 import os
-import random
 import struct
+import sys
 import threading
 import time
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(SCRIPT_DIR)
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
 
 import rospy
 from geometry_msgs.msg import TwistStamped
@@ -43,6 +48,20 @@ from std_msgs.msg import String, Float32MultiArray
 from std_srvs.srv import Trigger, TriggerResponse
 from mavros_msgs.msg import State, WaypointReached, Mavlink
 from mavros_msgs.srv import SetMode, SetModeRequest
+from scripts.lib.lab_sim.coordinates import Coordinate
+from scripts.lib.lab_sim.model_config import (
+    Analyte,
+    LabConfigV2,
+    PollutionSource,
+    RouteSnapshot,
+    WaterSnapshot,
+)
+from scripts.lib.lab_sim.model_primitives import CoordinatePairRef, GeoPoint
+from scripts.lib.lab_sim.sampling_service import (
+    SurveySamplingContext,
+    WaypointSamplingContext,
+    generate_sampling_event,
+)
 
 try:
     from usv_ros.srv import ControlCommand
@@ -219,7 +238,7 @@ class MAVLinkTriggerNode(object):
         self.steps_pub = rospy.Publisher('/usv/automation_steps', String, queue_size=1)
         self.pump_command_pub = rospy.Publisher('/usv/pump_command', String, queue_size=10)
         self.spectrometer_command_pub = rospy.Publisher('/usv/spectrometer_command', String, queue_size=10)
-        # 实验模拟数据源: 伪造分光电压注入真实通路, 与真实设备数据格式一致
+        self.sample_event_pub = rospy.Publisher('/usv/lab_sim/sample_event', String, queue_size=10)
         self.spectrometer_voltage_pub = rospy.Publisher('/usv/spectrometer_voltage', String, queue_size=10)
         self.lab_command_pub = rospy.Publisher('/usv/lab_sim/command', String, queue_size=5)
         self.cmd_ack_pub = rospy.Publisher('/usv/mavlink_cmd_ack', Float32MultiArray, queue_size=10)
@@ -457,44 +476,110 @@ class MAVLinkTriggerNode(object):
             args=(seq, lat, lng, lab), daemon=True).start()
 
     @staticmethod
-    def _simulated_voltage(lat, lng, lab):
-        """按"距污染源越近浓度越高"模型生成模拟分光电压。
+    def _lab_coord_ref(raw, fallback_lat=None, fallback_lng=None):
+        if isinstance(raw, dict) and isinstance(raw.get("wgs84"), dict) and isinstance(raw.get("gcj02"), dict):
+            return CoordinatePairRef.from_dict({"wgs84": raw["wgs84"], "gcj02": raw["gcj02"]}, "$.coordinate")
+        if isinstance(raw, dict) and raw.get("lat") is not None and raw.get("lng") is not None:
+            lat = float(raw["lat"])
+            lng = float(raw["lng"])
+            point = GeoPoint(lat=lat, lng=lng)
+            return CoordinatePairRef(wgs84=point, gcj02=point)
+        if fallback_lat is not None and fallback_lng is not None:
+            point = GeoPoint(lat=float(fallback_lat), lng=float(fallback_lng))
+            return CoordinatePairRef(wgs84=point, gcj02=point)
+        point = GeoPoint(lat=0.0, lng=0.0)
+        return CoordinatePairRef(wgs84=point, gcj02=point)
 
-        污染源: 模式 center 取航线中心(由 web 写入 lab_mode.mission.center),
-                模式 manual 取 lab_mode.pollution.source。半径外趋近基线。
-        返回 (voltage, absorbance)。voltage 越低代表吸光度越高(浓度越高)。
-        """
+    @staticmethod
+    def _bounded_droplet_count(lab):
+        raw = lab.get("droplet_count", 12) if isinstance(lab, dict) else 12
+        try:
+            count = int(raw)
+        except (TypeError, ValueError):
+            count = 12
+        return max(3, min(64, count))
+
+    @classmethod
+    def _lab_domain_config(cls, lab, lat, lng):
         pollution = lab.get('pollution', {}) if isinstance(lab.get('pollution'), dict) else {}
-        src = None
-        if str(pollution.get('mode', 'center')) == 'manual':
-            s = pollution.get('source', {})
-            if isinstance(s, dict) and s.get('lat') is not None and s.get('lng') is not None:
-                src = (float(s['lat']), float(s['lng']))
-        if src is None:
-            center = (lab.get('mission', {}) or {}).get('center', {})
-            if isinstance(center, dict) and center.get('lat') is not None:
-                src = (float(center['lat']), float(center['lng']))
-        ref_v = _float_or_default(pollution.get('reference_voltage', 3.0), 3.0)
-        radius = max(1.0, _float_or_default(pollution.get('radius_m', 150.0), 150.0))
-        strength = min(1.0, max(0.0, _float_or_default(pollution.get('strength', 0.8), 0.8)))
+        mission = lab.get('mission', {}) if isinstance(lab.get('mission'), dict) else {}
+        water_area = lab.get('water_area', {}) if isinstance(lab.get('water_area'), dict) else {}
+        origin = cls._lab_coord_ref(None, lat, lng)
+        source_raw = pollution.get("source") if str(pollution.get('mode', 'center')) == 'manual' else mission.get("center")
+        source = cls._lab_coord_ref(source_raw, lat, lng)
+        waypoints = []
+        for waypoint in mission.get("waypoints", []) or []:
+            waypoints.append(cls._lab_coord_ref(waypoint, lat, lng))
+        if not waypoints:
+            waypoints = [origin]
+        polygon = []
+        for point in water_area.get("polygon", []) or []:
+            polygon.append(cls._lab_coord_ref(point, lat, lng))
+        if len(polygon) < 3:
+            base = origin.wgs84
+            polygon = [
+                cls._lab_coord_ref(None, base.lat, base.lng),
+                cls._lab_coord_ref(None, base.lat + 0.0001, base.lng),
+                cls._lab_coord_ref(None, base.lat, base.lng + 0.0001),
+            ]
         value_min = _float_or_default(pollution.get('value_min', 0.0), 0.0)
         value_max = _float_or_default(pollution.get('value_max', 1.0), 1.0)
-        intensity = 0.0
-        if src is not None and lat is not None and lng is not None:
-            north = (float(lat) - src[0]) * 110540.0
-            cos_lat = max(0.01, math.cos(math.radians(float(lat))))
-            east = (float(lng) - src[1]) * 111320.0 * cos_lat
-            dist = math.hypot(north, east)
-            intensity = strength * max(0.0, 1.0 - dist / radius)
-        intensity = min(1.0, max(0.0, intensity))
-        value = value_min + (value_max - value_min) * intensity
-        voltage_ratio = min(0.95, max(0.0, intensity + random.uniform(-0.03, 0.03)))
-        voltage = max(0.05, ref_v * (1.0 - voltage_ratio))
-        absorbance = max(0.0, math.log10(ref_v / max(voltage, 1e-6)))
-        return round(voltage, 4), round(absorbance, 4), round(value, 6)
+        strength = min(1.0, max(0.0, _float_or_default(pollution.get('strength', 1.0), 1.0)))
+        concentration = value_min + (value_max - value_min) * strength
+        analyte_id = str(pollution.get("analyte_id", "sim") or "sim")
+        return LabConfigV2(
+            schema_version=2,
+            coordinate_schema_version=2,
+            droplet_count=cls._bounded_droplet_count(lab),
+            analytes=(Analyte(analyte_id=analyte_id, name=str(pollution.get("name", analyte_id)), unit=str(pollution.get("unit", ""))),),
+            sources=(PollutionSource(source_id="lab-source", position=source, concentrations=((analyte_id, concentration),)),),
+            route=RouteSnapshot(route_id=str(mission.get("route_id", "lab-route")), kind="manual_route", waypoints=tuple(waypoints)),
+            water=WaterSnapshot(snapshot_id=str(water_area.get("snapshot_id", "lab-water")), polygon=tuple(polygon)),
+        )
+
+    @staticmethod
+    def _event_mean(droplets, key):
+        values = [float(item[key]) for item in droplets if item.get("valid") and item.get(key) is not None]
+        if not values:
+            values = [float(item[key]) for item in droplets if item.get(key) is not None]
+        if not values:
+            return 0.0
+        return sum(values) / len(values)
+
+    def _publish_lab_sampling_event(self, seq, lat, lng, lab, context):
+        config = self._lab_domain_config(lab, lat, lng)
+        event = generate_sampling_event(
+            Coordinate(float(lat), float(lng)),
+            config,
+            context=context,
+            seed=int(seq),
+        )
+        event_payload = event.to_dict()
+        droplets = event_payload.get("droplets", [])
+        truth_value = self._event_mean(droplets, "truth_concentration")
+        payload = {
+            "voltage": round(self._event_mean(droplets, "voltage"), 4),
+            "absorbance": round(self._event_mean(droplets, "absorbance"), 4),
+            "value": round(truth_value, 6),
+            "concentration": event_payload["mean"],
+            "status": "ok" if event.valid else "invalid",
+            "waypoint_seq": seq,
+            "lab_mode": True,
+            "simulated": True,
+            "valid": event.valid,
+            "sample_event_id": event.event_id,
+            "sample_event_mode": event.mode,
+            "droplet_count": len(droplets),
+            "valid_count": event.valid_count,
+            "quality_flags": list(event.quality_flags),
+            "timestamp": time.time(),
+        }
+        self.sample_event_pub.publish(String(json.dumps(event_payload)))
+        self.spectrometer_voltage_pub.publish(String(json.dumps(payload)))
+        return event_payload, payload
 
     def _run_lab_sampling(self, seq, lat, lng, lab):
-        """实验模式采样: 真实数据源走 automation 服务; 模拟数据源伪造电压注入。"""
+        """实验模式采样: 真实数据源走 automation 服务; 模拟数据源生成有限液滴事件。"""
         if self.is_sampling:
             rospy.logwarn("Lab sampling already in progress, skip wp %d", seq)
             return
@@ -514,24 +599,24 @@ class MAVLinkTriggerNode(object):
                 self._set_mission_state(MissionState.FAILED, "%d:lab_real_start_failed" % seq)
                 self._publish_status("sampling_stopped")
             return
-        # 模拟数据源: 生成电压并发布到真实通路, 由 web 落入 data_points
+        # 模拟数据源: 生成有限液滴事件, 详情走专用话题, 兼容通路只发一次聚合值。
         sim_cfg = lab.get('sim', {}) if isinstance(lab.get('sim'), dict) else {}
         dwell_s = max(0.0, _float_or_default(sim_cfg.get('sample_dwell_s', 3.0), 3.0))
         rospy.sleep(dwell_s)
-        voltage, absorbance, value = self._simulated_voltage(lat, lng, lab)
-        payload = {
-            "voltage": voltage,
-            "absorbance": absorbance,
-            "value": value,
-            "status": "ok",
-            "waypoint_seq": seq,
-            "lab_mode": True,
-            "simulated": True,
-            "valid": True,
-            "timestamp": time.time(),
-        }
-        self.spectrometer_voltage_pub.publish(String(json.dumps(payload)))
-        rospy.loginfo("Lab simulated sample wp %d: V=%.3f A=%.3f value=%.3f", seq, voltage, absorbance, value)
+        _, payload = self._publish_lab_sampling_event(
+            seq,
+            lat,
+            lng,
+            lab,
+            WaypointSamplingContext(waypoint_index=int(seq)),
+        )
+        rospy.loginfo(
+            "Lab simulated sample wp %d: V=%.3f A=%.3f value=%.3f",
+            seq,
+            payload["voltage"],
+            payload["absorbance"],
+            payload["value"],
+        )
         self._set_mission_state(MissionState.SAMPLING_DONE, str(seq))
         self._publish_status("sampling_stopped")
         if hasattr(self, "lab_command_pub"):
@@ -1174,6 +1259,7 @@ class MAVLinkTriggerNode(object):
             self.is_sampling = False
             self.current_sampling_context = None
             self._set_mission_state(MissionState.FAILED, "fcu_injection_start_failed")
+            self._publish_status("sampling_stopped")
             return False
 
         msg = String()
@@ -1192,6 +1278,7 @@ class MAVLinkTriggerNode(object):
             self.current_sampling_context = None
             self._stop_injection_session("fcu", "automation_start_failed")
             self._set_mission_state(MissionState.FAILED, "fcu_sample_start_failed")
+            self._publish_status("sampling_stopped")
             return False
 
         self._publish_status("sampling_started")
@@ -1338,6 +1425,29 @@ class MAVLinkTriggerNode(object):
         if not gate_ok:
             self._publish_status("survey_gate_skipped:{}".format(gate_reason))
             return "skipped"
+
+        lab = config.get('lab_mode', {}) if isinstance(config.get('lab_mode', {}), dict) else {}
+        if lab.get('enabled', False) and str(lab.get('data_source', 'simulated')).strip().lower() == 'simulated':
+            position = self._survey_state_snapshot()["position"]
+            lat = position.get("lat")
+            lng = position.get("lon", position.get("lng"))
+            if lat is None or lng is None:
+                self._publish_status("survey_gate_skipped:no_gps")
+                return "skipped"
+            self._set_survey_sampling_flags(True)
+            self._publish_status("sampling_started")
+            self._publish_lab_sampling_event(
+                int(self.current_waypoint),
+                lat,
+                lng,
+                lab,
+                SurveySamplingContext(segment_index=int(self.current_waypoint)),
+            )
+            self._remember_survey_sample_position()
+            self._set_survey_sampling_flags(False)
+            self._set_mission_state(MissionState.SURVEYING, "{:.1f}".format(getattr(self, "_survey_interval", 5.0)))
+            self._publish_status("sampling_stopped")
+            return "started"
 
         steps_data = self._build_steps_payload(config, self.current_waypoint)
         steps_data['loop_count'] = 1

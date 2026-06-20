@@ -1,21 +1,87 @@
 import { useCallback, useEffect, useState } from 'react'
-import { Activity, Crosshair, Download, FlaskConical, Gauge, MapPin, Navigation, Play, RotateCcw, Save, Square, Trash2 } from 'lucide-react'
+import { Activity, Crosshair, Download, FlaskConical, Gauge, MapPin, Navigation, Play, RotateCcw, Route, Save, Settings2, Square, Trash2 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { useLabMap } from '@/hooks/use-lab-map'
+import { configWriteForManualStart, gcj02Input } from '@/lib/lab-coordinate-adapter'
 import { speedPercent } from '@/lib/lab-map'
-import type { LabConfig, LabMission, LabPollution, LabStatus } from '@/lib/lab-types'
+import type {
+  LabConfig,
+  LabAutoScanParams,
+  LabAutoScanResponse,
+  LabConfigWrite,
+  LabMission,
+  LabMissionWrite,
+  LabNoiseConfig,
+  LabPollution,
+  LabSamplingMode,
+  LabStatus,
+  WaterArea,
+  WaterAreaWrite,
+} from '@/lib/lab-types'
 import { fallbackConfig, fallbackStatus } from '@/lib/lab-types'
 
+const dropletMin = 3
+const dropletMax = 64
+
+function numberOrDefault(value: unknown, fallback: number) {
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : fallback
+}
+
+function uiLabDefaults(config: LabConfig = fallbackConfig) {
+  const analyte = config.analytes?.[0] || fallbackConfig.analytes![0]
+  const source = config.sources?.[0] || fallbackConfig.sources![0]
+  return {
+    sampling_mode: config.sampling_mode || fallbackConfig.sampling_mode!,
+    droplet_count: config.droplet_count ?? fallbackConfig.droplet_count!,
+    seed: config.seed ?? fallbackConfig.seed!,
+    noise: config.noise || fallbackConfig.noise!,
+    analytes: [analyte],
+    sources: [source],
+    auto_scan: config.auto_scan || fallbackConfig.auto_scan!,
+  }
+}
+
+function mergeLabUiConfig(remote: LabConfig, previous: LabConfig = fallbackConfig): LabConfig {
+  const previousUi = uiLabDefaults(previous)
+  return {
+    ...remote,
+    sampling_mode: remote.sampling_mode || previousUi.sampling_mode,
+    droplet_count: remote.droplet_count ?? previousUi.droplet_count,
+    seed: remote.seed ?? previousUi.seed,
+    noise: remote.noise || previousUi.noise,
+    analytes: remote.analytes?.length ? remote.analytes : previousUi.analytes,
+    sources: remote.sources?.length ? remote.sources : previousUi.sources,
+    auto_scan: remote.auto_scan || previousUi.auto_scan,
+  }
+}
+
+function apiErrorMessage(json: { message?: string; error?: { code?: string; detail?: string } }) {
+  if (json.message) return json.message
+  if (json.error?.detail) return json.error.detail
+  if (json.error?.code) return json.error.code
+  return '请求失败'
+}
+
 export default function Lab() {
-  const [config, setConfig] = useState<LabConfig>(fallbackConfig)
+  const [config, setConfig] = useState<LabConfig>(() => mergeLabUiConfig(fallbackConfig))
   const [status, setStatus] = useState<LabStatus>(fallbackStatus)
   const [pending, setPending] = useState('')
   const [message, setMessage] = useState('')
-  const persistMission = useCallback(async (mission: LabMission) => {
+  const [autoScanPreview, setAutoScanPreview] = useState<LabAutoScanResponse | null>(null)
+  const setMergedConfig: typeof setConfig = (value) => {
+    setConfig((current) => {
+      const next = typeof value === 'function' ? value(current) : value
+      return mergeLabUiConfig(next, current)
+    })
+  }
+  const persistMission = useCallback(async (
+    mission: LabMissionWrite,
+  ): Promise<LabMission | null> => {
     try {
       const res = await fetch('/api/lab/mission', {
         method: 'POST',
@@ -24,17 +90,18 @@ export default function Lab() {
       })
       const json = await res.json()
       if (json.success && json.data) {
-        setConfig((c) => ({ ...c, mission: json.data }))
-        return true
+        return json.data
       }
       setMessage(json.message || '实验航线保存失败')
     } catch {
       setMessage('实验航线保存失败')
     }
-    return false
+    return null
   }, [])
 
-  const persistConfig = useCallback(async (nextConfig: LabConfig) => {
+  const persistConfig = useCallback(async (
+    nextConfig: LabConfigWrite,
+  ): Promise<LabConfig | null> => {
     try {
       const res = await fetch('/api/lab/config', {
         method: 'POST',
@@ -43,14 +110,33 @@ export default function Lab() {
       })
       const json = await res.json()
       if (json.success && json.data) {
-        setConfig(json.data)
-        return true
+        return json.data
       }
       setMessage(json.message || '配置保存失败')
     } catch {
       setMessage('配置保存失败')
     }
-    return false
+    return null
+  }, [])
+
+  const persistWaterArea = useCallback(async (
+    waterArea: WaterAreaWrite,
+  ): Promise<WaterArea | null> => {
+    try {
+      const res = await fetch('/api/lab/water-area', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(waterArea),
+      })
+      const json = await res.json()
+      if (json.success && json.data) {
+        return json.data
+      }
+      setMessage(json.message || '水域范围保存失败')
+    } catch {
+      setMessage('水域范围保存失败')
+    }
+    return null
   }, [])
 
   const {
@@ -60,22 +146,25 @@ export default function Lab() {
     hasLabBounds,
     fitLabBounds,
     updateBoatPosition,
+    setPreviewRoute,
+    clearPreviewRoute,
     markDirty,
     clearDirty,
     canAcceptRemoteConfig,
   } = useLabMap({
     config,
     pending,
-    setConfig,
+    setConfig: setMergedConfig,
     setMessage,
     persistConfig,
     persistMission,
+    persistWaterArea,
   })
 
   const refresh = async () => {
     const res = await fetch('/api/lab/status')
     const json = await res.json()
-    if (json.data?.config && canAcceptRemoteConfig()) setConfig(json.data.config)
+    if (json.data?.config && canAcceptRemoteConfig()) setConfig((current) => mergeLabUiConfig(json.data.config, current))
     if (json.data?.status) setStatus({ ...fallbackStatus, ...json.data.status })
     if (json.data?.position?.gcj02) {
       updateBoatPosition(json.data.position.gcj02, Number(json.data.position.heading_deg || json.data.status?.heading_deg || 0))
@@ -101,6 +190,41 @@ export default function Lab() {
     markDirty()
     setConfig((c) => ({ ...c, ...patch }))
   }
+  const updateSamplingMode = (sampling_mode: LabSamplingMode) => updateConfig({ sampling_mode })
+  const updateDropletCount = (value: string) => updateConfig({ droplet_count: Number(value) || 0 })
+  const updateSeed = (value: string) => updateConfig({ seed: Number(value) || 0 })
+  const updateNoise = (patch: Partial<LabNoiseConfig>) => {
+    markDirty()
+    setConfig((c) => ({ ...c, noise: { ...uiLabDefaults(c).noise, ...patch } }))
+  }
+  const updateAutoScan = (patch: Partial<LabAutoScanParams>) => {
+    markDirty()
+    setConfig((c) => ({ ...c, auto_scan: { ...uiLabDefaults(c).auto_scan, ...patch } }))
+  }
+  const updateAnalyte = (patch: Partial<NonNullable<LabConfig['analytes']>[number]>) => {
+    markDirty()
+    setConfig((c) => {
+      const current = uiLabDefaults(c).analytes[0]
+      const next = { ...current, ...patch }
+      return {
+        ...c,
+        analytes: [next],
+        pollution: {
+          ...c.pollution,
+          analyte_id: next.analyte_id,
+          name: next.name,
+          unit: next.unit,
+        },
+      }
+    })
+  }
+  const updateSource = (patch: Partial<NonNullable<LabConfig['sources']>[number]>) => {
+    markDirty()
+    setConfig((c) => {
+      const current = uiLabDefaults(c).sources[0]
+      return { ...c, sources: [{ ...current, ...patch }] }
+    })
+  }
   const updateSim = (key: keyof LabConfig['sim'], value: string) => {
     markDirty()
     setConfig((c) => ({ ...c, sim: { ...c.sim, [key]: Number(value) || 0 } }))
@@ -110,7 +234,7 @@ export default function Lab() {
     setConfig((c) => ({ ...c, pollution: { ...c.pollution, ...patch } }))
   }
 
-  const run = async (key: string, action: () => Promise<void>) => {
+  const run = async (key: string, action: () => Promise<unknown>) => {
     if (pending) return
     setPending(key)
     setMessage('')
@@ -118,22 +242,28 @@ export default function Lab() {
   }
 
   const saveConfig = async () => {
-    const res = await fetch('/api/lab/config', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config),
-    })
-    const json = await res.json()
-    setMessage(json.message || (json.success ? '已保存' : '保存失败'))
-    if (json.data) {
-      clearDirty()
-      setConfig(json.data)
+    const dropletCount = numberOrDefault(config.droplet_count, 12)
+    if (dropletCount < dropletMin || dropletCount > dropletMax) {
+      setMessage(`后端错误: droplet_count_range ($.droplet_count) ${dropletCount}`)
+      return false
     }
+    const saved = await persistConfig(configWriteForManualStart(config))
+    if (!saved) return false
+    clearDirty()
+    setConfig((current) => mergeLabUiConfig(saved, current))
+    setMessage('已保存')
+    return true
   }
 
   const clearWaypoints = async () => {
     const nextMission = { waypoints: [], center: null }
     markDirty()
-    setConfig((c) => ({ ...c, mission: nextMission }))
-    await persistMission(nextMission)
+    const saved = await persistMission(nextMission)
+    if (!saved) return
+    clearDirty()
+    clearPreviewRoute()
+    setAutoScanPreview(null)
+    setConfig((c) => ({ ...c, mission: saved }))
   }
 
   const importQgc = async () => {
@@ -142,12 +272,51 @@ export default function Lab() {
     setMessage(json.message || (json.success ? '已导入' : '导入失败'))
     if (json.success && json.data) {
       clearDirty()
+      clearPreviewRoute()
+      setAutoScanPreview(null)
       setConfig((c) => ({ ...c, mission: json.data }))
     }
   }
 
+  const requestAutoScan = async (preview: boolean) => {
+    const params = uiLabDefaults(config).auto_scan
+    const request = {
+      input_crs: 'GCJ02' as const,
+      polygon: config.water_area.polygon.map((point) => gcj02Input(point.gcj02)),
+      strip_spacing_m: params.strip_spacing_m,
+      heading_deg: params.heading_deg,
+      inward_margin_m: params.inward_margin_m,
+      max_waypoints: params.max_waypoints,
+      preview,
+    }
+    const res = await fetch('/api/lab/route/auto-scan', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(request),
+    })
+    const json = await res.json()
+    if (!json.success || !json.data) {
+      setMessage(apiErrorMessage(json))
+      return
+    }
+    const data = json.data as LabAutoScanResponse
+    setAutoScanPreview(data)
+    if (preview) {
+      setPreviewRoute(data.route_waypoints)
+      setMessage(`预览已生成 ${data.waypoint_count} 个航点，当前 mission 未修改。`)
+      return
+    }
+    clearDirty()
+    clearPreviewRoute()
+    setConfig((c) => ({ ...c, mission: { waypoints: data.route_waypoints, center: null } }))
+    setMessage(`自动扫描航线已应用并保存：${data.waypoint_count} 个航点。`)
+  }
+
   const start = async () => {
-    await saveConfig()
+    const saved = await saveConfig()
+    if (!saved) return
+    const dropletCount = numberOrDefault(config.droplet_count, 12)
+    if (dropletCount < dropletMin || dropletCount > dropletMax) return
     const res = await fetch('/api/lab/start', { method: 'POST' })
     const json = await res.json()
     setMessage(json.message || '已启动')
@@ -177,9 +346,20 @@ export default function Lab() {
     : '就绪'
   const samplingProgress = Math.max(0, Math.min(100, Number(sampling.progress_percent) || 0))
   const samplingDuration = Number(sampling.duration_s) || Number(config.sim.sample_dwell_s) || 0
+  const latestSamplingEvent = sampling.latest_event
+  const samplingDropletCount = latestSamplingEvent?.droplet_count ?? sampling.droplet_count ?? 12
+  const samplingValidCount = latestSamplingEvent?.valid_count ?? sampling.valid_count ?? 0
+  const samplingAggregateValue = latestSamplingEvent?.mean ?? sampling.aggregate_value ?? signal.pollution_value
   const signalValue = Number(signal.value || 0).toFixed(3)
   const absorbanceValue = Number(signal.absorbance || 0).toFixed(3)
   const pollutionValue = signal.pollution_value == null ? '--' : Number(signal.pollution_value).toFixed(3)
+  const uiConfig = uiLabDefaults(config)
+  const activeAnalyte = uiConfig.analytes[0]
+  const activeSource = uiConfig.sources[0]
+  const activeNoise = uiConfig.noise
+  const autoScan = uiConfig.auto_scan
+  const dropletCount = numberOrDefault(config.droplet_count, 12)
+  const dropletCountInvalid = dropletCount < dropletMin || dropletCount > dropletMax
 
   return (
     <div className="min-h-[calc(100vh-5rem)] px-3 pb-24 pt-3 md:p-5 xl:h-screen xl:min-h-0 flex flex-col gap-3 bg-muted/20">
@@ -244,24 +424,29 @@ export default function Lab() {
                   ))}
                 </div>
               </div>
+              <div className="space-y-2 rounded-md border p-3">
+                <span className="text-sm font-medium">采样模式</span>
+                <div className="grid grid-cols-2 rounded-md border bg-background p-1">
+                  {(['waypoint', 'survey'] as const).map((mode) => (
+                    <Button key={mode} size="sm" className="min-w-0" variant={uiConfig.sampling_mode === mode ? 'default' : 'ghost'}
+                      onClick={() => updateSamplingMode(mode)}>
+                      {mode === 'waypoint' ? '定点采样' : '走航 Survey'}
+                    </Button>
+                  ))}
+                </div>
+                <p className="text-xs text-muted-foreground">waypoint 到点等待液滴完成；survey 用覆盖航线连续走航采样。</p>
+              </div>
               <label className="flex items-center justify-between gap-3 rounded-md border p-3">
                 <span>限制水域范围 (剔除界外)</span>
                 <Switch checked={config.water_area.enabled} onCheckedChange={(enabled) => {
-                  const nextConfig = {
-                    ...config,
-                    water_area: {
-                      ...config.water_area,
-                      enabled,
-                    },
-                  }
-                  updateConfig(nextConfig)
-                  void fetch('/api/lab/water-area', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                      enabled,
-                      polygon: config.water_area.polygon,
-                    }),
+                  markDirty()
+                  void persistWaterArea({
+                    enabled,
+                    polygon: config.water_area.polygon,
+                  }).then((saved) => {
+                    if (!saved) return
+                    clearDirty()
+                    setConfig((current) => ({ ...current, water_area: saved }))
                   })
                 }} />
               </label>
@@ -281,6 +466,50 @@ export default function Lab() {
               <CardTitle className="text-base">模拟参数与污染源</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
+              <div className="rounded-md border bg-muted/30 p-3">
+                <div className="mb-3 flex items-center gap-2 text-sm font-medium">
+                  <Settings2 className="h-4 w-4" />液滴序列
+                </div>
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                  <div className="space-y-2">
+                    <Label>droplet_count</Label>
+                    <Input type="number" min={dropletMin} max={dropletMax} step={1} value={config.droplet_count ?? 12}
+                      onChange={(e) => updateDropletCount(e.target.value)} />
+                    <div className={dropletCountInvalid ? 'text-xs text-destructive' : 'text-xs text-muted-foreground'}>
+                      后端范围 3..64；非法值会阻止启动并显示 droplet_count_range。
+                    </div>
+                  </div>
+                  <div className="space-y-2">
+                    <Label>seed</Label>
+                    <Input type="number" step={1} value={config.seed ?? 1} onChange={(e) => updateSeed(e.target.value)} />
+                    <div className="text-xs text-muted-foreground">固定 seed 用于重复同一组模拟采样。</div>
+                  </div>
+                </div>
+                <div className="mt-3 rounded-md border bg-background p-3">
+                  <label className="flex items-center justify-between gap-3">
+                    <span className="text-sm font-medium">液滴信号噪声</span>
+                    <Switch checked={activeNoise.enabled} onCheckedChange={(enabled) => updateNoise({ enabled })} />
+                  </label>
+                  <div className="mt-3 grid grid-cols-1 gap-3 sm:grid-cols-3">
+                    <div className="space-y-2">
+                      <Label>电压噪声</Label>
+                      <Input type="number" min={0} step={0.001} value={activeNoise.voltage_noise} disabled={!activeNoise.enabled}
+                        onChange={(e) => updateNoise({ voltage_noise: Number(e.target.value) || 0 })} />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>吸光度噪声</Label>
+                      <Input type="number" min={0} step={0.001} value={activeNoise.absorbance_noise} disabled={!activeNoise.enabled}
+                        onChange={(e) => updateNoise({ absorbance_noise: Number(e.target.value) || 0 })} />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>浓度噪声</Label>
+                      <Input type="number" min={0} step={0.001} value={activeNoise.concentration_noise} disabled={!activeNoise.enabled}
+                        onChange={(e) => updateNoise({ concentration_noise: Number(e.target.value) || 0 })} />
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <div className="rounded-md border bg-muted/30 p-3">
                 <div className="mb-3 flex items-center justify-between gap-3">
                   <div>
@@ -359,6 +588,77 @@ export default function Lab() {
                   <Input type="number" step="0.1" value={config.pollution.strength}
                     onChange={(e) => updatePollution({ strength: Number(e.target.value) || 0 })} />
                 </div>
+                <div className="col-span-2 rounded-md border bg-muted/30 p-3">
+                  <div className="mb-3 text-sm font-medium">多分析物 / 污染源基础配置</div>
+                  <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+                    <div className="space-y-2">
+                      <Label>分析物 ID</Label>
+                      <Input value={activeAnalyte.analyte_id} onChange={(e) => {
+                        updateAnalyte({ analyte_id: e.target.value || 'sim' })
+                        updateSource({ analyte_id: e.target.value || 'sim' })
+                      }} />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>显示名称</Label>
+                      <Input value={activeAnalyte.name} onChange={(e) => updateAnalyte({ name: e.target.value || activeAnalyte.analyte_id })} />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>单位</Label>
+                      <Input value={activeAnalyte.unit} onChange={(e) => updateAnalyte({ unit: e.target.value })} />
+                    </div>
+                    <div className="space-y-2">
+                      <Label>污染源 ID</Label>
+                      <Input value={activeSource.source_id} onChange={(e) => updateSource({ source_id: e.target.value || 'lab-source' })} />
+                    </div>
+                    <div className="space-y-2 sm:col-span-2">
+                      <Label>峰值浓度</Label>
+                      <Input type="number" min={0} step={0.1} value={activeSource.peak_concentration}
+                        onChange={(e) => updateSource({ peak_concentration: Number(e.target.value) || 0 })} />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </CardContent>
+          </Card>
+
+          <Card>
+            <CardHeader className="pb-2">
+              <CardTitle className="flex items-center gap-2 text-base">
+                <Route className="h-5 w-5" />自动扫描
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="rounded-md border bg-muted/30 p-3 text-xs text-muted-foreground">
+                先画水域，再预览覆盖航线；预览只画红色虚线，不保存 mission。点应用后才调用后端保存。
+              </div>
+              <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+                <div className="space-y-2">
+                  <Label>条带间距(m)</Label>
+                  <Input type="number" min={0.1} step={0.5} value={autoScan.strip_spacing_m}
+                    onChange={(e) => updateAutoScan({ strip_spacing_m: Number(e.target.value) || 0 })} />
+                </div>
+                <div className="space-y-2">
+                  <Label>扫描角度(deg)</Label>
+                  <Input type="number" min={0} max={360} step={1} value={autoScan.heading_deg}
+                    onChange={(e) => updateAutoScan({ heading_deg: Number(e.target.value) || 0 })} />
+                </div>
+                <div className="space-y-2">
+                  <Label>内缩距离(m)</Label>
+                  <Input type="number" min={0} step={0.5} value={autoScan.inward_margin_m}
+                    onChange={(e) => updateAutoScan({ inward_margin_m: Number(e.target.value) || 0 })} />
+                </div>
+                <div className="space-y-2">
+                  <Label>最大航点数</Label>
+                  <Input type="number" min={2} step={1} value={autoScan.max_waypoints}
+                    onChange={(e) => updateAutoScan({ max_waypoints: Number(e.target.value) || 0 })} />
+                </div>
+              </div>
+              <div className="grid grid-cols-2 gap-2">
+                <Button variant="outline" disabled={!!pending} onClick={() => run('auto-scan-preview', () => requestAutoScan(true))}>预览扫描</Button>
+                <Button disabled={!!pending || !autoScanPreview} onClick={() => run('auto-scan-apply', () => requestAutoScan(false))}>应用扫描</Button>
+              </div>
+              <div className="rounded-md border p-3 text-xs text-muted-foreground">
+                水域顶点 {config.water_area.polygon.length} 个；预览 {autoScanPreview ? `${autoScanPreview.waypoint_count} 点 · ${autoScanPreview.water_snapshot_hash.slice(0, 8)}` : '未生成'}
               </div>
             </CardContent>
           </Card>
@@ -424,6 +724,13 @@ export default function Lab() {
                   <span>用时 {sampling.elapsed_s.toFixed(1)}s</span>
                   <span>剩余 {sampling.remaining_s.toFixed(1)}s</span>
                   <span>采样停留 {sampling.duration_s.toFixed(1)}s</span>
+                </div>
+                <div className="grid grid-cols-3 gap-2 border-t pt-2 text-xs text-muted-foreground">
+                  <span>液滴 {samplingDropletCount}</span>
+                  <span>有效 {samplingValidCount}</span>
+                  <span>
+                    聚合 {Number.isFinite(Number(samplingAggregateValue)) ? Number(samplingAggregateValue).toFixed(3) : '-'}
+                  </span>
                 </div>
                 <div className="text-xs text-muted-foreground">任务阶段 {sampling.mission_status || 'IDLE'}</div>
               </div>
@@ -506,26 +813,12 @@ export default function Lab() {
                   <Download className="w-4 h-4 mr-1" />导入QGC
                 </Button>
                 <Button size="sm" variant="outline" onClick={async () => {
-                  const nextConfig = {
-                    ...config,
-                    water_area: {
-                      enabled: config.water_area.enabled,
-                      polygon: [],
-                    },
-                  }
-                  setConfig(nextConfig)
-                  try {
-                    await fetch('/api/lab/water-area', {
-                      method: 'POST',
-                      headers: { 'Content-Type': 'application/json' },
-                      body: JSON.stringify({
-                        enabled: config.water_area.enabled,
-                        polygon: [],
-                      }),
-                    })
-                  } catch (e) {
-                    console.error(e)
-                  }
+                  const saved = await persistWaterArea({
+                    enabled: config.water_area.enabled,
+                    polygon: [],
+                  })
+                  if (!saved) return
+                  setConfig((current) => ({ ...current, water_area: saved }))
                 }}>
                   <Trash2 className="w-4 h-4 mr-1 text-emerald-500" />清空水域
                 </Button>

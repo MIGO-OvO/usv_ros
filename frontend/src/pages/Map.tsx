@@ -5,13 +5,13 @@ import 'leaflet.heat'
 import { Activity, AlertTriangle, Database, Download, Layers, Loader2, MapPinned, Navigation, RefreshCw, Route, Trash2, Upload, Wifi, WifiOff, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { gcj02Input } from '@/lib/lab-coordinate-adapter'
 import { cn } from '@/lib/utils'
 import { useAppStore } from '@/store'
 
 type MapMode = 'live' | 'history'
 type MetricMode = 'auto' | 'concentration' | 'absorbance' | 'voltage'
 type TileStyle = 'satellite' | 'annotation'
-type CoordinateDatum = 'gcj02' | 'wgs84'
 
 interface MapConfig {
   enabled: boolean
@@ -172,9 +172,9 @@ interface LivePayload {
   automation_running?: boolean
 }
 
-interface MissionDraftWaypoint extends MapCoordinate {
-  wgs84: MapCoordinate
-  sample: boolean
+interface MissionDraftWaypoint {
+  readonly gcj02: MapCoordinate
+  readonly sample: boolean
 }
 
 type HeatLayer = L.Layer & {
@@ -244,55 +244,6 @@ function escapeHtml(value: unknown) {
   })
 }
 
-// WGS-84 -> GCJ-02, 与后端 web_config_server.py:wgs84_to_gcj02 算法一致,
-// 用于把手持 GPS 的实测 WGS-84 读数对齐到高德 GCJ-02 底图。
-function outOfChina(lat: number, lng: number) {
-  return lng < 72.004 || lng > 137.8347 || lat < 0.8293 || lat > 55.8271
-}
-
-function transformLat(x: number, y: number) {
-  let ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * Math.sqrt(Math.abs(x))
-  ret += ((20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0) / 3.0
-  ret += ((20.0 * Math.sin(y * Math.PI) + 40.0 * Math.sin((y / 3.0) * Math.PI)) * 2.0) / 3.0
-  ret += ((160.0 * Math.sin((y / 12.0) * Math.PI) + 320 * Math.sin((y * Math.PI) / 30.0)) * 2.0) / 3.0
-  return ret
-}
-
-function transformLng(x: number, y: number) {
-  let ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * Math.sqrt(Math.abs(x))
-  ret += ((20.0 * Math.sin(6.0 * x * Math.PI) + 20.0 * Math.sin(2.0 * x * Math.PI)) * 2.0) / 3.0
-  ret += ((20.0 * Math.sin(x * Math.PI) + 40.0 * Math.sin((x / 3.0) * Math.PI)) * 2.0) / 3.0
-  ret += ((150.0 * Math.sin((x / 12.0) * Math.PI) + 300.0 * Math.sin((x / 30.0) * Math.PI)) * 2.0) / 3.0
-  return ret
-}
-
-function wgs84ToGcj02(lat: number, lng: number): MapCoordinate {
-  if (outOfChina(lat, lng)) return { lat, lng }
-  const a = 6378245.0
-  const ee = 0.006693421622965943
-  let dLat = transformLat(lng - 105.0, lat - 35.0)
-  let dLng = transformLng(lng - 105.0, lat - 35.0)
-  const radLat = (lat / 180.0) * Math.PI
-  let magic = Math.sin(radLat)
-  magic = 1 - ee * magic * magic
-  const sqrtMagic = Math.sqrt(magic)
-  dLat = (dLat * 180.0) / (((a * (1 - ee)) / (magic * sqrtMagic)) * Math.PI)
-  dLng = (dLng * 180.0) / ((a / sqrtMagic) * Math.cos(radLat) * Math.PI)
-  return { lat: lat + dLat, lng: lng + dLng }
-}
-
-function gcj02ToWgs84(lat: number, lng: number): MapCoordinate {
-  if (outOfChina(lat, lng)) return { lat, lng }
-  let wgsLat = lat
-  let wgsLng = lng
-  for (let i = 0; i < 3; i += 1) {
-    const shifted = wgs84ToGcj02(wgsLat, wgsLng)
-    wgsLat -= shifted.lat - lat
-    wgsLng -= shifted.lng - lng
-  }
-  return { lat: wgsLat, lng: wgsLng }
-}
-
 function colorFor(value: number, min: number, max: number) {
   if (max <= min) return sampleColors[0]
   const idx = Math.max(0, Math.min(sampleColors.length - 1, Math.floor(((value - min) / (max - min)) * sampleColors.length)))
@@ -347,7 +298,6 @@ export default function MapPage() {
   const gotoMarkerRef = useRef<L.Marker | null>(null)
   const [gotoLat, setGotoLat] = useState('')
   const [gotoLng, setGotoLng] = useState('')
-  const [gotoDatum, setGotoDatum] = useState<CoordinateDatum>('gcj02')
   const [gotoMsg, setGotoMsg] = useState('')
   const [missionPlanEnabled, setMissionPlanEnabled] = useState(false)
   const [draftSampleEnabled, setDraftSampleEnabled] = useState(true)
@@ -432,7 +382,7 @@ export default function MapPage() {
       setGotoMsg('请输入有效经纬度 (纬度 -90~90, 经度 -180~180)')
       return
     }
-    const target = gotoDatum === 'wgs84' ? wgs84ToGcj02(lat, lng) : { lat, lng }
+    const target = { lat, lng }
     const zoom = Math.max(map.getZoom(), mapConfig?.default_zoom ?? 15)
     map.flyTo([target.lat, target.lng], zoom)
     if (gotoMarkerRef.current) {
@@ -448,7 +398,7 @@ export default function MapPage() {
     }
     gotoMarkerRef.current.bindPopup(`手动定位点<br/>${target.lat.toFixed(6)}, ${target.lng.toFixed(6)}`)
     setGotoMsg(`已跳转至 ${target.lat.toFixed(6)}, ${target.lng.toFixed(6)}`)
-  }, [gotoLat, gotoLng, gotoDatum, mapConfig])
+  }, [gotoLat, gotoLng, mapConfig])
 
   const importPack = useCallback(async (file: File) => {
     setImporting(true)
@@ -708,9 +658,8 @@ export default function MapPage() {
           replace: true,
           sample_timeout_s: sampleTimeoutS,
           waypoints: draftWaypoints.map((wp, index) => ({
+            ...gcj02Input(wp.gcj02),
             seq: index,
-            lat: wp.wgs84.lat,
-            lng: wp.wgs84.lng,
             sample: wp.sample,
           })),
         }),
@@ -806,9 +755,10 @@ export default function MapPage() {
       map.on('click', (event: L.LeafletMouseEvent) => {
         if (!missionPlanEnabledRef.current) return
         const point = {
-          lat: event.latlng.lat,
-          lng: event.latlng.lng,
-          wgs84: gcj02ToWgs84(event.latlng.lat, event.latlng.lng),
+          gcj02: {
+            lat: event.latlng.lat,
+            lng: event.latlng.lng,
+          },
           sample: draftSampleEnabledRef.current,
         }
         setDraftWaypoints((current) => {
@@ -860,7 +810,7 @@ export default function MapPage() {
     if (!group) return
     group.clearLayers()
     if (draftWaypoints.length === 0) return
-    const latlngs = draftWaypoints.map((wp) => [wp.lat, wp.lng] as [number, number])
+    const latlngs = draftWaypoints.map((wp) => [wp.gcj02.lat, wp.gcj02.lng] as [number, number])
     if (latlngs.length > 1) {
       L.polyline(latlngs, {
         color: '#dc2626',
@@ -870,7 +820,7 @@ export default function MapPage() {
       }).addTo(group)
     }
     draftWaypoints.forEach((wp, index) => {
-      const marker = L.marker([wp.lat, wp.lng], {
+      const marker = L.marker([wp.gcj02.lat, wp.gcj02.lng], {
         icon: L.divIcon({
           className: 'usv-draft-waypoint-icon',
           html: `<span>${index + 1}${wp.sample ? 'S' : ''}</span>`,
@@ -880,7 +830,7 @@ export default function MapPage() {
       marker.bindPopup(
         `<div style="min-width:180px;font-size:12px;line-height:1.65">
           <b>Web 规划航点 #${index + 1}</b><br/>
-          WGS-84: ${wp.wgs84.lat.toFixed(7)}, ${wp.wgs84.lng.toFixed(7)}<br/>
+          GCJ-02: ${wp.gcj02.lat.toFixed(7)}, ${wp.gcj02.lng.toFixed(7)}<br/>
           采样触发: ${wp.sample ? 'NAV_SCRIPT_TIME' : '无'}
         </div>`,
       )
@@ -976,14 +926,14 @@ export default function MapPage() {
                       草案航点 0
                     </div>
                   ) : draftWaypoints.map((wp, index) => (
-                    <div key={`${wp.lat}-${wp.lng}-${index}`} className="grid grid-cols-[1fr_auto] gap-2 rounded-md border bg-background px-3 py-2">
+                    <div key={`${wp.gcj02.lat}-${wp.gcj02.lng}-${index}`} className="grid grid-cols-[1fr_auto] gap-2 rounded-md border bg-background px-3 py-2">
                       <div className="min-w-0">
                         <div className="flex items-center gap-2">
                           <span className="font-medium">#{index + 1}</span>
                           {wp.sample && <span className="rounded bg-emerald-500/10 px-1.5 py-0.5 text-[11px] font-medium text-emerald-700 dark:text-emerald-300">采样</span>}
                         </div>
                         <div className="mt-1 truncate font-mono text-[11px] text-muted-foreground">
-                          {wp.wgs84.lat.toFixed(6)}, {wp.wgs84.lng.toFixed(6)}
+                          {wp.gcj02.lat.toFixed(6)}, {wp.gcj02.lng.toFixed(6)}
                         </div>
                       </div>
                       <Button size="icon" variant="ghost" className="h-7 w-7 text-destructive" onClick={() => removeDraftWaypoint(index)}>
@@ -1160,22 +1110,15 @@ export default function MapPage() {
                   />
                 </label>
               </div>
-              <label className="flex items-center justify-between">
+              <div className="flex items-center justify-between">
                 <span className="text-muted-foreground">坐标系</span>
-                <select
-                  className="h-9 rounded-md border border-input bg-background px-2 text-sm"
-                  value={gotoDatum}
-                  onChange={(e) => setGotoDatum(e.target.value as CoordinateDatum)}
-                >
-                  <option value="gcj02">图面 GCJ-02</option>
-                  <option value="wgs84">实测 WGS-84</option>
-                </select>
-              </label>
+                <span className="font-medium">GCJ-02</span>
+              </div>
               <Button size="sm" className="w-full" onClick={flyToCoordinate} disabled={!mapConfig?.enabled}>
                 <Navigation className="w-4 h-4 mr-1" />跳转到坐标
               </Button>
               {gotoMsg && <div className="rounded-md bg-muted p-2 text-xs">{gotoMsg}</div>}
-              <p className="text-xs text-muted-foreground">无 GPS 信号时手动跳转到作业区。手持 GPS 读数选实测 WGS-84, 自动对齐底图。</p>
+              <p className="text-xs text-muted-foreground">无 GPS 信号时手动跳转到作业区；此处只接收图面 GCJ-02 坐标。</p>
             </CardContent>
           </Card>
 

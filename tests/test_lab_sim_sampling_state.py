@@ -142,6 +142,7 @@ class LabSimSamplingStateTests(unittest.TestCase):
         node.status_pub = RecordingPublisher()
         node.mission_status_pub = RecordingPublisher()
         node.spectrometer_voltage_pub = RecordingPublisher()
+        node.sample_event_pub = RecordingPublisher()
         node.lab_command_pub = RecordingPublisher()
 
         node._run_lab_sampling(3, 25.0, 110.0, {"sim": {"sample_dwell_s": 1.25}})
@@ -161,6 +162,7 @@ class LabSimSamplingStateTests(unittest.TestCase):
         node.status_pub = RecordingPublisher()
         node.mission_status_pub = RecordingPublisher()
         node.spectrometer_voltage_pub = RecordingPublisher()
+        node.sample_event_pub = RecordingPublisher()
         node.lab_command_pub = RecordingPublisher()
 
         node._run_lab_sampling(4, 25.0, 110.0, {
@@ -181,6 +183,81 @@ class LabSimSamplingStateTests(unittest.TestCase):
         self.assertLessEqual(payload["value"], 20.0)
         self.assertAlmostEqual(payload["value"], 15.0, places=3)
         self.assertTrue(payload["valid"])
+
+    def test_simulated_lab_sampling_publishes_bounded_event_and_one_aggregate_voltage(self):
+        module = _load_script("mavlink_trigger_node_lab_event_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.is_sampling = False
+        node.current_sampling_context = None
+        node.status_pub = RecordingPublisher()
+        node.mission_status_pub = RecordingPublisher()
+        node.spectrometer_voltage_pub = RecordingPublisher()
+        node.sample_event_pub = RecordingPublisher()
+        node.lab_command_pub = RecordingPublisher()
+
+        node._run_lab_sampling(5, 25.314167, 110.412778, {
+            "droplet_count": 12,
+            "sim": {"sample_dwell_s": 0.0},
+            "mission": {
+                "waypoints": [
+                    {"wgs84": {"lat": 25.314167, "lng": 110.412778}, "gcj02": {"lat": 25.315, "lng": 110.414}}
+                ],
+                "center": {"wgs84": {"lat": 25.314167, "lng": 110.412778}, "gcj02": {"lat": 25.315, "lng": 110.414}},
+            },
+            "pollution": {
+                "mode": "center",
+                "value_max": 20.0,
+                "source": {"wgs84": {"lat": 25.314167, "lng": 110.412778}, "gcj02": {"lat": 25.315, "lng": 110.414}},
+            },
+        })
+
+        event_payload = json.loads(node.sample_event_pub.messages[-1].data)
+        aggregate_payload = json.loads(node.spectrometer_voltage_pub.messages[-1].data)
+        self.assertEqual(len(node.sample_event_pub.messages), 1)
+        self.assertEqual(len(node.spectrometer_voltage_pub.messages), 1)
+        self.assertEqual(len(event_payload["droplets"]), 12)
+        self.assertEqual(event_payload["config_snapshot"]["droplet_count"], 12)
+        self.assertEqual(aggregate_payload["sample_event_id"], event_payload["event_id"])
+        self.assertEqual(aggregate_payload["droplet_count"], 12)
+        self.assertNotIn("droplets", aggregate_payload)
+
+    def test_simulated_survey_window_publishes_bounded_event_without_automation(self):
+        module = _load_script("mavlink_trigger_node_survey_event_test", "scripts/mavlink_trigger_node.py")
+        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.current_waypoint = 0
+        node.is_sampling = False
+        node._survey_active = True
+        node._survey_sample_active = False
+        node._last_survey_sample_position = None
+        node.latest_spectrometer_payload = {"valid": True}
+        node.last_linear_speed = 1.0
+        node._latest_global_position = {"lat": 25.314167, "lon": 110.412778, "received_at": 0.0}
+        node.status_pub = RecordingPublisher()
+        node.mission_status_pub = RecordingPublisher()
+        node.spectrometer_voltage_pub = RecordingPublisher()
+        node.sample_event_pub = RecordingPublisher()
+        node.steps_pub = RecordingPublisher()
+        node._load_config = lambda: {
+            "lab_mode": {
+                "enabled": True,
+                "data_source": "simulated",
+                "droplet_count": 12,
+                "sim": {"sample_dwell_s": 0.0},
+                "pollution": {"value_max": 2.0},
+            },
+            "survey_sampling": {"survey_require_gps": True, "survey_max_position_age_s": 0.0},
+        }
+
+        result = node._start_survey_sample_once(node._load_config())
+
+        event_payload = json.loads(node.sample_event_pub.messages[-1].data)
+        aggregate_payload = json.loads(node.spectrometer_voltage_pub.messages[-1].data)
+        self.assertEqual(result, "started")
+        self.assertEqual(len(node.steps_pub.messages), 0)
+        self.assertEqual(len(event_payload["droplets"]), 12)
+        self.assertEqual(event_payload["mode"], "survey")
+        self.assertEqual(aggregate_payload["sample_event_mode"], "survey")
+        self.assertEqual(node._last_survey_sample_position["lat"], 25.314167)
 
     def test_lab_sim_completion_status_is_latched_once_after_sampling_done(self):
         module = _load_script("lab_sim_node_completed_once_test", "scripts/lab_sim_node.py")

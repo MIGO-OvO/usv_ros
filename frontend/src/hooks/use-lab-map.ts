@@ -2,8 +2,25 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import type { Dispatch, RefObject, SetStateAction } from 'react'
 import L from 'leaflet'
 import 'leaflet/dist/leaflet.css'
+import {
+  configWriteWithGcj02PollutionSource,
+  configWriteWithGcj02Start,
+  gcj02ForDrawing,
+  missionWriteWithGcj02Waypoint,
+  waterAreaWriteWithGcj02Vertex,
+} from '@/lib/lab-coordinate-adapter'
 import { boatIcon, isFiniteLatLng, moveBoatMarker, startIcon } from '@/lib/lab-map'
-import type { LabConfig, LabMission, LabPollution, LatLng, MapConfigLite } from '@/lib/lab-types'
+import type {
+  LabConfig,
+  LabConfigWrite,
+  LabMission,
+  LabMissionWrite,
+  LatLng,
+  MapConfigLite,
+  Waypoint,
+  WaterArea,
+  WaterAreaWrite,
+} from '@/lib/lab-types'
 
 type DrawMode = '' | 'start' | 'waypoint' | 'source' | 'water_area'
 
@@ -12,8 +29,9 @@ interface UseLabMapArgs {
   readonly pending: string
   readonly setConfig: Dispatch<SetStateAction<LabConfig>>
   readonly setMessage: (message: string) => void
-  readonly persistConfig: (nextConfig: LabConfig) => Promise<boolean>
-  readonly persistMission: (mission: LabMission) => Promise<boolean>
+  readonly persistConfig: (nextConfig: LabConfigWrite) => Promise<LabConfig | null>
+  readonly persistMission: (mission: LabMissionWrite) => Promise<LabMission | null>
+  readonly persistWaterArea: (waterArea: WaterAreaWrite) => Promise<WaterArea | null>
 }
 
 interface UseLabMapResult {
@@ -24,6 +42,8 @@ interface UseLabMapResult {
   readonly fitLabBounds: () => void
   readonly setBoatToStart: (simConfig: LabConfig['sim']) => void
   readonly updateBoatPosition: (position: LatLng, headingDeg: number) => void
+  readonly setPreviewRoute: (waypoints: readonly Waypoint[]) => void
+  readonly clearPreviewRoute: () => void
   readonly markDirty: () => void
   readonly clearDirty: () => void
   readonly canAcceptRemoteConfig: () => boolean
@@ -66,10 +86,12 @@ export function useLabMap({
   setMessage,
   persistConfig,
   persistMission,
+  persistWaterArea,
 }: UseLabMapArgs): UseLabMapResult {
   const containerRef = useRef<HTMLDivElement | null>(null)
   const mapRef = useRef<L.Map | null>(null)
   const layerRef = useRef<L.LayerGroup | null>(null)
+  const previewLayerRef = useRef<L.LayerGroup | null>(null)
   const boatRef = useRef<L.Marker | null>(null)
   const labBoundsRef = useRef<L.LatLngBounds | null>(null)
   const labInitialFitDoneRef = useRef(false)
@@ -118,31 +140,37 @@ export function useLabMap({
     moveBoatMarker(boatRef.current, position, headingDeg)
   }, [])
 
+  const clearPreviewRoute = useCallback(() => {
+    previewLayerRef.current?.clearLayers()
+  }, [])
+
+  const setPreviewRoute = useCallback((waypoints: readonly Waypoint[]) => {
+    const group = previewLayerRef.current
+    if (!group) return
+    group.clearLayers()
+    const points: Array<[number, number]> = waypoints.map((waypoint) => {
+      const point = gcj02ForDrawing(waypoint)
+      return [point.lat, point.lng]
+    })
+    if (points.length > 1) {
+      L.polyline(points, { color: '#dc2626', weight: 3, opacity: 0.78, dashArray: '6, 6' }).addTo(group)
+    }
+    waypoints.forEach((waypoint, index) => {
+      const point = gcj02ForDrawing(waypoint)
+      L.marker([point.lat, point.lng], {
+        icon: L.divIcon({ className: 'usv-draft-waypoint-icon', html: `<span>P${index}</span>`, iconAnchor: [0, 0] }),
+      }).addTo(group)
+    })
+  }, [])
+
   const setBoatToStart = useCallback((simConfig: LabConfig['sim']) => {
+    const start = gcj02ForDrawing(simConfig.start)
     moveBoatMarker(
       boatRef.current,
-      { lat: Number(simConfig.start_lat), lng: Number(simConfig.start_lng) },
+      start,
       Number(simConfig.heading_deg) || 0,
     )
   }, [])
-
-  const setStartPosition = useCallback((position: LatLng) => {
-    if (!isFiniteLatLng(position)) return
-    const nextConfig = {
-      ...configRef.current,
-      sim: {
-        ...configRef.current.sim,
-        start_lat: position.lat,
-        start_lng: position.lng,
-      },
-    }
-    dirtyRef.current = true
-    setConfig(nextConfig)
-    setBoatToStart(nextConfig.sim)
-    void persistConfig(nextConfig).then((saved) => {
-      if (saved) dirtyRef.current = false
-    })
-  }, [persistConfig, setBoatToStart, setConfig])
 
   useEffect(() => {
     let cancelled = false
@@ -161,6 +189,7 @@ export function useLabMap({
         maxZoom: cfg.max_zoom,
       }).addTo(map)
       layerRef.current = L.layerGroup().addTo(map)
+      previewLayerRef.current = L.layerGroup().addTo(map)
       boatRef.current = L.marker([cfg.default_center.lat, cfg.default_center.lng], {
         icon: boatIcon(configRef.current.sim.heading_deg),
       }).addTo(map)
@@ -183,81 +212,74 @@ export function useLabMap({
         console.error('Failed to load water-area config:', err)
       }
 
-      map.on('click', (event: L.LeafletMouseEvent) => {
+      const handleMapClickPosition = (position: LatLng) => {
         const mode = drawModeRef.current
+        if (!isFiniteLatLng(position)) return
         if (mode === 'start') {
-          setStartPosition({ lat: event.latlng.lat, lng: event.latlng.lng })
+          const request = configWriteWithGcj02Start(configRef.current, position)
+          dirtyRef.current = true
+          void persistConfig(request).then((saved) => {
+            if (!saved) return
+            dirtyRef.current = false
+            setConfig(saved)
+            setBoatToStart(saved.sim)
+          })
           return
         }
         if (mode === 'waypoint') {
-          const current = configRef.current
-          const waypoints = [
-            ...current.mission.waypoints,
-            { lat: event.latlng.lat, lng: event.latlng.lng, seq: current.mission.waypoints.length },
-          ]
-          const nextMission = { waypoints, center: null }
+          const request = missionWriteWithGcj02Waypoint(
+            configRef.current.mission,
+            position,
+          )
           dirtyRef.current = true
-          setConfig((labConfig) => ({ ...labConfig, mission: nextMission }))
-          void persistMission(nextMission).then((saved) => {
-            if (saved) dirtyRef.current = false
+          void persistMission(request).then((saved) => {
+            if (!saved) return
+            dirtyRef.current = false
+            setConfig((labConfig) => ({ ...labConfig, mission: saved }))
           })
           return
         }
         if (mode === 'source') {
-          const pollution: LabPollution = {
-            ...configRef.current.pollution,
-            mode: 'manual',
-            source: { lat: event.latlng.lat, lng: event.latlng.lng },
-          }
-          const nextConfig = { ...configRef.current, pollution }
+          const request = configWriteWithGcj02PollutionSource(
+            configRef.current,
+            position,
+          )
           dirtyRef.current = true
-          setConfig(nextConfig)
-          void persistConfig(nextConfig).then((saved) => {
-            if (saved) dirtyRef.current = false
+          void persistConfig(request).then((saved) => {
+            if (!saved) return
+            dirtyRef.current = false
+            setConfig(saved)
           })
           return
         }
         if (mode === 'water_area') {
-          const current = configRef.current
-          const polygon = [
-            ...current.water_area.polygon,
-            { lat: event.latlng.lat, lng: event.latlng.lng },
-          ]
-          const nextConfig = {
-            ...current,
-            water_area: {
-              ...current.water_area,
-              polygon,
-            },
-          }
+          const request = waterAreaWriteWithGcj02Vertex(
+            configRef.current.water_area,
+            position,
+          )
           dirtyRef.current = true
-          setConfig(nextConfig)
-          void fetch('/api/lab/water-area', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              enabled: current.water_area.enabled,
-              polygon,
-            }),
-          }).then(async (res) => {
-            const json = await res.json()
-            if (json.success) {
-              dirtyRef.current = false
-            } else {
-              setMessage(json.message || '水域范围保存失败')
-            }
-          }).catch(() => {
-            setMessage('水域范围保存失败')
+          void persistWaterArea(request).then((saved) => {
+            if (!saved) return
+            dirtyRef.current = false
+            setConfig((labConfig) => ({ ...labConfig, water_area: saved }))
           })
         }
-      })
-      if (typeof ResizeObserver !== 'undefined') {
-        resizeObserver = new ResizeObserver(() => map.invalidateSize())
-        resizeObserver.observe(containerRef.current)
       }
+      map.on('click', (event: L.LeafletMouseEvent) => {
+        handleMapClickPosition(event.latlng)
+      })
       mapRef.current = map
       setMapReady(true)
-      window.setTimeout(() => map.invalidateSize(), 0)
+      const invalidateMapSize = () => {
+        if (cancelled || mapRef.current !== map) return
+        if (!map.getContainer().isConnected || !map.getPane('mapPane')) return
+        map.invalidateSize()
+      }
+      if (typeof ResizeObserver !== 'undefined') {
+        resizeObserver = new ResizeObserver(invalidateMapSize)
+        resizeObserver.observe(containerRef.current)
+      }
+      window.setTimeout(invalidateMapSize, 0)
     }
     void initialiseMap().catch((error: unknown) => {
       if (error instanceof Error) {
@@ -272,19 +294,24 @@ export function useLabMap({
       mapRef.current?.remove()
       mapRef.current = null
       layerRef.current = null
+      previewLayerRef.current = null
       boatRef.current = null
       setMapReady(false)
     }
-  }, [persistConfig, persistMission, setBoatToStart, setConfig, setMessage, setStartPosition])
+  }, [persistConfig, persistMission, persistWaterArea, setBoatToStart, setConfig, setMessage])
 
   useEffect(() => {
     const group = layerRef.current
     if (!mapReady || !group) return
     group.clearLayers()
-    const pts: Array<[number, number]> = config.mission.waypoints.map((w) => [w.lat, w.lng])
+    const pts: Array<[number, number]> = config.mission.waypoints.map((waypoint) => {
+      const point = gcj02ForDrawing(waypoint)
+      return [point.lat, point.lng]
+    })
     const bounds = L.latLngBounds([])
-    const startLat = Number(config.sim.start_lat)
-    const startLng = Number(config.sim.start_lng)
+    const start = gcj02ForDrawing(config.sim.start)
+    const startLat = Number(start.lat)
+    const startLng = Number(start.lng)
     if (Number.isFinite(startLat) && Number.isFinite(startLng)) {
       L.marker([startLat, startLng], { icon: startIcon() }).addTo(group)
       bounds.extend([startLat, startLng])
@@ -293,24 +320,29 @@ export function useLabMap({
       L.polyline(pts, { color: '#2563eb', weight: 3, opacity: 0.7 }).addTo(group)
     }
     config.mission.waypoints.forEach((waypoint, index) => {
-      L.marker([waypoint.lat, waypoint.lng], {
+      const point = gcj02ForDrawing(waypoint)
+      L.marker([point.lat, point.lng], {
         icon: L.divIcon({ className: 'usv-waypoint-icon', html: `<span>#${index}</span>`, iconAnchor: [0, 0] }),
       }).addTo(group)
-      bounds.extend([waypoint.lat, waypoint.lng])
+      bounds.extend([point.lat, point.lng])
     })
     const source = config.pollution.mode === 'manual' ? config.pollution.source : config.mission.center
     if (source) {
-      L.circle([source.lat, source.lng], {
+      const point = gcj02ForDrawing(source)
+      L.circle([point.lat, point.lng], {
         radius: config.pollution.radius_m,
         color: '#e03131',
         fillColor: '#e03131',
         fillOpacity: 0.12,
         weight: 1,
       }).addTo(group)
-      bounds.extend([source.lat, source.lng])
+      bounds.extend([point.lat, point.lng])
     }
     if (config.water_area.polygon && config.water_area.polygon.length >= 2) {
-      const wpts: Array<[number, number]> = config.water_area.polygon.map((p) => [p.lat, p.lng])
+      const wpts: Array<[number, number]> = config.water_area.polygon.map((coordinate) => {
+        const point = gcj02ForDrawing(coordinate)
+        return [point.lat, point.lng]
+      })
       L.polygon(wpts, {
         color: '#2b8a3e',
         fillColor: '#2b8a3e',
@@ -318,8 +350,9 @@ export function useLabMap({
         weight: 2,
         dashArray: '5, 5',
       }).addTo(group)
-      config.water_area.polygon.forEach((p) => {
-        bounds.extend([p.lat, p.lng])
+      config.water_area.polygon.forEach((coordinate) => {
+        const point = gcj02ForDrawing(coordinate)
+        bounds.extend([point.lat, point.lng])
       })
     }
     let validBounds = false
@@ -339,7 +372,7 @@ export function useLabMap({
       setHasLabBounds(validBounds)
     }, 0)
     return () => clearTimeout(timer)
-  }, [config.mission, config.pollution, config.sim.start_lat, config.sim.start_lng, config.water_area.polygon, mapReady])
+  }, [config.mission, config.pollution, config.sim.start, config.water_area.polygon, mapReady])
 
   return {
     containerRef,
@@ -349,6 +382,8 @@ export function useLabMap({
     fitLabBounds,
     setBoatToStart,
     updateBoatPosition,
+    setPreviewRoute,
+    clearPreviewRoute,
     markDirty,
     clearDirty,
     canAcceptRemoteConfig,
