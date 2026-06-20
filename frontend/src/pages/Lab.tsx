@@ -73,12 +73,12 @@ export default function Lab() {
   const [pending, setPending] = useState('')
   const [message, setMessage] = useState('')
   const [autoScanPreview, setAutoScanPreview] = useState<LabAutoScanResponse | null>(null)
-  const setMergedConfig: typeof setConfig = (value) => {
+  const setMergedConfig = useCallback<typeof setConfig>((value) => {
     setConfig((current) => {
       const next = typeof value === 'function' ? value(current) : value
       return mergeLabUiConfig(next, current)
     })
-  }
+  }, [])
   const persistMission = useCallback(async (
     mission: LabMissionWrite,
   ): Promise<LabMission | null> => {
@@ -161,7 +161,7 @@ export default function Lab() {
     persistWaterArea,
   })
 
-  const refresh = async () => {
+  const refresh = useCallback(async () => {
     const res = await fetch('/api/lab/status')
     const json = await res.json()
     if (json.data?.config && canAcceptRemoteConfig()) setConfig((current) => mergeLabUiConfig(json.data.config, current))
@@ -169,8 +169,8 @@ export default function Lab() {
     if (json.data?.position?.gcj02) {
       updateBoatPosition(json.data.position.gcj02, Number(json.data.position.heading_deg || json.data.status?.heading_deg || 0))
     }
-  }
-  const refreshQuietly = () => {
+  }, [canAcceptRemoteConfig, updateBoatPosition])
+  const refreshQuietly = useCallback(() => {
     void refresh().catch((error: unknown) => {
       if (error instanceof Error) {
         setMessage('状态刷新失败')
@@ -178,13 +178,13 @@ export default function Lab() {
       }
       throw error
     })
-  }
+  }, [refresh])
 
   useEffect(() => {
     refreshQuietly()
     const timer = window.setInterval(refreshQuietly, 1000)
     return () => window.clearInterval(timer)
-  }, [])
+  }, [refreshQuietly])
 
   const updateConfig = (patch: Partial<LabConfig>) => {
     markDirty()
