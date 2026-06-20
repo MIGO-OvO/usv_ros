@@ -28,6 +28,8 @@ yarn-error.log
 *.swp
 *.swo
 
+# Agent local state
+.omo/
 
 # Offline map resources
 .map_packs/
