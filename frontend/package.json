@@ -7,6 +7,7 @@
     "dev": "vite",
     "build": "tsc -b && vite build",
     "lint": "eslint .",
+    "test:lab-coordinates": "node --test scripts/test-lab-coordinate-contract.mjs",
     "smoke:map": "node scripts/smoke-map.mjs",
     "smoke:map:browser": "node scripts/smoke-map-browser.mjs",
     "preview": "vite preview"

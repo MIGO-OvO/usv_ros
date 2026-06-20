@@ -100,16 +100,29 @@ for _path in (SCRIPT_DIR, MAP_RESOURCES_DIR):
 from preset_manager import PresetManager
 import map_tile_cache as mtc
 from mission_plan_service import MAV_CMD_NAV_WAYPOINT, build_mission_plan, upload_mission_plan
+from scripts.lib.lab_sim.coordinates import (
+    Coordinate,
+    CoordinateError,
+    CoordinatePair,
+    parse_coordinate,
+    wgs84_to_gcj02 as lab_wgs84_to_gcj02,
+)
+from scripts.lib.lab_sim.models import CoordinatePairRef, ModelParseError, SamplingEvent
+from scripts.lib.lab_sim.route_planner import RoutePlannerError, plan_coverage_route
 
 # 配置文件路径
 CONFIG_DIR = os.path.expanduser("~/usv_ws/config")
 CONFIG_FILE = os.path.join(CONFIG_DIR, "sampling_config.json")
 CALIBRATION_FILE = os.path.join(CONFIG_DIR, "calibration.json")
 DATA_DIR = os.path.expanduser("~/usv_ws/data/missions")
+LOG_DIR = os.path.expanduser("~/usv_ws/logs")
 
 MAX_LIVE_TRACK_POINTS = 1000
+MAX_LIVE_DATA_POINTS = 500
+MAX_VOLTAGE_HISTORY = 300
 DEFAULT_SURFACE_SIZE = 50
 MAX_SURFACE_SIZE = 80
+MAX_AUTO_SCAN_WAYPOINTS = 1000
 POSITION_STALE_AFTER_S = 5.0
 ANGLE_AXES = ("X", "Y", "Z", "A")
 ANGLE_STALE_AFTER_MS = 1000
@@ -155,45 +168,14 @@ def _bool_or_default(value, default=False):
     return bool(value)
 
 
-def _out_of_china(lat, lng):
-    return lng < 72.004 or lng > 137.8347 or lat < 0.8293 or lat > 55.8271
-
-
-def _transform_lat(x, y):
-    ret = -100.0 + 2.0 * x + 3.0 * y + 0.2 * y * y + 0.1 * x * y + 0.2 * math.sqrt(abs(x))
-    ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
-    ret += (20.0 * math.sin(y * math.pi) + 40.0 * math.sin(y / 3.0 * math.pi)) * 2.0 / 3.0
-    ret += (160.0 * math.sin(y / 12.0 * math.pi) + 320 * math.sin(y * math.pi / 30.0)) * 2.0 / 3.0
-    return ret
-
-
-def _transform_lng(x, y):
-    ret = 300.0 + x + 2.0 * y + 0.1 * x * x + 0.1 * x * y + 0.1 * math.sqrt(abs(x))
-    ret += (20.0 * math.sin(6.0 * x * math.pi) + 20.0 * math.sin(2.0 * x * math.pi)) * 2.0 / 3.0
-    ret += (20.0 * math.sin(x * math.pi) + 40.0 * math.sin(x / 3.0 * math.pi)) * 2.0 / 3.0
-    ret += (150.0 * math.sin(x / 12.0 * math.pi) + 300.0 * math.sin(x / 30.0 * math.pi)) * 2.0 / 3.0
-    return ret
-
-
 def wgs84_to_gcj02(lat, lng):
     """Convert WGS84 coordinates to GCJ-02 for AMap display."""
-    lat = _to_float_or_none(lat)
-    lng = _to_float_or_none(lng)
-    if lat is None or lng is None:
+    try:
+        wgs84 = parse_coordinate(lat, lng)
+    except CoordinateError:
         return None
-    if _out_of_china(lat, lng):
-        return {"lat": lat, "lng": lng}
-    a = 6378245.0
-    ee = 0.00669342162296594323
-    d_lat = _transform_lat(lng - 105.0, lat - 35.0)
-    d_lng = _transform_lng(lng - 105.0, lat - 35.0)
-    rad_lat = lat / 180.0 * math.pi
-    magic = math.sin(rad_lat)
-    magic = 1 - ee * magic * magic
-    sqrt_magic = math.sqrt(magic)
-    d_lat = (d_lat * 180.0) / ((a * (1 - ee)) / (magic * sqrt_magic) * math.pi)
-    d_lng = (d_lng * 180.0) / (a / sqrt_magic * math.cos(rad_lat) * math.pi)
-    return {"lat": lat + d_lat, "lng": lng + d_lng}
+    gcj02 = lab_wgs84_to_gcj02(wgs84)
+    return {"lat": gcj02.lat, "lng": gcj02.lng}
 
 
 def make_position_snapshot(lat, lng, alt=None, timestamp=None, source="real", lab_mode=False):
@@ -214,22 +196,22 @@ def make_position_snapshot(lat, lng, alt=None, timestamp=None, source="real", la
 
 
 def make_lab_position_snapshot(lat, lng, alt=None, timestamp=None):
-    lat = _to_float_or_none(lat)
-    lng = _to_float_or_none(lng)
-    if lat is None or lng is None:
-        return None
     alt_value = _to_float_or_none(alt)
-    coord = {"lat": lat, "lng": lng, "alt": alt_value}
+    try:
+        pair = CoordinatePair.from_wgs84(parse_coordinate(lat, lng, alt_value))
+    except CoordinateError:
+        return None
+    coord = pair.as_dict()
     return {
         "timestamp": timestamp or datetime.now().isoformat(),
-        "wgs84": dict(coord),
-        "gcj02": dict(coord),
+        "wgs84": coord["wgs84"],
+        "gcj02": coord["gcj02"],
         "position_source": "lab_sim",
         "lab_mode": True,
     }
 
 
-def normalize_lab_config(config):
+def normalize_lab_config(config, allow_legacy_bare=True):
     raw = config if isinstance(config, dict) else {}
     sim_raw = raw.get("sim", {}) if isinstance(raw.get("sim", {}), dict) else {}
 
@@ -259,7 +241,26 @@ def normalize_lab_config(config):
     if data_source not in ("simulated", "real"):
         data_source = "simulated"
 
+    start = _coordinate_or_none(
+        sim_raw.get("start"),
+        "$.sim.start",
+        allow_legacy_bare=allow_legacy_bare,
+    )
+    if start is None and ("start_lat" in sim_raw or "start_lng" in sim_raw):
+        start = _coordinate_or_none(
+            {"lat": sim_raw.get("start_lat"), "lng": sim_raw.get("start_lng")},
+            "$.sim.start",
+            allow_legacy_bare=True,
+        )
+    if start is None:
+        start = _coordinate_or_none(
+            {"lat": 25.314167, "lng": 110.412778},
+            "$.sim.start",
+            allow_legacy_bare=True,
+        )
+
     return {
+        "coordinate_schema_version": 2,
         "enabled": to_bool("enabled", False),
         "profile": profile,
         "position_source": position_source,
@@ -269,51 +270,138 @@ def normalize_lab_config(config):
         "real_propulsion_enabled": to_bool("real_propulsion_enabled", False),
         "include_lab_data_by_default": to_bool("include_lab_data_by_default", False),
         "sim": {
-            "start_lat": sim_float("start_lat", 25.314167, -90.0, 90.0),
-            "start_lng": sim_float("start_lng", 110.412778, -180.0, 180.0),
+            "start": _coordinate_payload(start),
+            "start_lat": start.gcj02.lat,
+            "start_lng": start.gcj02.lng,
             "heading_deg": sim_float("heading_deg", 0.0, 0.0, 360.0),
             "max_speed_mps": sim_float("max_speed_mps", 1.0, 0.0, 20.0),
             "wheel_base_m": sim_float("wheel_base_m", 0.6, 0.05, 10.0),
             "arrival_radius_m": sim_float("arrival_radius_m", 3.0, 0.5, 100.0),
             "sample_dwell_s": sim_float("sample_dwell_s", 3.0, 0.0, 600.0),
         },
-        "mission": normalize_lab_mission(raw.get("mission")),
-        "pollution": normalize_lab_pollution(raw.get("pollution")),
-        "water_area": normalize_lab_water_area(raw.get("water_area")),
+        "mission": normalize_lab_mission(raw.get("mission"), allow_legacy_bare=allow_legacy_bare),
+        "pollution": normalize_lab_pollution(raw.get("pollution"), allow_legacy_bare=allow_legacy_bare),
+        "water_area": normalize_lab_water_area(raw.get("water_area"), allow_legacy_bare=allow_legacy_bare),
     }
 
 
-def _coord_or_none(raw):
-    """解析 {lat,lng} 坐标, 非法返回 None。"""
+def _coordinate_payload(pair):
+    payload = pair.as_dict()
+    payload["lat"] = pair.gcj02.lat
+    payload["lng"] = pair.gcj02.lng
+    payload["deprecated_aliases"] = {"lat": "gcj02.lat", "lng": "gcj02.lng"}
+    return payload
+
+
+def _coordinate_runtime_payload(pair):
+    payload = pair.as_dict()
+    payload["lat"] = pair.wgs84.lat
+    payload["lng"] = pair.wgs84.lng
+    payload["runtime_crs"] = "wgs84"
+    payload["deprecated_aliases"] = {"lat": "wgs84.lat", "lng": "wgs84.lng"}
+    return payload
+
+
+def _coordinate_or_none(raw, path, allow_legacy_bare=True):
     if not isinstance(raw, dict):
         return None
-    lat = _to_float_or_none(raw.get("lat"))
-    lng = _to_float_or_none(raw.get("lng"))
-    if lat is None or lng is None:
+    input_crs = str(raw.get("input_crs", "") or "").strip().lower()
+    if input_crs:
+        if input_crs != "gcj02":
+            raise ModelParseError("unsupported_crs", path + ".input_crs", input_crs)
+        if "wgs84" in raw or "lat" in raw or "lng" in raw:
+            raise ModelParseError(
+                "ambiguous_coordinate",
+                path,
+                "GCJ02 input must contain only the labeled gcj02 coordinate",
+            )
+        gcj02_raw = raw.get("gcj02")
+        if not isinstance(gcj02_raw, dict):
+            raise ModelParseError("expected_object", path + ".gcj02", type(gcj02_raw).__name__)
+        return CoordinatePair.from_gcj02(parse_coordinate(
+            gcj02_raw.get("lat"),
+            gcj02_raw.get("lng"),
+            gcj02_raw.get("alt"),
+        ))
+    has_wgs84 = "wgs84" in raw
+    has_gcj02 = "gcj02" in raw
+    if has_wgs84 or has_gcj02:
+        if not has_wgs84 or not has_gcj02:
+            raise ModelParseError("missing_crs", path, "both wgs84 and gcj02 are required")
+        if raw.get("coordinate_schema_version", 2) != 2:
+            raise ModelParseError("unsupported_schema", path + ".coordinate_schema_version", str(raw.get("coordinate_schema_version")))
+        ref = CoordinatePairRef.from_dict({"wgs84": raw.get("wgs84"), "gcj02": raw.get("gcj02")}, path)
+        return CoordinatePair(
+            2,
+            Coordinate(ref.wgs84.lat, ref.wgs84.lng, ref.wgs84.alt),
+            Coordinate(ref.gcj02.lat, ref.gcj02.lng, ref.gcj02.alt),
+        )
+    if "lat" not in raw and "lng" not in raw:
         return None
-    return {"lat": lat, "lng": lng}
+    if not allow_legacy_bare:
+        raise ModelParseError("ambiguous_coordinate", path, "bare lat/lng has no CRS")
+    return CoordinatePair.from_gcj02(parse_coordinate(raw.get("lat"), raw.get("lng"), raw.get("alt")))
 
 
-def normalize_lab_mission(config):
+def _runtime_coordinate_or_none(raw, path):
+    pair = _coordinate_or_none(raw, path, allow_legacy_bare=False)
+    if pair is None:
+        return None
+    return _coordinate_runtime_payload(pair)
+
+
+def _lab_runtime_mission(mission):
+    raw = mission if isinstance(mission, dict) else {}
+    runtime_waypoints = []
+    for index, waypoint in enumerate(raw.get("waypoints", []) or []):
+        runtime = _runtime_coordinate_or_none(waypoint, "$.mission.waypoints[%d]" % index)
+        if runtime is None:
+            continue
+        if isinstance(waypoint, dict) and waypoint.get("seq") is not None:
+            runtime["seq"] = waypoint.get("seq")
+        else:
+            runtime["seq"] = len(runtime_waypoints)
+        runtime_waypoints.append(runtime)
+    center = _runtime_coordinate_or_none(raw.get("center"), "$.mission.center") if raw.get("center") else None
+    return {"waypoints": runtime_waypoints, "center": center}
+
+
+def _lab_runtime_config(lab_config):
+    runtime = copy.deepcopy(lab_config if isinstance(lab_config, dict) else {})
+    sim = dict(runtime.get("sim", {}) if isinstance(runtime.get("sim", {}), dict) else {})
+    start = _runtime_coordinate_or_none(sim.get("start"), "$.sim.start")
+    if start is not None:
+        sim["start"] = start
+        sim["start_lat"] = start["lat"]
+        sim["start_lng"] = start["lng"]
+        sim["runtime_crs"] = "wgs84"
+    runtime["sim"] = sim
+    runtime["mission"] = _lab_runtime_mission(runtime.get("mission", {}))
+    runtime["runtime_crs"] = "wgs84"
+    return runtime
+
+
+def normalize_lab_mission(config, allow_legacy_bare=True):
     """规范实验虚拟航线: waypoints 列表 + 自动计算的 center(航线包络中心)。"""
     raw = config if isinstance(config, dict) else {}
     waypoints = []
     for i, wp in enumerate(raw.get("waypoints", []) or []):
-        coord = _coord_or_none(wp)
+        coord = _coordinate_or_none(wp, "$.mission.waypoints[%d]" % i, allow_legacy_bare=allow_legacy_bare)
         if coord is None:
             continue
-        coord["seq"] = i
-        waypoints.append(coord)
-    center = _coord_or_none(raw.get("center"))
+        payload = _coordinate_payload(coord)
+        payload["seq"] = i
+        waypoints.append(payload)
+    center = _coordinate_or_none(raw.get("center"), "$.mission.center", allow_legacy_bare=allow_legacy_bare)
     if center is None and waypoints:
-        center = {
-            "lat": sum(w["lat"] for w in waypoints) / len(waypoints),
-            "lng": sum(w["lng"] for w in waypoints) / len(waypoints),
-        }
-    return {"waypoints": waypoints, "center": center}
+        center = CoordinatePair.from_gcj02(parse_coordinate(
+            sum(w["gcj02"]["lat"] for w in waypoints) / len(waypoints),
+            sum(w["gcj02"]["lng"] for w in waypoints) / len(waypoints),
+        ))
+    return {"waypoints": waypoints, "center": _coordinate_payload(center) if center else None}
 
 
-def normalize_lab_pollution(config):
+def normalize_lab_pollution(config, allow_legacy_bare=True):
     """规范模拟污染源: 模式 center(航线中心)/manual(手动放置) + 强度/半径。"""
     raw = config if isinstance(config, dict) else {}
     mode = str(raw.get("mode", "center") or "center").strip().lower()
@@ -333,9 +421,11 @@ def normalize_lab_pollution(config):
     if value_max <= value_min:
         value_max = value_min + 0.000001
 
+    source = _coordinate_or_none(raw.get("source"), "$.pollution.source", allow_legacy_bare=allow_legacy_bare)
+
     return {
         "mode": mode,
-        "source": _coord_or_none(raw.get("source")),
+        "source": _coordinate_payload(source) if source else None,
         "strength": fnum("strength", 0.8, 0.0, 1.0),
         "radius_m": fnum("radius_m", 150.0, 1.0, 100000.0),
         "reference_voltage": fnum("reference_voltage", 3.0, 0.1, 10.0),
@@ -344,17 +434,134 @@ def normalize_lab_pollution(config):
     }
 
 
-def normalize_lab_water_area(config):
+def normalize_lab_water_area(config, allow_legacy_bare=True):
     raw = config if isinstance(config, dict) else {}
     polygon = []
-    for point in raw.get("polygon", []) or []:
-        coord = _coord_or_none(point)
+    for index, point in enumerate(raw.get("polygon", []) or []):
+        coord = _coordinate_or_none(point, "$.water_area.polygon[%d]" % index, allow_legacy_bare=allow_legacy_bare)
         if coord is not None:
-            polygon.append(coord)
+            polygon.append(_coordinate_payload(coord))
     enabled = raw.get("enabled", False)
     if isinstance(enabled, str):
         enabled = enabled.strip().lower() in ("1", "true", "yes", "on")
     return {"enabled": bool(enabled), "polygon": polygon}
+
+
+def _auto_scan_coordinate(raw, path, request_input_crs=None):
+    if not isinstance(raw, dict):
+        raise ModelParseError("expected_object", path, type(raw).__name__)
+    input_crs = str(raw.get("input_crs", request_input_crs or "") or "").strip().lower()
+    if input_crs == "gcj02" and "wgs84" not in raw and "gcj02" not in raw:
+        return CoordinatePair.from_gcj02(parse_coordinate(raw.get("lat"), raw.get("lng"), raw.get("alt")))
+    if input_crs and input_crs != "gcj02":
+        raise ModelParseError("unsupported_crs", path + ".input_crs", input_crs)
+    coord = _coordinate_or_none(raw, path, allow_legacy_bare=False)
+    if coord is None:
+        raise ModelParseError("missing_coordinate", path, "coordinate point is required")
+    return coord
+
+
+def _auto_scan_polygon(data):
+    raw_polygon = data.get("polygon")
+    if not isinstance(raw_polygon, list):
+        raise ModelParseError("expected_array", "$.polygon", type(raw_polygon).__name__)
+    request_input_crs = data.get("input_crs")
+    polygon = [
+        _auto_scan_coordinate(point, "$.polygon[%d]" % index, request_input_crs)
+        for index, point in enumerate(raw_polygon)
+    ]
+    if len(polygon) < 3:
+        raise ModelParseError("invalid_polygon", "$.polygon", "at least three vertices are required")
+    return polygon
+
+
+def _auto_scan_number(data, name, default):
+    value = data.get(name, default)
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ModelParseError("invalid_parameters", "$.'%s'" % name, "must be numeric") from exc
+    if not math.isfinite(parsed):
+        raise ModelParseError("invalid_parameters", "$.'%s'" % name, "must be finite")
+    return parsed
+
+
+def _auto_scan_max_waypoints(data):
+    value = data.get("max_waypoints", 500)
+    if isinstance(value, bool):
+        raise ModelParseError("invalid_parameters", "$.max_waypoints", "must be an integer")
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError) as exc:
+        raise ModelParseError("invalid_parameters", "$.max_waypoints", "must be an integer") from exc
+    if parsed < 2 or parsed > MAX_AUTO_SCAN_WAYPOINTS:
+        raise ModelParseError(
+            "invalid_parameters",
+            "$.max_waypoints",
+            "must be between 2 and %d" % MAX_AUTO_SCAN_WAYPOINTS,
+        )
+    return parsed
+
+
+def _auto_scan_snapshot_hash(polygon):
+    snapshot = [
+        {"lat": round(point.wgs84.lat, 9), "lng": round(point.wgs84.lng, 9)}
+        for point in polygon
+    ]
+    payload = json.dumps(snapshot, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def _auto_scan_route_waypoints(route):
+    waypoints = []
+    for index, point in enumerate(route):
+        payload = CoordinatePair.from_wgs84(parse_coordinate(point["lat"], point["lng"])).as_dict()
+        payload["seq"] = index
+        waypoints.append(payload)
+    return waypoints
+
+
+def build_auto_scan_route_response(data):
+    polygon = _auto_scan_polygon(data)
+    heading_deg = _auto_scan_number(data, "heading_deg", data.get("angle_deg", data.get("scan_angle_deg", 0.0)))
+    strip_spacing_m = _auto_scan_number(data, "strip_spacing_m", data.get("strip_spacing", 10.0))
+    inward_margin_m = _auto_scan_number(data, "inward_margin_m", data.get("margin_m", 0.0))
+    max_waypoints = _auto_scan_max_waypoints(data)
+    wgs_polygon = tuple({"lat": point.wgs84.lat, "lng": point.wgs84.lng} for point in polygon)
+    try:
+        route = plan_coverage_route(
+            wgs_polygon,
+            heading_deg=heading_deg,
+            strip_spacing_m=strip_spacing_m,
+            inward_margin_m=inward_margin_m,
+            max_waypoints=max_waypoints,
+        )
+    except RoutePlannerError as exc:
+        raise ModelParseError(exc.code, "$.route", exc.detail) from exc
+    route_waypoints = _auto_scan_route_waypoints(route)
+    return {
+        "route_waypoints": route_waypoints,
+        "water_snapshot_hash": _auto_scan_snapshot_hash(polygon),
+        "waypoint_count": len(route_waypoints),
+        "preview": _bool_or_default(data.get("preview", False), False),
+        "parameters": {
+            "heading_deg": heading_deg,
+            "strip_spacing_m": strip_spacing_m,
+            "inward_margin_m": inward_margin_m,
+            "max_waypoints": max_waypoints,
+        },
+    }
+
+
+def _coordinate_error_response(error):
+    code = getattr(error, "code", "invalid_coordinate")
+    path = getattr(error, "path", getattr(error, "field", "coordinate"))
+    detail = getattr(error, "detail", getattr(error, "reason", str(error)))
+    return {
+        "success": False,
+        "message": str(error),
+        "error": {"code": code, "path": path, "detail": detail},
+    }
 
 
 def normalize_sampling_config(config):
@@ -795,6 +1002,7 @@ class MissionDataManager(object):
             "end_time": None,
             "track_points": [],
             "route_waypoints": [],
+            "sampling_events": [],
             "data_points": []
         }
         self._save_current()
@@ -911,6 +1119,83 @@ class MissionDataManager(object):
             self.current_mission_data["data_points"].append(point)
             if point.get("lab_mode") or len(self.current_mission_data["data_points"]) % 10 == 0:
                 self._save_current()
+
+    @staticmethod
+    def _mean_event_droplet_value(droplets, key):
+        values = []
+        for droplet in droplets:
+            if not isinstance(droplet, dict):
+                continue
+            value = _to_float_or_none(droplet.get(key))
+            if value is not None:
+                values.append(value)
+        if not values:
+            return 0.0
+        return sum(values) / len(values)
+
+    @classmethod
+    def _sampling_event_data_point(cls, event_payload):
+        event_id = str(event_payload.get("event_id", ""))
+        droplets = [
+            droplet for droplet in event_payload.get("droplets", [])
+            if isinstance(droplet, dict)
+        ]
+        valid_droplets = [droplet for droplet in droplets if bool(droplet.get("valid", False))]
+        aggregate_droplets = valid_droplets or droplets
+        position = event_payload.get("position", {})
+        position = position if isinstance(position, dict) else {}
+        route_ref = event_payload.get("route_ref", {})
+        route_ref = route_ref if isinstance(route_ref, dict) else {}
+        quality_flags = event_payload.get("quality_flags", [])
+        quality_flags = quality_flags if isinstance(quality_flags, list) else []
+        point = {
+            "timestamp": datetime.now().isoformat(),
+            "voltage": cls._mean_event_droplet_value(aggregate_droplets, "voltage"),
+            "absorbance": cls._mean_event_droplet_value(aggregate_droplets, "absorbance"),
+            "concentration": _to_float_or_none(event_payload.get("mean")),
+            "concentration_unit": "",
+            "concentration_display_name": str(event_payload.get("analyte_id", "")),
+            "pollutant_name": str(event_payload.get("analyte_id", "")),
+            "method_name": "lab_sim_sampling_event",
+            "metric_used": "sampling_event_mean",
+            "position_source": "lab_sim",
+            "lab_mode": True,
+            "sample_id": event_id,
+            "sample_event_id": event_id,
+            "sample_event_mode": str(event_payload.get("mode", "")),
+            "route_ref": dict(route_ref),
+            "droplet_count": len(droplets),
+            "valid_count": int(event_payload.get("valid_count", 0) or 0),
+            "quality_flags": list(quality_flags),
+            "quality": {
+                "spectrometer_valid": bool(event_payload.get("valid_count", 0)),
+                "gps_valid": bool(position.get("wgs84")),
+                "position_source": "lab_sim",
+                "quality_flags": list(quality_flags),
+            },
+        }
+        if isinstance(position.get("wgs84"), dict):
+            point["wgs84"] = dict(position["wgs84"])
+        if isinstance(position.get("gcj02"), dict):
+            point["gcj02"] = dict(position["gcj02"])
+        if route_ref.get("waypoint_index") is not None:
+            point["waypoint_seq"] = route_ref.get("waypoint_index")
+        return point
+
+    def add_sampling_event(self, sampling_event):
+        if not self.current_mission_file or not isinstance(self.current_mission_data, dict):
+            return None
+        if isinstance(sampling_event, SamplingEvent):
+            event = sampling_event
+        else:
+            event = SamplingEvent.from_dict(sampling_event)
+        event_payload = event.to_dict()
+        self.current_mission_data.setdefault("sampling_events", []).append(event_payload)
+        self.current_mission_data.setdefault("data_points", []).append(
+            self._sampling_event_data_point(event_payload)
+        )
+        self._save_current()
+        return event_payload
 
     def _save_current(self):
         """保存当前任务数据到文件。"""
@@ -1091,6 +1376,14 @@ DEFAULT_CONFIG = {
         "real_propulsion_enabled": False,
         "include_lab_data_by_default": False,
         "sim": {
+            "start": {
+                "coordinate_schema_version": 2,
+                "wgs84": {"lat": 25.32259176452231, "lng": 110.39774012635971, "alt": None},
+                "gcj02": {"lat": 25.314167, "lng": 110.412778, "alt": None},
+                "lat": 25.314167,
+                "lng": 110.412778,
+                "deprecated_aliases": {"lat": "gcj02.lat", "lng": "gcj02.lng"},
+            },
             "start_lat": 25.314167,
             "start_lng": 110.412778,
             "heading_deg": 0.0,
@@ -1272,8 +1565,10 @@ class ConfigManager(object):
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     loaded = json.load(f)
                     self._merge_config(loaded)
+                if not self._same_persisted_lab_config(loaded, self.config):
+                    self.save()
                 return True
-        except Exception as e:
+        except (OSError, json.JSONDecodeError, ModelParseError, CoordinateError) as e:
             rospy.logwarn("Failed to load config: %s", str(e))
         return False
 
@@ -1305,7 +1600,7 @@ class ConfigManager(object):
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
             return True
-        except Exception as e:
+        except (OSError, TypeError, ValueError, ModelParseError, CoordinateError) as e:
             rospy.logerr("Failed to save config: %s", str(e))
             return False
 
@@ -1353,6 +1648,14 @@ class ConfigManager(object):
         self.config['lab_mode'] = self._normalize_lab_mode(
             self.config.get('lab_mode', {})
         )
+
+    @staticmethod
+    def _same_persisted_lab_config(left, right):
+        left_raw = left.get('lab_mode') if isinstance(left, dict) else {}
+        right_raw = right.get('lab_mode') if isinstance(right, dict) else {}
+        left_copy = copy.deepcopy(left_raw if isinstance(left_raw, dict) else {})
+        right_copy = copy.deepcopy(right_raw if isinstance(right_raw, dict) else {})
+        return left_copy == right_copy
 
     def _migrate_legacy_hardware_defaults(self):
         """Reserved for hardware default migrations."""
@@ -1480,6 +1783,7 @@ class WebConfigServer(object):
         self.current_absorbance = 0.0
         self.spectrometer_status = "idle"
         self.latest_spectrometer_payload = {}
+        self.latest_sampling_event = None
         self.mission_status = "IDLE"
         self.latest_trigger_status = {"status": "", "received_at": None}
         self.latest_survey_gate = None
@@ -1524,7 +1828,8 @@ class WebConfigServer(object):
         self.data_recording_source = None
         self.control_events = []
         self.control_events_max = 100
-        self.voltage_history = []  # List of {timestamp, voltage, absorbance, raw}
+        self.voltage_history = []
+        self.voltage_history_max = MAX_VOLTAGE_HISTORY
 
         # ROS 订阅 (仅在非独立模式)
         if not self.standalone:
@@ -1541,6 +1846,7 @@ class WebConfigServer(object):
             self.control_events_sub = rospy.Subscriber('/usv/control_events', String, self._control_event_cb)
             self.manual_status_sub = rospy.Subscriber('/usv/manual_status', String, self._manual_status_cb)
             self.lab_sim_status_sub = rospy.Subscriber('/usv/lab_sim/status', String, self._lab_sim_status_cb)
+            self.lab_sample_event_sub = rospy.Subscriber('/usv/lab_sim/sample_event', String, self._lab_sample_event_cb)
             self.system_health_sub = rospy.Subscriber('/usv/system_health', String, self._system_health_cb)
             try:
                 from sensor_msgs.msg import NavSatFix
@@ -1572,6 +1878,7 @@ class WebConfigServer(object):
             self.control_events_sub = None
             self.manual_status_sub = None
             self.lab_sim_status_sub = None
+            self.lab_sample_event_sub = None
             self.system_health_sub = None
             self.gps_sub = None
             self.waypoints_sub = None
@@ -1905,34 +2212,39 @@ class WebConfigServer(object):
         self.latest_spectrometer_payload = data
 
         if self.automation_running:
+            sample_event_aggregate = bool(data.get("sample_event_id"))
             automation = self.latest_automation_status if isinstance(self.latest_automation_status, dict) else {}
             position = self.current_position if isinstance(self.current_position, dict) else None
-            try:
-                self.data_manager.add_data_point(
-                    self.current_voltage,
-                    self.current_absorbance,
-                    position=position,
-                    waypoint_seq=self.current_waypoint_seq,
-                    step_index=automation.get("step_index", automation.get("current_step")),
-                    loop_index=automation.get("loop_index", automation.get("current_loop")),
-                    sample_id=automation.get("sample_id"),
-                    spectrometer_raw=data,
-                    pollution_metric=self._current_metric_config(),
-                    lab_mode=bool(position.get("lab_mode", False)) if position else False,
-                    system_health=self.latest_system_health,
-                    mission_status=self.mission_status,
-                    route_snapshot_id=self.route_snapshot_id,
-                    route_source=self.route_source,
-                )
-            except TypeError:
-                # Test doubles and older integrations may still expose the legacy two-argument API.
-                self.data_manager.add_data_point(self.current_voltage, self.current_absorbance)
+            if not sample_event_aggregate:
+                try:
+                    self.data_manager.add_data_point(
+                        self.current_voltage,
+                        self.current_absorbance,
+                        position=position,
+                        waypoint_seq=self.current_waypoint_seq,
+                        step_index=automation.get("step_index", automation.get("current_step")),
+                        loop_index=automation.get("loop_index", automation.get("current_loop")),
+                        sample_id=automation.get("sample_id"),
+                        spectrometer_raw=data,
+                        pollution_metric=self._current_metric_config(),
+                        lab_mode=bool(position.get("lab_mode", False)) if position else False,
+                        system_health=self.latest_system_health,
+                        mission_status=self.mission_status,
+                        route_snapshot_id=self.route_snapshot_id,
+                        route_source=self.route_source,
+                    )
+                except TypeError:
+                    # Test doubles and older integrations may still expose the legacy two-argument API.
+                    self.data_manager.add_data_point(self.current_voltage, self.current_absorbance)
+            raw_summary = self._spectrometer_raw_summary(data)
             self.voltage_history.append({
                 "timestamp": datetime.now().isoformat(),
                 "voltage": self.current_voltage,
                 "absorbance": self.current_absorbance,
-                "raw": data,
+                "raw": raw_summary,
             })
+            if len(self.voltage_history) > self.voltage_history_max:
+                self.voltage_history = self.voltage_history[-self.voltage_history_max:]
 
         if self.socketio:
             self.socketio.emit('voltage', {
@@ -1942,7 +2254,7 @@ class WebConfigServer(object):
                 "reference_voltage": data.get('reference_voltage'),
                 "baseline_voltage": data.get('baseline_voltage'),
                 "baseline_set": data.get('baseline_set'),
-                "raw": data,
+                "raw": self._spectrometer_raw_summary(data),
             })
 
     def _spectro_status_cb(self, msg):
@@ -1998,6 +2310,89 @@ class WebConfigServer(object):
     def _current_lab_config(self):
         return normalize_lab_config(self.config_manager.get().get("lab_mode", {}))
 
+    @staticmethod
+    def _sampling_event_status_summary(event_payload):
+        if not isinstance(event_payload, dict):
+            return None
+        droplets = event_payload.get("droplets", [])
+        droplets = droplets if isinstance(droplets, list) else []
+        valid_count = event_payload.get("valid_count")
+        try:
+            valid_count = int(valid_count)
+        except (TypeError, ValueError):
+            valid_count = sum(1 for droplet in droplets if isinstance(droplet, dict) and droplet.get("valid"))
+        position = event_payload.get("position", {})
+        position = position if isinstance(position, dict) else {}
+        route_ref = event_payload.get("route_ref", {})
+        route_ref = route_ref if isinstance(route_ref, dict) else {}
+        quality_flags = event_payload.get("quality_flags", [])
+        quality_flags = quality_flags if isinstance(quality_flags, list) else []
+        droplet_count = len(droplets)
+        return {
+            "event_id": str(event_payload.get("event_id", "")),
+            "mode": str(event_payload.get("mode", "")),
+            "analyte_id": str(event_payload.get("analyte_id", "")),
+            "route_ref": dict(route_ref),
+            "position": copy.deepcopy(position),
+            "droplet_count": droplet_count,
+            "valid_count": valid_count,
+            "mean": event_payload.get("mean"),
+            "median": event_payload.get("median"),
+            "standard_deviation": event_payload.get("standard_deviation"),
+            "quality_flags": list(quality_flags),
+            "timestamp": event_payload.get("timestamp"),
+            "progress_percent": 100.0 if droplet_count else 0.0,
+        }
+
+    def _lab_sample_event_cb(self, msg):
+        try:
+            data = json.loads(msg.data)
+        except Exception as exc:
+            rospy.logwarn("Invalid lab sample event JSON: %s", str(exc))
+            return
+        if not isinstance(data, dict):
+            return
+        try:
+            event_payload = SamplingEvent.from_dict(data).to_dict()
+        except (ModelParseError, CoordinateError, ValueError, TypeError) as exc:
+            rospy.logwarn("Invalid lab sample event payload: %s", str(exc))
+            return
+
+        if self._data_recording_active():
+            try:
+                stored_event = self.data_manager.add_sampling_event(event_payload)
+                if stored_event:
+                    event_payload = stored_event
+            except (ModelParseError, CoordinateError, ValueError, TypeError) as exc:
+                rospy.logwarn("Failed to persist lab sample event: %s", str(exc))
+                return
+
+        self.latest_sampling_event = event_payload
+        point = MissionDataManager._sampling_event_data_point(event_payload)
+        self.current_voltage = float(point.get("voltage", 0.0) or 0.0)
+        self.current_absorbance = float(point.get("absorbance", 0.0) or 0.0)
+        self.spectrometer_status = "sample_event"
+
+        summary = self._sampling_event_status_summary(event_payload) or {}
+        raw = dict(summary)
+        raw.update({
+            "sample_event_id": summary.get("event_id"),
+            "sample_event_mode": summary.get("mode"),
+            "voltage": self.current_voltage,
+            "absorbance": self.current_absorbance,
+            "value": summary.get("mean"),
+            "simulated": True,
+            "valid": bool(summary.get("valid_count")),
+        })
+        route_ref = summary.get("route_ref") if isinstance(summary.get("route_ref"), dict) else {}
+        if route_ref.get("waypoint_index") is not None:
+            raw["waypoint_seq"] = route_ref.get("waypoint_index")
+        self.latest_spectrometer_payload = raw
+
+        if self.socketio:
+            self.socketio.emit("sample_event", summary)
+            self.socketio.emit("lab_status", self._lab_status_snapshot())
+
     def _lab_sampling_snapshot(self, lab_config):
         raw_status = str(self.latest_trigger_status.get("status", "") or "")
         status_lower = raw_status.lower()
@@ -2015,7 +2410,7 @@ class WebConfigServer(object):
         if active and duration_s > 0:
             progress = min(99.0, max(0.0, (elapsed_s / duration_s) * 100.0))
         remaining_s = max(0.0, duration_s - elapsed_s) if active and duration_s > 0 else 0.0
-        return {
+        snapshot = {
             "active": bool(active),
             "status": raw_status,
             "mission_status": self.mission_status,
@@ -2025,6 +2420,13 @@ class WebConfigServer(object):
             "remaining_s": round(remaining_s, 3),
             "progress_percent": round(progress, 1),
         }
+        latest_event = self._sampling_event_status_summary(self.latest_sampling_event)
+        if latest_event:
+            snapshot["latest_event"] = latest_event
+            snapshot["droplet_count"] = latest_event["droplet_count"]
+            snapshot["valid_count"] = latest_event["valid_count"]
+            snapshot["aggregate_value"] = latest_event["mean"]
+        return snapshot
 
     def _lab_signal_snapshot(self):
         raw = self.latest_spectrometer_payload if isinstance(self.latest_spectrometer_payload, dict) else {}
@@ -2037,8 +2439,47 @@ class WebConfigServer(object):
             "pollution_value": raw.get("value"),
             "waypoint_seq": raw.get("waypoint_seq"),
             "timestamp": raw.get("timestamp"),
-            "raw": raw,
+            "raw": self._spectrometer_raw_summary(raw),
         }
+
+    @staticmethod
+    def _spectrometer_raw_summary(raw):
+        if not isinstance(raw, dict):
+            return {}
+        allowed = (
+            "sample_event_id",
+            "sample_event_mode",
+            "droplet_count",
+            "valid_count",
+            "voltage",
+            "sample_voltage",
+            "absorbance",
+            "value",
+            "simulated",
+            "valid",
+            "status",
+            "reference_voltage",
+            "baseline_voltage",
+            "baseline_set",
+            "waypoint_seq",
+            "timestamp",
+        )
+        summary = {key: raw[key] for key in allowed if key in raw}
+        if "droplets" in raw:
+            droplets = raw.get("droplets")
+            summary["droplets_omitted"] = len(droplets) if isinstance(droplets, list) else True
+        return summary
+
+    @staticmethod
+    def _live_data_point_summary(point):
+        if not isinstance(point, dict):
+            return point
+        sanitized = dict(point)
+        raw = sanitized.get("raw")
+        if isinstance(raw, dict):
+            sanitized["raw"] = WebConfigServer._spectrometer_raw_summary(raw)
+        sanitized.pop("droplets", None)
+        return sanitized
 
     def _lab_status_snapshot(self):
         lab_config = self._current_lab_config()
@@ -2052,7 +2493,8 @@ class WebConfigServer(object):
         """把实验虚拟航线下发给 lab_sim 节点 (mission 指令)。"""
         if not self.lab_sim_command_pub:
             return
-        waypoints = (lab_config.get("mission", {}) or {}).get("waypoints", [])
+        runtime_mission = _lab_runtime_mission((lab_config.get("mission", {}) or {}))
+        waypoints = runtime_mission.get("waypoints", [])
         msg = String()
         msg.data = json.dumps({"cmd": "mission", "waypoints": waypoints, "start": False}, ensure_ascii=False)
         self.lab_sim_command_pub.publish(msg)
@@ -2306,7 +2748,8 @@ class WebConfigServer(object):
     def _current_live_samples(self):
         data = getattr(self.data_manager, "current_mission_data", {})
         if isinstance(data, dict):
-            return list(data.get("data_points", []) or [])
+            points = list(data.get("data_points", []) or [])
+            return [self._live_data_point_summary(point) for point in points[-MAX_LIVE_DATA_POINTS:]]
         return []
 
     def _current_live_mission_data(self):
@@ -3317,11 +3760,14 @@ class WebConfigServer(object):
             data = json_object()
             if data is None:
                 return jsonify({"success": False, "message": "request body must be a JSON object"}), 400
-            normalized = normalize_lab_config(data)
+            try:
+                normalized = normalize_lab_config(data, allow_legacy_bare=False)
+            except (ModelParseError, CoordinateError) as exc:
+                return jsonify(_coordinate_error_response(exc)), 400
             if self.config_manager.update({"lab_mode": normalized}):
                 if self.lab_sim_command_pub:
                     msg = String()
-                    msg.data = json.dumps({"cmd": "config", "config": normalized}, ensure_ascii=False)
+                    msg.data = json.dumps({"cmd": "config", "config": _lab_runtime_config(normalized)}, ensure_ascii=False)
                     self.lab_sim_command_pub.publish(msg)
                 return jsonify({"success": True, "message": "lab config saved", "data": normalized})
             return jsonify({"success": False, "message": "save failed"}), 500
@@ -3333,8 +3779,9 @@ class WebConfigServer(object):
                 lab_config["enabled"] = True
                 self.config_manager.update({"lab_mode": lab_config})
             if self.lab_sim_command_pub:
-                waypoints = (lab_config.get("mission", {}) or {}).get("waypoints", [])
-                payload = {"cmd": "start", "config": lab_config, "reset_to_start": True}
+                runtime_config = _lab_runtime_config(lab_config)
+                waypoints = (runtime_config.get("mission", {}) or {}).get("waypoints", [])
+                payload = {"cmd": "start", "config": runtime_config, "reset_to_start": True}
                 if waypoints:
                     payload["waypoints"] = waypoints
                 msg = String()
@@ -3382,7 +3829,10 @@ class WebConfigServer(object):
             if data is None:
                 return jsonify({"success": False, "message": "request body must be a JSON object"}), 400
             lab = self._current_lab_config()
-            lab["water_area"] = normalize_lab_water_area(data)
+            try:
+                lab["water_area"] = normalize_lab_water_area(data, allow_legacy_bare=False)
+            except (ModelParseError, CoordinateError) as exc:
+                return jsonify(_coordinate_error_response(exc)), 400
             if self.config_manager.update({"lab_mode": lab}):
                 return jsonify({"success": True, "message": "water area saved", "data": lab["water_area"]})
             return jsonify({"success": False, "message": "save failed"}), 500
@@ -3394,29 +3844,58 @@ class WebConfigServer(object):
             if data is None:
                 return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
             lab = self._current_lab_config()
-            lab["mission"] = normalize_lab_mission(data)
+            try:
+                lab["mission"] = normalize_lab_mission(data, allow_legacy_bare=False)
+            except (ModelParseError, CoordinateError) as exc:
+                return jsonify(_coordinate_error_response(exc)), 400
             if self.config_manager.update({"lab_mode": lab}):
                 self._push_lab_mission(lab)
                 return jsonify({"success": True, "message": "实验航线已保存",
                                 "data": lab["mission"]})
             return jsonify({"success": False, "message": "保存失败"}), 500
 
+        @self.app.route('/api/lab/route/auto-scan', methods=['POST'])
+        def generate_lab_auto_scan_route():
+            data = json_object()
+            if data is None:
+                return jsonify({"success": False, "message": "request body must be a JSON object"}), 400
+            try:
+                route_data = build_auto_scan_route_response(data)
+            except (ModelParseError, CoordinateError) as exc:
+                return jsonify(_coordinate_error_response(exc)), 400
+            saved = False
+            if not route_data["preview"]:
+                lab = self._current_lab_config()
+                lab["mission"] = {"waypoints": route_data["route_waypoints"], "center": None}
+                if not self.config_manager.update({"lab_mode": lab}):
+                    return jsonify({"success": False, "message": "save failed"}), 500
+                self._push_lab_mission(lab)
+                saved = True
+            response_data = dict(route_data)
+            response_data["saved"] = saved
+            return jsonify({"success": True, "message": "auto-scan route generated", "data": response_data})
+
         @self.app.route('/api/lab/mission/import-qgc', methods=['POST'])
         def import_lab_mission_from_qgc():
             """从飞控当前缓存航点 (route_waypoints) 导入为实验虚拟航线。"""
             waypoints = []
             for wp in (self.route_waypoints or []):
-                coord = wp.get("gcj02") if isinstance(wp, dict) else None
-                src = coord if isinstance(coord, dict) else (wp if isinstance(wp, dict) else {})
-                lat = src.get("lat")
-                lng = src.get("lng")
-                if lat is None or lng is None:
+                coord = wp.get("wgs84") if isinstance(wp, dict) else None
+                if not isinstance(coord, dict):
                     continue
-                waypoints.append({"lat": lat, "lng": lng})
+                try:
+                    pair = CoordinatePair.from_wgs84(parse_coordinate(
+                        coord.get("lat"),
+                        coord.get("lng"),
+                        coord.get("alt"),
+                    ))
+                except CoordinateError:
+                    continue
+                waypoints.append(_coordinate_payload(pair))
             if not waypoints:
                 return jsonify({"success": False, "message": "无可导入航点 (飞控未上传 mission)"}), 400
             lab = self._current_lab_config()
-            lab["mission"] = normalize_lab_mission({"waypoints": waypoints})
+            lab["mission"] = normalize_lab_mission({"waypoints": waypoints}, allow_legacy_bare=False)
             if self.config_manager.update({"lab_mode": lab}):
                 self._push_lab_mission(lab)
                 return jsonify({"success": True, "message": "已从 QGC 导入 %d 个航点" % len(waypoints),
@@ -3879,7 +4358,7 @@ class WebConfigServer(object):
         # ================= 数据 API =================
         @self.app.route('/api/data/voltage', methods=['GET'])
         def get_voltage_history():
-            return jsonify({"success": True, "data": self.voltage_history})
+            return jsonify({"success": True, "data": self.voltage_history[-self.voltage_history_max:]})
 
         @self.app.route('/api/data/voltage/clear', methods=['POST'])
         def clear_voltage_history():

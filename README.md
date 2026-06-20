@@ -30,6 +30,7 @@ English version: `README.en.md`
 - [ROS 接口](#ros-接口)
 - [Web 控制台与 API](#web-控制台与-api)
 - [MAVLink 链路](#mavlink-链路)
+- [实验仿真与坐标 Schema v2](#实验仿真与坐标-schema-v2)
 - [检测装置串口协议](#检测装置串口协议)
 - [数据与日志](#数据与日志)
 - [验证](#验证)
@@ -513,7 +514,11 @@ roslaunch usv_ros usv_bringup.launch \
 | `/usv/pump_pid_complete` | `std_msgs/String` | pub | PID 完成通知 |
 | `/usv/pump_pid_error` | `std_msgs/String` | pub | PID 误差 JSON |
 | `/usv/injection_pump_status` | `std_msgs/String` | pub | 进样泵状态 JSON |
-| `/usv/spectrometer_voltage` | `std_msgs/String` | pub | 分光数据 JSON，包含 `voltage`、`absorbance` 等 |
+| `/usv/spectrometer_voltage` | `std_msgs/String` | pub | 分光数据 JSON，包含 `voltage`、`absorbance` 等；实验模拟下发布液滴事件聚合值 |
+| `/usv/lab_sim/sample_event` | `std_msgs/String` | pub | 实验定点采样液滴事件明细：`event_id`、`mode`、`droplets[]`、`mean`、`valid_count` |
+| `/usv/lab_sim/command` | `std_msgs/String` | sub | 实验仿真控制：`config`、`start`、`stop`、`waypoints` |
+| `/usv/lab_sim/status` | `std_msgs/String` | pub | 虚拟船位、航向、运行状态（latched） |
+| `/usv/lab_sim/waypoint_reached` | `std_msgs/String` | pub | 虚拟航点到达事件，不污染 `/mavros/mission/reached` |
 | `/usv/detector_health` | `std_msgs/String` | pub | ESP32 主控健康 JSON，包含温度、heap、任务栈水位 |
 | `/usv/system_health` | `std_msgs/String` | pub | Jetson、ROS 节点和 ESP32 聚合健康 JSON |
 | `/usv/spectrometer_status` | `std_msgs/String` | pub | ADS 配置、采集中、错误等状态 |
@@ -578,6 +583,11 @@ REST API 和 Socket.IO 实时事件。
 | `GET /api/data/mission/<id>/geojson` | 历史污染物点位 GeoJSON；可带 `metric=concentration` 与 `download=true` |
 | `GET /api/data/mission/<id>/surface` | 历史污染物 IDW surface；可带 `metric`、`size`、`power` 与 `download=true` |
 | `GET /api/map/live` | 当前任务实时点位、轨迹、污染物 surface、走航门控状态 |
+| `GET/POST /api/lab/config`、`GET /api/lab/status` | 实验模式配置读写与状态快照 |
+| `POST /api/lab/start`、`POST /api/lab/stop` | 启停实验虚拟航行仿真 |
+| `GET/POST /api/lab/water-area`、`POST /api/lab/mission` | 实验水域多边形与虚拟航线读写 |
+| `POST /api/lab/route/auto-scan` | 生成/校验弓字形水域覆盖航线，返回双坐标航点与 `water_snapshot_hash`；`preview=true` 只生成不保存 |
+| `POST /api/lab/mission/import-qgc` | 从飞控缓存航点 (`route_waypoints[].wgs84`) 导入为实验虚拟航线 |
 | `GET /api/logs/files`、`GET /api/logs/<filename>` | 系统日志查看 |
 | `GET /api/hardware/config`、`POST /api/hardware/config` | 硬件连接配置 |
 | `GET /api/hardware/serial-ports` | 枚举串口 |
@@ -700,6 +710,47 @@ rostopic echo /usv/mavlink_cmd_rx
 rostopic echo /usv/radio_status
 ```
 
+## 实验仿真与坐标 Schema v2
+
+实验模式（Lab）在无飞控/检测装置硬件时做半实物仿真，源码集中在 `scripts/lib/lab_sim/`、`scripts/lab_sim_node.py`、`scripts/mavlink_trigger_node.py` 与 `scripts/web_config_server.py`，不改动 MAVLink 命令号、`USV_SMPL/USV_DONE` 语义和 22 个遥测字段。
+
+### 坐标 Schema v2 与 CRS 边界
+
+- 实体统一携带双坐标对：`{"coordinate_schema_version": 2, "wgs84": {lat,lng,alt?}, "gcj02": {lat,lng,alt?}}`。
+- WGS-84 是计算、持久化、航行、距离、ENU、污染场和 surface 的唯一真源；GCJ-02 仅用于高德底图显示。
+- Web 点击事件 `event.latlng` 标记 `input_crs=GCJ02` 提交，后端是唯一转换源（迭代式 GCJ-02 -> WGS-84 反算），响应同时返回 `wgs84` 与 `gcj02`。
+- QGC 导入读取航点的 `route_waypoints[].wgs84`；旧版裸 `{lat,lng}` 按 GCJ-02 迁移到 schema v2，迁移幂等。
+- 桂林默认区域 WGS-84 -> GCJ-02 -> WGS-84 round-trip 地面误差 `<=0.5 m`；图面点击/保存航点/船位 marker 中心距离 `<=2 CSS px`。
+
+### 有界液滴采样事件
+
+- 模拟数据源下，每个采样事件生成 `droplet_count` 个液滴（默认 12，范围 `3..64`），聚合为单个地图采样点。
+- 持久化粒度：一个事件 = 一次 mission JSON 写入 = 一个 `data_point`，不做逐液滴持久化，也不开原始帧流；`data_point` 携带 `sample_event_id` 与 `droplet_count`。
+- `/usv/spectrometer_voltage` 继续发布聚合电压/吸光度/浓度；液滴明细经专用话题 `/usv/lab_sim/sample_event` 发布。
+- 采样模式：waypoint / survey / manual_route / auto_scan。
+
+### 自动扫描航线 auto-scan
+
+- `POST /api/lab/route/auto-scan` 生成/校验弓字形水域覆盖航线：内缩水域多边形、最大航点上限、版本化 `water_snapshot_hash`，支持 `preview` 预览与应用两种模式。
+- 该接口只生成/校验航线，不自动启动任务。
+
+### 科研 surface 与图件导出
+
+- `scripts/lib/lab_sim/surface.py` 在版本化水域快照的 ENU 网格上生成 truth/reconstruction/error/voltage/absorbance/risk 六层 surface，使用水域 polygon bbox（不是采样点 bbox），polygon 外严格 mask。
+- `scripts/lib/lab_sim/figure_export.py` 的 `export_surface_figure()` 导出 300 DPI PNG/TIFF、SVG/PDF 和 metadata JSON；DPI 限 `72..1200`，尺寸限 `0.1..20` inch，缺 matplotlib 时抛 `FigureExportError`。
+- 这些计算只在 ROS/Web 承载；ArduPilot、DetFirmware、QGC 不参与液滴生成、surface 计算或科研绘图。
+
+### 实验仿真验收命令
+
+```bash
+cd ~/usv_ws/src/usv_ros
+python3 -m py_compile scripts/*.py scripts/lib/lab_sim/*.py
+python3 -m unittest discover -s tests -p 'test_*.py'
+cd frontend && npm run build
+```
+
+`surface`/`figure_export` 及其测试额外需要 `numpy`（surface）与 `matplotlib`（图件导出）。
+
 ## 检测装置串口协议
 
 默认泵控串口为 `/dev/ttyUSB0`，`115200 8N1`，文本命令以 `\r\n` 结尾。
@@ -800,8 +851,11 @@ python3 -m py_compile \
   scripts/usv_mavlink_router_bridge.py \
   scripts/lib/automation_engine.py \
   scripts/lib/command_generator.py
+python3 -m py_compile scripts/lib/lab_sim/*.py
 python3 -m unittest discover -s tests -p "test_*.py"
 ```
+
+实验仿真 schema v2 验收阈值与对应单元测试（坐标 round-trip `<=0.5 m`、图面 `<=2 CSS px`、100 事件 => 100 点 + 100 次写入）见工作空间 `docs/current/70_verification.md`。
 
 前端验证：
 

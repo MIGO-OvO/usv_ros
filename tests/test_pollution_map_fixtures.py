@@ -25,6 +25,13 @@ def _load_script(module_name, relative_path):
     return module
 
 
+def _coord_pair(lat, lng):
+    return {
+        "wgs84": {"lat": lat, "lng": lng},
+        "gcj02": {"lat": lat, "lng": lng},
+    }
+
+
 class PollutionMapFixtureTests(unittest.TestCase):
     def test_fixture_feeds_backend_geojson_and_surface(self):
         module = _load_script("web_config_server_pollution_map_fixture_test", "scripts/web_config_server.py")
@@ -76,9 +83,9 @@ class PollutionMapFixtureTests(unittest.TestCase):
             water_area = {
                 "enabled": True,
                 "polygon": [
-                    {"lat": 30.0, "lng": 120.0},
-                    {"lat": 30.0, "lng": 120.001},
-                    {"lat": 30.001, "lng": 120.0},
+                    _coord_pair(30.0, 120.0),
+                    _coord_pair(30.0, 120.001),
+                    _coord_pair(30.001, 120.0),
                 ],
             }
             save_resp = client.post("/api/lab/water-area", json=water_area)
@@ -90,7 +97,7 @@ class PollutionMapFixtureTests(unittest.TestCase):
         kept_centers = {(round(cell["lat"], 6), round(cell["lng"], 6)) for cell in surface["grid"]}
         self.assertEqual(save_resp.status_code, 200)
         self.assertTrue(surface["valid"])
-        self.assertEqual(surface["water_area"], water_area)
+        self.assertEqual(surface["water_area"]["enabled"], True)
         self.assertEqual(surface["masked_count"], 3)
         self.assertEqual(len(surface["grid"]), 6)
         self.assertIn((30.0, 120.0), kept_centers)
