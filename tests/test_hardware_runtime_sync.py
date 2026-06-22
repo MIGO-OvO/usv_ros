@@ -964,12 +964,13 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmpdir:
             Path(tmpdir, ".offline_mode").write_text("1", encoding="utf-8")
             cache = module.MapTileCache(cache_dir=tmpdir)
-            cache._fetch_remote = lambda style, z, x, y: b"tile"
+            remote_tile = b"\x89PNG\r\n\x1a\n" + b"tile" * 64
+            cache._fetch_remote = lambda style, z, x, y: remote_tile
 
             data, hit = cache.get_tile("satellite", 13, 6610, 3385)
             enabled = cache.set_offline_mode(True)
 
-            self.assertEqual(data, b"tile")
+            self.assertEqual(data, remote_tile)
             self.assertEqual(hit, "remote")
             self.assertFalse(enabled)
             self.assertFalse(cache.offline_mode)

@@ -22,15 +22,16 @@ import zlib
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from map_network_fetch import VALID_STYLES  # noqa: E402
+from map_tile_inspect import is_blank_tile  # noqa: E402,F401
 
 # 缓存根目录, 与 ~/usv_ws/config 平级, 不随代码更新被覆盖
 CACHE_DIR = os.path.expanduser("~/usv_ws/map_cache")
 
 # 预热缩放级别默认上下限 (可被请求参数覆盖)
 DEFAULT_ZOOM_MIN = 13
-DEFAULT_ZOOM_MAX = 20
+DEFAULT_ZOOM_MAX = 18
 ZOOM_HARD_MIN = 3
-ZOOM_HARD_MAX = 20
+ZOOM_HARD_MAX = 18
 
 # 单次预热瓦片总数安全阀, 防止误选超大范围炸盘
 MAX_PREWARM_TILES = 2000000

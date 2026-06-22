@@ -49,7 +49,7 @@ def _download_to_root(tiles_root, bbox, zoom_min, zoom_max, styles, workers):
         sys.exit(2)
     print("待下载瓦片: %d 张 (z%d-%d)" % (total, zoom_min, zoom_max))
     counter = {
-        "cached": 0, "downloaded": 0, "timeout": 0,
+        "cached": 0, "downloaded": 0, "blank": 0, "timeout": 0,
         "invalid": 0, "write_failed": 0, "n": 0, "retried": 0,
     }
     sub_state = {"idx": 0}
@@ -66,7 +66,8 @@ def _download_to_root(tiles_root, bbox, zoom_min, zoom_max, styles, workers):
         if os.path.isfile(dst):
             try:
                 with open(dst, "rb") as f:
-                    if mtc.verify_tile_bytes(f.read()):
+                    data = f.read()
+                    if mtc.verify_tile_bytes(data) and not mtc.is_blank_tile(data):
                         return "cached", 0
                 os.remove(dst)
             except OSError:
@@ -76,6 +77,8 @@ def _download_to_root(tiles_root, bbox, zoom_min, zoom_max, styles, workers):
             base_delay=0.2, max_delay=2.0)
         if result.status != "ok" or not mtc.verify_tile_bytes(result.data):
             return result.status, max(0, int(result.attempts) - 1)
+        if mtc.is_blank_tile(result.data):
+            return "blank", max(0, int(result.attempts) - 1)
         try:
             os.makedirs(os.path.dirname(dst), exist_ok=True)
             tmp = dst + ".tmp"
@@ -95,17 +98,20 @@ def _download_to_root(tiles_root, bbox, zoom_min, zoom_max, styles, workers):
             else:
                 counter["timeout"] += 1
             if counter["n"] % 200 == 0 or counter["n"] == total:
-                fail = counter["timeout"] + counter["invalid"] + counter["write_failed"]
+                fail = (counter["timeout"] + counter["invalid"] +
+                        counter["blank"] + counter["write_failed"])
                 sys.stdout.write(
                     "\r进度: %d/%d (缓存 %d 下载 %d 失败 %d 重试 %d)" % (
                         counter["n"], total, counter["cached"],
                         counter["downloaded"], fail, counter["retried"]))
                 sys.stdout.flush()
     print()
-    fail = counter["timeout"] + counter["invalid"] + counter["write_failed"]
+    fail = (counter["timeout"] + counter["invalid"] +
+            counter["blank"] + counter["write_failed"])
     if fail:
-        print("失败分类: timeout=%d invalid=%d write_failed=%d" % (
-            counter["timeout"], counter["invalid"], counter["write_failed"]))
+        print("失败分类: timeout=%d invalid=%d blank=%d write_failed=%d" % (
+            counter["timeout"], counter["invalid"], counter["blank"],
+            counter["write_failed"]))
     return counter["cached"] + counter["downloaded"], fail
 
 
