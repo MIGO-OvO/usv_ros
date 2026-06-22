@@ -91,6 +91,8 @@ class MapTileCachePublicApiTests(unittest.TestCase):
         mtc = _fresh_import("map_tile_cache")
         self.assertLessEqual(mtc.ZOOM_HARD_MIN, mtc.DEFAULT_ZOOM_MIN)
         self.assertLessEqual(mtc.DEFAULT_ZOOM_MAX, mtc.ZOOM_HARD_MAX)
+        self.assertEqual(mtc.ZOOM_HARD_MAX, 18)
+        self.assertEqual(mtc.DEFAULT_ZOOM_MAX, 18)
         self.assertGreater(mtc.MAX_PREWARM_TILES, 0)
 
     def test_pack_format_constants(self):

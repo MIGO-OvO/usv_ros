@@ -72,6 +72,7 @@ from map_tile_store import (  # noqa: E402,F401
     clamp_zoom,
     deg2tile,
     enumerate_tiles,
+    is_blank_tile,
     read_tile,
     sweep_orphan_tmp,
     tile_disk_path,
@@ -358,7 +359,7 @@ class PrewarmCoordinator(object):
             if key in done_on_disk:
                 continue
             data = read_tile(self.cache_dir, tile_key)
-            if verify_tile_bytes(data):
+            if verify_tile_bytes(data) and not is_blank_tile(data):
                 journal.append_done(style, z, x, y)
                 continue
             yield task
@@ -370,7 +371,8 @@ class PrewarmCoordinator(object):
             base_delay=0.001, max_delay=0.001, _fetch=self._fetch_impl)
         if result.status == "aborted":
             return task, False, result.attempts, "aborted", True
-        if result.status == "ok" and verify_tile_bytes(result.data):
+        if (result.status == "ok" and verify_tile_bytes(result.data)
+                and not is_blank_tile(result.data)):
             if write_tile_atomic(self.cache_dir, TileKey(style, z, x, y), result.data):
                 return task, True, result.attempts, "", False
             return task, False, result.attempts, "write_failed", False
@@ -506,12 +508,15 @@ class MapTileCache(object):
         if os.path.isfile(path):
             try:
                 with open(path, "rb") as f:
-                    return f.read(), "cache"
+                    data = f.read()
+                if verify_tile_bytes(data) and not is_blank_tile(data):
+                    return data, "cache"
+                os.remove(path)
             except OSError:
                 pass
         if allow_remote:
             data = self._fetch_remote(style, z, x, y)
-            if data:
+            if data and verify_tile_bytes(data) and not is_blank_tile(data):
                 self._write_tile(style, z, x, y, data)
                 return data, "remote"
         return PLACEHOLDER_TILE, "placeholder"

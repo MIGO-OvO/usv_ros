@@ -59,7 +59,7 @@ class MapTileCacheResumeTests(unittest.TestCase):
     def setUp(self):
         self.mtc = _fresh_import()
         self.sb = _Sandbox()
-        self.png = self.mtc.PLACEHOLDER_TILE
+        self.png = b"\x89PNG\r\n\x1a\n" + b"0" * 200
         self.bbox = (113.0, 22.0, 113.002, 22.002)
 
     def tearDown(self):
@@ -125,6 +125,32 @@ class MapTileCacheResumeTests(unittest.TestCase):
         self.assertEqual(st["status"], "completed")
         self.assertNotIn(existing, fetch.calls)
         self.assertEqual(st["done"], st["total"])
+
+    def test_get_tile_drops_existing_blank_cache_before_remote_fetch(self):
+        target = os.path.join(self.sb.root, "satellite", "13", "1", "1.png")
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        with open(target, "wb") as f:
+            f.write(self.mtc.PLACEHOLDER_TILE)
+        cache = self._cache()
+        cache._fetch_remote = lambda style, z, x, y: self.png
+
+        data, hit = cache.get_tile("satellite", 13, 1, 1)
+
+        self.assertEqual(data, self.png)
+        self.assertEqual(hit, "remote")
+        with open(target, "rb") as f:
+            self.assertEqual(f.read(), self.png)
+
+    def test_get_tile_rejects_remote_blank_tile_without_writing_cache(self):
+        target = os.path.join(self.sb.root, "satellite", "13", "1", "1.png")
+        cache = self._cache()
+        cache._fetch_remote = lambda style, z, x, y: self.mtc.PLACEHOLDER_TILE
+
+        data, hit = cache.get_tile("satellite", 13, 1, 1)
+
+        self.assertEqual(data, self.mtc.PLACEHOLDER_TILE)
+        self.assertEqual(hit, "placeholder")
+        self.assertFalse(os.path.exists(target))
 
     def test_hp06_resume_uses_journal_done_and_does_not_refetch(self):
         old_workers = self.mtc.PREWARM_WORKERS
