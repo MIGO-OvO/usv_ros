@@ -6,6 +6,7 @@ import { Activity, AlertTriangle, Database, Download, Layers, Loader2, MapPinned
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { gcj02Input } from '@/lib/lab-coordinate-adapter'
+import { createOverscaledAmapTileLayer } from '@/lib/map-tiles'
 import { cn } from '@/lib/utils'
 import { useAppStore } from '@/store'
 
@@ -738,11 +739,7 @@ export default function MapPage() {
         zoomControl: true,
         attributionControl: false,
       })
-      const tileTpl = mapConfig.tile_url
-      const tileLayer = L.tileLayer(tileTpl.replace('{style}', mapConfig.default_style), {
-        minZoom: mapConfig.min_zoom,
-        maxZoom: mapConfig.max_zoom,
-      })
+      const tileLayer = createOverscaledAmapTileLayer(mapConfig)
       tileLayer.addTo(map)
       tileLayerRef.current = tileLayer
       overlaysRef.current = L.layerGroup().addTo(map)
