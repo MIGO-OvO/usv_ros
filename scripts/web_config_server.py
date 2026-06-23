@@ -2783,9 +2783,9 @@ class WebConfigServer(object):
         """探测能否到达谷歌瓦片端点, 用于在线/离线状态显示。"""
         try:
             req = mtc.Request(
-                "https://mt0.google.cn/vt/lyrs=s&hl=zh-CN&gl=cn&x=0&y=0&z=1",
+                "https://mt0.google.com/vt/lyrs=s&hl=en&x=0&y=0&z=1",
                 headers={"User-Agent": "USV-OfflineMap/1.0",
-                         "Referer": "https://www.google.cn/maps"})
+                         "Referer": "https://www.google.com/maps"})
             resp = mtc.urlopen(req, timeout=2.5)
             resp.read(64)
             return True
