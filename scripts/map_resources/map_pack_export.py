@@ -163,7 +163,7 @@ def _prompt_styles(default):
 
 
 def _fill_interactive_args(args):
-    print("USV 地图离线包导出向导 (高德缓存优先瓦片)")
+    print("USV 地图离线包导出向导 (默认谷歌国际版瓦片, WGS-84)")
     mode = _prompt_text("来源 download/from-cache", "download").lower()
     if mode in ("cache", "from-cache", "from_cache"):
         args.from_cache = args.from_cache or _prompt_text("已有缓存目录", mtc.CACHE_DIR)
@@ -192,7 +192,7 @@ def main(argv=None):
                         help="经纬度范围: 西 南 东 北 (下载模式必填)")
     parser.add_argument("--zoom-min", type=int, default=mtc.DEFAULT_ZOOM_MIN)
     parser.add_argument("--zoom-max", type=int, default=mtc.DEFAULT_ZOOM_MAX)
-    parser.add_argument("--styles", nargs="+", default=list(mtc.VALID_STYLES),
+    parser.add_argument("--styles", nargs="+", default=list(mtc.DEFAULT_PREWARM_STYLES),
                         choices=list(mtc.VALID_STYLES), help="瓦片类型")
     parser.add_argument("--workers", type=int, default=mtc.PREWARM_WORKERS)
     parser.add_argument("--from-cache", metavar="DIR",
