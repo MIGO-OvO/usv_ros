@@ -1,6 +1,8 @@
 import L from 'leaflet'
 
-export const MAP_TILE_NATIVE_MAX_ZOOM = 18
+// 谷歌卫星 (gsatellite, google.cn) 原生瓦片可到 z=20; 高德仅到 z=18。
+// 取两源较高者作为原生上限, 实际由后端 config.max_zoom 收口 (当前 20)。
+export const MAP_TILE_NATIVE_MAX_ZOOM = 20
 export const MAP_TILE_DISPLAY_MAX_ZOOM = 22
 
 export type AmapTileLayerConfig = {

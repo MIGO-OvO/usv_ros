@@ -27,11 +27,21 @@ from map_tile_inspect import is_blank_tile  # noqa: E402,F401
 # 缓存根目录, 与 ~/usv_ws/config 平级, 不随代码更新被覆盖
 CACHE_DIR = os.path.expanduser("~/usv_ws/map_cache")
 
+# 默认底图/预热来源: 谷歌两层 (gsatellite 卫星 + gannotation 注记路网)。
+# 高德 (satellite/annotation) 仍是合法 style 可单独请求, 但默认不再用于
+# 预热/底图, 因其原生仅到 z=18, 高层级会返回空白页。
+DEFAULT_BASE_STYLE = "gsatellite"
+DEFAULT_PREWARM_STYLES = ("gsatellite", "gannotation")
+
 # 预热缩放级别默认上下限 (可被请求参数覆盖)
+# ZOOM_HARD_MAX 决定全链路可下载/显示的最高层级:
+#   - 高德 (satellite/annotation) 原生仅到 z=18, 超过返回空白页, 由缓存层判空丢弃;
+#   - 谷歌 (gsatellite/gannotation, google.cn) 原生可到 z=20, 故硬上限提到 20。
+# 实际某区域能到多少级用 map_resources/map_tile_probe.py 探测验证。
 DEFAULT_ZOOM_MIN = 13
-DEFAULT_ZOOM_MAX = 18
+DEFAULT_ZOOM_MAX = 20
 ZOOM_HARD_MIN = 3
-ZOOM_HARD_MAX = 18
+ZOOM_HARD_MAX = 20
 
 # 单次预热瓦片总数安全阀, 防止误选超大范围炸盘
 MAX_PREWARM_TILES = 2000000

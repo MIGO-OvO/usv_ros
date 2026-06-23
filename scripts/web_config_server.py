@@ -2780,11 +2780,12 @@ class WebConfigServer(object):
 
     @staticmethod
     def _probe_online():
-        """探测能否到达高德瓦片端点, 用于在线/离线状态显示。"""
+        """探测能否到达谷歌瓦片端点, 用于在线/离线状态显示。"""
         try:
             req = mtc.Request(
-                "https://webst01.is.autonavi.com/appmaptile?style=6&x=0&y=0&z=1",
-                headers={"User-Agent": "USV-OfflineMap/1.0"})
+                "https://mt0.google.cn/vt/lyrs=s&hl=zh-CN&gl=cn&x=0&y=0&z=1",
+                headers={"User-Agent": "USV-OfflineMap/1.0",
+                         "Referer": "https://www.google.cn/maps"})
             resp = mtc.urlopen(req, timeout=2.5)
             resp.read(64)
             return True
@@ -3642,18 +3643,22 @@ class WebConfigServer(object):
 
         @self.app.route('/api/map/config', methods=['GET'])
         def get_map_config():
-            """下发离线地图配置: 瓦片代理走本地, 无需高德 Key。"""
+            """下发离线地图配置: 瓦片代理走本地, 无需 Key。
+
+            默认底图为谷歌 (gsatellite, GCJ-02, 原生可到 z=20); 高德
+            satellite/annotation 仍在 styles 列表中可选, 但原生仅到 z=18。
+            """
             return jsonify({
                 "success": True,
                 "data": {
                     "enabled": True,
-                    "provider": "leaflet-amap-raster",
-                    # v2 deliberately busts browser caches created before placeholder
-                    # tiles used no-store headers. The style segment keeps satellite
-                    # and annotation caches separated on disk and in the browser.
-                    "tile_url": "/api/map/tile/{style}/{z}/{x}/{y}.png?v=2",
+                    "provider": "leaflet-google-raster",
+                    # v3 deliberately busts browser caches created before the
+                    # google source switch. The style segment keeps each source
+                    # /layer cache separated on disk and in the browser.
+                    "tile_url": "/api/map/tile/{style}/{z}/{x}/{y}.png?v=3",
                     "styles": list(mtc.VALID_STYLES),
-                    "default_style": "satellite",
+                    "default_style": mtc.DEFAULT_BASE_STYLE,
                     "min_zoom": mtc.ZOOM_HARD_MIN,
                     "max_zoom": mtc.ZOOM_HARD_MAX,
                     "default_center": {"lng": 110.412778, "lat": 25.314167},
@@ -3702,7 +3707,7 @@ class WebConfigServer(object):
                 bbox,
                 data.get("zoom_min", mtc.DEFAULT_ZOOM_MIN),
                 data.get("zoom_max", mtc.DEFAULT_ZOOM_MAX),
-                data.get("styles") or list(mtc.VALID_STYLES),
+                data.get("styles") or list(mtc.DEFAULT_PREWARM_STYLES),
                 progress_cb=self._emit_prewarm_progress,
             )
             status = 200 if ok else 409
