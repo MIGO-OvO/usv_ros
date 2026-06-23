@@ -15,7 +15,16 @@ export interface Gcj02CoordinateInput {
   readonly gcj02: CoordinateValue
 }
 
-export type LabCoordinateWrite = LabCoordinatePair | Gcj02CoordinateInput
+
+export interface Wgs84CoordinateInput {
+  readonly input_crs: 'WGS84'
+  readonly wgs84: CoordinateValue
+}
+
+
+export type LabCoordinateWrite = LabCoordinatePair | Gcj02CoordinateInput | Wgs84CoordinateInput
+
+
 
 export type Waypoint = LabCoordinatePair & {
   readonly seq: number

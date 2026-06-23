@@ -8,6 +8,7 @@ import type {
   LabMissionWrite,
   WaterArea,
   WaterAreaWrite,
+  Wgs84CoordinateInput,
 } from '@/lib/lab-types'
 
 export function gcj02Input(position: CoordinateValue): Gcj02CoordinateInput {
@@ -19,6 +20,17 @@ export function gcj02Input(position: CoordinateValue): Gcj02CoordinateInput {
     },
   }
 }
+
+export function wgs84Input(position: CoordinateValue): Wgs84CoordinateInput {
+  return {
+    input_crs: 'WGS84',
+    wgs84: {
+      lat: position.lat,
+      lng: position.lng,
+    },
+  }
+}
+
 
 export function gcj02ForDrawing(coordinate: LabCoordinatePair): CoordinateValue {
   return coordinate.gcj02
