@@ -104,8 +104,9 @@ class MapTileCachePublicApiTests(unittest.TestCase):
         mtc = _fresh_import("map_tile_cache")
         self.assertLessEqual(mtc.ZOOM_HARD_MIN, mtc.DEFAULT_ZOOM_MIN)
         self.assertLessEqual(mtc.DEFAULT_ZOOM_MAX, mtc.ZOOM_HARD_MAX)
-        # 切谷歌后硬上限从 18 提到 20 (谷歌卫星原生可达层级)
-        self.assertEqual(mtc.ZOOM_HARD_MAX, 20)
+        # 切谷歌国际版后硬上限提到 22 (现场实测可达层级);
+        # 预热默认上限保持 20, 避免 z21/22 瓦片量过大, 需要时手动指定。
+        self.assertEqual(mtc.ZOOM_HARD_MAX, 22)
         self.assertEqual(mtc.DEFAULT_ZOOM_MAX, 20)
         self.assertGreater(mtc.MAX_PREWARM_TILES, 0)
 

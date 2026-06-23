@@ -36,12 +36,12 @@ DEFAULT_PREWARM_STYLES = ("gsatellite", "gannotation")
 # 预热缩放级别默认上下限 (可被请求参数覆盖)
 # ZOOM_HARD_MAX 决定全链路可下载/显示的最高层级:
 #   - 高德 (satellite/annotation) 原生仅到 z=18, 超过返回空白页, 由缓存层判空丢弃;
-#   - 谷歌 (gsatellite/gannotation, google.cn) 原生可到 z=20, 故硬上限提到 20。
+#   - 谷歌国际版 (gsatellite/gannotation, mt.google.com) 现场实测可到 z=22。
 # 实际某区域能到多少级用 map_resources/map_tile_probe.py 探测验证。
 DEFAULT_ZOOM_MIN = 13
 DEFAULT_ZOOM_MAX = 20
 ZOOM_HARD_MIN = 3
-ZOOM_HARD_MAX = 20
+ZOOM_HARD_MAX = 22
 
 # 单次预热瓦片总数安全阀, 防止误选超大范围炸盘
 MAX_PREWARM_TILES = 2000000
