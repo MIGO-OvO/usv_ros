@@ -1,4 +1,4 @@
-import { readFileSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 
 const root = resolve(import.meta.dirname, '..')
@@ -6,6 +6,11 @@ const mapSource = readFileSync(resolve(root, 'src/pages/Map.tsx'), 'utf8')
 const labSource = readFileSync(resolve(root, 'src/pages/Lab.tsx'), 'utf8')
 const labTypesSource = readFileSync(resolve(root, 'src/lib/lab-types.ts'), 'utf8')
 const settingsSource = readFileSync(resolve(root, 'src/pages/Settings.tsx'), 'utf8')
+const mapTilesPath = resolve(root, 'src/lib/map-tiles.ts')
+if (!existsSync(mapTilesPath)) {
+  throw new Error('Map smoke failed: missing map tile overscale helper')
+}
+const mapTilesSource = readFileSync(mapTilesPath, 'utf8')
 
 const requiredMapTokens = [
   'leaflet.heat',
@@ -31,6 +36,14 @@ const requiredMapTokens = [
   'tileLayerRef',
   '.redraw()',
   '适配范围',
+  'createOverscaledAmapTileLayer(',
+]
+
+const requiredMapTileTokens = [
+  'MAP_TILE_NATIVE_MAX_ZOOM = 18',
+  'MAP_TILE_DISPLAY_MAX_ZOOM = 22',
+  'maxNativeZoom: nativeMaxZoom',
+  'maxZoom: Math.max(nativeMaxZoom, MAP_TILE_DISPLAY_MAX_ZOOM)',
 ]
 
 const forbiddenMapTokens = [
@@ -73,6 +86,12 @@ for (const token of requiredMapTokens) {
 for (const token of forbiddenMapTokens) {
   if (mapSource.includes(token)) {
     throw new Error(`Map smoke failed: forbidden ${token}`)
+  }
+}
+
+for (const token of requiredMapTileTokens) {
+  if (!mapTilesSource.includes(token)) {
+    throw new Error(`Map tile smoke failed: missing ${token}`)
   }
 }
 
