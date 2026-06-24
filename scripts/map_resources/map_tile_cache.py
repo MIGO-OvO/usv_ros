@@ -59,6 +59,8 @@ from map_pack_journal import (  # noqa: E402,F401
 )
 from map_tile_store import (  # noqa: E402,F401
     CACHE_DIR,
+    DEFAULT_BASE_STYLE,
+    DEFAULT_PREWARM_STYLES,
     DEFAULT_ZOOM_MAX,
     DEFAULT_ZOOM_MIN,
     MAX_PREWARM_TILES,

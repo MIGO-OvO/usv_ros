@@ -2,7 +2,7 @@
 # -*- coding: utf-8 -*-
 """离线地图瓦片包导出 CLI (Offline Map Tile Pack Exporter)
 ================================================================
-在任意有网络的设备上下载/打包高德瓦片, 产出单个 tar 包 (含 manifest.json),
+在任意有网络的设备上下载/打包地图瓦片, 产出单个 tar 包 (含 manifest.json),
 随后通过任意通道 (Git LFS / U盘 / scp) 传到 ROS 设备, 用 map_pack_import.py 导入。
 
 仅依赖 Python 标准库, 复用 map_tile_cache 的端点/枚举/下载逻辑, 保证瓦片
@@ -26,6 +26,7 @@ Python: 3.8
 from __future__ import print_function
 
 import argparse
+import math
 import os
 import sys
 import threading
@@ -35,7 +36,8 @@ from concurrent.futures import ThreadPoolExecutor
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import map_tile_cache as mtc  # noqa: E402
 
-DEFAULT_INTERACTIVE_BBOX = (110.31, 25.22, 110.51, 25.41)
+DEFAULT_INTERACTIVE_CENTER = (25.314167, 110.412778)
+DEFAULT_INTERACTIVE_RANGE_KM = 2.0
 DEFAULT_INTERACTIVE_OUT = "guilin_area_map.tar"
 
 
@@ -137,25 +139,48 @@ def _prompt_int(label, default, lo=None, hi=None):
             print("请输入整数。")
 
 
-def _prompt_bbox(default):
-    labels = ("西边界经度 W", "南边界纬度 S", "东边界经度 E", "北边界纬度 N")
-    values = []
-    for label, value in zip(labels, default):
-        while True:
-            raw = _prompt_text(label, value)
-            try:
-                values.append(float(raw))
-                break
-            except ValueError:
-                print("请输入有效经纬度。")
-    return values
+def _prompt_float(label, default, lo=None, hi=None):
+    while True:
+        raw = _prompt_text(label, default)
+        try:
+            value = float(raw)
+            if lo is not None:
+                value = max(lo, value)
+            if hi is not None:
+                value = min(hi, value)
+            return value
+        except ValueError:
+            print("请输入数字。")
+
+
+def _bbox_from_center_range(lat, lng, range_km):
+    lat = max(-85.0, min(85.0, float(lat)))
+    lng = max(-180.0, min(180.0, float(lng)))
+    distance_km = max(0.001, float(range_km))
+    km_per_lat_deg = 111.32
+    cos_lat = max(0.01, math.cos(math.radians(lat)))
+    km_per_lng_deg = km_per_lat_deg * cos_lat
+    south = max(-85.0, lat - distance_km / km_per_lat_deg)
+    north = min(85.0, lat + distance_km / km_per_lat_deg)
+    west = max(-180.0, lng - distance_km / km_per_lng_deg)
+    east = min(180.0, lng + distance_km / km_per_lng_deg)
+    return (west, south, east, north)
+
+
+def _prompt_center_range_bbox(default_center, default_range_km):
+    lat = _prompt_float("中心纬度(北纬为正)", default_center[0], -85.0, 85.0)
+    lng = _prompt_float("中心经度(东经为正)", default_center[1], -180.0, 180.0)
+    range_km = _prompt_float("东南西北边界到中心距离 km", default_range_km, 0.001, None)
+    bbox = _bbox_from_center_range(lat, lng, range_km)
+    print("下载范围 bbox(W,S,E,N): %.6f %.6f %.6f %.6f" % bbox)
+    return bbox
 
 
 def _prompt_styles(default):
     default_text = ",".join(default)
     valid = set(mtc.VALID_STYLES)
     while True:
-        raw = _prompt_text("瓦片类型 satellite/annotation, 逗号分隔", default_text)
+        raw = _prompt_text("瓦片类型(默认谷歌 gsatellite/gannotation), 逗号分隔", default_text)
         styles = [s.strip() for s in raw.replace(";", ",").split(",") if s.strip()]
         if styles and all(style in valid for style in styles):
             return styles
@@ -163,7 +188,7 @@ def _prompt_styles(default):
 
 
 def _fill_interactive_args(args):
-    print("USV 地图离线包导出向导 (高德缓存优先瓦片)")
+    print("USV 地图离线包导出向导 (默认谷歌国际版瓦片, WGS-84)")
     mode = _prompt_text("来源 download/from-cache", "download").lower()
     if mode in ("cache", "from-cache", "from_cache"):
         args.from_cache = args.from_cache or _prompt_text("已有缓存目录", mtc.CACHE_DIR)
@@ -175,7 +200,8 @@ def _fill_interactive_args(args):
         args.zoom_min, args.zoom_max = args.zoom_max, args.zoom_min
     args.workers = _prompt_int("并发下载线程", args.workers, 1, 32)
     if not args.from_cache:
-        args.bbox = args.bbox or _prompt_bbox(DEFAULT_INTERACTIVE_BBOX)
+        args.bbox = args.bbox or _prompt_center_range_bbox(
+            DEFAULT_INTERACTIVE_CENTER, DEFAULT_INTERACTIVE_RANGE_KM)
         bbox = (args.bbox[0], args.bbox[1], args.bbox[2], args.bbox[3])
         _, total = mtc.enumerate_tiles(bbox, args.zoom_min, args.zoom_max, args.styles)
         print("预计下载瓦片: %d 张 (z%d-z%d)" % (total, args.zoom_min, args.zoom_max))
@@ -192,7 +218,7 @@ def main(argv=None):
                         help="经纬度范围: 西 南 东 北 (下载模式必填)")
     parser.add_argument("--zoom-min", type=int, default=mtc.DEFAULT_ZOOM_MIN)
     parser.add_argument("--zoom-max", type=int, default=mtc.DEFAULT_ZOOM_MAX)
-    parser.add_argument("--styles", nargs="+", default=list(mtc.VALID_STYLES),
+    parser.add_argument("--styles", nargs="+", default=list(mtc.DEFAULT_PREWARM_STYLES),
                         choices=list(mtc.VALID_STYLES), help="瓦片类型")
     parser.add_argument("--workers", type=int, default=mtc.PREWARM_WORKERS)
     parser.add_argument("--from-cache", metavar="DIR",

@@ -5,7 +5,7 @@ import 'leaflet.heat'
 import { Activity, AlertTriangle, Database, Download, Layers, Loader2, MapPinned, Navigation, RefreshCw, Route, Trash2, Upload, Wifi, WifiOff, X } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { gcj02Input } from '@/lib/lab-coordinate-adapter'
+import { wgs84Input } from '@/lib/lab-coordinate-adapter'
 import { createOverscaledAmapTileLayer } from '@/lib/map-tiles'
 import { cn } from '@/lib/utils'
 import { useAppStore } from '@/store'
@@ -146,8 +146,14 @@ interface MapCoordinate {
 }
 
 interface GeoPoint {
+  wgs84?: MapCoordinate
   gcj02: MapCoordinate
 }
+
+function mapCoord(point?: GeoPoint | null): MapCoordinate | null {
+  return point?.wgs84 || point?.gcj02 || null
+}
+
 
 interface LiveSample extends GeoPoint {
   voltage?: number
@@ -568,16 +574,18 @@ export default function MapPage() {
     const liveSurface = live.surface || null
     const liveSurveyStatus = live.survey_status || null
     const features: GeoFeature[] = []
-    if (live.position?.gcj02) {
+    const livePosition = mapCoord(live.position)
+    if (livePosition) {
       features.push({
         type: 'Feature',
-        geometry: { type: 'Point', coordinates: [live.position.gcj02.lng, live.position.gcj02.lat] },
+        geometry: { type: 'Point', coordinates: [livePosition.lng, livePosition.lat] },
         properties: { layer: 'position' },
       })
     }
     const trackPoints = live.track_points || []
-    if (trackPoints.length > 1) {
-      const coordinates: [number, number][] = trackPoints.map((p) => [p.gcj02.lng, p.gcj02.lat])
+    const trackCoords = trackPoints.map(mapCoord).filter(Boolean) as MapCoordinate[]
+    if (trackCoords.length > 1) {
+      const coordinates: [number, number][] = trackCoords.map((p) => [p.lng, p.lat])
       features.push({
         type: 'Feature',
         geometry: {
@@ -588,14 +596,17 @@ export default function MapPage() {
       })
     }
     live.route_waypoints?.forEach((wp) => {
+      const coord = mapCoord(wp)
+      if (!coord) return
       features.push({
         type: 'Feature',
-        geometry: { type: 'Point', coordinates: [wp.gcj02.lng, wp.gcj02.lat] },
+        geometry: { type: 'Point', coordinates: [coord.lng, coord.lat] },
         properties: { layer: 'waypoint', seq: wp.seq },
       })
     })
     live.data_points?.forEach((point) => {
-      if (!point.gcj02) return
+      const coord = mapCoord(point)
+      if (!coord) return
       const value = metric === 'voltage'
         ? point.voltage
         : metric === 'absorbance'
@@ -604,7 +615,7 @@ export default function MapPage() {
       if (!Number.isFinite(Number(value))) return
       features.push({
         type: 'Feature',
-        geometry: { type: 'Point', coordinates: [point.gcj02.lng, point.gcj02.lat] },
+        geometry: { type: 'Point', coordinates: [coord.lng, coord.lat] },
         properties: { ...point, layer: 'sample', value },
       })
     })
@@ -617,7 +628,7 @@ export default function MapPage() {
     } else if (liveSurface?.reason) {
       setStatusText(gateText ? `${liveSurface.reason} · 走航门控: ${gateText}` : liveSurface.reason)
     } else {
-      const positionText = live.position ? `实时船位 ${live.position.gcj02.lat.toFixed(6)}, ${live.position.gcj02.lng.toFixed(6)}` : '等待 GPS 船位'
+      const positionText = livePosition ? `实时船位 ${livePosition.lat.toFixed(6)}, ${livePosition.lng.toFixed(6)}` : '等待 GPS 船位'
       setStatusText(gateText ? `${positionText} · 走航门控: ${gateText}` : positionText)
     }
   }, [idwPower, idwSize, metric, includeLab])
@@ -659,7 +670,7 @@ export default function MapPage() {
           replace: true,
           sample_timeout_s: sampleTimeoutS,
           waypoints: draftWaypoints.map((wp, index) => ({
-            ...gcj02Input(wp.gcj02),
+            ...wgs84Input(wp.gcj02),
             seq: index,
             sample: wp.sample,
           })),
@@ -827,7 +838,7 @@ export default function MapPage() {
       marker.bindPopup(
         `<div style="min-width:180px;font-size:12px;line-height:1.65">
           <b>Web 规划航点 #${index + 1}</b><br/>
-          GCJ-02: ${wp.gcj02.lat.toFixed(7)}, ${wp.gcj02.lng.toFixed(7)}<br/>
+          WGS-84: ${wp.gcj02.lat.toFixed(7)}, ${wp.gcj02.lng.toFixed(7)}<br/>
           采样触发: ${wp.sample ? 'NAV_SCRIPT_TIME' : '无'}
         </div>`,
       )

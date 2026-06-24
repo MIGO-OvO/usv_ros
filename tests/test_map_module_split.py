@@ -76,8 +76,21 @@ class MapTileCachePublicApiTests(unittest.TestCase):
 
     def test_valid_styles_contains_known_keys(self):
         mtc = _fresh_import("map_tile_cache")
+        # 高德两层 (原生 z<=18)
         self.assertIn("satellite", mtc.VALID_STYLES)
         self.assertIn("annotation", mtc.VALID_STYLES)
+        # 谷歌两层 (google.cn, 原生 z 可到 20+)
+        self.assertIn("gsatellite", mtc.VALID_STYLES)
+        self.assertIn("gannotation", mtc.VALID_STYLES)
+
+    def test_default_base_and_prewarm_styles_are_google(self):
+        mtc = _fresh_import("map_tile_cache")
+        self.assertEqual(mtc.DEFAULT_BASE_STYLE, "gsatellite")
+        self.assertEqual(set(mtc.DEFAULT_PREWARM_STYLES),
+                         {"gsatellite", "gannotation"})
+        # 默认底图/预热来源必须都是合法 style
+        for style in (mtc.DEFAULT_BASE_STYLE,) + tuple(mtc.DEFAULT_PREWARM_STYLES):
+            self.assertIn(style, mtc.VALID_STYLES)
 
     def test_tile_endpoints_match_valid_styles(self):
         mtc = _fresh_import("map_tile_cache")
@@ -91,8 +104,10 @@ class MapTileCachePublicApiTests(unittest.TestCase):
         mtc = _fresh_import("map_tile_cache")
         self.assertLessEqual(mtc.ZOOM_HARD_MIN, mtc.DEFAULT_ZOOM_MIN)
         self.assertLessEqual(mtc.DEFAULT_ZOOM_MAX, mtc.ZOOM_HARD_MAX)
-        self.assertEqual(mtc.ZOOM_HARD_MAX, 18)
-        self.assertEqual(mtc.DEFAULT_ZOOM_MAX, 18)
+        # 切谷歌国际版后硬上限提到 22 (现场实测可达层级);
+        # 预热默认上限保持 20, 避免 z21/22 瓦片量过大, 需要时手动指定。
+        self.assertEqual(mtc.ZOOM_HARD_MAX, 22)
+        self.assertEqual(mtc.DEFAULT_ZOOM_MAX, 20)
         self.assertGreater(mtc.MAX_PREWARM_TILES, 0)
 
     def test_pack_format_constants(self):

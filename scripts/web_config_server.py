@@ -308,8 +308,24 @@ def _coordinate_or_none(raw, path, allow_legacy_bare=True):
         return None
     input_crs = str(raw.get("input_crs", "") or "").strip().lower()
     if input_crs:
-        if input_crs != "gcj02":
+        if input_crs not in ("gcj02", "wgs84"):
             raise ModelParseError("unsupported_crs", path + ".input_crs", input_crs)
+        if input_crs == "wgs84":
+            if "gcj02" in raw or "lat" in raw or "lng" in raw:
+                raise ModelParseError(
+                    "ambiguous_coordinate",
+                    path,
+                    "WGS84 input must contain only the labeled wgs84 coordinate",
+                )
+            wgs84_raw = raw.get("wgs84")
+            if not isinstance(wgs84_raw, dict):
+                raise ModelParseError("expected_object", path + ".wgs84", type(wgs84_raw).__name__)
+            return CoordinatePair.from_wgs84(parse_coordinate(
+                wgs84_raw.get("lat"),
+                wgs84_raw.get("lng"),
+                wgs84_raw.get("alt"),
+            ))
+
         if "wgs84" in raw or "lat" in raw or "lng" in raw:
             raise ModelParseError(
                 "ambiguous_coordinate",
@@ -2749,13 +2765,13 @@ class WebConfigServer(object):
         }
 
     def _resolve_prewarm_bbox(self, client_bbox):
-        """预热范围: 优先航点包络(gcj02), 无航点回退到前端传入的当前视野。
+        """预热范围: 优先航点包络(wgs84, 匹配谷歌国际版底图), 无航点回退到前端当前视野。
 
         返回 (min_lng, min_lat, max_lng, max_lat) 或 None。
         """
         lngs, lats = [], []
         for wp in (self.route_waypoints or []):
-            coord = wp.get("gcj02") if isinstance(wp, dict) else None
+            coord = wp.get("wgs84") or wp.get("gcj02") if isinstance(wp, dict) else None
             if isinstance(coord, dict):
                 lng, lat = coord.get("lng"), coord.get("lat")
                 if isinstance(lng, (int, float)) and isinstance(lat, (int, float)):
@@ -2780,11 +2796,12 @@ class WebConfigServer(object):
 
     @staticmethod
     def _probe_online():
-        """探测能否到达高德瓦片端点, 用于在线/离线状态显示。"""
+        """探测能否到达谷歌瓦片端点, 用于在线/离线状态显示。"""
         try:
             req = mtc.Request(
-                "https://webst01.is.autonavi.com/appmaptile?style=6&x=0&y=0&z=1",
-                headers={"User-Agent": "USV-OfflineMap/1.0"})
+                "https://mt0.google.com/vt/lyrs=s&hl=en&x=0&y=0&z=1",
+                headers={"User-Agent": "USV-OfflineMap/1.0",
+                         "Referer": "https://www.google.com/maps"})
             resp = mtc.urlopen(req, timeout=2.5)
             resp.read(64)
             return True
@@ -2832,7 +2849,7 @@ class WebConfigServer(object):
 
     @staticmethod
     def _point_display_coord(point):
-        coord = point.get("gcj02") if isinstance(point, dict) else None
+        coord = (point.get("wgs84") or point.get("gcj02")) if isinstance(point, dict) else None
         if not isinstance(coord, dict):
             return None
         lat = _to_float_or_none(coord.get("lat"))
@@ -3642,18 +3659,24 @@ class WebConfigServer(object):
 
         @self.app.route('/api/map/config', methods=['GET'])
         def get_map_config():
-            """下发离线地图配置: 瓦片代理走本地, 无需高德 Key。"""
+            """下发离线地图配置: 瓦片代理走本地, 无需 Key。
+
+            默认底图为谷歌 (gsatellite, GCJ-02, 原生可到 z=20); 高德
+            satellite/annotation 仍在 styles 列表中可选, 但原生仅到 z=18。
+            """
             return jsonify({
                 "success": True,
                 "data": {
                     "enabled": True,
-                    "provider": "leaflet-amap-raster",
-                    # v2 deliberately busts browser caches created before placeholder
-                    # tiles used no-store headers. The style segment keeps satellite
-                    # and annotation caches separated on disk and in the browser.
-                    "tile_url": "/api/map/tile/{style}/{z}/{x}/{y}.png?v=2",
+                    "provider": "leaflet-google-raster",
+                    # v3 deliberately busts browser caches created before the
+                    # google source switch. The style segment keeps each source
+                    # /layer cache separated on disk and in the browser.
+                    "map_datum": "wgs84",
+
+                    "tile_url": "/api/map/tile/{style}/{z}/{x}/{y}.png?v=3",
                     "styles": list(mtc.VALID_STYLES),
-                    "default_style": "satellite",
+                    "default_style": mtc.DEFAULT_BASE_STYLE,
                     "min_zoom": mtc.ZOOM_HARD_MIN,
                     "max_zoom": mtc.ZOOM_HARD_MAX,
                     "default_center": {"lng": 110.412778, "lat": 25.314167},
@@ -3702,7 +3725,7 @@ class WebConfigServer(object):
                 bbox,
                 data.get("zoom_min", mtc.DEFAULT_ZOOM_MIN),
                 data.get("zoom_max", mtc.DEFAULT_ZOOM_MAX),
-                data.get("styles") or list(mtc.VALID_STYLES),
+                data.get("styles") or list(mtc.DEFAULT_PREWARM_STYLES),
                 progress_cb=self._emit_prewarm_progress,
             )
             status = 200 if ok else 409
