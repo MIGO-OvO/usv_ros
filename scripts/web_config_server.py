@@ -110,6 +110,7 @@ from scripts.lib.lab_sim.coordinates import (
 )
 from scripts.lib.lab_sim.models import CoordinatePairRef, ModelParseError, SamplingEvent
 from scripts.lib.lab_sim.route_planner import RoutePlannerError, plan_coverage_route
+from scripts.lib.sample_recording import SampleRecordingStorage, normalize_raw_frame
 
 # 配置文件路径
 CONFIG_DIR = os.path.expanduser("~/usv_ws/config")
@@ -1235,6 +1236,9 @@ class MissionDataManager(object):
         self._save_current()
         return event_payload
 
+    def save_current(self):
+        self._save_current()
+
     def _save_current(self):
         """保存当前任务数据到文件。"""
         if self.current_mission_file:
@@ -1296,6 +1300,25 @@ class MissionDataManager(object):
             with open(path, 'r', encoding='utf-8') as f:
                 return self._with_summary(json.load(f))
         return None
+
+    def save_mission(self, mission_id, data):
+        if isinstance(data, dict) and "summary" in data:
+            data = dict(data)
+            data.pop("summary", None)
+        if (
+            self.current_mission_file
+            and isinstance(self.current_mission_data, dict)
+            and str(self.current_mission_data.get("mission_id")) == str(mission_id)
+        ):
+            self.current_mission_data = data
+            self._save_current()
+            return True
+        path = os.path.join(self.data_dir, f"mission_{mission_id}.json")
+        if not os.path.exists(path):
+            return False
+        with open(path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        return True
 
     def delete_mission(self, mission_id):
         """删除任务。"""
@@ -1794,6 +1817,8 @@ class WebConfigServer(object):
         self.config_manager.load()
         self.preset_manager = PresetManager()
         self.data_manager = MissionDataManager()
+        self.sample_storage = SampleRecordingStorage(self.data_manager.data_dir)
+        self.current_sample_window = None
         self.calibration_manager = CalibrationManager()
         self.tile_cache = mtc.MapTileCache(logger=rospy.logwarn)
 
@@ -1876,6 +1901,7 @@ class WebConfigServer(object):
             self.angle_telemetry_sub = rospy.Subscriber('/usv/pump_angle_telemetry', String, self._angle_telemetry_cb)
             self.injection_status_sub = rospy.Subscriber('/usv/injection_pump_status', String, self._injection_status_cb)
             self.voltage_sub = rospy.Subscriber('/usv/spectrometer_voltage', String, self._voltage_cb)
+            self.spectrometer_raw_sub = rospy.Subscriber('/usv/spectrometer_raw', String, self._spectrometer_raw_cb)
             self.spectro_status_sub = rospy.Subscriber('/usv/spectrometer_status', String, self._spectro_status_cb)
             self.mission_sub = rospy.Subscriber('/usv/mission_status', String, self._mission_status_cb)
             self.trigger_status_sub = rospy.Subscriber('/usv/trigger_status', String, self._trigger_status_cb)
@@ -1908,6 +1934,7 @@ class WebConfigServer(object):
             self.angle_telemetry_sub = None
             self.injection_status_sub = None
             self.voltage_sub = None
+            self.spectrometer_raw_sub = None
             self.spectro_status_sub = None
             self.mission_sub = None
             self.trigger_status_sub = None
@@ -2002,9 +2029,86 @@ class WebConfigServer(object):
             self.data_manager.add_track_point(self.current_position)
 
     def _stop_data_recording_if_active(self):
+        self._close_sample_window_if_open()
         if self._data_recording_active():
             self.data_manager.stop_mission()
         self.data_recording_source = None
+
+    def _save_current_mission_data(self):
+        save_current = getattr(self.data_manager, "save_current", None)
+        if callable(save_current):
+            save_current()
+
+    def _active_mission_data(self):
+        data = getattr(self.data_manager, "current_mission_data", None)
+        return data if isinstance(data, dict) else None
+
+    def _current_sample_context(self):
+        mission_status = str(getattr(self, "mission_status", "") or "")
+        waypoint_seq = self.current_waypoint_seq
+        mode = "survey" if self.data_recording_source == "survey" or "survey" in mission_status.lower() else "manual"
+        if waypoint_seq is not None:
+            mode = "waypoint"
+        automation = self.latest_automation_status if isinstance(self.latest_automation_status, dict) else {}
+        mavlink_sample_id = automation.get("sample_id")
+        return {
+            "mode": mode,
+            "source": "fcu" if mode == "waypoint" else (self.data_recording_source or "trigger"),
+            "waypoint_seq": waypoint_seq,
+            "mavlink_sample_id": mavlink_sample_id,
+            "route_ref": {
+                "route_snapshot_id": self.route_snapshot_id,
+                "route_source": self.route_source,
+            },
+        }
+
+    def _start_sample_window_if_needed(self):
+        if self.current_sample_window is not None:
+            return
+        mission_data = self._active_mission_data()
+        if not mission_data:
+            return
+        try:
+            self.current_sample_window = self.sample_storage.start_window(
+                mission_data,
+                self._current_sample_context(),
+                self.current_position,
+            )
+            self._save_current_mission_data()
+        except (OSError, ValueError) as exc:
+            rospy.logwarn("Unable to start sample window: %s", str(exc))
+
+    def _close_sample_window_if_open(self):
+        if self.current_sample_window is None:
+            return
+        mission_data = self._active_mission_data()
+        if not mission_data:
+            self.current_sample_window = None
+            return
+        try:
+            self.sample_storage.close_window(mission_data, self.current_sample_window, self.current_position)
+            self._save_current_mission_data()
+        except (OSError, ValueError) as exc:
+            rospy.logwarn("Unable to close sample window: %s", str(exc))
+        finally:
+            self.current_sample_window = None
+
+    def _spectrometer_raw_cb(self, msg):
+        if self.current_sample_window is None:
+            return
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError):
+            rospy.logwarn("Invalid spectrometer raw JSON skipped")
+            return
+        if not isinstance(payload, dict):
+            rospy.logwarn("Invalid spectrometer raw payload skipped")
+            return
+        try:
+            frame = normalize_raw_frame(payload, latest_voltage=self.latest_spectrometer_payload)
+            self.sample_storage.append_raw_frame(self.current_sample_window, frame)
+        except (OSError, ValueError) as exc:
+            rospy.logwarn("Unable to append spectrometer raw frame: %s", str(exc))
 
     def _current_injection_pump_policy(self):
         config = self.config_manager.get()
@@ -2110,12 +2214,15 @@ class WebConfigServer(object):
             self.automation_running = True
             source = "lab" if self._lab_mission_recording_active() else "trigger"
             self._start_data_recording_if_needed(source=source)
+            self._start_sample_window_if_needed()
         elif (
             'sampling_stopped' in status
             or 'survey_stopped' in status
             or 'manual_start_rejected' in status
             or 'start_failed' in status
         ):
+            if 'sampling_stopped' in status or 'survey_stopped' in status:
+                self._close_sample_window_if_open()
             self.automation_running = False
             keep_recording = (
                 'sampling_stopped' in status
@@ -4584,6 +4691,67 @@ class WebConfigServer(object):
             if data:
                 return jsonify({"success": True, "data": data})
             return jsonify({"success": False, "message": "任务不存在"}), 404
+
+        @self.app.route('/api/data/mission/<mission_id>/samples', methods=['GET'])
+        def list_mission_samples(mission_id):
+            data = self.data_manager.get_mission(mission_id)
+            if not data:
+                return jsonify({"success": False, "error": "任务不存在"}), 404
+            return jsonify({
+                "success": True,
+                "data": {
+                    "mission_id": mission_id,
+                    "samples": self.sample_storage.list_windows(data),
+                },
+            })
+
+        @self.app.route('/api/data/mission/<mission_id>/sample/<sample_id>', methods=['GET'])
+        def get_mission_sample(mission_id, sample_id):
+            data = self.data_manager.get_mission(mission_id)
+            if not data:
+                return jsonify({"success": False, "error": "任务不存在"}), 404
+            for window in self.sample_storage.list_windows(data):
+                if str(window.get("sample_id")) == str(sample_id):
+                    return jsonify({"success": True, "data": window})
+            return jsonify({"success": False, "error": "采样窗口不存在"}), 404
+
+        @self.app.route('/api/data/mission/<mission_id>/sample/<sample_id>/raw', methods=['GET'])
+        def get_mission_sample_raw(mission_id, sample_id):
+            data = self.data_manager.get_mission(mission_id)
+            if not data:
+                return jsonify({"success": False, "error": "任务不存在"}), 404
+            if not any(str(window.get("sample_id")) == str(sample_id) for window in self.sample_storage.list_windows(data)):
+                return jsonify({"success": False, "error": "采样窗口不存在"}), 404
+            try:
+                limit = int(request.args.get("limit", 2000))
+                offset = int(request.args.get("offset", 0))
+                frames = self.sample_storage.read_raw_frames(mission_id, sample_id, limit=limit, offset=offset)
+            except (TypeError, ValueError) as exc:
+                return jsonify({"success": False, "error": str(exc)}), 400
+            return jsonify({
+                "success": True,
+                "data": {
+                    "mission_id": mission_id,
+                    "sample_id": sample_id,
+                    "count": len(frames),
+                    "frames": frames,
+                },
+            })
+
+        @self.app.route('/api/data/mission/<mission_id>/sample/<sample_id>/manual-result', methods=['POST'])
+        def update_mission_sample_manual_result(mission_id, sample_id):
+            data = self.data_manager.get_mission(mission_id)
+            if not data:
+                return jsonify({"success": False, "error": "任务不存在"}), 404
+            try:
+                window = self.sample_storage.update_manual_result(data, sample_id, request.get_json(silent=True) or {})
+            except ValueError as exc:
+                return jsonify({"success": False, "error": str(exc)}), 400
+            if window is None:
+                return jsonify({"success": False, "error": "采样窗口不存在"}), 404
+            if not self.data_manager.save_mission(mission_id, data):
+                return jsonify({"success": False, "error": "保存失败"}), 500
+            return jsonify({"success": True, "data": window})
 
         @self.app.route('/api/data/mission/<mission_id>/geojson', methods=['GET'])
         def get_mission_geojson(mission_id):
