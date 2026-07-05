@@ -579,6 +579,10 @@ REST API 和 Socket.IO 实时事件。
 | `POST /api/spectrometer/start`、`POST /api/spectrometer/stop`、`POST /api/spectrometer/baseline` | 分光采集启停；基线稳定后用当前有效电压设定吸光度参考电压 |
 | `GET /api/data/missions` | 历史任务文件列表 |
 | `GET /api/data/mission/<id>` | 历史任务 JSON |
+| `GET /api/data/mission/<id>/samples` | 任务下采样窗口列表，不返回 raw frames |
+| `GET /api/data/mission/<id>/sample/<sample_id>` | 单个采样窗口元数据和摘要 |
+| `GET /api/data/mission/<id>/sample/<sample_id>/raw` | 读取窗口 raw frames，支持 `limit`、`offset` |
+| `POST /api/data/mission/<id>/sample/<sample_id>/manual-result` | 写入人工浓度、单位、方法、记录人和备注 |
 | `GET /api/data/mission/<id>/csv` | 历史任务 CSV 下载 |
 | `GET /api/data/mission/<id>/geojson` | 历史污染物点位 GeoJSON；可带 `metric=concentration` 与 `download=true` |
 | `GET /api/data/mission/<id>/surface` | 历史污染物 IDW surface；可带 `metric`、`size`、`power` 与 `download=true` |
@@ -801,7 +805,8 @@ Web 的 `POST /api/hardware/test-pump-port` 使用同一握手逻辑，不能只
 | `~/usv_ws/.usv_run/logs/boot_check.log` | 开机自启自检日志 |
 | `~/usv_ws/config/sampling_config.json` | Web 采样配置 |
 | `~/usv_ws/config/calibration.json` | 校准 offset |
-| `~/usv_ws/data/missions/mission_*.json` | 任务采样数据 |
+| `~/usv_ws/data/missions/mission_*.json` | 任务采样数据和 `sample_windows[]` 摘要 |
+| `~/usv_ws/data/missions/raw/<mission_id>/<sample_id>.jsonl` | 采样窗口原始分光帧，一行一帧 |
 
 查看状态：
 
@@ -817,6 +822,8 @@ curl "http://127.0.0.1:5000/api/logs/usv_system.log?lines=100"
 ```bash
 curl http://127.0.0.1:5000/api/data/missions
 curl http://127.0.0.1:5000/api/data/mission/<mission_id>/csv > mission.csv
+curl http://127.0.0.1:5000/api/data/mission/<mission_id>/samples
+curl http://127.0.0.1:5000/api/data/mission/<mission_id>/sample/<sample_id>/raw
 curl "http://127.0.0.1:5000/api/data/mission/<mission_id>/geojson?metric=concentration&download=true" > mission.geojson
 curl "http://127.0.0.1:5000/api/data/mission/<mission_id>/surface?metric=concentration&size=80&power=2&download=true" > mission_surface.json
 curl http://127.0.0.1:5000/api/map/live > live_map_snapshot.json
