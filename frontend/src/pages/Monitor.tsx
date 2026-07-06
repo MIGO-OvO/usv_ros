@@ -59,8 +59,8 @@ function computeAdaptiveDomain(values: number[], fallback: [number, number], min
 }
 
 const MIN_CHART_POINTS = 20
-const MAX_CHART_POINTS = 150
-const DEFAULT_CHART_POINTS = 120
+const MAX_CHART_POINTS = 6000
+const DEFAULT_CHART_POINTS = 500
 
 function clampChartPoints(value: number): number {
   if (!Number.isFinite(value)) return DEFAULT_CHART_POINTS
@@ -291,81 +291,79 @@ export default function Monitor() {
         </Card>
       </div>
 
-      {/* Charts Row */}
-      <div className="grid min-w-0 grid-cols-1 gap-6 xl:grid-cols-3">
-        <div className="min-w-0 space-y-6 xl:col-span-2">
-          {/* Voltage Chart */}
-          <Card className="flex h-[460px] min-w-0 flex-col overflow-hidden xl:h-[560px]">
-             <CardHeader className="flex flex-col gap-3 pb-2 sm:flex-row sm:items-center sm:justify-between">
-                <div>
-                  <CardTitle className="text-base">分光计电压</CardTitle>
-                  <div className="mt-1 text-xs text-muted-foreground">显示 {displayedVoltageHistory.length}/{voltageHistory.length} 个数据点</div>
-                </div>
-                <label className="flex items-center gap-2 text-xs text-muted-foreground">
-                  显示点数
-                  <NumericInput
-                    className="h-9 min-h-9 w-24"
-                    integer
-                    min={MIN_CHART_POINTS}
-                    max={MAX_CHART_POINTS}
-                    value={chartPointCount}
-                    onValueChange={(value) => setChartPointCount(clampChartPoints(value))}
-                  />
-                </label>
-             </CardHeader>
-             <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden">
-                <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={displayedVoltageHistory}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" opacity={0.4} />
-                        <XAxis dataKey="time" stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} interval="preserveStartEnd" />
-                        <YAxis stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} domain={voltageDomain}
-                               allowDataOverflow
-                               tickFormatter={formatChartNumber}
-                               label={{ value: 'V', angle: -90, position: 'insideLeft', style: { fill: 'hsl(var(--muted-foreground))', fontSize: 11 } }} />
-                        <Tooltip contentStyle={tooltipStyle} formatter={formatChartTooltip} />
-                        <Line type="monotone" dataKey="voltage" name="电压" stroke="hsl(var(--chart-1))" strokeWidth={2} dot={false} isAnimationActive={false} />
-                    </LineChart>
-                </ResponsiveContainer>
-             </CardContent>
+      <Card className="flex h-[440px] min-w-0 flex-col overflow-hidden lg:h-[500px]">
+         <CardHeader className="flex flex-col gap-3 pb-2 sm:flex-row sm:items-center sm:justify-between">
+            <div>
+              <CardTitle className="text-base">分光计电压</CardTitle>
+              <div className="mt-1 text-xs text-muted-foreground">显示 {displayedVoltageHistory.length}/{voltageHistory.length} 个数据点</div>
+            </div>
+            <label className="flex items-center gap-2 text-xs text-muted-foreground">
+              显示点数
+              <NumericInput
+                className="h-9 min-h-9 w-28"
+                integer
+                min={MIN_CHART_POINTS}
+                max={MAX_CHART_POINTS}
+                value={chartPointCount}
+                onValueChange={(value) => setChartPointCount(clampChartPoints(value))}
+              />
+            </label>
+         </CardHeader>
+         <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden">
+            <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={displayedVoltageHistory}>
+                    <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" opacity={0.4} />
+                    <XAxis dataKey="time" stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} interval="preserveStartEnd" />
+                    <YAxis stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} domain={voltageDomain}
+                           allowDataOverflow
+                           tickFormatter={formatChartNumber}
+                           label={{ value: 'V', angle: -90, position: 'insideLeft', style: { fill: 'hsl(var(--muted-foreground))', fontSize: 11 } }} />
+                    <Tooltip contentStyle={tooltipStyle} formatter={formatChartTooltip} />
+                    <Line type="monotone" dataKey="voltage" name="电压" stroke="hsl(var(--chart-1))" strokeWidth={2} dot={false} isAnimationActive={false} />
+                </LineChart>
+            </ResponsiveContainer>
+         </CardContent>
+      </Card>
+
+      <div className="grid min-w-0 grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_380px]">
+        <div className="min-w-0 space-y-6">
+          <Card className="min-w-0">
+            <CardHeader className="pb-2">
+              <CardTitle className="text-base">PID 误差</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 sm:gap-4">
+                {(['X', 'Y', 'Z', 'A'] as const).map((axis) => {
+                  const err = pidErrors[axis] ?? 0
+                  const absErr = Math.abs(err)
+                  return (
+                    <div key={axis} className="rounded-lg border border-border/60 bg-muted/20 p-3 text-center">
+                      <div className="mb-1 text-xs font-medium text-muted-foreground">{axis} 轴</div>
+                      <div className={cn(
+                        "font-mono text-xl font-bold",
+                        absErr < 0.5 ? "text-emerald-500" : absErr < 2 ? "text-amber-500" : "text-red-500"
+                      )}>
+                        {err.toFixed(2)}°
+                      </div>
+                      <div className={cn(
+                        "mt-1 text-xs",
+                        absErr < 0.5 ? "text-emerald-500/70" : absErr < 2 ? "text-amber-500/70" : "text-red-500/70"
+                      )}>
+                        {absErr < 0.5 ? "到位" : absErr < 2 ? "调节中" : "偏差大"}
+                      </div>
+                    </div>
+                  )
+                })}
+              </div>
+            </CardContent>
           </Card>
 
-          {/* PID Errors as Text */}
-          <Card className="min-w-0">
-             <CardHeader className="pb-2">
-                <CardTitle className="text-base">PID 误差</CardTitle>
-             </CardHeader>
-             <CardContent>
-                <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 sm:gap-4">
-                  {(['X', 'Y', 'Z', 'A'] as const).map((axis) => {
-                    const err = pidErrors[axis] ?? 0
-                    const absErr = Math.abs(err)
-                    return (
-                      <div key={axis} className="text-center p-3 rounded-lg border border-border/60 bg-muted/20">
-                        <div className="text-xs text-muted-foreground font-medium mb-1">{axis} 轴</div>
-                        <div className={cn(
-                          "text-xl font-mono font-bold",
-                          absErr < 0.5 ? "text-emerald-500" : absErr < 2 ? "text-amber-500" : "text-red-500"
-                        )}>
-                          {err.toFixed(2)}°
-                        </div>
-                        <div className={cn(
-                          "text-xs mt-1",
-                          absErr < 0.5 ? "text-emerald-500/70" : absErr < 2 ? "text-amber-500/70" : "text-red-500/70"
-                        )}>
-                          {absErr < 0.5 ? "到位" : absErr < 2 ? "调节中" : "偏差大"}
-                        </div>
-                      </div>
-                    )
-                  })}
-                </div>
-             </CardContent>
-          </Card>
+          <LinkDiagnosticsCard />
         </div>
 
-        <div className="min-w-0 space-y-6 xl:col-span-1">
+        <div className="min-w-0 space-y-6">
           <InjectionPumpCard />
           <SystemHealthCard />
-          <LinkDiagnosticsCard />
         </div>
       </div>
     </div>
