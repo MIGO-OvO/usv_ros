@@ -146,7 +146,7 @@ interface StatusPayload {
   spectrometer_status?: string
 }
 
-const MAX_HISTORY_POINTS = 150
+const MAX_HISTORY_POINTS = 6000
 const VOLTAGE_UI_INTERVAL_MS = 200
 const FAST_TELEMETRY_INTERVAL_MS = 100
 
