@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
+import { NumericInput } from "@/components/ui/numeric-input"
 import { useAppStore } from '@/store'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
 import { Activity, Zap, Play, Square, Anchor, Navigation, Pause, AlertTriangle, CheckCircle, Loader, Target } from 'lucide-react'
@@ -57,6 +58,15 @@ function computeAdaptiveDomain(values: number[], fallback: [number, number], min
   return [min, max]
 }
 
+const MIN_CHART_POINTS = 20
+const MAX_CHART_POINTS = 150
+const DEFAULT_CHART_POINTS = 120
+
+function clampChartPoints(value: number): number {
+  if (!Number.isFinite(value)) return DEFAULT_CHART_POINTS
+  return Math.min(MAX_CHART_POINTS, Math.max(MIN_CHART_POINTS, Math.round(value)))
+}
+
 function formatChartNumber(value: number | string | undefined): string {
   const numeric = typeof value === 'number' ? value : Number(value)
   return Number.isFinite(numeric) ? Number.parseFloat(numeric.toPrecision(4)).toString() : String(value ?? '')
@@ -82,6 +92,7 @@ export default function Monitor() {
   const pidErrorsRef = useRef<Record<string, number>>({ X: 0, Y: 0, Z: 0, A: 0 })
   const [pidErrors, setPidErrors] = useState<Record<string, number>>({ X: 0, Y: 0, Z: 0, A: 0 })
   const [spectroSubmitting, setSpectroSubmitting] = useState<'start' | 'stop' | 'baseline' | null>(null)
+  const [chartPointCount, setChartPointCount] = useState(DEFAULT_CHART_POINTS)
 
   useEffect(() => {
     if (!socket) return
@@ -128,21 +139,18 @@ export default function Monitor() {
     borderRadius: '8px',
   }
 
+  const displayedVoltageHistory = useMemo(
+    () => voltageHistory.slice(-chartPointCount),
+    [chartPointCount, voltageHistory],
+  )
+
   const voltageDomain = useMemo<[number, number]>(() => {
     return computeAdaptiveDomain(
-      voltageHistory.map((point) => point.voltage),
+      displayedVoltageHistory.map((point) => point.voltage),
       [0, 5],
       0.05,
     )
-  }, [voltageHistory])
-
-  const absorbanceDomain = useMemo<[number, number]>(() => {
-    return computeAdaptiveDomain(
-      voltageHistory.map((point) => point.absorbance),
-      [-0.05, 0.05],
-      0.01,
-    )
-  }, [voltageHistory])
+  }, [displayedVoltageHistory])
 
   const spectroStatusLabels: Record<string, string> = {
     configured: '已配置，未采集',
@@ -287,42 +295,35 @@ export default function Monitor() {
       <div className="grid min-w-0 grid-cols-1 gap-6 xl:grid-cols-3">
         <div className="min-w-0 space-y-6 xl:col-span-2">
           {/* Voltage Chart */}
-          <Card className="flex h-[280px] min-w-0 flex-col overflow-hidden">
-             <CardHeader className="pb-2">
-                <CardTitle className="text-base">分光计电压</CardTitle>
+          <Card className="flex h-[460px] min-w-0 flex-col overflow-hidden xl:h-[560px]">
+             <CardHeader className="flex flex-col gap-3 pb-2 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <CardTitle className="text-base">分光计电压</CardTitle>
+                  <div className="mt-1 text-xs text-muted-foreground">显示 {displayedVoltageHistory.length}/{voltageHistory.length} 个数据点</div>
+                </div>
+                <label className="flex items-center gap-2 text-xs text-muted-foreground">
+                  显示点数
+                  <NumericInput
+                    className="h-9 min-h-9 w-24"
+                    integer
+                    min={MIN_CHART_POINTS}
+                    max={MAX_CHART_POINTS}
+                    value={chartPointCount}
+                    onValueChange={(value) => setChartPointCount(clampChartPoints(value))}
+                  />
+                </label>
              </CardHeader>
              <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden">
                 <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={voltageHistory}>
+                    <LineChart data={displayedVoltageHistory}>
                         <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" opacity={0.4} />
-                        <XAxis dataKey="time" stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} />
+                        <XAxis dataKey="time" stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} interval="preserveStartEnd" />
                         <YAxis stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} domain={voltageDomain}
                                allowDataOverflow
                                tickFormatter={formatChartNumber}
                                label={{ value: 'V', angle: -90, position: 'insideLeft', style: { fill: 'hsl(var(--muted-foreground))', fontSize: 11 } }} />
                         <Tooltip contentStyle={tooltipStyle} formatter={formatChartTooltip} />
                         <Line type="monotone" dataKey="voltage" name="电压" stroke="hsl(var(--chart-1))" strokeWidth={2} dot={false} isAnimationActive={false} />
-                    </LineChart>
-                </ResponsiveContainer>
-             </CardContent>
-          </Card>
-
-          {/* Absorbance Chart */}
-          <Card className="flex h-[280px] min-w-0 flex-col overflow-hidden">
-             <CardHeader className="pb-2">
-                <CardTitle className="text-base">吸光度曲线</CardTitle>
-             </CardHeader>
-             <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden">
-                <ResponsiveContainer width="100%" height="100%">
-                    <LineChart data={voltageHistory}>
-                        <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" opacity={0.4} />
-                        <XAxis dataKey="time" stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} />
-                        <YAxis stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} domain={absorbanceDomain}
-                               allowDataOverflow
-                               tickFormatter={formatChartNumber}
-                               label={{ value: 'Abs', angle: -90, position: 'insideLeft', style: { fill: 'hsl(var(--muted-foreground))', fontSize: 11 } }} />
-                        <Tooltip contentStyle={tooltipStyle} formatter={formatChartTooltip} />
-                        <Line type="monotone" dataKey="absorbance" name="吸光度" stroke="hsl(var(--chart-2))" strokeWidth={2} dot={false} isAnimationActive={false} />
                     </LineChart>
                 </ResponsiveContainer>
              </CardContent>
