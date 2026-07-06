@@ -114,6 +114,11 @@ function fmt(value: number | null | undefined, digits = 4): string {
   return Number.parseFloat(digits === 4 ? value.toPrecision(4) : value.toPrecision(digits)).toString()
 }
 
+function fmtAxis(value: number | string | undefined): string {
+  const numeric = typeof value === 'number' ? value : Number(value)
+  return Number.isFinite(numeric) ? Number.parseFloat(numeric.toPrecision(4)).toString() : String(value ?? '')
+}
+
 function gpsText(gps: SampleWindow['gps_start']): string {
   if (!gps || typeof gps.lat !== 'number' || typeof gps.lng !== 'number') return '-'
   return `${gps.lat.toFixed(6)}, ${gps.lng.toFixed(6)}`
@@ -420,8 +425,8 @@ export default function Data() {
                       <LineChart data={rawChartData}>
                         <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
                         <XAxis dataKey="frame_index" fontSize={11} tickLine={false} axisLine={false} />
-                        <YAxis yAxisId="voltage" fontSize={11} tickLine={false} axisLine={false} />
-                        {rawHasAbsorbance && <YAxis yAxisId="absorbance" orientation="right" fontSize={11} tickLine={false} axisLine={false} />}
+                        <YAxis yAxisId="voltage" fontSize={11} tickLine={false} axisLine={false} tickFormatter={fmtAxis} width={48} />
+                        {rawHasAbsorbance && <YAxis yAxisId="absorbance" orientation="right" fontSize={11} tickLine={false} axisLine={false} tickFormatter={fmtAxis} width={48} />}
                         <Tooltip contentStyle={tooltipStyle} formatter={formatTooltipValue} />
                         <Legend />
                         <Line yAxisId="voltage" type="monotone" dataKey="voltage" name="电压" stroke="hsl(var(--chart-1))" dot={false} isAnimationActive={false} />
@@ -448,12 +453,12 @@ export default function Data() {
                 </div>
               </div>
             ) : chartData.length > 0 ? (
-              <div className="h-full min-h-80">
+              <div className="h-[clamp(320px,48vh,520px)] min-h-80">
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={chartData}>
                     <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
                     <XAxis dataKey="timestamp" tickFormatter={(t) => new Date(String(t)).toLocaleTimeString()} fontSize={11} tickLine={false} axisLine={false} />
-                    <YAxis yAxisId="voltage" domain={chartStats ? [chartStats.yMin, chartStats.yMax] : ['auto', 'auto']} fontSize={11} tickLine={false} axisLine={false} />
+                    <YAxis yAxisId="voltage" domain={chartStats ? [chartStats.yMin, chartStats.yMax] : ['auto', 'auto']} fontSize={11} tickLine={false} axisLine={false} tickFormatter={fmtAxis} width={48} />
                     <Tooltip contentStyle={tooltipStyle} labelFormatter={(t) => new Date(String(t)).toLocaleString()} formatter={formatTooltipValue} />
                     <Legend />
                     <Line yAxisId="voltage" type="monotone" dataKey="voltage" name="电压" stroke="hsl(var(--chart-1))" dot={false} isAnimationActive={false} />
