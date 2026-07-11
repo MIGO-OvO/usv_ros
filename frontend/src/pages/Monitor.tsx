@@ -2,7 +2,7 @@ import { useEffect, useMemo, useRef, useState } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { NumericInput } from "@/components/ui/numeric-input"
-import { useAppStore } from '@/store'
+import { useAppStore, type VoltagePoint } from '@/store'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
 import { Activity, Zap, Play, Square, Anchor, Navigation, Pause, AlertTriangle, CheckCircle, Loader, Target } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -37,12 +37,15 @@ function parseMissionStatus(raw: string): { state: string; waypointSeq: string; 
   }
 }
 
-function computeAdaptiveDomain(values: number[], fallback: [number, number], minSpan: number): [number, number] {
-  const finiteValues = values.filter((value) => Number.isFinite(value))
-  if (finiteValues.length === 0) return fallback
-
-  let min = Math.min(...finiteValues)
-  let max = Math.max(...finiteValues)
+function computeAdaptiveDomain(points: VoltagePoint[], fallback: [number, number], minSpan: number): [number, number] {
+  let min = Infinity
+  let max = -Infinity
+  for (const point of points) {
+    if (!Number.isFinite(point.voltage)) continue
+    min = Math.min(min, point.voltage)
+    max = Math.max(max, point.voltage)
+  }
+  if (!Number.isFinite(min) || !Number.isFinite(max)) return fallback
 
   if (min === max) {
     const pad = Math.max(Math.abs(min) * 0.15, minSpan / 2)
@@ -59,8 +62,8 @@ function computeAdaptiveDomain(values: number[], fallback: [number, number], min
 }
 
 const MIN_CHART_POINTS = 20
-const MAX_CHART_POINTS = 6000
-const DEFAULT_CHART_POINTS = 500
+const MAX_CHART_POINTS = 1200
+const DEFAULT_CHART_POINTS = 240
 
 function clampChartPoints(value: number): number {
   if (!Number.isFinite(value)) return DEFAULT_CHART_POINTS
@@ -145,11 +148,7 @@ export default function Monitor() {
   )
 
   const voltageDomain = useMemo<[number, number]>(() => {
-    return computeAdaptiveDomain(
-      displayedVoltageHistory.map((point) => point.voltage),
-      [0, 5],
-      0.05,
-    )
+    return computeAdaptiveDomain(displayedVoltageHistory, [0, 5], 0.05)
   }, [displayedVoltageHistory])
 
   const spectroStatusLabels: Record<string, string> = {
@@ -313,13 +312,13 @@ export default function Monitor() {
             <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={displayedVoltageHistory}>
                     <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" opacity={0.4} />
-                    <XAxis dataKey="time" stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} interval="preserveStartEnd" />
+                    <XAxis dataKey="receivedAtMs" type="number" scale="time" domain={['dataMin', 'dataMax']} stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} interval="preserveStartEnd" tickFormatter={(value) => new Date(value).toLocaleTimeString()} />
                     <YAxis stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} domain={voltageDomain}
                            allowDataOverflow
                            tickFormatter={formatChartNumber}
                            label={{ value: 'V', angle: -90, position: 'insideLeft', style: { fill: 'hsl(var(--muted-foreground))', fontSize: 11 } }} />
-                    <Tooltip contentStyle={tooltipStyle} formatter={formatChartTooltip} />
-                    <Line type="monotone" dataKey="voltage" name="电压" stroke="hsl(var(--chart-1))" strokeWidth={2} dot={false} isAnimationActive={false} />
+                    <Tooltip contentStyle={tooltipStyle} formatter={formatChartTooltip} labelFormatter={(value) => new Date(Number(value)).toLocaleTimeString([], { fractionalSecondDigits: 3 })} />
+                    <Line type="linear" dataKey="voltage" name="电压" stroke="hsl(var(--chart-1))" strokeWidth={2} dot={false} isAnimationActive={false} />
                 </LineChart>
             </ResponsiveContainer>
          </CardContent>

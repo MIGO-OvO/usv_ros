@@ -18,13 +18,14 @@ class SampleRecordingStorageTest(unittest.TestCase):
                 {"mode": "waypoint", "source": "fcu", "waypoint_seq": 3, "mavlink_sample_id": 18},
                 {"lat": 30.0, "lng": 120.0, "alt": None, "received_at": 1.0},
             )
-            storage.append_raw_frame(window, normalize_raw_frame({"timestamp_ms": 1, "raw_code": 10, "voltage": 1.0, "valid": True}))
+            storage.append_raw_frame(window, normalize_raw_frame({"seq": 7, "timestamp_ms": 1, "source_timestamp_ms": 1, "received_at_ms": 1001, "raw_code": 10, "voltage": 1.0, "valid": True}))
             storage.append_raw_frame(window, normalize_raw_frame({"timestamp_ms": 2, "raw_code": 12, "voltage": 2.0, "valid": False, "saturated": True}))
             closed = storage.close_window(mission, window, {"lat": 30.1, "lng": 120.1, "alt": None, "received_at": 2.0})
             updated = storage.update_manual_result(mission, closed["sample_id"], {"analyte": "COD", "concentration": "0.84", "unit": "mg/L"})
 
             raw_file = Path(tmp) / closed["spectrometer"]["raw_file"]
             self.assertEqual(2, len(raw_file.read_text(encoding="utf-8").splitlines()))
+            self.assertEqual(7, json.loads(raw_file.read_text(encoding="utf-8").splitlines()[0])["seq"])
             self.assertEqual({"lat": 30.0, "lng": 120.0, "alt": None, "received_at": 1.0}, closed["gps_start"])
             self.assertEqual({"lat": 30.1, "lng": 120.1, "alt": None, "received_at": 2.0}, closed["gps_end"])
             self.assertEqual(1, closed["spectrometer"]["valid_count"])

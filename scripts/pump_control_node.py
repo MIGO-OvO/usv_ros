@@ -515,6 +515,7 @@ class PumpControlNode(object):
         self.angles_lock = threading.Lock()
         self.latest_angle_received_at = 0.0
         self.detector_angle_age_ms = None
+        self.detector_angle_channel_age_ms = None
         self.latest_angle_telemetry = {}
 
         # PID 完成检测
@@ -540,6 +541,8 @@ class PumpControlNode(object):
         # 分光状态
         self.latest_spectro = None
         self.spectro_state = "idle"
+        self._last_published_spectro_status = None
+        self._spectro_sequence = 0
         self.spectro_reference_voltage = float(self.spectro_config.get('reference_voltage', 0.0))
         self.spectro_baseline_voltage = float(self.spectro_config.get('baseline_voltage', 0.0))
         self.spectro_command_event = threading.Event()
@@ -1303,6 +1306,7 @@ class PumpControlNode(object):
             "received_at": received_at,
             "age_ms": age_ms,
             "detector_angle_age_ms": detector_age_ms,
+            "channel_age_ms": self.detector_angle_channel_age_ms,
             "stale": bool(stale),
             "valid": received_at > 0,
         }
@@ -1375,6 +1379,34 @@ class PumpControlNode(object):
                 self._publish_angle_telemetry(source="detector_angle_age")
             except (TypeError, ValueError) as e:
                 rospy.logwarn("Failed to parse ANGLE_AGE_MS: %s (%s)", text, e)
+            return
+
+        if text.startswith("ANGLE_AGE_CH_MS:"):
+            try:
+                values = [int(float(value.strip())) for value in text.split(":", 1)[1].split(",")]
+                if len(values) != len(MOTOR_NAMES):
+                    raise ValueError("expected four channel ages")
+                self.detector_angle_channel_age_ms = dict(zip(MOTOR_NAMES, values))
+                payload = dict(self.latest_detector_health or {})
+                payload["received_at"] = time.time()
+                payload["angle_channel_age_ms"] = dict(self.detector_angle_channel_age_ms)
+                self._publish_detector_health_payload(payload)
+            except (TypeError, ValueError) as e:
+                rospy.logwarn("Failed to parse ANGLE_AGE_CH_MS: %s (%s)", text, e)
+            return
+
+        if text.startswith("ADS_HEALTH:"):
+            try:
+                counters = {}
+                for item in text.split(":", 1)[1].split(","):
+                    key, value = item.split("=", 1)
+                    counters[key.strip().lower()] = int(value.strip())
+                payload = dict(self.latest_detector_health or {})
+                payload["received_at"] = time.time()
+                payload["spectrometer"] = counters
+                self._publish_detector_health_payload(payload)
+            except (TypeError, ValueError) as e:
+                rospy.logwarn("Failed to parse ADS_HEALTH: %s (%s)", text, e)
             return
 
         if text.startswith("LOOP_GAP_ACTIVE_MAX_US:"):
@@ -1514,9 +1546,18 @@ class PumpControlNode(object):
 
     def _on_spectro_received(self, data):
         """分光数据回调。"""
+        received_at = time.time()
+        self._spectro_sequence += 1
+        data = dict(data)
+        data.update({
+            'seq': self._spectro_sequence,
+            'source_timestamp_ms': data.get('timestamp_ms', 0),
+            'received_at': received_at,
+            'received_at_ms': int(received_at * 1000),
+        })
         self.latest_spectro = data
         if data.get('valid', False):
-            self._latest_spectro_received_at = time.time()
+            self._latest_spectro_received_at = received_at
             self.spectro_state = 'acquiring'
         elif data.get('i2c_error', False):
             self.spectro_state = 'i2c_error'
@@ -1532,6 +1573,10 @@ class PumpControlNode(object):
             'absorbance': absorbance,
             'status': self.spectro_state,
             'timestamp_ms': data.get('timestamp_ms', 0),
+            'source_timestamp_ms': data.get('source_timestamp_ms', 0),
+            'received_at': data.get('received_at'),
+            'received_at_ms': data.get('received_at_ms'),
+            'seq': data.get('seq'),
             'tca_channel': data.get('tca_channel', -1),
             'raw_code': data.get('raw_code', 0),
             'valid': data.get('valid', False),
@@ -1599,6 +1644,9 @@ class PumpControlNode(object):
         return round(math.log10(ref / sample), 6)
 
     def _publish_spectro_status(self, status):
+        if status == self._last_published_spectro_status:
+            return
+        self._last_published_spectro_status = status
         msg = String()
         msg.data = status
         self.spectro_status_pub.publish(msg)
