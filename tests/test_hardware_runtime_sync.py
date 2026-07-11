@@ -328,6 +328,16 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertTrue(stale_telemetry["stale"])
         self.assertEqual(node.latest_detector_health["angle_age_ms"], 2500)
 
+        node._on_text_received("ANGLE_AGE_CH_MS:10,20,30,40")
+        node._on_text_received("ADS_HEALTH:SUCCESS=100,MUTEX_TIMEOUT=2,I2C_ERROR=1")
+
+        self.assertEqual(node.detector_angle_channel_age_ms, {"X": 10, "Y": 20, "Z": 30, "A": 40})
+        self.assertEqual(node.latest_detector_health["spectrometer"], {
+            "success": 100,
+            "mutex_timeout": 2,
+            "i2c_error": 1,
+        })
+
     def test_web_angle_telemetry_emits_staleness_without_polluting_raw_angles(self):
         module, _, string_cls = _load_script(
             "web_config_server_angle_telemetry_test",
@@ -354,6 +364,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
                 "stale": False,
                 "valid": True,
             })))
+            server._flush_realtime(force=True)
 
         angle_events = [payload for event, payload in server.socketio.events if event == "angle_telemetry"]
         self.assertTrue(angle_events)
@@ -457,7 +468,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
 
         event_names = [event for event, _ in server.socketio.events]
         self.assertIn("status", event_names)
-        self.assertIn("angles", event_names)
+        self.assertNotIn("angles", event_names)
         self.assertNotIn("voltage", event_names)
 
     def test_web_spectrometer_start_reapplies_runtime_config_before_start(self):
@@ -2361,6 +2372,59 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertNotIn("droplets", payload[-1]["raw"])
         self.assertEqual(payload[-1]["raw"]["droplets_omitted"], 64)
 
+    def test_web_realtime_socket_batches_preserve_high_rate_samples(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_realtime_throttle_test",
+            "scripts/web_config_server.py",
+        )
+
+        server = module.WebConfigServer(standalone=True)
+        server.socketio = RecordingSocket()
+        for seq in range(1, 101):
+            server._voltage_cb(string_cls(json.dumps({
+                "seq": seq,
+                "timestamp_ms": seq * 50,
+                "received_at_ms": 100000 + seq * 50,
+                "voltage": 5.0 if seq == 50 else 1.0,
+                "absorbance": 0.1,
+                "raw_code": seq,
+                "valid": True,
+            })))
+
+        self.assertEqual(server.socketio.events, [])
+        server._flush_realtime(force=True)
+
+        batches = [payload for event, payload in server.socketio.events if event == "voltage_batch"]
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(len(batches[0]["samples"]), 100)
+        self.assertEqual(batches[0]["first_seq"], 1)
+        self.assertEqual(batches[0]["last_seq"], 100)
+        self.assertIn(5.0, [sample["voltage"] for sample in batches[0]["samples"]])
+        self.assertEqual(server._realtime_stats_snapshot()["received"], 100)
+        self.assertEqual(server._realtime_stats_snapshot()["batched"], 100)
+
+    def test_web_angle_socket_events_are_throttled_as_a_group(self):
+        module, _, _ = _load_script(
+            "web_config_server_angle_throttle_test",
+            "scripts/web_config_server.py",
+        )
+
+        server = module.WebConfigServer(standalone=True)
+        server.socketio = RecordingSocket()
+        server._emit_angle_state()
+        server._emit_angle_state()
+        server._flush_realtime(force=True)
+
+        self.assertEqual([event for event, _ in server.socketio.events], [
+            "angle_snapshot",
+            "pump_angles",
+            "raw_angles",
+            "angle_telemetry",
+        ])
+        snapshot = server.socketio.events[0][1]
+        self.assertEqual(snapshot["seq"], 2)
+        self.assertEqual(snapshot["schema_version"], 1)
+
     def test_web_live_map_samples_are_bounded_and_summarize_raw_payload(self):
         module, _, _ = _load_script(
             "web_config_server_live_samples_bound_test",
@@ -3055,6 +3119,29 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         config_text = (REPO_ROOT / "config" / "usv_params.yaml").read_text(encoding="utf-8")
         self.assertIn("reference_voltage: 0.0", config_text)
 
+    def test_pump_spectrometer_payload_carries_source_receive_time_and_sequence(self):
+        module, publishers, _ = _load_script(
+            "pump_control_node_spectro_timing_test",
+            "scripts/pump_control_node.py",
+        )
+        node = module.PumpControlNode()
+
+        node._on_spectro_received({
+            "timestamp_ms": 1234,
+            "tca_channel": 2,
+            "raw_code": 42,
+            "voltage": 1.25,
+            "valid": True,
+        })
+
+        voltage = json.loads(publishers["/usv/spectrometer_voltage"].messages[-1].data)
+        raw = json.loads(publishers["/usv/spectrometer_raw"].messages[-1].data)
+        self.assertEqual(voltage["seq"], 1)
+        self.assertEqual(voltage["source_timestamp_ms"], 1234)
+        self.assertGreater(voltage["received_at_ms"], 0)
+        self.assertEqual(raw["seq"], 1)
+        self.assertEqual(raw["source_timestamp_ms"], 1234)
+
     def test_config_manager_preserves_correct_zero_spectro_channel(self):
         module, _, _ = _load_script(
             "web_config_server_legacy_spectro_channel_migration_test",
@@ -3078,8 +3165,20 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
     def test_frontend_voltage_handler_ignores_unmarked_periodic_snapshots(self):
         store_text = (REPO_ROOT / "frontend" / "src" / "store.ts").read_text(encoding="utf-8")
         self.assertNotIn("data.status === undefined || data.status === 'acquiring'", store_text)
-        self.assertIn("data.raw?.valid === true", store_text)
-        self.assertIn("VOLTAGE_UI_INTERVAL_MS = 200", store_text)
+        self.assertIn("raw.valid === true", store_text)
+        self.assertIn("socket.on('voltage_batch'", store_text)
+        self.assertIn("voltageBatchSupported", store_text)
+        self.assertIn("MAX_HISTORY_POINTS = 1200", store_text)
+
+    def test_frontend_uses_single_angle_snapshot_committer_and_numeric_time_axis(self):
+        store_text = (REPO_ROOT / "frontend" / "src" / "store.ts").read_text(encoding="utf-8")
+        monitor_text = (REPO_ROOT / "frontend" / "src" / "pages" / "Monitor.tsx").read_text(encoding="utf-8")
+
+        self.assertIn("angleSnapshotCommitter", store_text)
+        self.assertNotIn("rawAngleCommitter", store_text)
+        self.assertNotIn("angleTelemetryCommitter", store_text)
+        self.assertIn('dataKey="receivedAtMs"', monitor_text)
+        self.assertIn('type="linear"', monitor_text)
 
     def test_frontend_injection_on_passes_current_speed_input(self):
         card_text = (REPO_ROOT / "frontend" / "src" / "components" / "injection-pump-card.tsx").read_text(encoding="utf-8")

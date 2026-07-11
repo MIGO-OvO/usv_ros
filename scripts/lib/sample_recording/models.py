@@ -164,8 +164,12 @@ def normalize_raw_frame(
     latest_voltage: Optional[Mapping[str, object]] = None,
 ) -> dict[str, object]:
     latest_voltage = latest_voltage or {}
+    received_at_value = _finite_float(payload.get("received_at"))
     frame = {
-        "received_at": received_at if received_at is not None else time.time(),
+        "received_at": received_at if received_at is not None else (received_at_value if received_at_value is not None else time.time()),
+        "received_at_ms": _finite_float(payload.get("received_at_ms")),
+        "source_timestamp_ms": _finite_float(payload.get("source_timestamp_ms", payload.get("timestamp_ms"))),
+        "seq": int(payload["seq"]) if _finite_float(payload.get("seq")) is not None else None,
         "timestamp_ms": _finite_float(payload.get("timestamp_ms")),
         "tca_channel": int(payload["tca_channel"]) if _finite_float(payload.get("tca_channel")) is not None else None,
         "status": payload.get("status"),

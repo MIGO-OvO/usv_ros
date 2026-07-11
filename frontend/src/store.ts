@@ -15,6 +15,7 @@ interface AngleTelemetry {
   received_at: number | null
   age_ms: number | null
   detector_angle_age_ms: number | null
+  channel_age_ms?: Partial<PumpAngles> | null
   stale: boolean
   valid: boolean
 }
@@ -32,10 +33,14 @@ interface LogEntry {
   level: string
 }
 
-interface VoltagePoint {
-  time: string
+export interface VoltagePoint {
+  seq: number
+  sourceTimestampMs: number
+  receivedAtMs: number
   voltage: number
-  absorbance: number
+  absorbance: number | null
+  rawCode?: number
+  valid: boolean
 }
 
 interface SpectrometerRawPayload {
@@ -44,6 +49,10 @@ interface SpectrometerRawPayload {
   reference_voltage?: number
   baseline_voltage?: number
   baseline_set?: boolean
+  seq?: number
+  timestamp_ms?: number
+  source_timestamp_ms?: number
+  received_at_ms?: number
 }
 
 interface VoltagePayload {
@@ -55,6 +64,27 @@ interface VoltagePayload {
   baseline_set?: boolean
   raw?: SpectrometerRawPayload
   sample?: boolean
+}
+
+interface VoltageBatchSample {
+  seq: number
+  source_timestamp_ms: number
+  received_at_ms: number
+  voltage: number
+  absorbance: number | null
+  raw_code?: number
+  valid: boolean
+  status?: string
+  reference_voltage?: number
+  baseline_voltage?: number
+  baseline_set?: boolean
+}
+
+interface VoltageBatchPayload {
+  first_seq: number
+  last_seq: number
+  samples: VoltageBatchSample[]
+  dropped_for_ui?: number
 }
 
 interface PidErrorState {
@@ -146,8 +176,7 @@ interface StatusPayload {
   spectrometer_status?: string
 }
 
-const MAX_HISTORY_POINTS = 6000
-const VOLTAGE_UI_INTERVAL_MS = 200
+const MAX_HISTORY_POINTS = 1200
 const FAST_TELEMETRY_INTERVAL_MS = 100
 
 function createThrottledCommit<T>(intervalMs: number, commit: (data: T) => void) {
@@ -204,6 +233,9 @@ interface AppState {
   spectrometerBaselineSet: boolean
   spectrometerStatus: string
   voltageHistory: VoltagePoint[]
+  voltageBatchSupported: boolean
+  voltageSequenceGaps: number
+  voltageUiDropped: number
   pidErrors: PidErrorState
   injectionPump: InjectionPumpStatus
   logs: LogEntry[]
@@ -275,6 +307,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   spectrometerBaselineSet: false,
   spectrometerStatus: 'idle',
   voltageHistory: [],
+  voltageBatchSupported: false,
+  voltageSequenceGaps: 0,
+  voltageUiDropped: 0,
   pidErrors: { X: 0, Y: 0, Z: 0, A: 0 },
   injectionPump: DEFAULT_INJECTION_PUMP_STATUS,
   logs: [],
@@ -294,18 +329,19 @@ export const useAppStore = create<AppState>((set, get) => ({
       transports: ['websocket', 'polling'],
     })
 
+    let voltageBatchSupported = false
+    let angleSnapshotSupported = false
+    let lastVoltageSequence: number | null = null
+
     socket.on('connect', () => {
-      set({ connected: true })
+      voltageBatchSupported = false
+      angleSnapshotSupported = false
+      lastVoltageSequence = null
+      set({ connected: true, voltageBatchSupported: false, voltageSequenceGaps: 0, voltageUiDropped: 0 })
       console.log('Socket connected')
     })
 
-    const angleCommitter = createThrottledCommit<PumpAngles>(FAST_TELEMETRY_INTERVAL_MS, (data) => {
-      set({ pumpAngles: data })
-    })
-    const rawAngleCommitter = createThrottledCommit<PumpAngles>(FAST_TELEMETRY_INTERVAL_MS, (data) => {
-      set({ rawAngles: data })
-    })
-    const angleTelemetryCommitter = createThrottledCommit<AngleTelemetry>(FAST_TELEMETRY_INTERVAL_MS, (data) => {
+    const angleSnapshotCommitter = createThrottledCommit<AngleTelemetry>(FAST_TELEMETRY_INTERVAL_MS, (data) => {
       set((state) => ({
         angleTelemetry: {
           ...DEFAULT_ANGLE_TELEMETRY,
@@ -317,52 +353,40 @@ export const useAppStore = create<AppState>((set, get) => ({
         rawAngles: data.raw_angles || state.rawAngles,
       }))
     })
-    const voltageCommitter = createThrottledCommit<VoltagePayload>(VOLTAGE_UI_INTERVAL_MS, (data) => {
-      const voltage = data.value ?? 0
-      const absorbance = data.absorbance ?? 0
-      const hasSample =
-        data.raw?.valid === true ||
-        typeof data.raw?.raw_code === 'number' ||
-        data.sample === true
-      const referenceVoltage =
-        typeof data.reference_voltage === 'number'
-          ? data.reference_voltage
-          : data.raw?.reference_voltage
-      const baselineVoltage =
-        typeof data.baseline_voltage === 'number'
-          ? data.baseline_voltage
-          : data.raw?.baseline_voltage
-      const baselineSet =
-        typeof data.baseline_set === 'boolean'
-          ? data.baseline_set
-          : data.raw?.baseline_set
-      const time = new Date().toLocaleTimeString()
 
+    const commitVoltageSamples = (samples: VoltageBatchSample[], droppedForUi = 0, sequenceGap = 0, batch = false) => {
+      if (samples.length === 0) return
+      const points: VoltagePoint[] = samples
+        .filter((sample) => sample.valid || typeof sample.raw_code === 'number')
+        .map((sample) => ({
+          seq: sample.seq,
+          sourceTimestampMs: sample.source_timestamp_ms,
+          receivedAtMs: sample.received_at_ms,
+          voltage: sample.voltage,
+          absorbance: sample.absorbance,
+          rawCode: sample.raw_code,
+          valid: sample.valid,
+        }))
+      const latest = samples[samples.length - 1]
       set((state) => ({
-        currentVoltage: hasSample ? voltage : state.currentVoltage,
-        currentAbsorbance: hasSample ? absorbance : state.currentAbsorbance,
-        currentReferenceVoltage:
-          typeof referenceVoltage === 'number' ? referenceVoltage : state.currentReferenceVoltage,
-        currentBaselineVoltage:
-          typeof baselineVoltage === 'number' ? baselineVoltage : state.currentBaselineVoltage,
-        spectrometerBaselineSet:
-          typeof baselineSet === 'boolean' ? baselineSet : state.spectrometerBaselineSet,
-        spectrometerStatus: data.status || state.spectrometerStatus,
-        voltageHistory: hasSample
-          ? [
-              ...state.voltageHistory.slice(-(MAX_HISTORY_POINTS - 1)),
-              { time, voltage, absorbance },
-            ]
+        currentVoltage: latest.voltage,
+        currentAbsorbance: latest.absorbance ?? state.currentAbsorbance,
+        currentReferenceVoltage: typeof latest.reference_voltage === 'number' ? latest.reference_voltage : state.currentReferenceVoltage,
+        currentBaselineVoltage: typeof latest.baseline_voltage === 'number' ? latest.baseline_voltage : state.currentBaselineVoltage,
+        spectrometerBaselineSet: typeof latest.baseline_set === 'boolean' ? latest.baseline_set : state.spectrometerBaselineSet,
+        spectrometerStatus: latest.status || state.spectrometerStatus,
+        voltageHistory: points.length > 0
+          ? [...state.voltageHistory, ...points].slice(-MAX_HISTORY_POINTS)
           : state.voltageHistory,
+        voltageUiDropped: droppedForUi,
+        voltageBatchSupported: batch || state.voltageBatchSupported,
+        voltageSequenceGaps: state.voltageSequenceGaps + sequenceGap,
       }))
-    })
+    }
 
     socket.on('disconnect', () => {
-      angleCommitter.cancel()
-      rawAngleCommitter.cancel()
-      angleTelemetryCommitter.cancel()
-      voltageCommitter.cancel()
-      set({ connected: false })
+      angleSnapshotCommitter.cancel()
+      set({ connected: false, voltageBatchSupported: false })
       console.log('Socket disconnected')
     })
 
@@ -376,23 +400,57 @@ export const useAppStore = create<AppState>((set, get) => ({
     })
 
     socket.on('angles', (data: PumpAngles) => {
-      angleCommitter.push(data)
+      if (!angleSnapshotSupported) {
+        angleSnapshotCommitter.push({ ...DEFAULT_ANGLE_TELEMETRY, angles: data, raw_angles: data, valid: true })
+      }
     })
 
     socket.on('pump_angles', (data: PumpAngles) => {
-      angleCommitter.push(data)
+      if (!angleSnapshotSupported) {
+        angleSnapshotCommitter.push({ ...DEFAULT_ANGLE_TELEMETRY, angles: data, raw_angles: data, valid: true })
+      }
     })
 
     socket.on('raw_angles', (data: PumpAngles) => {
-      rawAngleCommitter.push(data)
+      if (!angleSnapshotSupported) {
+        angleSnapshotCommitter.push({ ...DEFAULT_ANGLE_TELEMETRY, angles: data, raw_angles: data, valid: true })
+      }
     })
 
     socket.on('angle_telemetry', (data: AngleTelemetry) => {
-      angleTelemetryCommitter.push(data)
+      if (!angleSnapshotSupported) angleSnapshotCommitter.push(data)
+    })
+
+    socket.on('angle_snapshot', (data: AngleTelemetry) => {
+      angleSnapshotSupported = true
+      angleSnapshotCommitter.push(data)
     })
 
     socket.on('voltage', (data: VoltagePayload) => {
-      voltageCommitter.push(data)
+      if (voltageBatchSupported) return
+      const raw = data.raw || {}
+      const hasSample = data.sample !== false && (raw.valid === true || typeof raw.raw_code === 'number' || data.sample === true)
+      if (!hasSample) return
+      commitVoltageSamples([{
+        seq: raw.seq ?? 0,
+        source_timestamp_ms: raw.source_timestamp_ms ?? raw.timestamp_ms ?? 0,
+        received_at_ms: raw.received_at_ms ?? Date.now(),
+        voltage: data.value ?? 0,
+        absorbance: data.absorbance ?? null,
+        raw_code: raw.raw_code,
+        valid: raw.valid === true,
+        status: data.status,
+        reference_voltage: data.reference_voltage ?? raw.reference_voltage,
+        baseline_voltage: data.baseline_voltage ?? raw.baseline_voltage,
+        baseline_set: data.baseline_set ?? raw.baseline_set,
+      }])
+    })
+
+    socket.on('voltage_batch', (data: VoltageBatchPayload) => {
+      voltageBatchSupported = true
+      const gap = lastVoltageSequence === null ? 0 : Math.max(0, data.first_seq - lastVoltageSequence - 1)
+      lastVoltageSequence = data.last_seq
+      commitVoltageSamples(data.samples || [], data.dropped_for_ui || 0, gap, true)
     })
 
     socket.on('spectrometer_status', (status: string) => {

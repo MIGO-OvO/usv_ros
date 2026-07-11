@@ -122,6 +122,9 @@ LOG_DIR = os.path.expanduser("~/usv_ws/logs")
 MAX_LIVE_TRACK_POINTS = 1000
 MAX_LIVE_DATA_POINTS = 500
 MAX_VOLTAGE_HISTORY = 300
+SOCKET_VOLTAGE_EMIT_INTERVAL_S = 0.2
+SOCKET_ANGLE_EMIT_INTERVAL_S = 0.1
+REALTIME_BUFFER_CAPACITY = 512
 DEFAULT_SURFACE_SIZE = 50
 MAX_SURFACE_SIZE = 80
 MAX_AUTO_SCAN_WAYPOINTS = 1000
@@ -1893,6 +1896,20 @@ class WebConfigServer(object):
         self.control_events_max = 100
         self.voltage_history = []
         self.voltage_history_max = MAX_VOLTAGE_HISTORY
+        self._realtime_lock = threading.Lock()
+        self._voltage_realtime_buffer = []
+        self._pending_angle_snapshot = None
+        self._voltage_sequence = 0
+        self._angle_sequence = 0
+        self._last_voltage_flush_at = time.monotonic()
+        self._realtime_stats = {
+            "received": 0,
+            "recorded": 0,
+            "record_errors": 0,
+            "batched": 0,
+            "batches": 0,
+            "ui_dropped": 0,
+        }
 
         # ROS 订阅 (仅在非独立模式)
         if not self.standalone:
@@ -2107,7 +2124,11 @@ class WebConfigServer(object):
         try:
             frame = normalize_raw_frame(payload, latest_voltage=self.latest_spectrometer_payload)
             self.sample_storage.append_raw_frame(self.current_sample_window, frame)
+            with self._realtime_lock:
+                self._realtime_stats["recorded"] += 1
         except (OSError, ValueError) as exc:
+            with self._realtime_lock:
+                self._realtime_stats["record_errors"] += 1
             rospy.logwarn("Unable to append spectrometer raw frame: %s", str(exc))
 
     def _current_injection_pump_policy(self):
@@ -2328,16 +2349,23 @@ class WebConfigServer(object):
             "received_at": received_at,
             "age_ms": age_ms,
             "detector_angle_age_ms": detector_age_ms,
+            "channel_age_ms": source_payload.get("channel_age_ms"),
             "stale": bool(stale),
             "valid": bool(source_payload.get("valid", bool(received_at))),
         }
 
     def _emit_angle_state(self):
-        if not self.socketio:
-            return
-        self.socketio.emit('pump_angles', self.current_angles)
-        self.socketio.emit('raw_angles', self.raw_angles)
-        self.socketio.emit('angle_telemetry', self.latest_angle_telemetry)
+        self._angle_sequence += 1
+        snapshot = dict(self.latest_angle_telemetry)
+        snapshot.update({
+            "schema_version": 1,
+            "seq": self._angle_sequence,
+            "angles": dict(self.current_angles),
+            "raw_angles": dict(self.raw_angles),
+            "oldest_age_ms": self.latest_angle_telemetry.get("detector_angle_age_ms"),
+        })
+        with self._realtime_lock:
+            self._pending_angle_snapshot = snapshot
 
     def _angle_telemetry_cb(self, msg):
         try:
@@ -2378,6 +2406,31 @@ class WebConfigServer(object):
         self.current_absorbance = float(data.get('absorbance', 0.0) or 0.0)
         self.spectrometer_status = str(data.get('status', self.spectrometer_status))
         self.latest_spectrometer_payload = data
+        try:
+            source_sequence = int(data.get("seq") or 0)
+        except (TypeError, ValueError):
+            source_sequence = 0
+        self._voltage_sequence = max(self._voltage_sequence + 1, source_sequence)
+        received_at_ms = int(data.get("received_at_ms") or time.time() * 1000)
+        realtime_sample = {
+            "seq": self._voltage_sequence,
+            "source_timestamp_ms": int(data.get("source_timestamp_ms", data.get("timestamp_ms", 0)) or 0),
+            "received_at_ms": received_at_ms,
+            "voltage": self.current_voltage,
+            "absorbance": self.current_absorbance,
+            "raw_code": data.get("raw_code"),
+            "valid": bool(data.get("valid", False)),
+            "status": self.spectrometer_status,
+            "reference_voltage": data.get("reference_voltage"),
+            "baseline_voltage": data.get("baseline_voltage"),
+            "baseline_set": data.get("baseline_set"),
+        }
+        with self._realtime_lock:
+            self._realtime_stats["received"] += 1
+            if len(self._voltage_realtime_buffer) >= REALTIME_BUFFER_CAPACITY:
+                self._voltage_realtime_buffer.pop(0)
+                self._realtime_stats["ui_dropped"] += 1
+            self._voltage_realtime_buffer.append(realtime_sample)
 
         if self.automation_running:
             sample_event_aggregate = bool(data.get("sample_event_id"))
@@ -2413,17 +2466,6 @@ class WebConfigServer(object):
             })
             if len(self.voltage_history) > self.voltage_history_max:
                 self.voltage_history = self.voltage_history[-self.voltage_history_max:]
-
-        if self.socketio:
-            self.socketio.emit('voltage', {
-                "value": self.current_voltage,
-                "absorbance": self.current_absorbance,
-                "status": self.spectrometer_status,
-                "reference_voltage": data.get('reference_voltage'),
-                "baseline_voltage": data.get('baseline_voltage'),
-                "baseline_set": data.get('baseline_set'),
-                "raw": self._spectrometer_raw_summary(data),
-            })
 
     def _spectro_status_cb(self, msg):
         """分光采集状态回调。"""
@@ -2631,6 +2673,12 @@ class WebConfigServer(object):
             "baseline_set",
             "waypoint_seq",
             "timestamp",
+            "timestamp_ms",
+            "source_timestamp_ms",
+            "received_at",
+            "received_at_ms",
+            "seq",
+            "raw_code",
         )
         summary = {key: raw[key] for key in allowed if key in raw}
         if "droplets" in raw:
@@ -4520,6 +4568,7 @@ class WebConfigServer(object):
             })
             emit('angles', self.current_angles)
             emit('angle_telemetry', self.latest_angle_telemetry)
+            emit('angle_snapshot', dict(self.latest_angle_telemetry, schema_version=1, seq=self._angle_sequence))
             emit('voltage', {
                 "value": self.current_voltage,
                 "absorbance": self.current_absorbance,
@@ -4527,10 +4576,12 @@ class WebConfigServer(object):
                 "reference_voltage": self.latest_spectrometer_payload.get('reference_voltage'),
                 "baseline_voltage": self.latest_spectrometer_payload.get('baseline_voltage'),
                 "baseline_set": self.latest_spectrometer_payload.get('baseline_set'),
+                "sample": False,
                 "raw": self.latest_spectrometer_payload,
             })
             emit('injection_pump_status', self.injection_pump_status)
             emit('system_health', self.latest_system_health)
+            emit('realtime_health', self._realtime_stats_snapshot())
 
         # ================= 数据 API =================
         @self.app.route('/api/data/voltage', methods=['GET'])
@@ -5283,6 +5334,7 @@ class WebConfigServer(object):
                 "data": {
                     "latest": self.latest_system_health,
                     "history": self.system_health_history,
+                    "realtime": self._realtime_stats_snapshot(),
                 }
             })
 
@@ -5294,6 +5346,7 @@ class WebConfigServer(object):
                 "mavros_state": self._mavros_state,
                 "bridge_latest": self._bridge_diag,
                 "system_health_latest": self.latest_system_health,
+                "realtime": self._realtime_stats_snapshot(),
                 "bridge_history": self._diag_history,
                 "link_events": self._link_events,
                 "config": {
@@ -5414,9 +5467,7 @@ class WebConfigServer(object):
                     "mission_status": self.mission_status,
                     "spectrometer_status": self.spectrometer_status,
                 })
-                self.socketio.emit('angles', self.current_angles)
                 self.latest_angle_telemetry = self._build_angle_telemetry(self.latest_angle_telemetry)
-                self.socketio.emit('angle_telemetry', self.latest_angle_telemetry)
                 self.socketio.emit('manual_status', self.manual_status)
 
             if self.standalone:
@@ -5434,6 +5485,66 @@ class WebConfigServer(object):
                 time.sleep(1.0/rate)
             else:
                 threading.Event().wait(1.0/rate)
+
+    def _realtime_stats_snapshot(self):
+        with self._realtime_lock:
+            snapshot = dict(self._realtime_stats)
+            snapshot["queue_depth"] = len(self._voltage_realtime_buffer)
+        return snapshot
+
+    def _flush_realtime(self, force=False):
+        if not self.socketio:
+            return
+        now = time.monotonic()
+        flush_voltage = force or now - self._last_voltage_flush_at >= SOCKET_VOLTAGE_EMIT_INTERVAL_S
+        with self._realtime_lock:
+            samples = self._voltage_realtime_buffer if flush_voltage else []
+            if flush_voltage:
+                self._voltage_realtime_buffer = []
+                self._last_voltage_flush_at = now
+            angle_snapshot = self._pending_angle_snapshot
+            self._pending_angle_snapshot = None
+            if samples:
+                self._realtime_stats["batched"] += len(samples)
+                self._realtime_stats["batches"] += 1
+            stats = dict(self._realtime_stats)
+            stats["queue_depth"] = len(self._voltage_realtime_buffer)
+
+        if samples:
+            batch = {
+                "schema_version": 1,
+                "first_seq": samples[0]["seq"],
+                "last_seq": samples[-1]["seq"],
+                "sent_at_ms": int(time.time() * 1000),
+                "samples": samples,
+                "dropped_for_ui": stats["ui_dropped"],
+            }
+            self.socketio.emit("voltage_batch", batch)
+            latest = samples[-1]
+            self.socketio.emit("voltage", {
+                "value": latest["voltage"],
+                "absorbance": latest["absorbance"],
+                "status": latest["status"],
+                "reference_voltage": latest["reference_voltage"],
+                "baseline_voltage": latest["baseline_voltage"],
+                "baseline_set": latest["baseline_set"],
+                "raw": latest,
+            })
+            self.socketio.emit("realtime_health", stats)
+
+        if angle_snapshot:
+            self.socketio.emit("angle_snapshot", angle_snapshot)
+            self.socketio.emit("pump_angles", angle_snapshot["angles"])
+            self.socketio.emit("raw_angles", angle_snapshot["raw_angles"])
+            self.socketio.emit("angle_telemetry", angle_snapshot)
+
+    def _realtime_flush_loop(self):
+        while not rospy.is_shutdown():
+            try:
+                self._flush_realtime()
+            except Exception as exc:
+                rospy.logwarn("Realtime Socket.IO flush failed: %s", str(exc))
+            threading.Event().wait(min(SOCKET_VOLTAGE_EMIT_INTERVAL_S, SOCKET_ANGLE_EMIT_INTERVAL_S))
 
     def _apply_saved_hardware_on_startup(self):
         """启动后延迟推送已保存的硬件配置到 pump_control_node ROS 参数并调用 reconnect。"""
@@ -5471,6 +5582,10 @@ class WebConfigServer(object):
         data_thread = threading.Thread(target=self._data_push_loop)
         data_thread.daemon = True
         data_thread.start()
+
+        realtime_thread = threading.Thread(target=self._realtime_flush_loop)
+        realtime_thread.daemon = True
+        realtime_thread.start()
 
         # 启动后自动推送已保存的硬件配置 (延迟执行)
         if not self.standalone:
