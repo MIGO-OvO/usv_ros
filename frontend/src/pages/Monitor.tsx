@@ -1,14 +1,13 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
-import { NumericInput } from "@/components/ui/numeric-input"
 import { useAppStore, type VoltagePoint } from '@/store'
-import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer } from 'recharts'
 import { Activity, Zap, Play, Square, Anchor, Navigation, Pause, AlertTriangle, CheckCircle, Loader, Target } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { InjectionPumpCard } from '@/components/injection-pump-card'
 import { LinkDiagnosticsCard } from '@/components/link-diagnostics-card'
 import { SystemHealthCard } from '@/components/system-health-card'
+import { VoltageCanvasChart } from '@/components/voltage-canvas-chart'
 
 const MISSION_STATUS_MAP: Record<string, { label: string; color: string; icon: typeof Play }> = {
   IDLE:             { label: '空闲',       color: 'text-muted-foreground', icon: Square },
@@ -37,45 +36,12 @@ function parseMissionStatus(raw: string): { state: string; waypointSeq: string; 
   }
 }
 
-function computeAdaptiveDomain(points: VoltagePoint[], fallback: [number, number], minSpan: number): [number, number] {
-  let min = Infinity
-  let max = -Infinity
-  for (const point of points) {
-    if (!Number.isFinite(point.voltage)) continue
-    min = Math.min(min, point.voltage)
-    max = Math.max(max, point.voltage)
-  }
-  if (!Number.isFinite(min) || !Number.isFinite(max)) return fallback
-
-  if (min === max) {
-    const pad = Math.max(Math.abs(min) * 0.15, minSpan / 2)
-    min -= pad
-    max += pad
-  } else {
-    const span = max - min
-    const pad = Math.max(span * 0.12, minSpan / 2)
-    min -= pad
-    max += pad
-  }
-
-  return [min, max]
-}
-
-const MIN_CHART_POINTS = 20
-const MAX_CHART_POINTS = 1200
-const DEFAULT_CHART_POINTS = 240
-
-function clampChartPoints(value: number): number {
-  if (!Number.isFinite(value)) return DEFAULT_CHART_POINTS
-  return Math.min(MAX_CHART_POINTS, Math.max(MIN_CHART_POINTS, Math.round(value)))
-}
-
-function formatChartNumber(value: number | string | undefined): string {
-  const numeric = typeof value === 'number' ? value : Number(value)
-  return Number.isFinite(numeric) ? Number.parseFloat(numeric.toPrecision(4)).toString() : String(value ?? '')
-}
-
-const formatChartTooltip = (value: number | string | undefined) => formatChartNumber(value)
+const TIME_WINDOWS = [
+  { label: '30 秒', value: 30_000 },
+  { label: '2 分钟', value: 120_000 },
+  { label: '10 分钟', value: 600_000 },
+  { label: '全部', value: 0 },
+] as const
 
 export default function Monitor() {
   const socket = useAppStore((state) => state.socket)
@@ -90,12 +56,18 @@ export default function Monitor() {
   const spectrometerBaselineSet = useAppStore((state) => state.spectrometerBaselineSet)
   const spectrometerStatus = useAppStore((state) => state.spectrometerStatus)
   const voltageHistory = useAppStore((state) => state.voltageHistory)
+  const voltageHistoryRevision = useAppStore((state) => state.voltageHistoryRevision)
+  const voltageSequenceGaps = useAppStore((state) => state.voltageSequenceGaps)
+  const voltageUiDropped = useAppStore((state) => state.voltageUiDropped)
   const refreshInjectionPumpStatus = useAppStore((state) => state.refreshInjectionPumpStatus)
 
   const pidErrorsRef = useRef<Record<string, number>>({ X: 0, Y: 0, Z: 0, A: 0 })
   const [pidErrors, setPidErrors] = useState<Record<string, number>>({ X: 0, Y: 0, Z: 0, A: 0 })
   const [spectroSubmitting, setSpectroSubmitting] = useState<'start' | 'stop' | 'baseline' | null>(null)
-  const [chartPointCount, setChartPointCount] = useState(DEFAULT_CHART_POINTS)
+  const [timeWindowMs, setTimeWindowMs] = useState(600_000)
+  const [pausedHistory, setPausedHistory] = useState<VoltagePoint[] | null>(null)
+  const [renderedCount, setRenderedCount] = useState(0)
+  const [, setClock] = useState(0)
 
   useEffect(() => {
     if (!socket) return
@@ -117,6 +89,11 @@ export default function Monitor() {
     refreshInjectionPumpStatus().catch(() => {})
   }, [refreshInjectionPumpStatus])
 
+  useEffect(() => {
+    const timer = setInterval(() => setClock(Date.now()), 1000)
+    return () => clearInterval(timer)
+  }, [])
+
   const handleSpectrometerCommand = async (action: 'start' | 'stop') => {
     setSpectroSubmitting(action)
     try {
@@ -136,20 +113,24 @@ export default function Monitor() {
     }
   }
 
-  const tooltipStyle = {
-    backgroundColor: 'hsl(var(--card))',
-    borderColor: 'hsl(var(--border))',
-    borderRadius: '8px',
-  }
-
-  const displayedVoltageHistory = useMemo(
-    () => voltageHistory.slice(-chartPointCount),
-    [chartPointCount, voltageHistory],
-  )
-
-  const voltageDomain = useMemo<[number, number]>(() => {
-    return computeAdaptiveDomain(displayedVoltageHistory, [0, 5], 0.05)
+  const liveHistory = useMemo(() => voltageHistory.toArray(voltageHistoryRevision), [voltageHistory, voltageHistoryRevision])
+  const displayedVoltageHistory = useMemo(() => {
+    const points = pausedHistory ?? liveHistory
+    if (timeWindowMs === 0 || points.length === 0) return points
+    const cutoff = points[points.length - 1].receivedAtMs - timeWindowMs
+    let start = 0
+    while (start < points.length && points[start].receivedAtMs < cutoff) start += 1
+    return points.slice(start)
+  }, [liveHistory, pausedHistory, timeWindowMs])
+  const latestPoint = liveHistory[liveHistory.length - 1]
+  const latestAgeMs = latestPoint ? Math.max(0, Date.now() - latestPoint.receivedAtMs) : null
+  const receiveRateHz = useMemo(() => {
+    const recent = displayedVoltageHistory.slice(-100)
+    if (recent.length < 2) return 0
+    const elapsed = recent[recent.length - 1].receivedAtMs - recent[0].receivedAtMs
+    return elapsed > 0 ? (recent.length - 1) * 1000 / elapsed : 0
   }, [displayedVoltageHistory])
+  const handleRenderedCount = useCallback((count: number) => setRenderedCount(count), [])
 
   const spectroStatusLabels: Record<string, string> = {
     configured: '已配置，未采集',
@@ -291,36 +272,26 @@ export default function Monitor() {
       </div>
 
       <Card className="flex h-[440px] min-w-0 flex-col overflow-hidden lg:h-[500px]">
-         <CardHeader className="flex flex-col gap-3 pb-2 sm:flex-row sm:items-center sm:justify-between">
+         <CardHeader className="flex flex-col gap-3 pb-2 lg:flex-row lg:items-center lg:justify-between">
             <div>
               <CardTitle className="text-base">分光计电压</CardTitle>
-              <div className="mt-1 text-xs text-muted-foreground">显示 {displayedVoltageHistory.length}/{voltageHistory.length} 个数据点</div>
+              <div className="mt-1 text-xs text-muted-foreground">
+                原始 {displayedVoltageHistory.length}/{voltageHistory.length} · 绘制 {renderedCount} · {receiveRateHz.toFixed(1)} Hz · 延迟 {latestAgeMs === null ? '--' : Math.round(latestAgeMs)} ms
+                {(voltageSequenceGaps > 0 || voltageUiDropped > 0) && ` · gap ${voltageSequenceGaps} / UI 丢弃 ${voltageUiDropped}`}
+              </div>
             </div>
-            <label className="flex items-center gap-2 text-xs text-muted-foreground">
-              显示点数
-              <NumericInput
-                className="h-9 min-h-9 w-28"
-                integer
-                min={MIN_CHART_POINTS}
-                max={MAX_CHART_POINTS}
-                value={chartPointCount}
-                onValueChange={(value) => setChartPointCount(clampChartPoints(value))}
-              />
-            </label>
+            <div className="flex flex-wrap items-center gap-2">
+              {TIME_WINDOWS.map((window) => (
+                <Button key={window.label} size="sm" variant={timeWindowMs === window.value ? 'secondary' : 'ghost'} onClick={() => setTimeWindowMs(window.value)}>{window.label}</Button>
+              ))}
+              <Button size="sm" variant="outline" onClick={() => setPausedHistory(pausedHistory ? null : liveHistory)}>
+                {pausedHistory ? <Play className="mr-2 h-4 w-4" /> : <Pause className="mr-2 h-4 w-4" />}
+                {pausedHistory ? '回到实时' : '暂停视图'}
+              </Button>
+            </div>
          </CardHeader>
          <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden">
-            <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={displayedVoltageHistory}>
-                    <CartesianGrid strokeDasharray="3 3" stroke="hsl(var(--border))" opacity={0.4} />
-                    <XAxis dataKey="receivedAtMs" type="number" scale="time" domain={['dataMin', 'dataMax']} stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} interval="preserveStartEnd" tickFormatter={(value) => new Date(value).toLocaleTimeString()} />
-                    <YAxis stroke="hsl(var(--muted-foreground))" fontSize={11} tickLine={false} axisLine={false} domain={voltageDomain}
-                           allowDataOverflow
-                           tickFormatter={formatChartNumber}
-                           label={{ value: 'V', angle: -90, position: 'insideLeft', style: { fill: 'hsl(var(--muted-foreground))', fontSize: 11 } }} />
-                    <Tooltip contentStyle={tooltipStyle} formatter={formatChartTooltip} labelFormatter={(value) => new Date(Number(value)).toLocaleTimeString([], { fractionalSecondDigits: 3 })} />
-                    <Line type="linear" dataKey="voltage" name="电压" stroke="hsl(var(--chart-1))" strokeWidth={2} dot={false} isAnimationActive={false} />
-                </LineChart>
-            </ResponsiveContainer>
+            <VoltageCanvasChart points={displayedVoltageHistory} onRenderedCount={handleRenderedCount} />
          </CardContent>
       </Card>
 

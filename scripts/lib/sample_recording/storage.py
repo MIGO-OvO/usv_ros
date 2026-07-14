@@ -121,21 +121,117 @@ class SampleRecordingStorage(object):
         ]
 
     def read_raw_frames(self, mission_id: object, sample_id: object, limit: Optional[int] = None, offset: int = 0) -> list[dict[str, object]]:
-        relpath = self._raw_relpath(mission_id, sample_id)
-        path = self._raw_abspath(relpath)
-        if not os.path.exists(path):
-            return []
         limit = 2000 if limit is None else max(0, min(int(limit), 20000))
         offset = max(0, int(offset))
         frames = []
-        with open(path, "r", encoding="utf-8") as file_obj:
-            for index, line in enumerate(file_obj):
-                if index < offset:
-                    continue
-                if len(frames) >= limit:
-                    break
-                frames.append(json.loads(line))
+        for index, frame in enumerate(self.iter_raw_frames(mission_id, sample_id)):
+            if index < offset:
+                continue
+            if len(frames) >= limit:
+                break
+            frames.append(frame)
         return frames
+
+    def iter_raw_frames(self, mission_id: object, sample_id: object):
+        path = self._raw_abspath(self._raw_relpath(mission_id, sample_id))
+        if not os.path.exists(path):
+            return
+        with open(path, "r", encoding="utf-8") as file_obj:
+            for line in file_obj:
+                if line.strip():
+                    yield json.loads(line)
+
+    @staticmethod
+    def _frame_time_ms(frame: Mapping[str, object]):
+        for key, multiplier in (("received_at_ms", 1.0), ("received_at", 1000.0), ("source_timestamp_ms", 1.0), ("timestamp_ms", 1.0)):
+            try:
+                value = float(frame.get(key)) * multiplier
+                if value == value and value not in (float("inf"), float("-inf")):
+                    return value
+            except (TypeError, ValueError):
+                pass
+        return None
+
+    def read_raw_series(
+        self,
+        mission_id: object,
+        sample_id: object,
+        from_ms: Optional[float] = None,
+        to_ms: Optional[float] = None,
+        max_points: int = 2000,
+    ) -> dict[str, object]:
+        path = self._raw_abspath(self._raw_relpath(mission_id, sample_id))
+        max_points = max(4, min(int(max_points), 20000))
+        if not os.path.exists(path):
+            return {"raw_count": 0, "returned_count": 0, "from_ms": from_ms, "to_ms": to_ms, "covered": True, "samples": []}
+
+        raw_count = 0
+        first_time = None
+        last_time = None
+        small = []
+        with open(path, "r", encoding="utf-8") as file_obj:
+            for line in file_obj:
+                if not line.strip():
+                    continue
+                frame = json.loads(line)
+                timestamp = self._frame_time_ms(frame)
+                if timestamp is None or (from_ms is not None and timestamp < from_ms) or (to_ms is not None and timestamp > to_ms):
+                    continue
+                raw_count += 1
+                first_time = timestamp if first_time is None else min(first_time, timestamp)
+                last_time = timestamp if last_time is None else max(last_time, timestamp)
+                if len(small) <= max_points:
+                    small.append((raw_count - 1, timestamp, frame))
+
+        if raw_count <= max_points:
+            samples = [frame for _, _, frame in small]
+        else:
+            bucket_count = max(1, (max_points - 2) // 2)
+            span = max(1.0, last_time - first_time)
+            buckets = {}
+            first = last = None
+            selected_index = 0
+            with open(path, "r", encoding="utf-8") as file_obj:
+                for line in file_obj:
+                    if not line.strip():
+                        continue
+                    frame = json.loads(line)
+                    timestamp = self._frame_time_ms(frame)
+                    if timestamp is None or (from_ms is not None and timestamp < from_ms) or (to_ms is not None and timestamp > to_ms):
+                        continue
+                    entry = (selected_index, frame)
+                    first = first or entry
+                    last = entry
+                    selected_index += 1
+                    voltage = frame.get("voltage")
+                    try:
+                        voltage = float(voltage)
+                    except (TypeError, ValueError):
+                        continue
+                    bucket = min(bucket_count - 1, int((timestamp - first_time) * bucket_count / span))
+                    current = buckets.get(bucket)
+                    if current is None:
+                        buckets[bucket] = [entry, entry, voltage, voltage]
+                    else:
+                        if voltage < current[2]:
+                            current[0], current[2] = entry, voltage
+                        if voltage > current[3]:
+                            current[1], current[3] = entry, voltage
+            selected = {entry[0]: entry[1] for entry in (first, last) if entry is not None}
+            for minimum, maximum, _, _ in buckets.values():
+                selected[minimum[0]] = minimum[1]
+                selected[maximum[0]] = maximum[1]
+            samples = [selected[index] for index in sorted(selected)]
+
+        return {
+            "raw_count": raw_count,
+            "returned_count": len(samples),
+            "from_ms": first_time if from_ms is None else from_ms,
+            "to_ms": last_time if to_ms is None else to_ms,
+            "covered": len(samples) == raw_count,
+            "method": "minmax",
+            "samples": samples,
+        }
 
     def update_manual_result(
         self,

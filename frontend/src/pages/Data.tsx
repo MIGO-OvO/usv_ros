@@ -73,6 +73,7 @@ type RawFrame = {
   readonly absorbance?: number | null
   readonly valid?: boolean
   readonly status?: string | number | null
+  readonly received_at_ms?: number | null
 }
 
 type MissionData = {
@@ -202,10 +203,10 @@ export default function Data() {
   const fetchSample = async (missionId: string, sampleId: string) => {
     const [detail, raw] = await Promise.all([
       fetchJson<SampleWindow>(`/api/data/mission/${missionId}/sample/${sampleId}`),
-      fetchJson<{ readonly frames: readonly RawFrame[] }>(`/api/data/mission/${missionId}/sample/${sampleId}/raw`),
+      fetchJson<{ readonly samples: readonly RawFrame[] }>(`/api/data/voltage-series?mission_id=${encodeURIComponent(missionId)}&sample_id=${encodeURIComponent(sampleId)}&max_points=2000`),
     ])
     setSampleDetail(detail.success ? detail.data : null)
-    setRawFrames(raw.success ? raw.data.frames : [])
+    setRawFrames(raw.success ? raw.data.samples : [])
   }
 
   const deleteMission = async (e: MouseEvent, id: string) => {
@@ -251,25 +252,8 @@ export default function Data() {
   }
 
   const exportRawCsv = () => {
-    if (!sampleDetail) return
-    const rows = [
-      'frame_index,timestamp_ms,voltage,absorbance,raw_code,valid,status',
-      ...rawFrames.map((frame, index) => [
-        index,
-        frame.timestamp_ms ?? '',
-        frame.voltage ?? '',
-        frame.absorbance ?? '',
-        frame.raw_code ?? '',
-        frame.valid ?? '',
-        frame.status ?? '',
-      ].join(',')),
-    ].join('\n')
-    const blob = new Blob([rows], { type: 'text/csv;charset=utf-8' })
-    const link = document.createElement('a')
-    link.href = URL.createObjectURL(blob)
-    link.download = `${sampleDetail.sample_id}.csv`
-    link.click()
-    URL.revokeObjectURL(link.href)
+    if (!selectedId || !sampleDetail) return
+    window.open(`/api/data/mission/${encodeURIComponent(selectedId)}/sample/${encodeURIComponent(sampleDetail.sample_id)}/raw.csv`, '_blank')
   }
 
   const chartStats = useMemo(() => {

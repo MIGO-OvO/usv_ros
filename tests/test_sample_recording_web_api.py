@@ -49,6 +49,8 @@ class SampleRecordingWebApiTest(unittest.TestCase):
             listed = client.get("/api/data/mission/%s/samples" % mission_id).get_json()
             detail = client.get("/api/data/mission/%s/sample/%s" % (mission_id, sample_id)).get_json()
             raw = client.get("/api/data/mission/%s/sample/%s/raw" % (mission_id, sample_id)).get_json()
+            series = client.get("/api/data/voltage-series?mission_id=%s&sample_id=%s&max_points=4" % (mission_id, sample_id)).get_json()
+            raw_csv = client.get("/api/data/mission/%s/sample/%s/raw.csv" % (mission_id, sample_id))
             updated = client.post(
                 "/api/data/mission/%s/sample/%s/manual-result" % (mission_id, sample_id),
                 json={"analyte": "COD", "concentration": 0.84, "unit": "mg/L"},
@@ -61,6 +63,9 @@ class SampleRecordingWebApiTest(unittest.TestCase):
             self.assertEqual({"lat": 30.0, "lng": 120.0, "alt": 5.0, "received_at": 1.0}, detail["data"]["gps_start"])
             self.assertEqual({"lat": 30.1, "lng": 120.1, "alt": 6.0, "received_at": 2.0}, detail["data"]["gps_end"])
             self.assertEqual(3, raw["data"]["count"])
+            self.assertEqual(3, series["data"]["raw_count"])
+            self.assertEqual(3, series["data"]["returned_count"])
+            self.assertEqual(4, len(raw_csv.get_data(as_text=True).splitlines()))
             self.assertEqual("recorded", updated["data"]["manual_result"]["status"])
             self.assertEqual(0.84, reloaded["sample_windows"][0]["manual_result"]["concentration"])
 

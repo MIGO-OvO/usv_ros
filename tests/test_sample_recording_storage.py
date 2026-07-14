@@ -53,6 +53,26 @@ class SampleRecordingStorageTest(unittest.TestCase):
             self.assertEqual(0, closed["spectrometer"]["frame_count"])
             self.assertIn("no_frames", closed["spectrometer"]["quality_flags"])
 
+    def test_raw_series_streaming_minmax_keeps_peak_and_budget(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mission = {"mission_id": "mission_series"}
+            storage = SampleRecordingStorage(tmp)
+            window = storage.start_window(mission, {"sample_id": "sample_series"})
+            for index in range(1000):
+                storage.append_raw_frame(window, {
+                    "received_at_ms": index,
+                    "voltage": 9.0 if index == 501 else -4.0 if index == 502 else 1.0,
+                    "valid": True,
+                })
+
+            series = storage.read_raw_series("mission_series", window["sample_id"], max_points=100)
+
+            self.assertEqual(1000, series["raw_count"])
+            self.assertLessEqual(series["returned_count"], 100)
+            self.assertFalse(series["covered"])
+            self.assertIn(9.0, [frame["voltage"] for frame in series["samples"]])
+            self.assertIn(-4.0, [frame["voltage"] for frame in series["samples"]])
+
     def test_window_lifecycle_accepts_web_position_shape(self):
         with tempfile.TemporaryDirectory() as tmp:
             mission = {"mission_id": "mission_web"}
