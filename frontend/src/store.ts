@@ -1,5 +1,6 @@
 import { create } from 'zustand'
 import { io, Socket } from 'socket.io-client'
+import { RingBuffer } from '@/lib/time-series/ring-buffer'
 
 interface PumpAngles {
   X: number
@@ -176,7 +177,7 @@ interface StatusPayload {
   spectrometer_status?: string
 }
 
-const MAX_HISTORY_POINTS = 1200
+const MAX_HISTORY_POINTS = 20_000
 const FAST_TELEMETRY_INTERVAL_MS = 100
 
 function createThrottledCommit<T>(intervalMs: number, commit: (data: T) => void) {
@@ -232,7 +233,8 @@ interface AppState {
   currentBaselineVoltage: number
   spectrometerBaselineSet: boolean
   spectrometerStatus: string
-  voltageHistory: VoltagePoint[]
+  voltageHistory: RingBuffer<VoltagePoint>
+  voltageHistoryRevision: number
   voltageBatchSupported: boolean
   voltageSequenceGaps: number
   voltageUiDropped: number
@@ -306,7 +308,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   currentBaselineVoltage: 0,
   spectrometerBaselineSet: false,
   spectrometerStatus: 'idle',
-  voltageHistory: [],
+  voltageHistory: new RingBuffer<VoltagePoint>(MAX_HISTORY_POINTS),
+  voltageHistoryRevision: 0,
   voltageBatchSupported: false,
   voltageSequenceGaps: 0,
   voltageUiDropped: 0,
@@ -368,20 +371,21 @@ export const useAppStore = create<AppState>((set, get) => ({
           valid: sample.valid,
         }))
       const latest = samples[samples.length - 1]
-      set((state) => ({
+      set((state) => {
+        state.voltageHistory.appendBatch(points)
+        return {
         currentVoltage: latest.voltage,
         currentAbsorbance: latest.absorbance ?? state.currentAbsorbance,
         currentReferenceVoltage: typeof latest.reference_voltage === 'number' ? latest.reference_voltage : state.currentReferenceVoltage,
         currentBaselineVoltage: typeof latest.baseline_voltage === 'number' ? latest.baseline_voltage : state.currentBaselineVoltage,
         spectrometerBaselineSet: typeof latest.baseline_set === 'boolean' ? latest.baseline_set : state.spectrometerBaselineSet,
         spectrometerStatus: latest.status || state.spectrometerStatus,
-        voltageHistory: points.length > 0
-          ? [...state.voltageHistory, ...points].slice(-MAX_HISTORY_POINTS)
-          : state.voltageHistory,
+        voltageHistoryRevision: state.voltageHistoryRevision + (points.length > 0 ? 1 : 0),
         voltageUiDropped: droppedForUi,
         voltageBatchSupported: batch || state.voltageBatchSupported,
         voltageSequenceGaps: state.voltageSequenceGaps + sequenceGap,
-      }))
+        }
+      })
     }
 
     socket.on('disconnect', () => {

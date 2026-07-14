@@ -3168,7 +3168,8 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertIn("raw.valid === true", store_text)
         self.assertIn("socket.on('voltage_batch'", store_text)
         self.assertIn("voltageBatchSupported", store_text)
-        self.assertIn("MAX_HISTORY_POINTS = 1200", store_text)
+        self.assertIn("MAX_HISTORY_POINTS = 20_000", store_text)
+        self.assertIn("RingBuffer<VoltagePoint>", store_text)
 
     def test_frontend_uses_single_angle_snapshot_committer_and_numeric_time_axis(self):
         store_text = (REPO_ROOT / "frontend" / "src" / "store.ts").read_text(encoding="utf-8")
@@ -3177,8 +3178,8 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertIn("angleSnapshotCommitter", store_text)
         self.assertNotIn("rawAngleCommitter", store_text)
         self.assertNotIn("angleTelemetryCommitter", store_text)
-        self.assertIn('dataKey="receivedAtMs"', monitor_text)
-        self.assertIn('type="linear"', monitor_text)
+        self.assertIn("VoltageCanvasChart", monitor_text)
+        self.assertIn("timeWindowMs", monitor_text)
 
     def test_frontend_injection_on_passes_current_speed_input(self):
         card_text = (REPO_ROOT / "frontend" / "src" / "components" / "injection-pump-card.tsx").read_text(encoding="utf-8")
@@ -3204,9 +3205,8 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         data_text = (REPO_ROOT / "frontend" / "src" / "pages" / "Data.tsx").read_text(encoding="utf-8")
         manual_text = (REPO_ROOT / "frontend" / "src" / "pages" / "Manual.tsx").read_text(encoding="utf-8")
 
-        self.assertIn("formatChartNumber", monitor_text)
-        self.assertIn("tickFormatter={formatChartNumber}", monitor_text)
-        self.assertIn("formatter={formatChartTooltip}", monitor_text)
+        self.assertIn("VoltageCanvasChart", monitor_text)
+        self.assertIn("暂停视图", monitor_text)
         self.assertNotIn("toPrecision(6)", data_text)
         self.assertIn("toPrecision(4)", data_text)
         self.assertIn("const interlockActive = manualStatus.automation_active", manual_text)

@@ -26,7 +26,9 @@ from __future__ import print_function
 
 import json
 import copy
+import csv
 import hashlib
+import io
 import math
 import os
 import sys
@@ -4788,6 +4790,54 @@ class WebConfigServer(object):
                     "frames": frames,
                 },
             })
+
+        @self.app.route('/api/data/voltage-series', methods=['GET'])
+        def get_voltage_series():
+            mission_id = request.args.get("mission_id", "")
+            sample_id = request.args.get("sample_id", "")
+            data = self.data_manager.get_mission(mission_id)
+            if not data:
+                return jsonify({"success": False, "error": "任务不存在"}), 404
+            if not any(str(window.get("sample_id")) == sample_id for window in self.sample_storage.list_windows(data)):
+                return jsonify({"success": False, "error": "采样窗口不存在"}), 404
+            try:
+                from_ms = request.args.get("from_ms")
+                to_ms = request.args.get("to_ms")
+                series = self.sample_storage.read_raw_series(
+                    mission_id,
+                    sample_id,
+                    from_ms=float(from_ms) if from_ms is not None else None,
+                    to_ms=float(to_ms) if to_ms is not None else None,
+                    max_points=int(request.args.get("max_points", 2000)),
+                )
+            except (TypeError, ValueError) as exc:
+                return jsonify({"success": False, "error": str(exc)}), 400
+            return jsonify({"success": True, "data": dict(series, mission_id=mission_id, sample_id=sample_id)})
+
+        @self.app.route('/api/data/mission/<mission_id>/sample/<sample_id>/raw.csv', methods=['GET'])
+        def export_mission_sample_raw_csv(mission_id, sample_id):
+            data = self.data_manager.get_mission(mission_id)
+            if not data:
+                return jsonify({"success": False, "error": "任务不存在"}), 404
+            if not any(str(window.get("sample_id")) == str(sample_id) for window in self.sample_storage.list_windows(data)):
+                return jsonify({"success": False, "error": "采样窗口不存在"}), 404
+
+            def generate_rows():
+                output = io.StringIO()
+                writer = csv.writer(output)
+                writer.writerow(("frame_index", "received_at_ms", "source_timestamp_ms", "voltage", "absorbance", "raw_code", "valid", "status"))
+                yield output.getvalue()
+                for index, frame in enumerate(self.sample_storage.iter_raw_frames(mission_id, sample_id)):
+                    output.seek(0)
+                    output.truncate(0)
+                    writer.writerow((index, frame.get("received_at_ms"), frame.get("source_timestamp_ms", frame.get("timestamp_ms")), frame.get("voltage"), frame.get("absorbance"), frame.get("raw_code"), frame.get("valid"), frame.get("status")))
+                    yield output.getvalue()
+
+            return Response(
+                generate_rows(),
+                mimetype="text/csv",
+                headers={"Content-Disposition": 'attachment; filename="%s.csv"' % sample_id},
+            )
 
         @self.app.route('/api/data/mission/<mission_id>/sample/<sample_id>/manual-result', methods=['POST'])
         def update_mission_sample_manual_result(mission_id, sample_id):
