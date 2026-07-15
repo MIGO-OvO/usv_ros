@@ -59,6 +59,7 @@ export default function Monitor() {
   const voltageHistoryRevision = useAppStore((state) => state.voltageHistoryRevision)
   const voltageSequenceGaps = useAppStore((state) => state.voltageSequenceGaps)
   const voltageUiDropped = useAppStore((state) => state.voltageUiDropped)
+  const voltageServerBacklogMs = useAppStore((state) => state.voltageServerBacklogMs)
   const refreshInjectionPumpStatus = useAppStore((state) => state.refreshInjectionPumpStatus)
 
   const pidErrorsRef = useRef<Record<string, number>>({ X: 0, Y: 0, Z: 0, A: 0 })
@@ -276,7 +277,7 @@ export default function Monitor() {
             <div>
               <CardTitle className="text-base">分光计电压</CardTitle>
               <div className="mt-1 text-xs text-muted-foreground">
-                原始 {displayedVoltageHistory.length}/{voltageHistory.length} · 绘制 {renderedCount} · {receiveRateHz.toFixed(1)} Hz · 延迟 {latestAgeMs === null ? '--' : Math.round(latestAgeMs)} ms
+                原始 {displayedVoltageHistory.length}/{voltageHistory.length} · 绘制 {renderedCount} · {receiveRateHz.toFixed(1)} Hz · 端到端 {latestAgeMs === null ? '--' : Math.round(latestAgeMs)} ms · 服务端积压 {Math.round(voltageServerBacklogMs)} ms
                 {(voltageSequenceGaps > 0 || voltageUiDropped > 0) && ` · gap ${voltageSequenceGaps} / UI 丢弃 ${voltageUiDropped}`}
               </div>
             </div>
