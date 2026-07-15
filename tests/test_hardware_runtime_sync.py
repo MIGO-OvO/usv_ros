@@ -2403,6 +2403,37 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(server._realtime_stats_snapshot()["received"], 100)
         self.assertEqual(server._realtime_stats_snapshot()["batched"], 100)
 
+    def test_web_automation_persistence_cannot_block_every_voltage_callback(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_automation_persistence_backpressure_test",
+            "scripts/web_config_server.py",
+        )
+
+        class SlowRecordingDataManager(RecordingDataManager):
+            def add_data_point(self, voltage, absorbance=0.0):
+                time.sleep(0.02)
+                super().add_data_point(voltage, absorbance)
+
+        server = module.WebConfigServer(standalone=True)
+        server.data_manager = SlowRecordingDataManager()
+        server.data_manager.start_mission("")
+        server.automation_running = True
+
+        started_at = time.perf_counter()
+        for seq in range(20):
+            server._voltage_cb(string_cls(json.dumps({
+                "seq": seq + 1,
+                "received_at_ms": 100000 + seq * 50,
+                "voltage": 1.0,
+                "absorbance": 0.1,
+                "valid": True,
+            })))
+        elapsed = time.perf_counter() - started_at
+
+        self.assertLessEqual(len(server.data_manager.points), 1)
+        self.assertLess(elapsed, 0.15)
+        self.assertEqual(server._realtime_stats_snapshot()["received"], 20)
+
     def test_web_angle_socket_events_are_throttled_as_a_group(self):
         module, _, _ = _load_script(
             "web_config_server_angle_throttle_test",
@@ -3168,6 +3199,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertIn("raw.valid === true", store_text)
         self.assertIn("socket.on('voltage_batch'", store_text)
         self.assertIn("voltageBatchSupported", store_text)
+        self.assertIn("voltageServerBacklogMs", store_text)
         self.assertIn("MAX_HISTORY_POINTS = 20_000", store_text)
         self.assertIn("RingBuffer<VoltagePoint>", store_text)
 

@@ -126,6 +126,7 @@ MAX_LIVE_DATA_POINTS = 500
 MAX_VOLTAGE_HISTORY = 300
 SOCKET_VOLTAGE_EMIT_INTERVAL_S = 0.2
 SOCKET_ANGLE_EMIT_INTERVAL_S = 0.1
+MISSION_DATA_POINT_INTERVAL_S = 0.5
 REALTIME_BUFFER_CAPACITY = 512
 DEFAULT_SURFACE_SIZE = 50
 MAX_SURFACE_SIZE = 80
@@ -1904,6 +1905,7 @@ class WebConfigServer(object):
         self._voltage_sequence = 0
         self._angle_sequence = 0
         self._last_voltage_flush_at = time.monotonic()
+        self._last_mission_data_point_at = 0.0
         self._realtime_stats = {
             "received": 0,
             "recorded": 0,
@@ -2041,6 +2043,7 @@ class WebConfigServer(object):
             return
         mission_name = self.config_manager.get().get('mission', {}).get('name', '')
         self.data_manager.start_mission(mission_name)
+        self._last_mission_data_point_at = 0.0
         self.data_recording_source = source
         if self.route_waypoints:
             self.data_manager.set_route_waypoints(self.route_waypoints)
@@ -2438,7 +2441,9 @@ class WebConfigServer(object):
             sample_event_aggregate = bool(data.get("sample_event_id"))
             automation = self.latest_automation_status if isinstance(self.latest_automation_status, dict) else {}
             position = self.current_position if isinstance(self.current_position, dict) else None
-            if not sample_event_aggregate:
+            now = time.monotonic()
+            if not sample_event_aggregate and now - self._last_mission_data_point_at >= MISSION_DATA_POINT_INTERVAL_S:
+                self._last_mission_data_point_at = now
                 try:
                     self.data_manager.add_data_point(
                         self.current_voltage,
@@ -2448,7 +2453,7 @@ class WebConfigServer(object):
                         step_index=automation.get("step_index", automation.get("current_step")),
                         loop_index=automation.get("loop_index", automation.get("current_loop")),
                         sample_id=automation.get("sample_id"),
-                        spectrometer_raw=data,
+                        spectrometer_raw=self._spectrometer_raw_summary(data),
                         pollution_metric=self._current_metric_config(),
                         lab_mode=bool(position.get("lab_mode", False)) if position else False,
                         system_health=self.latest_system_health,

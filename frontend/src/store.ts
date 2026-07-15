@@ -84,6 +84,7 @@ interface VoltageBatchSample {
 interface VoltageBatchPayload {
   first_seq: number
   last_seq: number
+  sent_at_ms?: number
   samples: VoltageBatchSample[]
   dropped_for_ui?: number
 }
@@ -238,6 +239,7 @@ interface AppState {
   voltageBatchSupported: boolean
   voltageSequenceGaps: number
   voltageUiDropped: number
+  voltageServerBacklogMs: number
   pidErrors: PidErrorState
   injectionPump: InjectionPumpStatus
   logs: LogEntry[]
@@ -313,6 +315,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   voltageBatchSupported: false,
   voltageSequenceGaps: 0,
   voltageUiDropped: 0,
+  voltageServerBacklogMs: 0,
   pidErrors: { X: 0, Y: 0, Z: 0, A: 0 },
   injectionPump: DEFAULT_INJECTION_PUMP_STATUS,
   logs: [],
@@ -340,7 +343,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       voltageBatchSupported = false
       angleSnapshotSupported = false
       lastVoltageSequence = null
-      set({ connected: true, voltageBatchSupported: false, voltageSequenceGaps: 0, voltageUiDropped: 0 })
+      set({ connected: true, voltageBatchSupported: false, voltageSequenceGaps: 0, voltageUiDropped: 0, voltageServerBacklogMs: 0 })
       console.log('Socket connected')
     })
 
@@ -357,7 +360,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       }))
     })
 
-    const commitVoltageSamples = (samples: VoltageBatchSample[], droppedForUi = 0, sequenceGap = 0, batch = false) => {
+    const commitVoltageSamples = (samples: VoltageBatchSample[], droppedForUi = 0, sequenceGap = 0, batch = false, serverBacklogMs = 0) => {
       if (samples.length === 0) return
       const points: VoltagePoint[] = samples
         .filter((sample) => sample.valid || typeof sample.raw_code === 'number')
@@ -382,6 +385,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         spectrometerStatus: latest.status || state.spectrometerStatus,
         voltageHistoryRevision: state.voltageHistoryRevision + (points.length > 0 ? 1 : 0),
         voltageUiDropped: droppedForUi,
+        voltageServerBacklogMs: serverBacklogMs,
         voltageBatchSupported: batch || state.voltageBatchSupported,
         voltageSequenceGaps: state.voltageSequenceGaps + sequenceGap,
         }
@@ -454,7 +458,11 @@ export const useAppStore = create<AppState>((set, get) => ({
       voltageBatchSupported = true
       const gap = lastVoltageSequence === null ? 0 : Math.max(0, data.first_seq - lastVoltageSequence - 1)
       lastVoltageSequence = data.last_seq
-      commitVoltageSamples(data.samples || [], data.dropped_for_ui || 0, gap, true)
+      const latest = data.samples?.[data.samples.length - 1]
+      const backlog = latest && typeof data.sent_at_ms === 'number'
+        ? Math.max(0, data.sent_at_ms - latest.received_at_ms)
+        : 0
+      commitVoltageSamples(data.samples || [], data.dropped_for_ui || 0, gap, true, backlog)
     })
 
     socket.on('spectrometer_status', (status: string) => {
