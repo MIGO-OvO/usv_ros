@@ -28,7 +28,7 @@ function App() {
         <div className="min-h-screen bg-background text-foreground font-sans antialiased selection:bg-primary/10">
           <Sidebar />
 
-          <main className="md:pl-64 min-h-screen pb-20 md:pb-0 transition-[padding] duration-300">
+          <main className="min-h-screen pb-[calc(5rem+env(safe-area-inset-bottom))] transition-[padding] duration-300 md:pb-0 md:pl-64">
              <Routes>
                <Route path="/" element={<Monitor />} />
                <Route path="/automation" element={<Automation />} />

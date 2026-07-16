@@ -16,7 +16,7 @@ export function MobileNav() {
   const location = useLocation()
 
   return (
-    <div className="md:hidden fixed bottom-0 left-0 right-0 border-t border-border/40 bg-background/80 backdrop-blur-xl z-50 pb-safe">
+    <div className="fixed bottom-0 left-0 right-0 z-50 border-t border-border/40 bg-background/80 pb-[env(safe-area-inset-bottom)] backdrop-blur-xl md:hidden">
       <nav className="flex justify-around items-center h-16 px-2">
         {navItems.map((item) => {
           const Icon = item.icon
@@ -26,6 +26,7 @@ export function MobileNav() {
             <Link
               key={item.name}
               to={item.href}
+              aria-current={isActive ? "page" : undefined}
               className={cn(
                 "flex flex-col items-center justify-center gap-1 w-full h-full text-xs font-medium transition-colors",
                 isActive ? "text-primary" : "text-muted-foreground hover:text-foreground",
