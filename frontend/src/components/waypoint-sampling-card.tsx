@@ -98,21 +98,21 @@ export function WaypointSamplingCard() {
 
   return (
     <Card>
-      <CardHeader className="flex flex-row items-center justify-between">
+      <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <CardTitle className="text-base">航点采样配置</CardTitle>
-        <div className="flex gap-2">
+        <div className="flex w-full flex-wrap gap-2 sm:w-auto">
           <Button size="sm" variant="outline" onClick={syncFromMavros} title="从飞控同步航点"><Download className="w-4 h-4 mr-1" />同步飞控</Button>
-          <Button size="sm" variant="ghost" onClick={fetchData}><RefreshCw className="w-4 h-4" /></Button>
+          <Button size="sm" variant="ghost" onClick={fetchData} aria-label="刷新航点配置"><RefreshCw className="w-4 h-4" /></Button>
           <Button size="sm" onClick={saveAll}><Save className="w-4 h-4 mr-1" />保存</Button>
         </div>
       </CardHeader>
       <CardContent className="space-y-4">
-        <div className="flex gap-2 items-end">
-          <div className="space-y-1 flex-1">
+        <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
+          <div className="min-w-0 flex-1 space-y-1">
             <Label className="text-xs">新增航点编号</Label>
             <Input value={newSeq} onChange={e => setNewSeq(e.target.value)} placeholder="例: 0" className="h-8" />
           </div>
-          <Button size="sm" onClick={addWaypoint}><Plus className="w-4 h-4 mr-1" />添加</Button>
+          <Button size="sm" className="w-full sm:w-auto" onClick={addWaypoint}><Plus className="w-4 h-4 mr-1" />添加</Button>
         </div>
 
         {sortedKeys.length === 0 && (
@@ -126,15 +126,26 @@ export function WaypointSamplingCard() {
               <div className="flex items-center justify-between">
                 <span className="font-bold text-sm">航点 #{key}</span>
                 <div className="flex items-center gap-3">
-                  <Label className="text-xs">启用</Label>
-                  <Switch checked={item.enabled} onCheckedChange={v => updateField(key, 'enabled', v)} />
-                  <Button size="icon" variant="ghost" className="text-destructive h-7 w-7" onClick={() => removeWaypoint(key)}>
+                  <Label htmlFor={`waypoint-${key}-enabled`} className="text-xs">启用</Label>
+                  <Switch
+                    id={`waypoint-${key}-enabled`}
+                    checked={item.enabled}
+                    onCheckedChange={v => updateField(key, 'enabled', v)}
+                    aria-label={`启用航点 ${key}`}
+                  />
+                  <Button
+                    size="icon"
+                    variant="ghost"
+                    className="text-destructive h-7 w-7"
+                    onClick={() => removeWaypoint(key)}
+                    aria-label={`删除航点 ${key}`}
+                  >
                     <Trash2 className="w-3.5 h-3.5" />
                   </Button>
                 </div>
               </div>
               {item.enabled && (
-                <div className="grid grid-cols-2 md:grid-cols-4 gap-3">
+                <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,9rem),1fr))] gap-3">
                   <div className="space-y-1">
                     <Label className="text-xs text-muted-foreground">采样轮次</Label>
                     <NumericInput integer min={0} value={item.loop_count} onValueChange={v => updateField(key, 'loop_count', v)} className="h-7 text-xs" />

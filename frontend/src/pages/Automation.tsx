@@ -275,7 +275,7 @@ export default function Automation() {
           <h1 className="text-3xl font-bold tracking-tight">自动化控制</h1>
           <p className="text-muted-foreground">配置并执行采样序列任务。</p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex w-full flex-wrap items-center gap-2 md:w-auto">
           <Button variant="outline" onClick={() => handleAction('start')} disabled={automationRunning}>
             <Play className="w-4 h-4 mr-2 text-emerald-500" /> 启动
           </Button>
@@ -291,8 +291,8 @@ export default function Automation() {
         </div>
       </header>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-        <div className="lg:col-span-1 space-y-6">
+      <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(18rem,22rem)_minmax(0,1fr)] xl:items-start">
+        <div className="space-y-6">
           <Card className="h-fit">
             <CardHeader>
               <CardTitle>全局配置</CardTitle>
@@ -366,12 +366,12 @@ export default function Automation() {
               </div>
               <div className="space-y-2">
                 <Label>预设名称</Label>
-                <div className="flex gap-2">
-                  <Input value={presetName} onChange={(e) => setPresetName(e.target.value)} placeholder="default" />
-                  <Button size="icon" variant="ghost" onClick={loadPreset} title="加载">
+                <div className="flex min-w-0 gap-2">
+                  <Input value={presetName} onChange={(e) => setPresetName(e.target.value)} placeholder="default" className="min-w-0 flex-1" />
+                  <Button size="icon" variant="ghost" onClick={loadPreset} title="加载" aria-label="加载预设">
                     <FolderOpen className="w-4 h-4" />
                   </Button>
-                  <Button size="icon" variant="ghost" onClick={savePreset} title="保存">
+                  <Button size="icon" variant="ghost" onClick={savePreset} title="保存" aria-label="保存预设">
                     <Save className="w-4 h-4" />
                   </Button>
                 </div>
@@ -393,11 +393,11 @@ export default function Automation() {
           <InjectionPumpCard />
         </div>
 
-        <div className="lg:col-span-2">
+        <div className="min-w-0">
           <WaypointSamplingCard />
         </div>
 
-        <Card className="lg:col-span-3">
+        <Card className="min-w-0 xl:col-span-2">
           <CardHeader className="flex flex-row items-center justify-between">
             <CardTitle>序列步骤</CardTitle>
             <Button size="sm" onClick={addStep}><Plus className="w-4 h-4 mr-2" /> 添加步骤</Button>
@@ -405,23 +405,22 @@ export default function Automation() {
           <CardContent className="space-y-4">
             {steps.map((step, index) => (
               <div key={index} className="p-4 border rounded-lg bg-card/50 space-y-4">
-                <div className="flex items-center gap-4">
+                <div className="flex flex-wrap items-center gap-3">
                   <div className="font-mono text-muted-foreground w-6">{index + 1}</div>
-                  <Input value={step.name} onChange={(e) => updateStep(index, 'name', e.target.value)} className="w-40" />
-                  <div className="flex-1" />
-                  <div className="flex items-center gap-2">
+                  <Input value={step.name} onChange={(e) => updateStep(index, 'name', e.target.value)} className="min-w-0 flex-[1_1_12rem]" />
+                  <div className="ml-auto flex items-center gap-2">
                     <Label className="whitespace-nowrap text-xs text-muted-foreground">完成后等待</Label>
                     <NumericInput value={step.interval} onValueChange={(v) => updateStep(index, 'interval', v)} integer className="w-24 h-7 text-xs px-2" />
                     <span className="text-xs text-muted-foreground">ms</span>
                   </div>
                   <div className="flex gap-1">
-                    <Button size="icon" variant="ghost" onClick={() => moveStep(index, -1)}><ArrowUp className="w-4 h-4" /></Button>
-                    <Button size="icon" variant="ghost" onClick={() => moveStep(index, 1)}><ArrowDown className="w-4 h-4" /></Button>
-                    <Button size="icon" variant="ghost" className="text-destructive" onClick={() => deleteStep(index)}><Trash2 className="w-4 h-4" /></Button>
+                    <Button size="icon" variant="ghost" onClick={() => moveStep(index, -1)} aria-label={`上移步骤 ${index + 1}`}><ArrowUp className="w-4 h-4" /></Button>
+                    <Button size="icon" variant="ghost" onClick={() => moveStep(index, 1)} aria-label={`下移步骤 ${index + 1}`}><ArrowDown className="w-4 h-4" /></Button>
+                    <Button size="icon" variant="ghost" className="text-destructive" onClick={() => deleteStep(index)} aria-label={`删除步骤 ${index + 1}`}><Trash2 className="w-4 h-4" /></Button>
                   </div>
                 </div>
 
-                <div className="grid grid-cols-2 xl:grid-cols-4 gap-3 pt-2">
+                <div className="grid grid-cols-[repeat(auto-fit,minmax(min(100%,12rem),1fr))] gap-3 pt-2">
                   {(['X', 'Y', 'Z', 'A'] as const).map((axis) => (
                     <div key={axis} className="space-y-2 p-3 rounded-lg border border-border/60 bg-muted/20">
                       <div className="flex items-center justify-between">
@@ -429,6 +428,7 @@ export default function Automation() {
                         <Switch
                           checked={(step as any)[axis].enable === 'E'}
                           onCheckedChange={(checked) => updateStep(index, `${axis}.enable`, checked ? 'E' : 'D')}
+                          aria-label={`步骤 ${index + 1}：启用 ${axis} 轴`}
                         />
                       </div>
                       {(step as any)[axis].enable === 'E' && (

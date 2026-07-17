@@ -282,7 +282,7 @@ export default function Data() {
   const formatTooltipValue = (value: unknown) => fmt(typeof value === 'number' ? value : Number(value))
 
   return (
-    <div className="p-4 md:p-8 space-y-6 max-w-[1600px] mx-auto h-[calc(100vh-6rem)] flex flex-col">
+    <div className="mx-auto flex min-h-[calc(100vh-5rem)] max-w-[1600px] flex-col gap-6 p-4 pb-24 md:p-8 xl:h-[calc(100vh-4rem)] xl:pb-8">
       <header className="flex flex-col sm:flex-row sm:items-center sm:justify-between shrink-0 gap-4">
         <div>
           <h1 className="text-3xl font-bold tracking-tight">数据中心</h1>
@@ -291,8 +291,9 @@ export default function Data() {
         <Button className="self-start sm:self-auto" variant="outline" onClick={fetchMissions}><RefreshCw className="w-4 h-4 mr-2" />刷新列表</Button>
       </header>
 
-      <div className="grid grid-cols-1 lg:grid-cols-[280px_320px_minmax(0,1fr)] gap-4 flex-1 min-h-0">
-        <Card className="flex flex-col min-h-[280px]">
+      <div className="grid grid-cols-1 gap-4 xl:min-h-0 xl:flex-1 xl:grid-cols-[minmax(18rem,22rem)_minmax(0,1fr)]">
+        <aside className="grid gap-4 xl:min-h-0 xl:grid-rows-2" aria-label="任务与采样列表">
+        <Card className="flex min-h-[280px] flex-col xl:min-h-0">
           <CardHeader className="pb-3">
             <CardTitle className="text-lg">任务列表</CardTitle>
           </CardHeader>
@@ -303,30 +304,34 @@ export default function Data() {
                 {missions.map((mission) => (
                   <div
                     key={mission.id}
-                    onClick={() => setSelectedId(mission.id)}
                     className={cn(
-                      "flex flex-col gap-1 p-3 rounded-lg cursor-pointer transition-colors border",
+                      "flex items-start gap-1 rounded-lg border p-1 transition-colors",
                       selectedId === mission.id ? "bg-primary/10 border-primary/20" : "hover:bg-muted border-transparent"
                     )}
                   >
-                    <div className="flex items-center justify-between gap-2">
-                      <span className="font-medium text-sm truncate">{mission.name}</span>
-                      <div className="flex gap-1 shrink-0">
-                        <Button size="icon" variant="ghost" className="h-6 w-6" onClick={(e) => exportMission(e, mission.id)} title="导出">
-                          <Download className="w-3 h-3" />
-                        </Button>
-                        <Button size="icon" variant="ghost" className="h-6 w-6 text-destructive hover:text-destructive" onClick={(e) => deleteMission(e, mission.id)} title="删除">
-                          <Trash2 className="w-3 h-3" />
-                        </Button>
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                      <Calendar className="w-3 h-3 shrink-0" />
-                      <span className="truncate">{new Date(mission.start_time).toLocaleString()}</span>
-                    </div>
-                    <div className="flex items-center gap-2 text-xs text-muted-foreground">
-                      <FileText className="w-3 h-3" />
-                      <span>{mission.point_count} 数据点</span>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedId(mission.id)}
+                      aria-pressed={selectedId === mission.id}
+                      className="flex min-w-0 flex-1 flex-col gap-1 rounded-md p-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                    >
+                      <span className="truncate text-sm font-medium">{mission.name}</span>
+                      <span className="flex items-center gap-2 text-xs text-muted-foreground">
+                        <Calendar className="w-3 h-3 shrink-0" />
+                        <span className="truncate">{new Date(mission.start_time).toLocaleString()}</span>
+                      </span>
+                      <span className="flex items-center gap-2 text-xs text-muted-foreground">
+                        <FileText className="w-3 h-3" />
+                        <span>{mission.point_count} 数据点</span>
+                      </span>
+                    </button>
+                    <div className="flex shrink-0 gap-1 pr-1 pt-2">
+                      <Button size="icon" variant="ghost" className="h-6 w-6" onClick={(e) => exportMission(e, mission.id)} title="导出" aria-label={`导出任务 ${mission.name}`}>
+                        <Download className="w-3 h-3" />
+                      </Button>
+                      <Button size="icon" variant="ghost" className="h-6 w-6 text-destructive hover:text-destructive" onClick={(e) => deleteMission(e, mission.id)} title="删除" aria-label={`删除任务 ${mission.name}`}>
+                        <Trash2 className="w-3 h-3" />
+                      </Button>
                     </div>
                   </div>
                 ))}
@@ -335,7 +340,7 @@ export default function Data() {
           </CardContent>
         </Card>
 
-        <Card className="flex flex-col min-h-[280px]">
+        <Card className="flex min-h-[280px] flex-col xl:min-h-0">
           <CardHeader className="pb-3">
             <CardTitle className="text-lg">采样窗口</CardTitle>
           </CardHeader>
@@ -371,8 +376,9 @@ export default function Data() {
             </ScrollArea>
           </CardContent>
         </Card>
+        </aside>
 
-        <Card className="flex flex-col min-h-[420px]">
+        <Card className="flex min-h-[420px] min-w-0 flex-col">
           <CardHeader className="pb-2 border-b">
             <div className="flex items-center justify-between gap-3">
               <CardTitle className="truncate">{sampleDetail ? sampleDetail.sample_id : selectedMission?.name ?? '请选择任务'}</CardTitle>

@@ -319,8 +319,8 @@ export default function Settings() {
           <p className="text-sm text-muted-foreground sm:text-base">底层控制参数与校准。</p>
       </header>
 
-      <div className="grid grid-cols-1 gap-4 xl:grid-cols-2 xl:gap-6">
-        <Card>
+      <div className="grid grid-cols-1 gap-4 xl:grid-cols-[minmax(0,1.35fr)_minmax(20rem,0.75fr)] xl:items-start xl:gap-6">
+        <Card className="xl:col-start-2 xl:row-start-1">
             <CardHeader>
                 <CardTitle className="flex items-center gap-2">
                     <Zap className="w-5 h-5 text-yellow-500" />
@@ -361,7 +361,7 @@ export default function Settings() {
             </CardContent>
         </Card>
 
-        <Card>
+        <Card className="xl:col-start-1 xl:row-span-3 xl:row-start-1">
             <CardHeader>
                 <CardTitle className="flex items-center gap-2">
                     <Activity className="w-5 h-5 text-emerald-500" />
@@ -447,7 +447,7 @@ export default function Settings() {
             </CardContent>
         </Card>
 
-        <Card>
+        <Card className="xl:col-start-2 xl:row-start-2">
             <CardHeader>
                 <CardTitle className="flex items-center gap-2">
                     <Route className="w-5 h-5 text-cyan-500" />
@@ -497,7 +497,7 @@ export default function Settings() {
             </CardContent>
         </Card>
 
-        <Card>
+        <Card className="xl:col-start-2 xl:row-start-3">
             <CardHeader>
                 <CardTitle className="flex items-center gap-2">
                     <Target className="w-5 h-5 text-blue-500" />
