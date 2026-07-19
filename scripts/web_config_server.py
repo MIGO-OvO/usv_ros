@@ -124,7 +124,7 @@ LOG_DIR = os.path.expanduser("~/usv_ws/logs")
 MAX_LIVE_TRACK_POINTS = 1000
 MAX_LIVE_DATA_POINTS = 500
 MAX_VOLTAGE_HISTORY = 300
-SOCKET_VOLTAGE_EMIT_INTERVAL_S = 0.2
+SOCKET_VOLTAGE_EMIT_INTERVAL_S = 0.05
 SOCKET_ANGLE_EMIT_INTERVAL_S = 0.1
 MISSION_DATA_POINT_INTERVAL_S = 0.5
 REALTIME_BUFFER_CAPACITY = 512
@@ -1927,7 +1927,6 @@ class WebConfigServer(object):
             self.mission_sub = rospy.Subscriber('/usv/mission_status', String, self._mission_status_cb)
             self.trigger_status_sub = rospy.Subscriber('/usv/trigger_status', String, self._trigger_status_cb)
             self.automation_status_sub = rospy.Subscriber('/usv/automation_status', String, self._automation_status_cb)
-            self.pid_error_sub = rospy.Subscriber('/usv/pump_pid_error', String, self._pid_error_cb)
             self.control_events_sub = rospy.Subscriber('/usv/control_events', String, self._control_event_cb)
             self.manual_status_sub = rospy.Subscriber('/usv/manual_status', String, self._manual_status_cb)
             self.lab_sim_status_sub = rospy.Subscriber('/usv/lab_sim/status', String, self._lab_sim_status_cb)
@@ -1960,7 +1959,6 @@ class WebConfigServer(object):
             self.mission_sub = None
             self.trigger_status_sub = None
             self.automation_status_sub = None
-            self.pid_error_sub = None
             self.control_events_sub = None
             self.manual_status_sub = None
             self.lab_sim_status_sub = None
@@ -2489,16 +2487,6 @@ class WebConfigServer(object):
             self.current_waypoint_seq = waypoint_seq
         if self.socketio:
             self.socketio.emit("survey_status", self._survey_status_snapshot())
-
-    def _pid_error_cb(self, msg):
-        """PID 误差回调"""
-        if self.socketio:
-            try:
-                # 透传 JSON 数据
-                data = json.loads(msg.data)
-                self.socketio.emit('pid_error', data)
-            except Exception:
-                pass
 
     def _control_event_cb(self, msg):
         try:
@@ -4543,10 +4531,12 @@ class WebConfigServer(object):
         # ================= 校准启动 API =================
         @self.app.route('/api/calibration/start', methods=['POST'])
         def start_calibration():
-            """启动电机校准"""
+            """驱动选定泵轴运动到编码器机械角度 0°。"""
             data = json_object()
             if data is None:
                 return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
+            if not self.standalone and getattr(self, 'automation_running', False):
+                return jsonify({"success": False, "message": "自动采样运行中，不能运动回零"}), 409
             motors = ''.join(ch for ch in clean_string(data.get('motors', 'XYZA'), 'XYZA', 4).upper() if ch in 'XYZA')
             if not motors:
                 return jsonify({"success": False, "message": "校准电机无效"}), 400
@@ -5575,16 +5565,6 @@ class WebConfigServer(object):
                 "dropped_for_ui": stats["ui_dropped"],
             }
             self.socketio.emit("voltage_batch", batch)
-            latest = samples[-1]
-            self.socketio.emit("voltage", {
-                "value": latest["voltage"],
-                "absorbance": latest["absorbance"],
-                "status": latest["status"],
-                "reference_voltage": latest["reference_voltage"],
-                "baseline_voltage": latest["baseline_voltage"],
-                "baseline_set": latest["baseline_set"],
-                "raw": latest,
-            })
             self.socketio.emit("realtime_health", stats)
 
         if angle_snapshot:

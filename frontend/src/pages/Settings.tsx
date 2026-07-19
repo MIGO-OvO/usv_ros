@@ -131,6 +131,7 @@ export default function Settings() {
   const [serialPorts, setSerialPorts] = useState<SerialPort[]>([])
   const [hwLoading, setHwLoading] = useState(false)
   const [hwMsg, setHwMsg] = useState('')
+  const [homing, setHoming] = useState<string | null>(null)
 
   useEffect(() => {
     fetchConfig()
@@ -281,6 +282,32 @@ export default function Settings() {
           headers: {'Content-Type': 'application/json'},
           body: JSON.stringify({ axis })
       })
+  }
+
+  const moveToZero = async (axis?: string) => {
+    const target = axis || 'XYZA'
+    const ok = await confirm({
+      title: axis ? `${axis} 轴运动回零` : '全部泵运动回零',
+      description: axis
+        ? `将驱动 ${axis} 轴自动转到机械角度 0°，不会修改零点偏移。确认继续吗？`
+        : '将驱动 X/Y/Z/A 四轴自动转到机械角度 0°，不会修改零点偏移。确认继续吗？',
+    })
+    if (!ok) return
+    setHoming(target)
+    try {
+      const res = await fetch('/api/calibration/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ motors: target }),
+      })
+      const data = await res.json()
+      if (!res.ok || !data.success) throw new Error(data.message || '运动回零失败')
+      toast({ title: axis ? `${axis} 轴已开始运动回零` : '四轴已开始运动回零', description: '请等待角度稳定到 0°。', variant: 'success' })
+    } catch (e) {
+      toast({ title: '运动回零失败', description: e instanceof Error ? e.message : String(e), variant: 'destructive' })
+    } finally {
+      setHoming(null)
+    }
   }
 
   const handleChange = (key: string, value: string) => {
@@ -524,6 +551,9 @@ export default function Settings() {
                             {pumpAngles[axis]?.toFixed(2)}°
                         </div>
                         <div className="col-span-3 flex gap-2 sm:col-span-1 sm:justify-center">
+                            <Button size="icon" variant="outline" className="h-11 w-full sm:w-12" onClick={() => moveToZero(axis)} disabled={homing !== null} title="运动到机械零点">
+                                <RotateCcw className="w-4 h-4 sm:w-3 sm:h-3" />
+                            </Button>
                             <Button size="icon" variant="outline" className="h-11 w-full sm:w-12" onClick={() => setZero(axis)} title="设为零点">
                                 <Target className="w-4 h-4 sm:w-3 sm:h-3" />
                             </Button>
@@ -535,6 +565,10 @@ export default function Settings() {
                 ))}
 
                 <div className="flex flex-col gap-2 border-t pt-4 sm:flex-row">
+                     <Button variant="default" className="flex-1" onClick={() => moveToZero()} disabled={homing !== null}>
+                       <RotateCcw className="w-4 h-4 mr-2" />
+                       {homing === 'XYZA' ? '运动回零中…' : '全部运动回零'}
+                     </Button>
                      <Button variant="secondary" className="flex-1" onClick={() => setZero()}>全部设为零点</Button>
                      <Button variant="ghost" className="flex-1" onClick={() => resetZero()}>全部重置</Button>
                 </div>

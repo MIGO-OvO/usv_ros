@@ -89,13 +89,6 @@ interface VoltageBatchPayload {
   dropped_for_ui?: number
 }
 
-interface PidErrorState {
-  X: number
-  Y: number
-  Z: number
-  A: number
-}
-
 interface MavrosState {
   connected: boolean
   armed: boolean
@@ -240,7 +233,6 @@ interface AppState {
   voltageSequenceGaps: number
   voltageUiDropped: number
   voltageServerBacklogMs: number
-  pidErrors: PidErrorState
   injectionPump: InjectionPumpStatus
   logs: LogEntry[]
   mavrosState: MavrosState
@@ -316,7 +308,6 @@ export const useAppStore = create<AppState>((set, get) => ({
   voltageSequenceGaps: 0,
   voltageUiDropped: 0,
   voltageServerBacklogMs: 0,
-  pidErrors: { X: 0, Y: 0, Z: 0, A: 0 },
   injectionPump: DEFAULT_INJECTION_PUMP_STATUS,
   logs: [],
   mavrosState: { connected: false, armed: false, mode: '' },
