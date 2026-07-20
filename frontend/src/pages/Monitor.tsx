@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { useAppStore, type VoltagePoint } from '@/store'
@@ -44,7 +44,6 @@ const TIME_WINDOWS = [
 ] as const
 
 export default function Monitor() {
-  const socket = useAppStore((state) => state.socket)
   const connected = useAppStore((state) => state.connected)
   const pumpConnected = useAppStore((state) => state.pumpConnected)
   const missionStatus = useAppStore((state) => state.missionStatus)
@@ -62,29 +61,11 @@ export default function Monitor() {
   const voltageServerBacklogMs = useAppStore((state) => state.voltageServerBacklogMs)
   const refreshInjectionPumpStatus = useAppStore((state) => state.refreshInjectionPumpStatus)
 
-  const pidErrorsRef = useRef<Record<string, number>>({ X: 0, Y: 0, Z: 0, A: 0 })
-  const [pidErrors, setPidErrors] = useState<Record<string, number>>({ X: 0, Y: 0, Z: 0, A: 0 })
   const [spectroSubmitting, setSpectroSubmitting] = useState<'start' | 'stop' | 'baseline' | null>(null)
   const [timeWindowMs, setTimeWindowMs] = useState(600_000)
   const [pausedHistory, setPausedHistory] = useState<VoltagePoint[] | null>(null)
   const [renderedCount, setRenderedCount] = useState(0)
   const [, setClock] = useState(0)
-
-  useEffect(() => {
-    if (!socket) return
-    const handlePidError = (data: { motor: string; error: number }) => {
-      pidErrorsRef.current[data.motor] = data.error ?? 0
-    }
-    socket.on('pid_error', handlePidError)
-    // 每 500ms 将 ref 同步到 state 触发渲染
-    const timer = setInterval(() => {
-      setPidErrors({ ...pidErrorsRef.current })
-    }, 500)
-    return () => {
-      socket.off('pid_error', handlePidError)
-      clearInterval(timer)
-    }
-  }, [socket])
 
   useEffect(() => {
     refreshInjectionPumpStatus().catch(() => {})
@@ -298,37 +279,6 @@ export default function Monitor() {
 
       <div className="grid min-w-0 grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_380px]">
         <div className="min-w-0 space-y-6">
-          <Card className="min-w-0">
-            <CardHeader className="pb-2">
-              <CardTitle className="text-base">PID 误差</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className="grid grid-cols-2 gap-3 sm:grid-cols-4 sm:gap-4">
-                {(['X', 'Y', 'Z', 'A'] as const).map((axis) => {
-                  const err = pidErrors[axis] ?? 0
-                  const absErr = Math.abs(err)
-                  return (
-                    <div key={axis} className="rounded-lg border border-border/60 bg-muted/20 p-3 text-center">
-                      <div className="mb-1 text-xs font-medium text-muted-foreground">{axis} 轴</div>
-                      <div className={cn(
-                        "font-mono text-xl font-bold",
-                        absErr < 0.5 ? "text-emerald-500" : absErr < 2 ? "text-amber-500" : "text-red-500"
-                      )}>
-                        {err.toFixed(2)}°
-                      </div>
-                      <div className={cn(
-                        "mt-1 text-xs",
-                        absErr < 0.5 ? "text-emerald-500/70" : absErr < 2 ? "text-amber-500/70" : "text-red-500/70"
-                      )}>
-                        {absErr < 0.5 ? "到位" : absErr < 2 ? "调节中" : "偏差大"}
-                      </div>
-                    </div>
-                  )
-                })}
-              </div>
-            </CardContent>
-          </Card>
-
           <LinkDiagnosticsCard />
         </div>
 
