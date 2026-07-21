@@ -134,6 +134,26 @@ MAX_AUTO_SCAN_WAYPOINTS = 1000
 POSITION_STALE_AFTER_S = 5.0
 ANGLE_AXES = ("X", "Y", "Z", "A")
 ANGLE_STALE_AFTER_MS = 1000
+
+
+def build_calibrated_zero_command(angles, motors, precision=0.1):
+    """Build relative PID moves from calibrated angles to calibrated 0°."""
+    parts = []
+    precision = max(0.01, min(10.0, float(precision)))
+    for axis in motors:
+        if axis not in ANGLE_AXES or axis not in angles:
+            continue
+        angle = float(angles[axis]) % 360.0
+        if angle <= precision or (360.0 - angle) <= precision:
+            continue
+        if angle <= 180.0:
+            direction = "B"
+            delta = angle
+        else:
+            direction = "F"
+            delta = 360.0 - angle
+        parts.append("{}E{}R{:.3f}P{:g}".format(axis, direction, delta, precision))
+    return "".join(parts) + ("\r\n" if parts else "")
 DEFAULT_MAPPING_PROFILE = {
     "survey_min_distance_m": 5.0,
     "survey_min_speed_mps": 0.0,
@@ -4531,26 +4551,34 @@ class WebConfigServer(object):
         # ================= 校准启动 API =================
         @self.app.route('/api/calibration/start', methods=['POST'])
         def start_calibration():
-            """驱动选定泵轴运动到编码器机械角度 0°。"""
+            """驱动选定泵轴运动到 Web 校准后的角度 0°。"""
             data = json_object()
             if data is None:
                 return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
             if not self.standalone and getattr(self, 'automation_running', False):
                 return jsonify({"success": False, "message": "自动采样运行中，不能运动回零"}), 409
-            motors = ''.join(ch for ch in clean_string(data.get('motors', 'XYZA'), 'XYZA', 4).upper() if ch in 'XYZA')
+            motors = ''.join(dict.fromkeys(
+                ch for ch in clean_string(data.get('motors', 'XYZA'), 'XYZA', 4).upper() if ch in 'XYZA'
+            ))
             if not motors:
                 return jsonify({"success": False, "message": "校准电机无效"}), 400
 
-            cmd = f"CAL{motors}\r\n"
-
             if self.standalone:
-                self._add_log(f"[模拟] 校准: {motors}", "info")
-                return jsonify({"success": True, "message": "校准已启动 (模拟模式)"})
+                self._add_log(f"[模拟] 运动到校准零点: {motors}", "info")
+                return jsonify({"success": True, "message": "运动回零已启动 (模拟模式)"})
+
+            telemetry = getattr(self, 'latest_angle_telemetry', {})
+            if not telemetry.get('valid') or telemetry.get('stale'):
+                return jsonify({"success": False, "message": "泵角度数据无效或已过期，不能运动回零"}), 409
+
+            cmd = build_calibrated_zero_command(self.current_angles, motors)
+            if not cmd:
+                return jsonify({"success": True, "message": "所选泵轴已经位于校准零点"})
 
             if hasattr(self, 'command_pub') and self.command_pub:
                 self.command_pub.publish(cmd)
-                self._add_log(f"校准已启动: {motors}", "info")
-                return jsonify({"success": True, "message": "校准已启动"})
+                self._add_log(f"运动到校准零点已启动: {motors} ({cmd.strip()})", "info")
+                return jsonify({"success": True, "message": "运动到校准零点已启动"})
 
             return jsonify({"success": False, "message": "ROS Publisher 未初始化"})
 
