@@ -2,7 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { useAppStore, type VoltagePoint } from '@/store'
-import { Activity, Zap, Play, Square, Anchor, Navigation, Pause, AlertTriangle, CheckCircle, Loader, Target } from 'lucide-react'
+import { Activity, Zap, Play, Square, Anchor, Navigation, Pause, AlertTriangle, CheckCircle, Loader, Target, Trash2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { InjectionPumpCard } from '@/components/injection-pump-card'
 import { LinkDiagnosticsCard } from '@/components/link-diagnostics-card'
@@ -43,6 +43,8 @@ const TIME_WINDOWS = [
   { label: '全部', value: 0 },
 ] as const
 
+const VOLTAGE_STALE_AFTER_MS = 2000
+
 export default function Monitor() {
   const connected = useAppStore((state) => state.connected)
   const pumpConnected = useAppStore((state) => state.pumpConnected)
@@ -59,6 +61,10 @@ export default function Monitor() {
   const voltageSequenceGaps = useAppStore((state) => state.voltageSequenceGaps)
   const voltageUiDropped = useAppStore((state) => state.voltageUiDropped)
   const voltageServerBacklogMs = useAppStore((state) => state.voltageServerBacklogMs)
+  const voltageIngressLagMs = useAppStore((state) => state.voltageIngressLagMs)
+  const voltageServerQueueMs = useAppStore((state) => state.voltageServerQueueMs)
+  const voltageStaleDropped = useAppStore((state) => state.voltageStaleDropped)
+  const clearVoltageHistory = useAppStore((state) => state.clearVoltageHistory)
   const refreshInjectionPumpStatus = useAppStore((state) => state.refreshInjectionPumpStatus)
 
   const [spectroSubmitting, setSpectroSubmitting] = useState<'start' | 'stop' | 'baseline' | null>(null)
@@ -106,6 +112,7 @@ export default function Monitor() {
   }, [liveHistory, pausedHistory, timeWindowMs])
   const latestPoint = liveHistory[liveHistory.length - 1]
   const latestAgeMs = latestPoint ? Math.max(0, Date.now() - latestPoint.receivedAtMs) : null
+  const voltageIsStale = connected && latestAgeMs !== null && latestAgeMs > VOLTAGE_STALE_AFTER_MS
   const receiveRateHz = useMemo(() => {
     const recent = displayedVoltageHistory.slice(-100)
     if (recent.length < 2) return 0
@@ -113,6 +120,11 @@ export default function Monitor() {
     return elapsed > 0 ? (recent.length - 1) * 1000 / elapsed : 0
   }, [displayedVoltageHistory])
   const handleRenderedCount = useCallback((count: number) => setRenderedCount(count), [])
+  const handleClearVoltageHistory = useCallback(() => {
+    clearVoltageHistory()
+    setPausedHistory(null)
+    setRenderedCount(0)
+  }, [clearVoltageHistory])
 
   const spectroStatusLabels: Record<string, string> = {
     configured: '已配置，未采集',
@@ -257,9 +269,11 @@ export default function Monitor() {
          <CardHeader className="flex flex-col gap-3 pb-2 lg:flex-row lg:items-center lg:justify-between">
             <div>
               <CardTitle className="text-base">分光计电压</CardTitle>
-              <div className="mt-1 text-xs text-muted-foreground">
-                原始 {displayedVoltageHistory.length}/{voltageHistory.length} · 绘制 {renderedCount} · {receiveRateHz.toFixed(1)} Hz · 端到端 {latestAgeMs === null ? '--' : Math.round(latestAgeMs)} ms · 服务端积压 {Math.round(voltageServerBacklogMs)} ms
+              <div className={cn("mt-1 text-xs text-muted-foreground", voltageIsStale && "text-amber-600 dark:text-amber-400")}>
+                原始 {displayedVoltageHistory.length}/{voltageHistory.length} · 绘制 {renderedCount} · {receiveRateHz.toFixed(1)} Hz · 端到端 {latestAgeMs === null ? '--' : Math.round(latestAgeMs)} ms · 发送前 {Math.round(voltageServerBacklogMs)} ms · ROS 入口 {Math.round(voltageIngressLagMs)} ms · 批次 {Math.round(voltageServerQueueMs)} ms
                 {(voltageSequenceGaps > 0 || voltageUiDropped > 0) && ` · gap ${voltageSequenceGaps} / UI 丢弃 ${voltageUiDropped}`}
+                {voltageStaleDropped > 0 && ` · 追实时丢弃 ${voltageStaleDropped}`}
+                {voltageIsStale && ' · 数据陈旧，正在追赶实时'}
               </div>
             </div>
             <div className="flex flex-wrap items-center gap-2">
@@ -270,6 +284,16 @@ export default function Monitor() {
                 {pausedHistory ? <Play className="mr-2 h-4 w-4" /> : <Pause className="mr-2 h-4 w-4" />}
                 {pausedHistory ? '回到实时' : '暂停视图'}
               </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={handleClearVoltageHistory}
+                disabled={voltageHistory.length === 0 && !pausedHistory?.length}
+                aria-label="清空分光计电压图表及历史数据"
+              >
+                <Trash2 className="mr-2 h-4 w-4" />
+                清空数据
+              </Button>
             </div>
          </CardHeader>
          <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden">
@@ -277,15 +301,10 @@ export default function Monitor() {
          </CardContent>
       </Card>
 
-      <div className="grid min-w-0 grid-cols-1 gap-6 xl:grid-cols-[minmax(0,1fr)_380px]">
-        <div className="min-w-0 space-y-6">
-          <LinkDiagnosticsCard />
-        </div>
-
-        <div className="min-w-0 space-y-6">
-          <InjectionPumpCard />
-          <SystemHealthCard />
-        </div>
+      <div className="min-w-0 space-y-6">
+        <LinkDiagnosticsCard />
+        <InjectionPumpCard />
+        <SystemHealthCard />
       </div>
     </div>
   )

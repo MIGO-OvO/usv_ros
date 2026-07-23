@@ -39,14 +39,14 @@ export function LinkDiagnosticsCard() {
   return (
     <Card className="bg-card/50 backdrop-blur-sm">
       <CardHeader
-        className="flex flex-row items-center justify-between space-y-0 pb-2 cursor-pointer select-none"
+        className="flex flex-col items-start justify-between gap-2 space-y-0 pb-2 cursor-pointer select-none sm:flex-row sm:items-center"
         onClick={() => setExpanded(v => !v)}
       >
         <CardTitle className="text-sm font-medium flex items-center gap-2">
           <Radio className="h-4 w-4" />
           通信链路诊断
         </CardTitle>
-        <div className="flex items-center gap-2">
+        <div className="flex w-full items-center justify-between gap-2 sm:w-auto sm:justify-start">
           <div className={cn(
             "h-2.5 w-2.5 rounded-full",
             mavConnected && routerAlive ? "bg-emerald-500" : (routerAlive ? "bg-yellow-500" : "bg-red-500")
@@ -61,7 +61,7 @@ export function LinkDiagnosticsCard() {
       {expanded && (
         <CardContent className="space-y-3 text-sm">
           {/* MAVROS 状态 */}
-          <div className="grid grid-cols-3 gap-2">
+          <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
             <KV label="模式" value={mavrosState?.mode || '--'} />
             <KV label="解锁" value={mavrosState?.armed ? '是' : '否'} warn={mavrosState?.armed} />
             <KV label="连接" value={mavConnected ? '正常' : '断开'} ok={mavConnected} err={!mavConnected} />
@@ -71,7 +71,7 @@ export function LinkDiagnosticsCard() {
           {bridge ? (
             <div>
               <h4 className="text-xs font-medium text-muted-foreground mb-1">MAVLink 桥接 ({bridge.router_url})</h4>
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
                 <KV label="SysID" value={String(bridge.sysid)} />
                 <KV label="CompID" value={String(bridge.compid)} />
                 <KV label="速率" value={`${bridge.rate_hz}Hz`} />
@@ -110,7 +110,7 @@ export function LinkDiagnosticsCard() {
           {radioStatus && (
             <div>
               <h4 className="text-xs font-medium text-muted-foreground mb-1">数传电台</h4>
-              <div className="grid grid-cols-3 gap-2">
+              <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
                 <RssiBar label="本地 RSSI" value={radioStatus.rssi} noise={radioStatus.noise} />
                 <RssiBar label="远端 RSSI" value={radioStatus.remrssi} noise={radioStatus.remnoise} />
                 <KV label="TX 缓冲" value={`${radioStatus.txbuf}%`} warn={radioStatus.txbuf < 30} err={radioStatus.txbuf < 10} />

@@ -23,6 +23,12 @@ export class RingBuffer<T> {
     }
   }
 
+  clear() {
+    this.items.fill(undefined)
+    this.start = 0
+    this.count = 0
+  }
+
   toArray(_revision?: number): T[] {
     void _revision
     return Array.from({ length: this.count }, (_, index) => this.items[(this.start + index) % this.capacity] as T)

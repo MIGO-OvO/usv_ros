@@ -26,7 +26,7 @@ export function SystemHealthCard() {
   return (
     <Card className="min-w-0 overflow-hidden bg-card/50 backdrop-blur-sm">
       <CardHeader className="pb-2">
-        <CardTitle className="text-sm font-medium flex items-center justify-between gap-2">
+        <CardTitle className="flex flex-wrap items-center justify-between gap-2 text-sm font-medium">
           <span className="flex items-center gap-2">
             <Activity className="h-4 w-4" />
             系统健康
@@ -41,7 +41,7 @@ export function SystemHealthCard() {
         </CardTitle>
       </CardHeader>
       <CardContent className="min-w-0 space-y-4 text-sm">
-        <div className="grid grid-cols-2 gap-3">
+        <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
           <Metric icon={Thermometer} label="Jetson 温度" value={fmt(health?.jetson?.temperature_c, '°C')} />
           <Metric icon={Thermometer} label="ESP32 温度" value={fmt(health?.detector?.temperature_c, '°C')} />
           <Metric icon={Cpu} label="Jetson CPU" value={fmt(health?.jetson?.cpu_percent, '%')} />
