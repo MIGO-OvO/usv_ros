@@ -20,6 +20,17 @@ test('ring buffer stays bounded at the production capacity', () => {
   assert.equal(snapshot[snapshot.length - 1], 29_999)
 })
 
+test('ring buffer clear removes retained items and accepts new samples', () => {
+  const buffer = new RingBuffer<number>(3)
+  buffer.appendBatch([1, 2, 3])
+  buffer.clear()
+  assert.equal(buffer.length, 0)
+  assert.deepEqual(buffer.toArray(), [])
+
+  buffer.appendBatch([4])
+  assert.deepEqual(buffer.toArray(), [4])
+})
+
 test('min/max downsampling retains a short peak and stays within the pixel budget', () => {
   const points = Array.from({ length: 1000 }, (_, index) => ({
     receivedAtMs: index,

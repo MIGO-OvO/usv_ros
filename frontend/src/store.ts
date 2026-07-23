@@ -71,6 +71,8 @@ interface VoltageBatchSample {
   seq: number
   source_timestamp_ms: number
   received_at_ms: number
+  server_received_at_ms?: number
+  ingress_lag_ms?: number
   voltage: number
   absorbance: number | null
   raw_code?: number
@@ -87,6 +89,12 @@ interface VoltageBatchPayload {
   sent_at_ms?: number
   samples: VoltageBatchSample[]
   dropped_for_ui?: number
+  stale_dropped?: number
+}
+
+interface RealtimeHealthPayload {
+  stale_dropped?: number
+  latest_ingress_lag_ms?: number
 }
 
 interface MavrosState {
@@ -233,6 +241,9 @@ interface AppState {
   voltageSequenceGaps: number
   voltageUiDropped: number
   voltageServerBacklogMs: number
+  voltageIngressLagMs: number
+  voltageServerQueueMs: number
+  voltageStaleDropped: number
   injectionPump: InjectionPumpStatus
   logs: LogEntry[]
   mavrosState: MavrosState
@@ -245,6 +256,7 @@ interface AppState {
 
   connect: () => void
   disconnect: () => void
+  clearVoltageHistory: () => void
   refreshInjectionPumpStatus: () => Promise<void>
   setInjectionPumpSpeed: (speed: number) => Promise<{ success: boolean; message: string }>
   turnInjectionPumpOn: (speed?: number) => Promise<{ success: boolean; message: string }>
@@ -308,6 +320,9 @@ export const useAppStore = create<AppState>((set, get) => ({
   voltageSequenceGaps: 0,
   voltageUiDropped: 0,
   voltageServerBacklogMs: 0,
+  voltageIngressLagMs: 0,
+  voltageServerQueueMs: 0,
+  voltageStaleDropped: 0,
   injectionPump: DEFAULT_INJECTION_PUMP_STATUS,
   logs: [],
   mavrosState: { connected: false, armed: false, mode: '' },
@@ -317,6 +332,21 @@ export const useAppStore = create<AppState>((set, get) => ({
   systemHealthHistory: [],
   manualStatus: DEFAULT_MANUAL_STATUS,
   controlEvents: [],
+
+  clearVoltageHistory: () => {
+    set((state) => {
+      state.voltageHistory.clear()
+      return {
+        voltageHistoryRevision: state.voltageHistoryRevision + 1,
+        voltageSequenceGaps: 0,
+        voltageUiDropped: 0,
+        voltageServerBacklogMs: 0,
+        voltageIngressLagMs: 0,
+        voltageServerQueueMs: 0,
+        voltageStaleDropped: 0,
+      }
+    })
+  },
 
   connect: () => {
     if (get().socket) return
@@ -334,7 +364,16 @@ export const useAppStore = create<AppState>((set, get) => ({
       voltageBatchSupported = false
       angleSnapshotSupported = false
       lastVoltageSequence = null
-      set({ connected: true, voltageBatchSupported: false, voltageSequenceGaps: 0, voltageUiDropped: 0, voltageServerBacklogMs: 0 })
+      set({
+        connected: true,
+        voltageBatchSupported: false,
+        voltageSequenceGaps: 0,
+        voltageUiDropped: 0,
+        voltageServerBacklogMs: 0,
+        voltageIngressLagMs: 0,
+        voltageServerQueueMs: 0,
+        voltageStaleDropped: 0,
+      })
       console.log('Socket connected')
     })
 
@@ -351,7 +390,16 @@ export const useAppStore = create<AppState>((set, get) => ({
       }))
     })
 
-    const commitVoltageSamples = (samples: VoltageBatchSample[], droppedForUi = 0, sequenceGap = 0, batch = false, serverBacklogMs = 0) => {
+    const commitVoltageSamples = (
+      samples: VoltageBatchSample[],
+      droppedForUi = 0,
+      sequenceGap = 0,
+      batch = false,
+      serverBacklogMs = 0,
+      ingressLagMs = 0,
+      serverQueueMs = 0,
+      staleDropped = 0,
+    ) => {
       if (samples.length === 0) return
       const points: VoltagePoint[] = samples
         .filter((sample) => sample.valid || typeof sample.raw_code === 'number')
@@ -377,6 +425,9 @@ export const useAppStore = create<AppState>((set, get) => ({
         voltageHistoryRevision: state.voltageHistoryRevision + (points.length > 0 ? 1 : 0),
         voltageUiDropped: droppedForUi,
         voltageServerBacklogMs: serverBacklogMs,
+        voltageIngressLagMs: ingressLagMs,
+        voltageServerQueueMs: serverQueueMs,
+        voltageStaleDropped: staleDropped,
         voltageBatchSupported: batch || state.voltageBatchSupported,
         voltageSequenceGaps: state.voltageSequenceGaps + sequenceGap,
         }
@@ -453,7 +504,30 @@ export const useAppStore = create<AppState>((set, get) => ({
       const backlog = latest && typeof data.sent_at_ms === 'number'
         ? Math.max(0, data.sent_at_ms - latest.received_at_ms)
         : 0
-      commitVoltageSamples(data.samples || [], data.dropped_for_ui || 0, gap, true, backlog)
+      const ingressLag = latest?.ingress_lag_ms
+        ?? (latest?.server_received_at_ms !== undefined
+          ? Math.max(0, latest.server_received_at_ms - latest.received_at_ms)
+          : backlog)
+      const serverQueue = latest?.server_received_at_ms !== undefined && typeof data.sent_at_ms === 'number'
+        ? Math.max(0, data.sent_at_ms - latest.server_received_at_ms)
+        : Math.max(0, backlog - ingressLag)
+      commitVoltageSamples(
+        data.samples || [],
+        data.dropped_for_ui || 0,
+        gap,
+        true,
+        backlog,
+        ingressLag,
+        serverQueue,
+        data.stale_dropped || 0,
+      )
+    })
+
+    socket.on('realtime_health', (data: RealtimeHealthPayload) => {
+      set((state) => ({
+        voltageStaleDropped: data.stale_dropped ?? state.voltageStaleDropped,
+        voltageIngressLagMs: data.latest_ingress_lag_ms ?? state.voltageIngressLagMs,
+      }))
     })
 
     socket.on('spectrometer_status', (status: string) => {

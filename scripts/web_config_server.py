@@ -126,8 +126,10 @@ MAX_LIVE_DATA_POINTS = 500
 MAX_VOLTAGE_HISTORY = 300
 SOCKET_VOLTAGE_EMIT_INTERVAL_S = 0.05
 SOCKET_ANGLE_EMIT_INTERVAL_S = 0.1
+SOCKET_HEALTH_EMIT_INTERVAL_S = 1.0
 MISSION_DATA_POINT_INTERVAL_S = 0.5
 REALTIME_BUFFER_CAPACITY = 512
+MAX_REALTIME_SAMPLE_AGE_MS = 1000
 DEFAULT_SURFACE_SIZE = 50
 MAX_SURFACE_SIZE = 80
 MAX_AUTO_SCAN_WAYPOINTS = 1000
@@ -1925,14 +1927,27 @@ class WebConfigServer(object):
         self._voltage_sequence = 0
         self._angle_sequence = 0
         self._last_voltage_flush_at = time.monotonic()
+        self._last_realtime_health_flush_at = time.monotonic()
         self._last_mission_data_point_at = 0.0
+        self._mission_sample_lock = threading.Lock()
+        self._mission_record_event = threading.Event()
+        self._latest_mission_sample = None
+        self._last_recorded_mission_sequence = None
         self._realtime_stats = {
             "received": 0,
+            "accepted": 0,
             "recorded": 0,
             "record_errors": 0,
             "batched": 0,
             "batches": 0,
             "ui_dropped": 0,
+            "stale_dropped": 0,
+            "latest_ingress_lag_ms": 0,
+            "max_ingress_lag_ms": 0,
+            "mission_recorded": 0,
+            "mission_record_errors": 0,
+            "mission_write_ms": 0,
+            "mission_write_max_ms": 0,
         }
 
         # ROS 订阅 (仅在非独立模式)
@@ -1941,7 +1956,12 @@ class WebConfigServer(object):
             self.angles_sub = rospy.Subscriber('/usv/pump_angles', String, self._angles_cb)
             self.angle_telemetry_sub = rospy.Subscriber('/usv/pump_angle_telemetry', String, self._angle_telemetry_cb)
             self.injection_status_sub = rospy.Subscriber('/usv/injection_pump_status', String, self._injection_status_cb)
-            self.voltage_sub = rospy.Subscriber('/usv/spectrometer_voltage', String, self._voltage_cb)
+            self.voltage_sub = rospy.Subscriber(
+                '/usv/spectrometer_voltage',
+                String,
+                self._voltage_cb,
+                queue_size=1,
+            )
             self.spectrometer_raw_sub = rospy.Subscriber('/usv/spectrometer_raw', String, self._spectrometer_raw_cb)
             self.spectro_status_sub = rospy.Subscriber('/usv/spectrometer_status', String, self._spectro_status_cb)
             self.mission_sub = rospy.Subscriber('/usv/mission_status', String, self._mission_status_cb)
@@ -2062,6 +2082,9 @@ class WebConfigServer(object):
         mission_name = self.config_manager.get().get('mission', {}).get('name', '')
         self.data_manager.start_mission(mission_name)
         self._last_mission_data_point_at = 0.0
+        with self._mission_sample_lock:
+            self._latest_mission_sample = None
+            self._last_recorded_mission_sequence = None
         self.data_recording_source = source
         if self.route_waypoints:
             self.data_manager.set_route_waypoints(self.route_waypoints)
@@ -2073,6 +2096,88 @@ class WebConfigServer(object):
         if self._data_recording_active():
             self.data_manager.stop_mission()
         self.data_recording_source = None
+        with self._mission_sample_lock:
+            self._latest_mission_sample = None
+            self._last_recorded_mission_sequence = None
+
+    def _record_latest_mission_point(self, now=None):
+        """按固定节拍记录最新分光值，避免在 ROS 电压回调中执行文件 I/O。"""
+        if not self.automation_running or not self._data_recording_active():
+            return False
+
+        now = time.monotonic() if now is None else float(now)
+        if now - self._last_mission_data_point_at < MISSION_DATA_POINT_INTERVAL_S:
+            return False
+
+        with self._mission_sample_lock:
+            sample = dict(self._latest_mission_sample or {})
+            last_recorded_sequence = self._last_recorded_mission_sequence
+
+        sequence = sample.get("seq")
+        if not sample or sequence == last_recorded_sequence:
+            return False
+        if sample.get("sample_event_aggregate"):
+            with self._mission_sample_lock:
+                self._last_recorded_mission_sequence = sequence
+            return False
+
+        automation = self.latest_automation_status if isinstance(self.latest_automation_status, dict) else {}
+        position = self.current_position if isinstance(self.current_position, dict) else None
+        started_at = time.perf_counter()
+        try:
+            try:
+                self.data_manager.add_data_point(
+                    sample.get("voltage", 0.0),
+                    sample.get("absorbance", 0.0),
+                    position=position,
+                    waypoint_seq=self.current_waypoint_seq,
+                    step_index=automation.get("step_index", automation.get("current_step")),
+                    loop_index=automation.get("loop_index", automation.get("current_loop")),
+                    sample_id=automation.get("sample_id"),
+                    spectrometer_raw=sample.get("raw_summary", {}),
+                    pollution_metric=self._current_metric_config(),
+                    lab_mode=bool(position.get("lab_mode", False)) if position else False,
+                    system_health=self.latest_system_health,
+                    mission_status=self.mission_status,
+                    route_snapshot_id=self.route_snapshot_id,
+                    route_source=self.route_source,
+                )
+            except TypeError:
+                # Test doubles and older integrations may still expose the legacy two-argument API.
+                self.data_manager.add_data_point(
+                    sample.get("voltage", 0.0),
+                    sample.get("absorbance", 0.0),
+                )
+        except Exception as exc:
+            elapsed_ms = int(round((time.perf_counter() - started_at) * 1000.0))
+            with self._realtime_lock:
+                self._realtime_stats["mission_record_errors"] += 1
+                self._realtime_stats["mission_write_ms"] = elapsed_ms
+                self._realtime_stats["mission_write_max_ms"] = max(
+                    self._realtime_stats["mission_write_max_ms"],
+                    elapsed_ms,
+                )
+            rospy.logwarn("Mission voltage persistence failed: %s", str(exc))
+            return False
+
+        elapsed_ms = int(round((time.perf_counter() - started_at) * 1000.0))
+        self._last_mission_data_point_at = now
+        with self._mission_sample_lock:
+            self._last_recorded_mission_sequence = sequence
+        with self._realtime_lock:
+            self._realtime_stats["mission_recorded"] += 1
+            self._realtime_stats["mission_write_ms"] = elapsed_ms
+            self._realtime_stats["mission_write_max_ms"] = max(
+                self._realtime_stats["mission_write_max_ms"],
+                elapsed_ms,
+            )
+        return True
+
+    def _mission_recording_loop(self):
+        while not rospy.is_shutdown():
+            self._mission_record_event.wait(MISSION_DATA_POINT_INTERVAL_S)
+            self._mission_record_event.clear()
+            self._record_latest_mission_point()
 
     def _save_current_mission_data(self):
         save_current = getattr(self.data_manager, "save_current", None)
@@ -2424,21 +2529,48 @@ class WebConfigServer(object):
             data = json.loads(msg.data)
         except Exception:
             data = {"voltage": 0.0, "raw": msg.data}
+        if not isinstance(data, dict):
+            data = {"voltage": 0.0, "raw": data}
+
+        server_received_at_ms = int(time.time() * 1000)
+        try:
+            source_sequence = int(data.get("seq") or 0)
+        except (TypeError, ValueError):
+            source_sequence = 0
+        self._voltage_sequence = max(self._voltage_sequence + 1, source_sequence)
+        try:
+            received_at_ms = int(data.get("received_at_ms") or server_received_at_ms)
+        except (TypeError, ValueError):
+            received_at_ms = server_received_at_ms
+        if received_at_ms <= 0:
+            received_at_ms = server_received_at_ms
+        ingress_lag_ms = max(0, server_received_at_ms - received_at_ms)
+
+        with self._realtime_lock:
+            self._realtime_stats["received"] += 1
+            self._realtime_stats["latest_ingress_lag_ms"] = ingress_lag_ms
+            self._realtime_stats["max_ingress_lag_ms"] = max(
+                self._realtime_stats["max_ingress_lag_ms"],
+                ingress_lag_ms,
+            )
+            if ingress_lag_ms > MAX_REALTIME_SAMPLE_AGE_MS:
+                self._realtime_stats["stale_dropped"] += 1
+                return
 
         self.current_voltage = float(data.get('voltage', data.get('sample_voltage', 0.0)) or 0.0)
         self.current_absorbance = float(data.get('absorbance', 0.0) or 0.0)
         self.spectrometer_status = str(data.get('status', self.spectrometer_status))
         self.latest_spectrometer_payload = data
         try:
-            source_sequence = int(data.get("seq") or 0)
+            source_timestamp_ms = int(data.get("source_timestamp_ms", data.get("timestamp_ms", 0)) or 0)
         except (TypeError, ValueError):
-            source_sequence = 0
-        self._voltage_sequence = max(self._voltage_sequence + 1, source_sequence)
-        received_at_ms = int(data.get("received_at_ms") or time.time() * 1000)
+            source_timestamp_ms = 0
         realtime_sample = {
             "seq": self._voltage_sequence,
-            "source_timestamp_ms": int(data.get("source_timestamp_ms", data.get("timestamp_ms", 0)) or 0),
+            "source_timestamp_ms": source_timestamp_ms,
             "received_at_ms": received_at_ms,
+            "server_received_at_ms": server_received_at_ms,
+            "ingress_lag_ms": ingress_lag_ms,
             "voltage": self.current_voltage,
             "absorbance": self.current_absorbance,
             "raw_code": data.get("raw_code"),
@@ -2449,7 +2581,7 @@ class WebConfigServer(object):
             "baseline_set": data.get("baseline_set"),
         }
         with self._realtime_lock:
-            self._realtime_stats["received"] += 1
+            self._realtime_stats["accepted"] += 1
             if len(self._voltage_realtime_buffer) >= REALTIME_BUFFER_CAPACITY:
                 self._voltage_realtime_buffer.pop(0)
                 self._realtime_stats["ui_dropped"] += 1
@@ -2457,32 +2589,16 @@ class WebConfigServer(object):
 
         if self.automation_running:
             sample_event_aggregate = bool(data.get("sample_event_id"))
-            automation = self.latest_automation_status if isinstance(self.latest_automation_status, dict) else {}
-            position = self.current_position if isinstance(self.current_position, dict) else None
-            now = time.monotonic()
-            if not sample_event_aggregate and now - self._last_mission_data_point_at >= MISSION_DATA_POINT_INTERVAL_S:
-                self._last_mission_data_point_at = now
-                try:
-                    self.data_manager.add_data_point(
-                        self.current_voltage,
-                        self.current_absorbance,
-                        position=position,
-                        waypoint_seq=self.current_waypoint_seq,
-                        step_index=automation.get("step_index", automation.get("current_step")),
-                        loop_index=automation.get("loop_index", automation.get("current_loop")),
-                        sample_id=automation.get("sample_id"),
-                        spectrometer_raw=self._spectrometer_raw_summary(data),
-                        pollution_metric=self._current_metric_config(),
-                        lab_mode=bool(position.get("lab_mode", False)) if position else False,
-                        system_health=self.latest_system_health,
-                        mission_status=self.mission_status,
-                        route_snapshot_id=self.route_snapshot_id,
-                        route_source=self.route_source,
-                    )
-                except TypeError:
-                    # Test doubles and older integrations may still expose the legacy two-argument API.
-                    self.data_manager.add_data_point(self.current_voltage, self.current_absorbance)
             raw_summary = self._spectrometer_raw_summary(data)
+            with self._mission_sample_lock:
+                self._latest_mission_sample = {
+                    "seq": self._voltage_sequence,
+                    "voltage": self.current_voltage,
+                    "absorbance": self.current_absorbance,
+                    "raw_summary": raw_summary,
+                    "sample_event_aggregate": sample_event_aggregate,
+                }
+            self._mission_record_event.set()
             self.voltage_history.append({
                 "timestamp": datetime.now().isoformat(),
                 "voltage": self.current_voltage,
@@ -5563,6 +5679,11 @@ class WebConfigServer(object):
         with self._realtime_lock:
             snapshot = dict(self._realtime_stats)
             snapshot["queue_depth"] = len(self._voltage_realtime_buffer)
+        with self._mission_sample_lock:
+            snapshot["mission_pending"] = bool(
+                self._latest_mission_sample
+                and self._latest_mission_sample.get("seq") != self._last_recorded_mission_sequence
+            )
         return snapshot
 
     def _flush_realtime(self, force=False):
@@ -5570,11 +5691,14 @@ class WebConfigServer(object):
             return
         now = time.monotonic()
         flush_voltage = force or now - self._last_voltage_flush_at >= SOCKET_VOLTAGE_EMIT_INTERVAL_S
+        flush_health = now - self._last_realtime_health_flush_at >= SOCKET_HEALTH_EMIT_INTERVAL_S
         with self._realtime_lock:
             samples = self._voltage_realtime_buffer if flush_voltage else []
             if flush_voltage:
                 self._voltage_realtime_buffer = []
                 self._last_voltage_flush_at = now
+            if flush_health:
+                self._last_realtime_health_flush_at = now
             angle_snapshot = self._pending_angle_snapshot
             self._pending_angle_snapshot = None
             if samples:
@@ -5591,8 +5715,11 @@ class WebConfigServer(object):
                 "sent_at_ms": int(time.time() * 1000),
                 "samples": samples,
                 "dropped_for_ui": stats["ui_dropped"],
+                "stale_dropped": stats["stale_dropped"],
             }
             self.socketio.emit("voltage_batch", batch)
+
+        if flush_health:
             self.socketio.emit("realtime_health", stats)
 
         if angle_snapshot:
@@ -5649,6 +5776,10 @@ class WebConfigServer(object):
         realtime_thread = threading.Thread(target=self._realtime_flush_loop)
         realtime_thread.daemon = True
         realtime_thread.start()
+
+        mission_recording_thread = threading.Thread(target=self._mission_recording_loop)
+        mission_recording_thread.daemon = True
+        mission_recording_thread.start()
 
         # 启动后自动推送已保存的硬件配置 (延迟执行)
         if not self.standalone:

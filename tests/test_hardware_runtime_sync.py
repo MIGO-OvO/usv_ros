@@ -96,6 +96,7 @@ class RecordingDataManager:
 
 def _install_fake_ros_modules():
     publishers = {}
+    subscribers = []
     mavros_state = types.SimpleNamespace(cleared=0, pushed=[], pulled=0)
 
     class String:
@@ -109,7 +110,12 @@ def _install_fake_ros_modules():
 
     rospy = types.ModuleType("rospy")
     rospy.Publisher = lambda topic, *args, **kwargs: publishers.setdefault(topic, RecordingPublisher(topic))
-    rospy.Subscriber = lambda *args, **kwargs: None
+    def subscriber(*args, **kwargs):
+        handle = types.SimpleNamespace(args=args, kwargs=kwargs)
+        subscribers.append(handle)
+        return handle
+
+    rospy.Subscriber = subscriber
     rospy.Service = lambda *args, **kwargs: None
     def service_proxy(name, *args, **kwargs):
         if name == "/mavros/mission/clear":
@@ -145,6 +151,7 @@ def _install_fake_ros_modules():
     rospy.is_shutdown = lambda: True
     rospy.Rate = lambda hz: types.SimpleNamespace(sleep=lambda: None)
     rospy._mavros_state = mavros_state
+    rospy._subscribers = subscribers
 
     std_msgs = types.ModuleType("std_msgs")
     std_msgs_msg = types.ModuleType("std_msgs.msg")
@@ -754,6 +761,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
 
             server._automation_status_cb(string_cls(json.dumps({"running": True})))
             server._voltage_cb(string_cls(json.dumps({"voltage": 1.2, "absorbance": 0.3})))
+            server._record_latest_mission_point()
 
             server._automation_status_cb(string_cls(json.dumps({"running": False})))
             server._voltage_cb(string_cls(json.dumps({"voltage": 2.4, "absorbance": 0.6})))
@@ -1088,6 +1096,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
                 "reference_voltage": 1.23,
                 "raw_code": 1234,
             })))
+            server._record_latest_mission_point()
 
             point = server.data_manager.current_mission_data["data_points"][-1]
 
@@ -1171,6 +1180,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
                 "valid": True,
                 "baseline_set": True,
             })))
+            server._record_latest_mission_point()
 
             point = server.data_manager.current_mission_data["data_points"][-1]
 
@@ -1371,7 +1381,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(saved["sim"]["sample_dwell_s"], 600.0)
         self.assertEqual(water_resp.get_json()["data"], saved["water_area"])
 
-    def test_web_lab_simulated_voltage_records_lab_mode_and_saves_immediately(self):
+    def test_web_lab_simulated_voltage_records_lab_mode_from_async_writer(self):
         module, _, string_cls = _load_script(
             "web_config_server_lab_voltage_recording_test",
             "scripts/web_config_server.py",
@@ -1398,6 +1408,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
                 "valid": True,
                 "baseline_set": True,
             })))
+            server._record_latest_mission_point()
             persisted = json.loads(mission_file.read_text(encoding="utf-8"))
 
         point = persisted["data_points"][-1]
@@ -2380,11 +2391,12 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
 
         server = module.WebConfigServer(standalone=True)
         server.socketio = RecordingSocket()
+        received_base_ms = int(time.time() * 1000)
         for seq in range(1, 101):
             server._voltage_cb(string_cls(json.dumps({
                 "seq": seq,
                 "timestamp_ms": seq * 50,
-                "received_at_ms": 100000 + seq * 50,
+                "received_at_ms": received_base_ms,
                 "voltage": 5.0 if seq == 50 else 1.0,
                 "absorbance": 0.1,
                 "raw_code": seq,
@@ -2403,7 +2415,59 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(server._realtime_stats_snapshot()["received"], 100)
         self.assertEqual(server._realtime_stats_snapshot()["batched"], 100)
 
-    def test_web_automation_persistence_cannot_block_every_voltage_callback(self):
+    def test_web_voltage_subscription_prefers_latest_sample(self):
+        module, _, _ = _load_script(
+            "web_config_server_voltage_subscription_queue_test",
+            "scripts/web_config_server.py",
+        )
+
+        module.WebConfigServer(standalone=False)
+
+        subscription = next(
+            handle for handle in module.rospy._subscribers
+            if handle.args[0] == "/usv/spectrometer_voltage"
+        )
+        self.assertEqual(subscription.kwargs.get("queue_size"), 1)
+
+    def test_web_stale_voltage_is_dropped_before_realtime_buffer(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_stale_voltage_test",
+            "scripts/web_config_server.py",
+        )
+
+        server = module.WebConfigServer(standalone=True)
+        now_ms = 2_000_000
+        with unittest.mock.patch.object(module.time, "time", return_value=now_ms / 1000.0):
+            server._voltage_cb(string_cls(json.dumps({
+                "seq": 1,
+                "received_at_ms": now_ms - module.MAX_REALTIME_SAMPLE_AGE_MS - 1,
+                "voltage": 99.0,
+                "absorbance": 0.1,
+                "valid": True,
+            })))
+
+        stats = server._realtime_stats_snapshot()
+        self.assertEqual(stats["received"], 1)
+        self.assertEqual(stats["stale_dropped"], 1)
+        self.assertEqual(stats["queue_depth"], 0)
+        self.assertEqual(server.current_voltage, 0.0)
+
+        with unittest.mock.patch.object(module.time, "time", return_value=now_ms / 1000.0):
+            server._voltage_cb(string_cls(json.dumps({
+                "seq": 2,
+                "received_at_ms": now_ms - 50,
+                "voltage": 2.5,
+                "absorbance": 0.2,
+                "valid": True,
+            })))
+
+        stats = server._realtime_stats_snapshot()
+        self.assertEqual(stats["accepted"], 1)
+        self.assertEqual(stats["latest_ingress_lag_ms"], 50)
+        self.assertEqual(stats["queue_depth"], 1)
+        self.assertEqual(server.current_voltage, 2.5)
+
+    def test_web_automation_persistence_runs_outside_voltage_callback(self):
         module, _, string_cls = _load_script(
             "web_config_server_automation_persistence_backpressure_test",
             "scripts/web_config_server.py",
@@ -2420,19 +2484,70 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         server.automation_running = True
 
         started_at = time.perf_counter()
-        for seq in range(20):
-            server._voltage_cb(string_cls(json.dumps({
-                "seq": seq + 1,
-                "received_at_ms": 100000 + seq * 50,
-                "voltage": 1.0,
-                "absorbance": 0.1,
-                "valid": True,
-            })))
+        with unittest.mock.patch.object(
+            module.time,
+            "monotonic",
+            side_effect=[1.0 + seq * module.MISSION_DATA_POINT_INTERVAL_S for seq in range(20)],
+        ):
+            for seq in range(20):
+                server._voltage_cb(string_cls(json.dumps({
+                    "seq": seq + 1,
+                    "received_at_ms": int(time.time() * 1000),
+                    "voltage": 1.0 + seq,
+                    "absorbance": 0.1,
+                    "valid": True,
+                })))
         elapsed = time.perf_counter() - started_at
 
-        self.assertLessEqual(len(server.data_manager.points), 1)
-        self.assertLess(elapsed, 0.15)
+        self.assertEqual(server.data_manager.points, [])
+        self.assertLess(elapsed, 0.05)
         self.assertEqual(server._realtime_stats_snapshot()["received"], 20)
+
+        self.assertTrue(server._record_latest_mission_point())
+        self.assertEqual(server.data_manager.points, [(20.0, 0.1)])
+
+    def test_web_virtual_30_minute_voltage_trace_stays_current(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_long_voltage_trace_test",
+            "scripts/web_config_server.py",
+        )
+
+        server = module.WebConfigServer(standalone=True)
+        server.socketio = RecordingSocket()
+        server.data_manager = RecordingDataManager()
+        server.data_manager.start_mission("")
+        server.automation_running = True
+        wall_time_s = [1_800_000_000.0]
+
+        with unittest.mock.patch.object(module.time, "time", side_effect=lambda: wall_time_s[0]):
+            for seq in range(1, 18_001):
+                elapsed_s = seq / 10.0
+                wall_time_s[0] = 1_800_000_000.0 + elapsed_s
+                server._voltage_cb(string_cls(json.dumps({
+                    "seq": seq,
+                    "received_at_ms": int(wall_time_s[0] * 1000),
+                    "voltage": 1.0 + (seq % 100) / 100.0,
+                    "absorbance": 0.1,
+                    "valid": True,
+                })))
+                if seq % 5 == 0:
+                    self.assertTrue(server._record_latest_mission_point(now=elapsed_s))
+                    server._flush_realtime(force=True)
+
+        batches = [payload for event, payload in server.socketio.events if event == "voltage_batch"]
+        stats = server._realtime_stats_snapshot()
+        self.assertEqual(stats["received"], 18_000)
+        self.assertEqual(stats["accepted"], 18_000)
+        self.assertEqual(stats["stale_dropped"], 0)
+        self.assertEqual(stats["ui_dropped"], 0)
+        self.assertEqual(stats["queue_depth"], 0)
+        self.assertEqual(stats["mission_recorded"], 3_600)
+        self.assertEqual(len(server.data_manager.points), 3_600)
+        self.assertTrue(batches)
+        self.assertLessEqual(max(
+            batch["sent_at_ms"] - batch["samples"][-1]["received_at_ms"]
+            for batch in batches
+        ), 250)
 
     def test_web_angle_socket_events_are_throttled_as_a_group(self):
         module, _, _ = _load_script(

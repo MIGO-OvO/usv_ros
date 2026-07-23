@@ -131,6 +131,14 @@ export function VoltageCanvasChart({ points, onRenderedCount }: {
   return (
     <div ref={hostRef} className="relative h-full w-full" onPointerMove={(event) => handlePointerMove(event.clientX)} onPointerLeave={() => setHover(null)}>
       <canvas ref={canvasRef} role="img" aria-label={`分光计电压时序图，共 ${points.length} 个原始样本`} />
+      {points.length === 0 && (
+        <div className="pointer-events-none absolute inset-0 flex items-center justify-center px-4 text-center" role="status">
+          <div>
+            <div className="text-sm font-medium text-muted-foreground">暂无电压历史数据</div>
+            <div className="mt-1 text-xs text-muted-foreground/80">新数据到达后将自动恢复绘制</div>
+          </div>
+        </div>
+      )}
       {hover && (
         <div className="pointer-events-none absolute right-3 top-3 rounded-md border bg-card/95 px-3 py-2 text-xs shadow-sm">
           <div>{new Date(hover.receivedAtMs).toLocaleTimeString([], { fractionalSecondDigits: 3 })}</div>
