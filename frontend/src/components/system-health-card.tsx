@@ -3,7 +3,6 @@ import { useAppStore } from '@/store'
 import { cn } from '@/lib/utils'
 import { Activity, AlertTriangle, CheckCircle, Cpu, HardDrive, Thermometer } from 'lucide-react'
 import type { LucideIcon } from 'lucide-react'
-import { Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis } from 'recharts'
 
 function fmt(value: number | null | undefined, suffix = '', digits = 1) {
   return typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(digits)}${suffix}` : '--'
@@ -11,17 +10,11 @@ function fmt(value: number | null | undefined, suffix = '', digits = 1) {
 
 export function SystemHealthCard() {
   const health = useAppStore((state) => state.systemHealth)
-  const history = useAppStore((state) => state.systemHealthHistory)
   const level = health?.health?.level || 'unknown'
   const ok = level === 'ok'
   const warn = level === 'warn'
   const nodes = health?.ros_nodes || []
   const aliveNodes = nodes.filter((node) => node.alive).length
-  const trend = history.slice(-120).map((item) => ({
-    time: item.ts ? new Date(item.ts).toLocaleTimeString() : '',
-    jetson: item.jetson?.temperature_c ?? null,
-    detector: item.detector?.temperature_c ?? null,
-  }))
 
   return (
     <Card className="min-w-0 overflow-hidden bg-card/50 backdrop-blur-sm">
@@ -40,7 +33,7 @@ export function SystemHealthCard() {
           </span>
         </CardTitle>
       </CardHeader>
-      <CardContent className="min-w-0 space-y-4 text-sm">
+      <CardContent className="min-w-0 text-sm">
         <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6">
           <Metric icon={Thermometer} label="Jetson 温度" value={fmt(health?.jetson?.temperature_c, '°C')} />
           <Metric icon={Thermometer} label="ESP32 温度" value={fmt(health?.detector?.temperature_c, '°C')} />
@@ -48,24 +41,6 @@ export function SystemHealthCard() {
           <Metric icon={HardDrive} label="Jetson 内存" value={fmt(health?.jetson?.memory_percent, '%')} />
           <Metric icon={HardDrive} label="ESP32 Heap" value={fmt(health?.detector?.heap_percent_free, '%')} />
           <Metric icon={Activity} label="ROS 节点" value={nodes.length ? `${aliveNodes}/${nodes.length}` : '--'} />
-        </div>
-
-        <div className="h-28 min-w-0 overflow-hidden">
-          <ResponsiveContainer width="100%" height="100%">
-            <LineChart data={trend}>
-              <XAxis dataKey="time" hide />
-              <YAxis hide domain={['dataMin - 2', 'dataMax + 2']} />
-              <Tooltip
-                contentStyle={{
-                  backgroundColor: 'hsl(var(--card))',
-                  borderColor: 'hsl(var(--border))',
-                  borderRadius: '8px',
-                }}
-              />
-              <Line type="monotone" dataKey="jetson" name="Jetson" stroke="hsl(var(--chart-1))" strokeWidth={2} dot={false} isAnimationActive={false} />
-              <Line type="monotone" dataKey="detector" name="ESP32" stroke="hsl(var(--chart-2))" strokeWidth={2} dot={false} isAnimationActive={false} />
-            </LineChart>
-          </ResponsiveContainer>
         </div>
       </CardContent>
     </Card>
