@@ -4,7 +4,6 @@ import { Button } from "@/components/ui/button"
 import { useAppStore, type VoltagePoint } from '@/store'
 import { Activity, Zap, Play, Square, Anchor, Navigation, Pause, AlertTriangle, CheckCircle, Loader, Target, Trash2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
-import { InjectionPumpCard } from '@/components/injection-pump-card'
 import { LinkDiagnosticsCard } from '@/components/link-diagnostics-card'
 import { SystemHealthCard } from '@/components/system-health-card'
 import { VoltageCanvasChart } from '@/components/voltage-canvas-chart'
@@ -65,17 +64,12 @@ export default function Monitor() {
   const voltageServerQueueMs = useAppStore((state) => state.voltageServerQueueMs)
   const voltageStaleDropped = useAppStore((state) => state.voltageStaleDropped)
   const clearVoltageHistory = useAppStore((state) => state.clearVoltageHistory)
-  const refreshInjectionPumpStatus = useAppStore((state) => state.refreshInjectionPumpStatus)
 
   const [spectroSubmitting, setSpectroSubmitting] = useState<'start' | 'stop' | 'baseline' | null>(null)
   const [timeWindowMs, setTimeWindowMs] = useState(600_000)
   const [pausedHistory, setPausedHistory] = useState<VoltagePoint[] | null>(null)
   const [renderedCount, setRenderedCount] = useState(0)
   const [, setClock] = useState(0)
-
-  useEffect(() => {
-    refreshInjectionPumpStatus().catch(() => {})
-  }, [refreshInjectionPumpStatus])
 
   useEffect(() => {
     const timer = setInterval(() => setClock(Date.now()), 1000)
@@ -303,7 +297,6 @@ export default function Monitor() {
 
       <div className="min-w-0 space-y-6">
         <LinkDiagnosticsCard />
-        <InjectionPumpCard />
         <SystemHealthCard />
       </div>
     </div>

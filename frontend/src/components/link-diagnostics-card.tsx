@@ -16,11 +16,11 @@ export function LinkDiagnosticsCard() {
   const bridgeDiag = useAppStore((state) => state.bridgeDiag)
   const radioStatus = useAppStore((state) => state.radioStatus)
   const connected = useAppStore((state) => state.connected)
-  const [expanded, setExpanded] = useState(false)
+  const [expanded, setExpanded] = useState(true)
   const [fullDiag, setFullDiag] = useState<LinkDiagData | null>(null)
 
   useEffect(() => {
-    if (!connected || !expanded) return
+    if (!connected) return
     const load = () => {
       fetch('/api/diagnostics/link')
         .then(r => r.json())
@@ -30,11 +30,18 @@ export function LinkDiagnosticsCard() {
     load()
     const t = setInterval(load, 5000)
     return () => clearInterval(t)
-  }, [connected, expanded])
+  }, [connected])
 
   const bridge = bridgeDiag
   const mavConnected = mavrosState?.connected ?? false
-  const routerAlive = fullDiag?.nodes?.find(n => n.name === 'mavlink-routerd')?.alive ?? false
+  const routerAlive = fullDiag?.nodes?.find(n => n.name === 'mavlink-routerd')?.alive
+  const linkStatus = routerAlive === undefined
+    ? { color: 'bg-muted-foreground', label: '检测中' }
+    : mavConnected && routerAlive
+      ? { color: 'bg-emerald-500', label: '链路正常' }
+      : routerAlive
+        ? { color: 'bg-yellow-500', label: 'MAVROS 断开' }
+        : { color: 'bg-red-500', label: 'Router 离线' }
 
   return (
     <Card className="bg-card/50 backdrop-blur-sm">
@@ -49,10 +56,10 @@ export function LinkDiagnosticsCard() {
         <div className="flex w-full items-center justify-between gap-2 sm:w-auto sm:justify-start">
           <div className={cn(
             "h-2.5 w-2.5 rounded-full",
-            mavConnected && routerAlive ? "bg-emerald-500" : (routerAlive ? "bg-yellow-500" : "bg-red-500")
+            linkStatus.color
           )} />
           <span className="text-xs text-muted-foreground">
-            {mavConnected && routerAlive ? "链路正常" : (routerAlive ? "MAVROS 断开" : "Router 离线")}
+            {linkStatus.label}
           </span>
           {expanded ? <ChevronDown className="h-4 w-4 text-muted-foreground" /> : <ChevronRight className="h-4 w-4 text-muted-foreground" />}
         </div>
