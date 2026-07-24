@@ -15,6 +15,7 @@ export function SystemHealthCard() {
   const warn = level === 'warn'
   const nodes = health?.ros_nodes || []
   const aliveNodes = nodes.filter((node) => node.alive).length
+  const spectrometer = health?.detector?.spectrometer
 
   return (
     <Card className="min-w-0 overflow-hidden bg-card/50 backdrop-blur-sm">
@@ -41,6 +42,9 @@ export function SystemHealthCard() {
           <Metric icon={HardDrive} label="Jetson 内存" value={fmt(health?.jetson?.memory_percent, '%')} />
           <Metric icon={HardDrive} label="ESP32 Heap" value={fmt(health?.detector?.heap_percent_free, '%')} />
           <Metric icon={Activity} label="ROS 节点" value={nodes.length ? `${aliveNodes}/${nodes.length}` : '--'} />
+          <Metric icon={Activity} label="ADS CRC" value={fmt(spectrometer?.crc_error, '', 0)} />
+          <Metric icon={Activity} label="ADS 重复" value={fmt(spectrometer?.duplicate, '', 0)} />
+          <Metric icon={Activity} label="ADS 瞬态丢弃" value={fmt(spectrometer?.transient_drop, '', 0)} />
         </div>
       </CardContent>
     </Card>

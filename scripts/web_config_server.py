@@ -130,6 +130,7 @@ SOCKET_HEALTH_EMIT_INTERVAL_S = 1.0
 MISSION_DATA_POINT_INTERVAL_S = 0.5
 REALTIME_BUFFER_CAPACITY = 512
 MAX_REALTIME_SAMPLE_AGE_MS = 1000
+REALTIME_INPUT_DROP_THRESHOLD_V = 0.020
 DEFAULT_SURFACE_SIZE = 50
 MAX_SURFACE_SIZE = 80
 MAX_AUTO_SCAN_WAYPOINTS = 1000
@@ -1923,6 +1924,7 @@ class WebConfigServer(object):
         self.voltage_history_max = MAX_VOLTAGE_HISTORY
         self._realtime_lock = threading.Lock()
         self._voltage_realtime_buffer = []
+        self._last_realtime_voltage = None
         self._pending_angle_snapshot = None
         self._voltage_sequence = 0
         self._angle_sequence = 0
@@ -1942,6 +1944,8 @@ class WebConfigServer(object):
             "batches": 0,
             "ui_dropped": 0,
             "stale_dropped": 0,
+            "input_drop_20mv": 0,
+            "non_detector_samples": 0,
             "latest_ingress_lag_ms": 0,
             "max_ingress_lag_ms": 0,
             "mission_recorded": 0,
@@ -2561,6 +2565,22 @@ class WebConfigServer(object):
         self.current_absorbance = float(data.get('absorbance', 0.0) or 0.0)
         self.spectrometer_status = str(data.get('status', self.spectrometer_status))
         self.latest_spectrometer_payload = data
+        raw_code = data.get("raw_code")
+        is_detector_sample = (
+            isinstance(raw_code, (int, float))
+            and not isinstance(raw_code, bool)
+        )
+        with self._realtime_lock:
+            if is_detector_sample:
+                if (
+                    self._last_realtime_voltage is not None
+                    and self._last_realtime_voltage - self.current_voltage
+                    > REALTIME_INPUT_DROP_THRESHOLD_V
+                ):
+                    self._realtime_stats["input_drop_20mv"] += 1
+                self._last_realtime_voltage = self.current_voltage
+            else:
+                self._realtime_stats["non_detector_samples"] += 1
         try:
             source_timestamp_ms = int(data.get("source_timestamp_ms", data.get("timestamp_ms", 0)) or 0)
         except (TypeError, ValueError):
@@ -2573,7 +2593,7 @@ class WebConfigServer(object):
             "ingress_lag_ms": ingress_lag_ms,
             "voltage": self.current_voltage,
             "absorbance": self.current_absorbance,
-            "raw_code": data.get("raw_code"),
+            "raw_code": raw_code,
             "valid": bool(data.get("valid", False)),
             "status": self.spectrometer_status,
             "reference_voltage": data.get("reference_voltage"),

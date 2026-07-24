@@ -1609,7 +1609,11 @@ class PumpControlNode(object):
 
     def _on_health_received(self, data):
         """检测装置健康数据回调。"""
-        payload = dict(data)
+        # Binary health and the following ADS_HEALTH text line are emitted in
+        # one firmware health cycle. Preserve the ADS counters when the next
+        # binary packet refreshes temperature/heap fields.
+        payload = dict(self.latest_detector_health or {})
+        payload.update(data)
         payload["received_at"] = time.time()
         if self.detector_angle_age_ms is not None:
             payload["angle_age_ms"] = self.detector_angle_age_ms

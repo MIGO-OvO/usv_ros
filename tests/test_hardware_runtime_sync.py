@@ -4,6 +4,7 @@ import importlib.util
 import json
 import math
 import os
+import re
 import sys
 import tempfile
 import time
@@ -364,6 +365,23 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(
             detector_health["spectrometer"]["transient_drop"],
             5,
+        )
+
+        node._on_health_received({
+            "temperature_c": 42.0,
+            "heap_free": 120000,
+            "heap_total": 320000,
+        })
+        self.assertEqual(
+            node.latest_detector_health["spectrometer"],
+            {
+                "success": 100,
+                "mutex_timeout": 2,
+                "i2c_error": 1,
+                "crc_error": 3,
+                "duplicate": 4,
+                "transient_drop": 5,
+            },
         )
 
     def test_web_angle_telemetry_emits_staleness_without_polluting_raw_angles(self):
@@ -2436,6 +2454,34 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(server._realtime_stats_snapshot()["received"], 100)
         self.assertEqual(server._realtime_stats_snapshot()["batched"], 100)
 
+    def test_web_realtime_diagnostics_count_input_drops_and_non_detector_sources(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_realtime_input_quality_test",
+            "scripts/web_config_server.py",
+        )
+
+        server = module.WebConfigServer(standalone=True)
+        received_at_ms = int(time.time() * 1000)
+        for seq, voltage in enumerate((0.923, 0.922, 0.890, 0.891, 0.923), start=1):
+            server._voltage_cb(string_cls(json.dumps({
+                "seq": seq,
+                "received_at_ms": received_at_ms,
+                "voltage": voltage,
+                "raw_code": 100000 + seq,
+                "valid": True,
+            })))
+        server._voltage_cb(string_cls(json.dumps({
+            "seq": 6,
+            "received_at_ms": received_at_ms,
+            "voltage": 0.923,
+            "valid": True,
+            "simulated": True,
+        })))
+
+        stats = server._realtime_stats_snapshot()
+        self.assertEqual(stats["input_drop_20mv"], 1)
+        self.assertEqual(stats["non_detector_samples"], 1)
+
     def test_web_voltage_subscription_prefers_latest_sample(self):
         module, _, _ = _load_script(
             "web_config_server_voltage_subscription_queue_test",
@@ -3348,6 +3394,35 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertNotIn("angleTelemetryCommitter", store_text)
         self.assertIn("VoltageCanvasChart", monitor_text)
         self.assertIn("timeWindowMs", monitor_text)
+
+    def test_frontend_system_health_displays_ads_integrity_counters(self):
+        store_text = (REPO_ROOT / "frontend" / "src" / "store.ts").read_text(encoding="utf-8")
+        card_text = (
+            REPO_ROOT / "frontend" / "src" / "components" / "system-health-card.tsx"
+        ).read_text(encoding="utf-8")
+        monitor_text = (REPO_ROOT / "frontend" / "src" / "pages" / "Monitor.tsx").read_text(encoding="utf-8")
+
+        self.assertIn("spectrometer?:", store_text)
+        self.assertIn("crc_error?:", store_text)
+        self.assertIn('label="ADS CRC"', card_text)
+        self.assertIn('label="ADS 重复"', card_text)
+        self.assertIn('label="ADS 瞬态丢弃"', card_text)
+        self.assertIn("voltageInputDrop20mv", monitor_text)
+        self.assertIn("voltageNonDetectorSamples", monitor_text)
+
+    def test_built_monitor_bundle_contains_ads_integrity_diagnostics(self):
+        index_text = (
+            REPO_ROOT / "static" / "dist" / "index.html"
+        ).read_text(encoding="utf-8")
+        match = re.search(r'src="/assets/([^"]+\.js)"', index_text)
+        self.assertIsNotNone(match)
+        bundle_text = (
+            REPO_ROOT / "static" / "dist" / "assets" / match.group(1)
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("ADS CRC", bundle_text)
+        self.assertIn("input_drop_20mv", bundle_text)
+        self.assertIn("non_detector_samples", bundle_text)
 
     def test_frontend_injection_on_passes_current_speed_input(self):
         card_text = (REPO_ROOT / "frontend" / "src" / "components" / "injection-pump-card.tsx").read_text(encoding="utf-8")
