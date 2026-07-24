@@ -78,6 +78,11 @@ class SystemHealthNodeTests(unittest.TestCase):
             "heap_free": 120000,
             "heap_total": 320000,
             "task_stack_hwm": {"loop": 2048, "comms": 4096, "sensors": 1024},
+            "spectrometer": {
+                "crc_error": 1,
+                "duplicate": 2,
+                "transient_drop": 3,
+            },
         })))
 
         snapshot = collector.collect()
@@ -87,6 +92,9 @@ class SystemHealthNodeTests(unittest.TestCase):
         self.assertTrue(snapshot["detector"]["online"])
         self.assertEqual(snapshot["detector"]["temperature_c"], 43.2)
         self.assertEqual(snapshot["detector"]["heap_percent_free"], 37.5)
+        self.assertEqual(snapshot["detector"]["spectrometer"]["crc_error"], 1)
+        self.assertEqual(snapshot["detector"]["spectrometer"]["duplicate"], 2)
+        self.assertEqual(snapshot["detector"]["spectrometer"]["transient_drop"], 3)
         self.assertEqual(snapshot["ros_nodes"][2]["name"], "/mavlink_trigger_node")
         self.assertFalse(snapshot["ros_nodes"][2]["alive"])
         self.assertEqual(snapshot["health"]["code"], 1)

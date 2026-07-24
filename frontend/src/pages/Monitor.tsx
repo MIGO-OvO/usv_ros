@@ -63,6 +63,8 @@ export default function Monitor() {
   const voltageIngressLagMs = useAppStore((state) => state.voltageIngressLagMs)
   const voltageServerQueueMs = useAppStore((state) => state.voltageServerQueueMs)
   const voltageStaleDropped = useAppStore((state) => state.voltageStaleDropped)
+  const voltageInputDrop20mv = useAppStore((state) => state.voltageInputDrop20mv)
+  const voltageNonDetectorSamples = useAppStore((state) => state.voltageNonDetectorSamples)
   const clearVoltageHistory = useAppStore((state) => state.clearVoltageHistory)
 
   const [spectroSubmitting, setSpectroSubmitting] = useState<'start' | 'stop' | 'baseline' | null>(null)
@@ -267,6 +269,8 @@ export default function Monitor() {
                 原始 {displayedVoltageHistory.length}/{voltageHistory.length} · 绘制 {renderedCount} · {receiveRateHz.toFixed(1)} Hz · 端到端 {latestAgeMs === null ? '--' : Math.round(latestAgeMs)} ms · 发送前 {Math.round(voltageServerBacklogMs)} ms · ROS 入口 {Math.round(voltageIngressLagMs)} ms · 批次 {Math.round(voltageServerQueueMs)} ms
                 {(voltageSequenceGaps > 0 || voltageUiDropped > 0) && ` · gap ${voltageSequenceGaps} / UI 丢弃 ${voltageUiDropped}`}
                 {voltageStaleDropped > 0 && ` · 追实时丢弃 ${voltageStaleDropped}`}
+                {` · ROS 入站下冲>20mV ${voltageInputDrop20mv}`}
+                {voltageNonDetectorSamples > 0 && ` · 非检测器源 ${voltageNonDetectorSamples}`}
                 {voltageIsStale && ' · 数据陈旧，正在追赶实时'}
               </div>
             </div>

@@ -95,6 +95,8 @@ interface VoltageBatchPayload {
 interface RealtimeHealthPayload {
   stale_dropped?: number
   latest_ingress_lag_ms?: number
+  input_drop_20mv?: number
+  non_detector_samples?: number
 }
 
 interface MavrosState {
@@ -146,6 +148,14 @@ interface SystemHealth {
     uptime_s?: number | null
     task_count?: number | null
     task_stack_hwm?: Record<string, number>
+    spectrometer?: {
+      success?: number | null
+      mutex_timeout?: number | null
+      i2c_error?: number | null
+      crc_error?: number | null
+      duplicate?: number | null
+      transient_drop?: number | null
+    }
   }
   ros_nodes?: { name: string; alive: boolean }[]
   health?: {
@@ -244,6 +254,8 @@ interface AppState {
   voltageIngressLagMs: number
   voltageServerQueueMs: number
   voltageStaleDropped: number
+  voltageInputDrop20mv: number
+  voltageNonDetectorSamples: number
   injectionPump: InjectionPumpStatus
   logs: LogEntry[]
   mavrosState: MavrosState
@@ -323,6 +335,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   voltageIngressLagMs: 0,
   voltageServerQueueMs: 0,
   voltageStaleDropped: 0,
+  voltageInputDrop20mv: 0,
+  voltageNonDetectorSamples: 0,
   injectionPump: DEFAULT_INJECTION_PUMP_STATUS,
   logs: [],
   mavrosState: { connected: false, armed: false, mode: '' },
@@ -344,6 +358,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         voltageIngressLagMs: 0,
         voltageServerQueueMs: 0,
         voltageStaleDropped: 0,
+        voltageInputDrop20mv: 0,
+        voltageNonDetectorSamples: 0,
       }
     })
   },
@@ -527,6 +543,8 @@ export const useAppStore = create<AppState>((set, get) => ({
       set((state) => ({
         voltageStaleDropped: data.stale_dropped ?? state.voltageStaleDropped,
         voltageIngressLagMs: data.latest_ingress_lag_ms ?? state.voltageIngressLagMs,
+        voltageInputDrop20mv: data.input_drop_20mv ?? state.voltageInputDrop20mv,
+        voltageNonDetectorSamples: data.non_detector_samples ?? state.voltageNonDetectorSamples,
       }))
     })
 
