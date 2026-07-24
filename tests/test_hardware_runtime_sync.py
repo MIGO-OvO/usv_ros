@@ -336,14 +336,35 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(node.latest_detector_health["angle_age_ms"], 2500)
 
         node._on_text_received("ANGLE_AGE_CH_MS:10,20,30,40")
-        node._on_text_received("ADS_HEALTH:SUCCESS=100,MUTEX_TIMEOUT=2,I2C_ERROR=1")
+        node._on_text_received(
+            "ADS_HEALTH:SUCCESS=100,MUTEX_TIMEOUT=2,I2C_ERROR=1,"
+            "CRC_ERROR=3,DUPLICATE=4,TRANSIENT_DROP=5"
+        )
 
         self.assertEqual(node.detector_angle_channel_age_ms, {"X": 10, "Y": 20, "Z": 30, "A": 40})
         self.assertEqual(node.latest_detector_health["spectrometer"], {
             "success": 100,
             "mutex_timeout": 2,
             "i2c_error": 1,
+            "crc_error": 3,
+            "duplicate": 4,
+            "transient_drop": 5,
         })
+        detector_health = json.loads(
+            publishers["/usv/detector_health"].messages[-1].data
+        )
+        self.assertEqual(
+            detector_health["spectrometer"]["crc_error"],
+            3,
+        )
+        self.assertEqual(
+            detector_health["spectrometer"]["duplicate"],
+            4,
+        )
+        self.assertEqual(
+            detector_health["spectrometer"]["transient_drop"],
+            5,
+        )
 
     def test_web_angle_telemetry_emits_staleness_without_polluting_raw_angles(self):
         module, _, string_cls = _load_script(
