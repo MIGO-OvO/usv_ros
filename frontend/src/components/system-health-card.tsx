@@ -8,7 +8,21 @@ function fmt(value: number | null | undefined, suffix = '', digits = 1) {
   return typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(digits)}${suffix}` : '--'
 }
 
-export function SystemHealthCard() {
+export interface VoltageDiagnostics {
+  latestAgeMs: number | null
+  serverBacklogMs: number
+  ingressLagMs: number
+  serverQueueMs: number
+  sequenceGaps: number
+  uiDropped: number
+  staleDropped: number
+  inputDrop20mv: number
+  nonDetectorSamples: number
+}
+
+export function SystemHealthCard({ voltageDiagnostics }: {
+  voltageDiagnostics?: VoltageDiagnostics
+}) {
   const health = useAppStore((state) => state.systemHealth)
   const level = health?.health?.level || 'unknown'
   const ok = level === 'ok'
@@ -46,6 +60,21 @@ export function SystemHealthCard() {
           <Metric icon={Activity} label="ADS 重复" value={fmt(spectrometer?.duplicate, '', 0)} />
           <Metric icon={Activity} label="ADS 瞬态丢弃" value={fmt(spectrometer?.transient_drop, '', 0)} />
         </div>
+        {voltageDiagnostics && (
+          <div className="mt-3 border-t pt-3">
+            <div className="mb-2 text-xs font-medium text-muted-foreground">分光链路</div>
+            <div className="grid grid-cols-2 gap-x-4 gap-y-2 sm:grid-cols-4 lg:grid-cols-8">
+              <DiagnosticMetric label="端到端" value={fmt(voltageDiagnostics.latestAgeMs, ' ms', 0)} />
+              <DiagnosticMetric label="发送前" value={fmt(voltageDiagnostics.serverBacklogMs, ' ms', 0)} />
+              <DiagnosticMetric label="ROS 入口" value={fmt(voltageDiagnostics.ingressLagMs, ' ms', 0)} />
+              <DiagnosticMetric label="批次" value={fmt(voltageDiagnostics.serverQueueMs, ' ms', 0)} />
+              <DiagnosticMetric label="Gap / UI 丢弃" value={`${voltageDiagnostics.sequenceGaps} / ${voltageDiagnostics.uiDropped}`} />
+              <DiagnosticMetric label="追实时丢弃" value={`${voltageDiagnostics.staleDropped}`} />
+              <DiagnosticMetric label="下冲 >20mV" value={`${voltageDiagnostics.inputDrop20mv}`} />
+              <DiagnosticMetric label="非检测器源" value={`${voltageDiagnostics.nonDetectorSamples}`} />
+            </div>
+          </div>
+        )}
       </CardContent>
     </Card>
   )
@@ -63,6 +92,15 @@ function Metric({ icon: Icon, label, value }: {
         {label}
       </span>
       <span className="font-medium tabular-nums">{value}</span>
+    </div>
+  )
+}
+
+function DiagnosticMetric({ label, value }: { label: string; value: string }) {
+  return (
+    <div className="min-w-0">
+      <div className="truncate text-[11px] text-muted-foreground">{label}</div>
+      <div className="font-mono text-xs font-medium tabular-nums">{value}</div>
     </div>
   )
 }

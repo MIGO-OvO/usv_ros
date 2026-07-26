@@ -262,19 +262,9 @@ export default function Monitor() {
       </div>
 
       <Card className="flex h-[440px] min-w-0 flex-col overflow-hidden lg:h-[500px]">
-         <CardHeader className="flex flex-col gap-3 pb-2 lg:flex-row lg:items-center lg:justify-between">
-            <div>
-              <CardTitle className="text-base">分光计电压</CardTitle>
-              <div className={cn("mt-1 text-xs text-muted-foreground", voltageIsStale && "text-amber-600 dark:text-amber-400")}>
-                原始 {displayedVoltageHistory.length}/{voltageHistory.length} · 绘制 {renderedCount} · {receiveRateHz.toFixed(1)} Hz · 端到端 {latestAgeMs === null ? '--' : Math.round(latestAgeMs)} ms · 发送前 {Math.round(voltageServerBacklogMs)} ms · ROS 入口 {Math.round(voltageIngressLagMs)} ms · 批次 {Math.round(voltageServerQueueMs)} ms
-                {(voltageSequenceGaps > 0 || voltageUiDropped > 0) && ` · gap ${voltageSequenceGaps} / UI 丢弃 ${voltageUiDropped}`}
-                {voltageStaleDropped > 0 && ` · 追实时丢弃 ${voltageStaleDropped}`}
-                {` · ROS 入站下冲>20mV ${voltageInputDrop20mv}`}
-                {voltageNonDetectorSamples > 0 && ` · 非检测器源 ${voltageNonDetectorSamples}`}
-                {voltageIsStale && ' · 数据陈旧，正在追赶实时'}
-              </div>
-            </div>
-            <div className="flex flex-wrap items-center gap-2">
+         <CardHeader className="grid min-w-0 gap-2 pb-2 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
+            <CardTitle className="text-base">分光计电压</CardTitle>
+            <div className="flex min-w-0 flex-wrap items-center gap-2 lg:justify-end">
               {TIME_WINDOWS.map((window) => (
                 <Button key={window.label} size="sm" variant={timeWindowMs === window.value ? 'secondary' : 'ghost'} onClick={() => setTimeWindowMs(window.value)}>{window.label}</Button>
               ))}
@@ -293,6 +283,12 @@ export default function Monitor() {
                 清空数据
               </Button>
             </div>
+            <div className={cn("flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs leading-relaxed text-muted-foreground lg:col-span-2", voltageIsStale && "text-amber-600 dark:text-amber-400")}>
+              <span>原始 {displayedVoltageHistory.length}/{voltageHistory.length}</span>
+              <span>绘制 {renderedCount}</span>
+              <span>{receiveRateHz.toFixed(1)} Hz</span>
+              {voltageIsStale && <span>数据陈旧，正在追赶实时</span>}
+            </div>
          </CardHeader>
          <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden">
             <VoltageCanvasChart points={displayedVoltageHistory} onRenderedCount={handleRenderedCount} />
@@ -301,7 +297,19 @@ export default function Monitor() {
 
       <div className="min-w-0 space-y-6">
         <LinkDiagnosticsCard />
-        <SystemHealthCard />
+        <SystemHealthCard
+          voltageDiagnostics={{
+            latestAgeMs,
+            serverBacklogMs: voltageServerBacklogMs,
+            ingressLagMs: voltageIngressLagMs,
+            serverQueueMs: voltageServerQueueMs,
+            sequenceGaps: voltageSequenceGaps,
+            uiDropped: voltageUiDropped,
+            staleDropped: voltageStaleDropped,
+            inputDrop20mv: voltageInputDrop20mv,
+            nonDetectorSamples: voltageNonDetectorSamples,
+          }}
+        />
       </div>
     </div>
   )
