@@ -2,6 +2,7 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { RingBuffer } from '../src/lib/time-series/ring-buffer.ts'
 import { minMaxDownsample } from '../src/lib/time-series/min-max-downsample.ts'
+import { buildVoltageHistoryCsv, voltageHistoryFilename } from '../src/lib/voltage-history-csv.ts'
 
 test('ring buffer keeps the newest items in order', () => {
   const buffer = new RingBuffer<number>(3)
@@ -53,4 +54,36 @@ test('one hundred thousand samples stay within a 1000px canvas budget', () => {
   const sampled = minMaxDownsample(points, 1000)
   assert.ok(sampled.length <= 2002)
   assert.ok(sampled.some((point) => point.voltage === 12))
+})
+
+test('voltage history CSV exports complete raw samples with an Excel-compatible BOM', () => {
+  const csv = buildVoltageHistoryCsv([
+    {
+      seq: 42,
+      sourceTimestampMs: 1_750_000_000_000,
+      receivedAtMs: 1_750_000_000_125,
+      voltage: 2.345,
+      absorbance: 0.1234,
+      rawCode: 123456,
+      valid: true,
+    },
+    {
+      seq: 43,
+      sourceTimestampMs: 0,
+      receivedAtMs: 1_750_000_000_225,
+      voltage: 2.346,
+      absorbance: null,
+      valid: false,
+    },
+  ])
+
+  assert.ok(csv.startsWith('\uFEFFreceived_time_iso,received_time_ms,source_time_iso'))
+  assert.match(csv, /,42,2\.345,0\.1234,123456,true\r\n/)
+  assert.match(csv, /,,43,2\.346,,,false\r\n$/)
+  assert.equal(csv.split('\r\n').filter(Boolean).length, 3)
+})
+
+test('voltage history filename uses a sortable local timestamp', () => {
+  const exportedAt = new Date(2026, 6, 26, 14, 5, 9)
+  assert.equal(voltageHistoryFilename(exportedAt), 'spectrometer-voltage-history_2026-07-26_14-05-09.csv')
 })

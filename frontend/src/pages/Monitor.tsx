@@ -2,11 +2,13 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { useAppStore, type VoltagePoint } from '@/store'
-import { Activity, Zap, Play, Square, Anchor, Navigation, Pause, AlertTriangle, CheckCircle, Loader, Target, Trash2 } from 'lucide-react'
+import { Activity, Zap, Play, Square, Anchor, Navigation, Pause, AlertTriangle, CheckCircle, Download, Loader, Target, Trash2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { LinkDiagnosticsCard } from '@/components/link-diagnostics-card'
 import { SystemHealthCard } from '@/components/system-health-card'
 import { VoltageCanvasChart } from '@/components/voltage-canvas-chart'
+import { toast } from '@/hooks/use-toast'
+import { buildVoltageHistoryCsv, voltageHistoryFilename } from '@/lib/voltage-history-csv'
 
 const MISSION_STATUS_MAP: Record<string, { label: string; color: string; icon: typeof Play }> = {
   IDLE:             { label: '空闲',       color: 'text-muted-foreground', icon: Square },
@@ -121,6 +123,23 @@ export default function Monitor() {
     setPausedHistory(null)
     setRenderedCount(0)
   }, [clearVoltageHistory])
+  const handleExportVoltageHistory = useCallback(() => {
+    if (liveHistory.length === 0) return
+    const blob = new Blob([buildVoltageHistoryCsv(liveHistory)], { type: 'text/csv;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = voltageHistoryFilename()
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    URL.revokeObjectURL(url)
+    toast({
+      title: '电压历史已导出',
+      description: `共 ${liveHistory.length.toLocaleString()} 条原始样本`,
+      variant: 'success',
+    })
+  }, [liveHistory])
 
   const spectroStatusLabels: Record<string, string> = {
     configured: '已配置，未采集',
@@ -271,6 +290,16 @@ export default function Monitor() {
               <Button size="sm" variant="outline" onClick={() => setPausedHistory(pausedHistory ? null : liveHistory)}>
                 {pausedHistory ? <Play className="mr-2 h-4 w-4" /> : <Pause className="mr-2 h-4 w-4" />}
                 {pausedHistory ? '回到实时' : '暂停视图'}
+              </Button>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={handleExportVoltageHistory}
+                disabled={liveHistory.length === 0}
+                aria-label="导出全部分光计电压历史数据为 CSV"
+              >
+                <Download className="mr-2 h-4 w-4" />
+                导出 CSV
               </Button>
               <Button
                 size="sm"
