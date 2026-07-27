@@ -3,6 +3,12 @@ import test from 'node:test'
 import { RingBuffer } from '../src/lib/time-series/ring-buffer.ts'
 import { minMaxDownsample } from '../src/lib/time-series/min-max-downsample.ts'
 import { buildVoltageHistoryCsv, voltageHistoryFilename } from '../src/lib/voltage-history-csv.ts'
+import {
+  analyzeSpikeTest,
+  buildSpikeTestSummaryCsv,
+  createSpikeTestSession,
+  finishSpikeTestSession,
+} from '../src/lib/spectro-spike-test.ts'
 
 test('ring buffer keeps the newest items in order', () => {
   const buffer = new RingBuffer<number>(3)
@@ -86,4 +92,93 @@ test('voltage history CSV exports complete raw samples with an Excel-compatible 
 test('voltage history filename uses a sortable local timestamp', () => {
   const exportedAt = new Date(2026, 6, 26, 14, 5, 9)
   assert.equal(voltageHistoryFilename(exportedAt), 'spectrometer-voltage-history_2026-07-26_14-05-09.csv')
+})
+
+test('spike test counts session drops and ADS counter deltas', () => {
+  const started = createSpikeTestSession(1000, {
+    crcError: 1,
+    duplicate: 10,
+    transientDrop: 2,
+  })
+  const points = [
+    [1000, 1.000],
+    [1050, 0.994],
+    [1100, 1.000],
+    [1150, 0.989],
+    [1200, 1.000],
+    [1250, 0.979],
+    [1300, 1.000],
+  ].map(([receivedAtMs, voltage], index) => ({
+    seq: index + 1,
+    sourceTimestampMs: receivedAtMs,
+    receivedAtMs,
+    voltage,
+    absorbance: null,
+    valid: true,
+  }))
+  const session = finishSpikeTestSession(started, 1350, {
+    crcError: 1,
+    duplicate: 13,
+    transientDrop: 4,
+  })
+
+  const summary = analyzeSpikeTest(points, session, {
+    crcError: 99,
+    duplicate: 99,
+    transientDrop: 99,
+  }, 9999)
+
+  assert.equal(summary.active, false)
+  assert.equal(summary.durationS, 0.35)
+  assert.equal(summary.sampleCount, 7)
+  assert.equal(summary.receiveRateHz, 20)
+  assert.equal(summary.dropCount5mv, 3)
+  assert.equal(summary.dropCount10mv, 2)
+  assert.equal(summary.dropCount20mv, 1)
+  assert.ok(Math.abs(summary.maxDownMv - 21) < 1e-9)
+  assert.equal(summary.adsCrcErrorDelta, 0)
+  assert.equal(summary.adsDuplicateDelta, 3)
+  assert.equal(summary.adsTransientDropDelta, 2)
+  assert.equal(summary.counterResetDetected, false)
+})
+
+test('spike test ignores invalid samples and marks counter reset', () => {
+  const session = createSpikeTestSession(2000, {
+    crcError: 3,
+    duplicate: 20,
+    transientDrop: 8,
+  })
+  const summary = analyzeSpikeTest([
+    { seq: 1, sourceTimestampMs: 2000, receivedAtMs: 2000, voltage: 1.0, absorbance: null, valid: true },
+    { seq: 2, sourceTimestampMs: 2050, receivedAtMs: 2050, voltage: 0.0, absorbance: null, valid: false },
+    { seq: 3, sourceTimestampMs: 2100, receivedAtMs: 2100, voltage: Number.NaN, absorbance: null, valid: true },
+    { seq: 4, sourceTimestampMs: 2150, receivedAtMs: 2150, voltage: 0.995, absorbance: null, valid: true },
+  ], session, {
+    crcError: 0,
+    duplicate: 2,
+    transientDrop: 1,
+  }, 2200)
+
+  assert.equal(summary.sampleCount, 2)
+  assert.equal(summary.dropCount5mv, 0)
+  assert.equal(summary.adsCrcErrorDelta, null)
+  assert.equal(summary.adsDuplicateDelta, null)
+  assert.equal(summary.adsTransientDropDelta, null)
+  assert.equal(summary.counterResetDetected, true)
+})
+
+test('spike test summary CSV uses cross-platform columns', () => {
+  const session = finishSpikeTestSession(
+    createSpikeTestSession(1000, { crcError: 0 }),
+    1100,
+    { crcError: 0 },
+  )
+  const summary = analyzeSpikeTest([
+    { seq: 1, sourceTimestampMs: 1000, receivedAtMs: 1000, voltage: 1.0, absorbance: null, valid: true },
+  ], session, { crcError: 99 }, 9999)
+  const csv = buildSpikeTestSummaryCsv(summary, 'ros-test', 'ros_web')
+
+  assert.ok(csv.startsWith('\uFEFFsession_id,transport_path,started_at_ms'))
+  assert.match(csv, /ros-test,ros_web,1000,1100,0\.1,1,/)
+  assert.match(csv, /ads_transient_drop_delta/)
 })

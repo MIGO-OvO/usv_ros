@@ -6,9 +6,19 @@ import { Activity, Zap, Play, Square, Anchor, Navigation, Pause, AlertTriangle, 
 import { cn } from '@/lib/utils'
 import { LinkDiagnosticsCard } from '@/components/link-diagnostics-card'
 import { SystemHealthCard } from '@/components/system-health-card'
+import { SpectroSpikeTestCard } from '@/components/spectro-spike-test-card'
 import { VoltageCanvasChart } from '@/components/voltage-canvas-chart'
 import { toast } from '@/hooks/use-toast'
 import { buildVoltageHistoryCsv, voltageHistoryFilename } from '@/lib/voltage-history-csv'
+import {
+  analyzeSpikeTest,
+  buildSpikeTestSummaryCsv,
+  createSpikeTestSession,
+  finishSpikeTestSession,
+  spikeTestSummaryFilename,
+  type SpikeTestCounters,
+  type SpikeTestSession,
+} from '@/lib/spectro-spike-test'
 
 const MISSION_STATUS_MAP: Record<string, { label: string; color: string; icon: typeof Play }> = {
   IDLE:             { label: '空闲',       color: 'text-muted-foreground', icon: Square },
@@ -67,13 +77,16 @@ export default function Monitor() {
   const voltageStaleDropped = useAppStore((state) => state.voltageStaleDropped)
   const voltageInputDrop20mv = useAppStore((state) => state.voltageInputDrop20mv)
   const voltageNonDetectorSamples = useAppStore((state) => state.voltageNonDetectorSamples)
+  const systemHealth = useAppStore((state) => state.systemHealth)
   const clearVoltageHistory = useAppStore((state) => state.clearVoltageHistory)
 
   const [spectroSubmitting, setSpectroSubmitting] = useState<'start' | 'stop' | 'baseline' | null>(null)
   const [timeWindowMs, setTimeWindowMs] = useState(600_000)
   const [pausedHistory, setPausedHistory] = useState<VoltagePoint[] | null>(null)
   const [renderedCount, setRenderedCount] = useState(0)
-  const [, setClock] = useState(0)
+  const [clock, setClock] = useState(Date.now())
+  const [spikeTestSession, setSpikeTestSession] = useState<SpikeTestSession | null>(null)
+  const [spikeTestSessionId, setSpikeTestSessionId] = useState('')
 
   useEffect(() => {
     const timer = setInterval(() => setClock(Date.now()), 1000)
@@ -122,6 +135,8 @@ export default function Monitor() {
     clearVoltageHistory()
     setPausedHistory(null)
     setRenderedCount(0)
+    setSpikeTestSession(null)
+    setSpikeTestSessionId('')
   }, [clearVoltageHistory])
   const handleExportVoltageHistory = useCallback(() => {
     if (liveHistory.length === 0) return
@@ -140,6 +155,73 @@ export default function Monitor() {
       variant: 'success',
     })
   }, [liveHistory])
+
+  const spectrometerHealth = systemHealth?.detector?.spectrometer
+  const spikeTestCounters: SpikeTestCounters = useMemo(() => ({
+    crcError: spectrometerHealth?.crc_error,
+    duplicate: spectrometerHealth?.duplicate,
+    transientDrop: spectrometerHealth?.transient_drop,
+  }), [
+    spectrometerHealth?.crc_error,
+    spectrometerHealth?.duplicate,
+    spectrometerHealth?.transient_drop,
+  ])
+  const spikeTestSummary = useMemo(() => (
+    spikeTestSession
+      ? analyzeSpikeTest(liveHistory, spikeTestSession, spikeTestCounters, clock)
+      : null
+  ), [clock, liveHistory, spikeTestCounters, spikeTestSession])
+
+  const handleStartSpikeTest = useCallback(() => {
+    const startedAtMs = Date.now()
+    clearVoltageHistory()
+    setPausedHistory(null)
+    setRenderedCount(0)
+    setSpikeTestSession(createSpikeTestSession(startedAtMs, spikeTestCounters))
+    setSpikeTestSessionId(`ros_${startedAtMs}`)
+    toast({
+      title: '毛刺测试已开始',
+      description: '图表和会话统计已归零，分光采集不会被停止。',
+      variant: 'success',
+    })
+  }, [clearVoltageHistory, spikeTestCounters])
+
+  const handleStopSpikeTest = useCallback(() => {
+    setSpikeTestSession((session) => (
+      session?.endedAtMs === null
+        ? finishSpikeTestSession(session, Date.now(), spikeTestCounters)
+        : session
+    ))
+    toast({
+      title: '毛刺测试已结束',
+      description: '结果已冻结，可继续采集或导出本次汇总。',
+      variant: 'success',
+    })
+  }, [spikeTestCounters])
+
+  const handleExportSpikeTest = useCallback(() => {
+    if (!spikeTestSummary || spikeTestSummary.active || spikeTestSummary.sampleCount === 0) return
+    const blob = new Blob([
+      buildSpikeTestSummaryCsv(
+        spikeTestSummary,
+        spikeTestSessionId || `ros_${spikeTestSummary.startedAtMs}`,
+        'ros_web',
+      ),
+    ], { type: 'text/csv;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const anchor = document.createElement('a')
+    anchor.href = url
+    anchor.download = spikeTestSummaryFilename()
+    document.body.appendChild(anchor)
+    anchor.click()
+    anchor.remove()
+    URL.revokeObjectURL(url)
+    toast({
+      title: '毛刺测试结果已导出',
+      description: '汇总字段与 Windows 上位机一致；原始样本可使用图表上方的“导出 CSV”。',
+      variant: 'success',
+    })
+  }, [spikeTestSessionId, spikeTestSummary])
 
   const spectroStatusLabels: Record<string, string> = {
     configured: '已配置，未采集',
@@ -325,6 +407,13 @@ export default function Monitor() {
       </Card>
 
       <div className="min-w-0 space-y-6">
+        <SpectroSpikeTestCard
+          summary={spikeTestSummary}
+          canStart={connected}
+          onStart={handleStartSpikeTest}
+          onStop={handleStopSpikeTest}
+          onExport={handleExportSpikeTest}
+        />
         <LinkDiagnosticsCard />
         <SystemHealthCard
           voltageDiagnostics={{

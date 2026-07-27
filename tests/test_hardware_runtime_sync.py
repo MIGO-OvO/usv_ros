@@ -3424,6 +3424,34 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertIn("input_drop_20mv", bundle_text)
         self.assertIn("non_detector_samples", bundle_text)
 
+    def test_frontend_and_built_bundle_include_session_scoped_spike_test(self):
+        monitor_text = (
+            REPO_ROOT / "frontend" / "src" / "pages" / "Monitor.tsx"
+        ).read_text(encoding="utf-8")
+        card_text = (
+            REPO_ROOT
+            / "frontend"
+            / "src"
+            / "components"
+            / "spectro-spike-test-card.tsx"
+        ).read_text(encoding="utf-8")
+        index_text = (
+            REPO_ROOT / "static" / "dist" / "index.html"
+        ).read_text(encoding="utf-8")
+        match = re.search(r'src="/assets/([^"]+\.js)"', index_text)
+        self.assertIsNotNone(match)
+        bundle_text = (
+            REPO_ROOT / "static" / "dist" / "assets" / match.group(1)
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("createSpikeTestSession", monitor_text)
+        self.assertIn("finishSpikeTestSession", monitor_text)
+        self.assertIn("毛刺测试", card_text)
+        self.assertIn("下冲 >5mV", card_text)
+        self.assertIn("ADS 瞬态 Δ", card_text)
+        self.assertIn("毛刺测试", bundle_text)
+        self.assertIn("drop_count_5mv", bundle_text)
+
     def test_frontend_injection_on_passes_current_speed_input(self):
         card_text = (REPO_ROOT / "frontend" / "src" / "components" / "injection-pump-card.tsx").read_text(encoding="utf-8")
         self.assertIn("turnInjectionPumpOn(speed)", card_text)
