@@ -3446,11 +3446,17 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
 
         self.assertIn("createSpikeTestSession", monitor_text)
         self.assertIn("finishSpikeTestSession", monitor_text)
+        self.assertIn("clock < spikeTestSession.deadlineMs", monitor_text)
+        self.assertIn("finishSpikeTestSession(session, session.deadlineMs", monitor_text)
         self.assertIn("毛刺测试", card_text)
+        self.assertIn("毛刺测试时长", card_text)
+        self.assertIn("SPIKE_TEST_DURATION_OPTIONS_S", card_text)
         self.assertIn("下冲 >5mV", card_text)
         self.assertIn("ADS 瞬态 Δ", card_text)
         self.assertIn("毛刺测试", bundle_text)
+        self.assertIn("测试时长", bundle_text)
         self.assertIn("drop_count_5mv", bundle_text)
+        self.assertIn("target_duration_s", bundle_text)
 
     def test_frontend_injection_on_passes_current_speed_input(self):
         card_text = (REPO_ROOT / "frontend" / "src" / "components" / "injection-pump-card.tsx").read_text(encoding="utf-8")

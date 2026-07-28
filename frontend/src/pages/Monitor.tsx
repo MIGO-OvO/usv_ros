@@ -11,6 +11,7 @@ import { VoltageCanvasChart } from '@/components/voltage-canvas-chart'
 import { toast } from '@/hooks/use-toast'
 import { buildVoltageHistoryCsv, voltageHistoryFilename } from '@/lib/voltage-history-csv'
 import {
+  DEFAULT_SPIKE_TEST_DURATION_S,
   analyzeSpikeTest,
   buildSpikeTestSummaryCsv,
   createSpikeTestSession,
@@ -87,6 +88,7 @@ export default function Monitor() {
   const [clock, setClock] = useState(Date.now())
   const [spikeTestSession, setSpikeTestSession] = useState<SpikeTestSession | null>(null)
   const [spikeTestSessionId, setSpikeTestSessionId] = useState('')
+  const [spikeTestDurationS, setSpikeTestDurationS] = useState(DEFAULT_SPIKE_TEST_DURATION_S)
 
   useEffect(() => {
     const timer = setInterval(() => setClock(Date.now()), 1000)
@@ -172,19 +174,43 @@ export default function Monitor() {
       : null
   ), [clock, liveHistory, spikeTestCounters, spikeTestSession])
 
+  useEffect(() => {
+    if (
+      !spikeTestSession
+      || spikeTestSession.endedAtMs !== null
+      || clock < spikeTestSession.deadlineMs
+    ) {
+      return
+    }
+    setSpikeTestSession((session) => (
+      session?.endedAtMs === null
+        ? finishSpikeTestSession(session, session.deadlineMs, spikeTestCounters)
+        : session
+    ))
+    toast({
+      title: '毛刺测试已自动完成',
+      description: `已达到设定的 ${spikeTestSession.targetDurationS} 秒，结果已冻结。`,
+      variant: 'success',
+    })
+  }, [clock, spikeTestCounters, spikeTestSession])
+
   const handleStartSpikeTest = useCallback(() => {
     const startedAtMs = Date.now()
     clearVoltageHistory()
     setPausedHistory(null)
     setRenderedCount(0)
-    setSpikeTestSession(createSpikeTestSession(startedAtMs, spikeTestCounters))
+    setSpikeTestSession(createSpikeTestSession(
+      startedAtMs,
+      spikeTestCounters,
+      spikeTestDurationS,
+    ))
     setSpikeTestSessionId(`ros_${startedAtMs}`)
     toast({
       title: '毛刺测试已开始',
-      description: '图表和会话统计已归零，分光采集不会被停止。',
+      description: `图表和会话统计已归零，将在 ${spikeTestDurationS} 秒后自动结束。`,
       variant: 'success',
     })
-  }, [clearVoltageHistory, spikeTestCounters])
+  }, [clearVoltageHistory, spikeTestCounters, spikeTestDurationS])
 
   const handleStopSpikeTest = useCallback(() => {
     setSpikeTestSession((session) => (
@@ -410,6 +436,8 @@ export default function Monitor() {
         <SpectroSpikeTestCard
           summary={spikeTestSummary}
           canStart={connected}
+          durationS={spikeTestDurationS}
+          onDurationChange={setSpikeTestDurationS}
           onStart={handleStartSpikeTest}
           onStop={handleStopSpikeTest}
           onExport={handleExportSpikeTest}

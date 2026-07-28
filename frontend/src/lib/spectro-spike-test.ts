@@ -13,6 +13,8 @@ export interface SpikeTestPoint {
 export interface SpikeTestSession {
   readonly startedAtMs: number
   readonly endedAtMs: number | null
+  readonly targetDurationS: number
+  readonly deadlineMs: number
   readonly baselineCounters: SpikeTestCounters
   readonly finalCounters: SpikeTestCounters | null
 }
@@ -22,6 +24,8 @@ export interface SpikeTestSummary {
   readonly startedAtMs: number
   readonly endedAtMs: number | null
   readonly durationS: number
+  readonly targetDurationS: number
+  readonly remainingS: number
   readonly sampleCount: number
   readonly receiveRateHz: number | null
   readonly dropCount5mv: number
@@ -36,6 +40,8 @@ export interface SpikeTestSummary {
 
 const DROP_THRESHOLDS_V = [0.005, 0.010, 0.020] as const
 const VOLTAGE_EPSILON_V = 1e-12
+export const SPIKE_TEST_DURATION_OPTIONS_S = [30, 120, 300, 600] as const
+export const DEFAULT_SPIKE_TEST_DURATION_S = 600
 
 const SUMMARY_COLUMNS = [
   'session_id',
@@ -43,6 +49,7 @@ const SUMMARY_COLUMNS = [
   'started_at_ms',
   'ended_at_ms',
   'duration_s',
+  'target_duration_s',
   'sample_count',
   'receive_rate_hz',
   'drop_count_5mv',
@@ -58,10 +65,17 @@ const SUMMARY_COLUMNS = [
 export function createSpikeTestSession(
   startedAtMs: number,
   counters: SpikeTestCounters = {},
+  targetDurationS = DEFAULT_SPIKE_TEST_DURATION_S,
 ): SpikeTestSession {
+  const normalizedDurationS = Math.trunc(targetDurationS)
+  if (!Number.isFinite(normalizedDurationS) || normalizedDurationS <= 0) {
+    throw new Error('targetDurationS must be positive')
+  }
   return {
     startedAtMs,
     endedAtMs: null,
+    targetDurationS: normalizedDurationS,
+    deadlineMs: startedAtMs + normalizedDurationS * 1000,
     baselineCounters: normalizeCounters(counters),
     finalCounters: null,
   }
@@ -74,7 +88,10 @@ export function finishSpikeTestSession(
 ): SpikeTestSession {
   return {
     ...session,
-    endedAtMs: Math.max(session.startedAtMs, endedAtMs),
+    endedAtMs: Math.min(
+      session.deadlineMs,
+      Math.max(session.startedAtMs, endedAtMs),
+    ),
     finalCounters: normalizeCounters(counters),
   }
 }
@@ -85,7 +102,10 @@ export function analyzeSpikeTest(
   currentCounters: SpikeTestCounters,
   nowMs = Date.now(),
 ): SpikeTestSummary {
-  const effectiveEndMs = session.endedAtMs ?? Math.max(session.startedAtMs, nowMs)
+  const effectiveEndMs = session.endedAtMs ?? Math.min(
+    session.deadlineMs,
+    Math.max(session.startedAtMs, nowMs),
+  )
   const samples = points.filter((point) => (
     point.valid
     && Number.isFinite(point.receivedAtMs)
@@ -124,6 +144,10 @@ export function analyzeSpikeTest(
     startedAtMs: session.startedAtMs,
     endedAtMs: session.endedAtMs,
     durationS: Math.max(0, effectiveEndMs - session.startedAtMs) / 1000,
+    targetDurationS: session.targetDurationS,
+    remainingS: session.endedAtMs === null
+      ? Math.max(0, session.deadlineMs - effectiveEndMs) / 1000
+      : 0,
     sampleCount: samples.length,
     receiveRateHz,
     dropCount5mv: dropCounts[0],
@@ -148,6 +172,7 @@ export function buildSpikeTestSummaryCsv(
     started_at_ms: summary.startedAtMs,
     ended_at_ms: summary.endedAtMs,
     duration_s: summary.durationS,
+    target_duration_s: summary.targetDurationS,
     sample_count: summary.sampleCount,
     receive_rate_hz: summary.receiveRateHz,
     drop_count_5mv: summary.dropCount5mv,
