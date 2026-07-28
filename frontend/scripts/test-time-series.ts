@@ -169,7 +169,7 @@ test('spike test ignores invalid samples and marks counter reset', () => {
 
 test('spike test summary CSV uses cross-platform columns', () => {
   const session = finishSpikeTestSession(
-    createSpikeTestSession(1000, { crcError: 0 }),
+    createSpikeTestSession(1000, { crcError: 0 }, 30),
     1100,
     { crcError: 0 },
   )
@@ -179,6 +179,30 @@ test('spike test summary CSV uses cross-platform columns', () => {
   const csv = buildSpikeTestSummaryCsv(summary, 'ros-test', 'ros_web')
 
   assert.ok(csv.startsWith('\uFEFFsession_id,transport_path,started_at_ms'))
-  assert.match(csv, /ros-test,ros_web,1000,1100,0\.1,1,/)
+  assert.match(csv, /ros-test,ros_web,1000,1100,0\.1,30,1,/)
+  assert.match(csv, /target_duration_s/)
   assert.match(csv, /ads_transient_drop_delta/)
+})
+
+test('spike test uses a fixed deadline and ignores late samples', () => {
+  const started = createSpikeTestSession(1000, { crcError: 0 }, 30)
+  assert.equal(started.targetDurationS, 30)
+  assert.equal(started.deadlineMs, 31000)
+
+  const points = [
+    { seq: 1, sourceTimestampMs: 1000, receivedAtMs: 1000, voltage: 1.000, absorbance: null, valid: true },
+    { seq: 2, sourceTimestampMs: 30999, receivedAtMs: 30999, voltage: 0.990, absorbance: null, valid: true },
+    { seq: 3, sourceTimestampMs: 31001, receivedAtMs: 31001, voltage: 0.900, absorbance: null, valid: true },
+  ]
+  const running = analyzeSpikeTest(points, started, { crcError: 0 }, 16000)
+  assert.equal(running.targetDurationS, 30)
+  assert.equal(running.remainingS, 15)
+  assert.equal(running.sampleCount, 1)
+
+  const completedSession = finishSpikeTestSession(started, 32000, { crcError: 0 })
+  assert.equal(completedSession.endedAtMs, 31000)
+  const completed = analyzeSpikeTest(points, completedSession, { crcError: 0 }, 99999)
+  assert.equal(completed.durationS, 30)
+  assert.equal(completed.remainingS, 0)
+  assert.equal(completed.sampleCount, 2)
 })
