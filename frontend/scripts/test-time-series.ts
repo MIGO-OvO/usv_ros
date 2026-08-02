@@ -4,6 +4,13 @@ import { RingBuffer } from '../src/lib/time-series/ring-buffer.ts'
 import { minMaxDownsample } from '../src/lib/time-series/min-max-downsample.ts'
 import { buildVoltageHistoryCsv, voltageHistoryFilename } from '../src/lib/voltage-history-csv.ts'
 import {
+  BASELINE_AVERAGING_MS,
+  BASELINE_STABILIZATION_MS,
+  calculateAbsorbance,
+  createBaselineAcquisitionSession,
+  summarizeBaselineAcquisition,
+} from '../src/lib/spectrometer-baseline.ts'
+import {
   analyzeSpikeTest,
   buildSpikeTestSummaryCsv,
   createSpikeTestSession,
@@ -182,6 +189,67 @@ test('spike test summary CSV uses cross-platform columns', () => {
   assert.match(csv, /ros-test,ros_web,1000,1100,0\.1,30,1,/)
   assert.match(csv, /target_duration_s/)
   assert.match(csv, /ads_transient_drop_delta/)
+})
+
+test('baseline acquisition waits five minutes and averages only the following minute', () => {
+  const session = createBaselineAcquisitionSession(1_000)
+  assert.equal(session.averagingStartedAtMs, 1_000 + BASELINE_STABILIZATION_MS)
+  assert.equal(session.endsAtMs, 1_000 + BASELINE_STABILIZATION_MS + BASELINE_AVERAGING_MS)
+
+  const points = [
+    { receivedAtMs: session.averagingStartedAtMs - 1, voltage: 99, valid: true },
+    { receivedAtMs: session.averagingStartedAtMs, voltage: 1, valid: true },
+    { receivedAtMs: session.averagingStartedAtMs + 10_000, voltage: 100, valid: false },
+    { receivedAtMs: session.averagingStartedAtMs + 30_000, voltage: 3, valid: true },
+    { receivedAtMs: session.endsAtMs, voltage: 5, valid: true },
+    { receivedAtMs: session.endsAtMs + 1, voltage: 101, valid: true },
+  ]
+
+  const stabilizing = summarizeBaselineAcquisition(points, session, session.averagingStartedAtMs - 1)
+  assert.equal(stabilizing.phase, 'stabilizing')
+  assert.equal(stabilizing.validSampleCount, 0)
+  assert.equal(stabilizing.averageVoltage, null)
+
+  const averaging = summarizeBaselineAcquisition(points, session, session.averagingStartedAtMs + 30_000)
+  assert.equal(averaging.phase, 'averaging')
+  assert.equal(averaging.validSampleCount, 2)
+  assert.equal(averaging.averageVoltage, 2)
+
+  const complete = summarizeBaselineAcquisition(points, session, session.endsAtMs + 1_000)
+  assert.equal(complete.phase, 'complete')
+  assert.equal(complete.validSampleCount, 3)
+  assert.equal(complete.averageVoltage, 3)
+  assert.equal(complete.remainingMs, 0)
+  assert.equal(complete.progressPercent, 100)
+})
+
+test('CSV recalculates absorbance from the active reference and baseline offset', () => {
+  const reference = { referenceVoltage: 2, baselineVoltage: 0.2 }
+  assert.equal(calculateAbsorbance(1.1, reference), 0.30103)
+
+  const csv = buildVoltageHistoryCsv([
+    {
+      seq: 1,
+      sourceTimestampMs: 1_000,
+      receivedAtMs: 1_100,
+      voltage: 1.1,
+      absorbance: 9.9,
+      rawCode: 10,
+      valid: true,
+    },
+    {
+      seq: 2,
+      sourceTimestampMs: 2_000,
+      receivedAtMs: 2_100,
+      voltage: 1.5,
+      absorbance: 8.8,
+      rawCode: 11,
+      valid: false,
+    },
+  ], reference)
+
+  assert.match(csv, /,1,1\.1,0\.30103,10,true\r\n/)
+  assert.match(csv, /,2,1\.5,,11,false\r\n$/)
 })
 
 test('spike test uses a fixed deadline and ignores late samples', () => {

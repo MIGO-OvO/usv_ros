@@ -1,3 +1,5 @@
+import { calculateAbsorbance, type AbsorbanceReference } from './spectrometer-baseline.ts'
+
 export interface VoltageHistoryCsvPoint {
   readonly seq: number
   readonly sourceTimestampMs: number
@@ -25,7 +27,10 @@ function isoTimestamp(timestampMs: number): string {
   return new Date(timestampMs).toISOString()
 }
 
-export function buildVoltageHistoryCsv(points: readonly VoltageHistoryCsvPoint[]): string {
+export function buildVoltageHistoryCsv(
+  points: readonly VoltageHistoryCsvPoint[],
+  absorbanceReference?: AbsorbanceReference,
+): string {
   const rows = points.map((point) => [
     isoTimestamp(point.receivedAtMs),
     point.receivedAtMs,
@@ -33,7 +38,9 @@ export function buildVoltageHistoryCsv(points: readonly VoltageHistoryCsvPoint[]
     point.sourceTimestampMs > 0 ? point.sourceTimestampMs : '',
     point.seq,
     point.voltage,
-    point.absorbance ?? '',
+    absorbanceReference
+      ? point.valid ? calculateAbsorbance(point.voltage, absorbanceReference) ?? '' : ''
+      : point.absorbance ?? '',
     point.rawCode ?? '',
     point.valid,
   ].join(','))

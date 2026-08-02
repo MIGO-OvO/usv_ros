@@ -1,12 +1,13 @@
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { useAppStore, type VoltagePoint } from '@/store'
-import { Activity, Zap, Play, Square, Anchor, Navigation, Pause, AlertTriangle, CheckCircle, Download, Loader, Target, Trash2 } from 'lucide-react'
+import { Activity, Zap, Play, Square, Anchor, Navigation, Pause, AlertTriangle, CheckCircle, Download, Loader, Trash2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { LinkDiagnosticsCard } from '@/components/link-diagnostics-card'
 import { SystemHealthCard } from '@/components/system-health-card'
 import { SpectroSpikeTestCard } from '@/components/spectro-spike-test-card'
+import { SpectrometerBaselineCard } from '@/components/spectrometer-baseline-card'
 import { VoltageCanvasChart } from '@/components/voltage-canvas-chart'
 import { toast } from '@/hooks/use-toast'
 import { buildVoltageHistoryCsv, voltageHistoryFilename } from '@/lib/voltage-history-csv'
@@ -20,6 +21,11 @@ import {
   type SpikeTestCounters,
   type SpikeTestSession,
 } from '@/lib/spectro-spike-test'
+import {
+  createBaselineAcquisitionSession,
+  summarizeBaselineAcquisition,
+  type BaselineAcquisitionSession,
+} from '@/lib/spectrometer-baseline'
 
 const MISSION_STATUS_MAP: Record<string, { label: string; color: string; icon: typeof Play }> = {
   IDLE:             { label: '空闲',       color: 'text-muted-foreground', icon: Square },
@@ -57,6 +63,32 @@ const TIME_WINDOWS = [
 
 const VOLTAGE_STALE_AFTER_MS = 2000
 
+interface SpectrometerApiResponse {
+  readonly success?: boolean
+  readonly message?: string
+  readonly reference_voltage?: number
+}
+
+async function postSpectrometerCommand(
+  url: string,
+  payload?: Record<string, unknown>,
+): Promise<SpectrometerApiResponse> {
+  const response = await fetch(url, {
+    method: 'POST',
+    ...(payload
+      ? {
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        }
+      : {}),
+  })
+  const data = await response.json().catch(() => ({})) as SpectrometerApiResponse
+  if (!response.ok || data.success === false) {
+    throw new Error(data.message || `请求失败 (${response.status})`)
+  }
+  return data
+}
+
 export default function Monitor() {
   const connected = useAppStore((state) => state.connected)
   const pumpConnected = useAppStore((state) => state.pumpConnected)
@@ -66,6 +98,7 @@ export default function Monitor() {
   const currentVoltage = useAppStore((state) => state.currentVoltage)
   const currentAbsorbance = useAppStore((state) => state.currentAbsorbance)
   const currentReferenceVoltage = useAppStore((state) => state.currentReferenceVoltage)
+  const currentBaselineVoltage = useAppStore((state) => state.currentBaselineVoltage)
   const spectrometerBaselineSet = useAppStore((state) => state.spectrometerBaselineSet)
   const spectrometerStatus = useAppStore((state) => state.spectrometerStatus)
   const voltageHistory = useAppStore((state) => state.voltageHistory)
@@ -89,6 +122,9 @@ export default function Monitor() {
   const [spikeTestSession, setSpikeTestSession] = useState<SpikeTestSession | null>(null)
   const [spikeTestSessionId, setSpikeTestSessionId] = useState('')
   const [spikeTestDurationS, setSpikeTestDurationS] = useState(DEFAULT_SPIKE_TEST_DURATION_S)
+  const [baselineSession, setBaselineSession] = useState<BaselineAcquisitionSession | null>(null)
+  const [baselineSaving, setBaselineSaving] = useState(false)
+  const baselineFinalizingRef = useRef(false)
 
   useEffect(() => {
     const timer = setInterval(() => setClock(Date.now()), 1000)
@@ -99,22 +135,26 @@ export default function Monitor() {
     setSpectroSubmitting(action)
     try {
       const url = action === 'start' ? '/api/spectrometer/start' : '/api/spectrometer/stop'
-      await fetch(url, { method: 'POST' })
-    } finally {
-      setSpectroSubmitting(null)
-    }
-  }
-
-  const handleSetSpectrometerBaseline = async () => {
-    setSpectroSubmitting('baseline')
-    try {
-      await fetch('/api/spectrometer/baseline', { method: 'POST' })
+      await postSpectrometerCommand(url)
+    } catch (error) {
+      toast({
+        title: action === 'start' ? '分光启动失败' : '分光停止失败',
+        description: error instanceof Error ? error.message : '未知错误',
+        variant: 'destructive',
+      })
     } finally {
       setSpectroSubmitting(null)
     }
   }
 
   const liveHistory = useMemo(() => voltageHistory.toArray(voltageHistoryRevision), [voltageHistory, voltageHistoryRevision])
+  const baselineSummary = useMemo(() => (
+    baselineSession
+      ? summarizeBaselineAcquisition(liveHistory, baselineSession, clock)
+      : null
+  ), [baselineSession, clock, liveHistory])
+  const baselineActive = baselineSession !== null || baselineSaving
+  const spikeTestActive = spikeTestSession?.endedAtMs === null
   const displayedVoltageHistory = useMemo(() => {
     const points = pausedHistory ?? liveHistory
     if (timeWindowMs === 0 || points.length === 0) return points
@@ -132,6 +172,98 @@ export default function Monitor() {
     const elapsed = recent[recent.length - 1].receivedAtMs - recent[0].receivedAtMs
     return elapsed > 0 ? (recent.length - 1) * 1000 / elapsed : 0
   }, [displayedVoltageHistory])
+
+  const handleStartBaselineAcquisition = useCallback(async () => {
+    if (baselineActive || spikeTestActive) return
+    setSpectroSubmitting('baseline')
+    try {
+      await postSpectrometerCommand('/api/spectrometer/start')
+      const startedAtMs = Date.now()
+      baselineFinalizingRef.current = false
+      setClock(startedAtMs)
+      setBaselineSession(createBaselineAcquisitionSession(startedAtMs))
+      setTimeWindowMs(600_000)
+      toast({
+        title: '参考基线获取已开始',
+        description: '正在进行 5 分钟稳定等待，之后将自动采集 1 分钟平均值。',
+        variant: 'success',
+      })
+    } catch (error) {
+      toast({
+        title: '参考基线获取启动失败',
+        description: error instanceof Error ? error.message : '未知错误',
+        variant: 'destructive',
+      })
+    } finally {
+      setSpectroSubmitting(null)
+    }
+  }, [baselineActive, spikeTestActive])
+
+  const handleCancelBaselineAcquisition = useCallback(() => {
+    baselineFinalizingRef.current = false
+    setBaselineSession(null)
+    toast({
+      title: '参考基线获取已取消',
+      description: '分光采集保持运行，可在确认油相状态后重新开始。',
+    })
+  }, [])
+
+  useEffect(() => {
+    if (
+      !baselineSession
+      || baselineSummary?.phase !== 'complete'
+      || baselineFinalizingRef.current
+    ) {
+      return
+    }
+
+    baselineFinalizingRef.current = true
+    setBaselineSaving(true)
+    void (async () => {
+      const averageVoltage = baselineSummary.averageVoltage
+      if (averageVoltage === null) {
+        toast({
+          title: '参考基线获取失败',
+          description: '1 分钟平均窗口内没有有效电压样本，请检查分光链路后重试。',
+          variant: 'destructive',
+        })
+        return
+      }
+      if (averageVoltage - currentBaselineVoltage <= 1e-6) {
+        toast({
+          title: '参考基线获取失败',
+          description: '平均参考电压未高于基线偏置，无法用于吸光度计算。',
+          variant: 'destructive',
+        })
+        return
+      }
+
+      try {
+        const result = await postSpectrometerCommand('/api/spectrometer/baseline', {
+          reference_voltage: averageVoltage,
+        })
+        const savedReference = typeof result.reference_voltage === 'number'
+          ? result.reference_voltage
+          : averageVoltage
+        toast({
+          title: '参考基线获取完成',
+          description: `${baselineSummary.validSampleCount.toLocaleString()} 个有效样本，参考电压 ${savedReference.toFixed(6)} V。`,
+          variant: 'success',
+        })
+      } catch (error) {
+        toast({
+          title: '参考基线写入失败',
+          description: error instanceof Error ? error.message : '未知错误',
+          variant: 'destructive',
+        })
+      }
+    })().finally(() => {
+      baselineFinalizingRef.current = false
+      setBaselineSaving(false)
+      setBaselineSession(null)
+    })
+  }, [baselineSession, baselineSummary, currentBaselineVoltage])
+
   const handleRenderedCount = useCallback((count: number) => setRenderedCount(count), [])
   const handleClearVoltageHistory = useCallback(() => {
     clearVoltageHistory()
@@ -142,7 +274,15 @@ export default function Monitor() {
   }, [clearVoltageHistory])
   const handleExportVoltageHistory = useCallback(() => {
     if (liveHistory.length === 0) return
-    const blob = new Blob([buildVoltageHistoryCsv(liveHistory)], { type: 'text/csv;charset=utf-8' })
+    const absorbanceReference = spectrometerBaselineSet && currentReferenceVoltage !== null
+      ? {
+          referenceVoltage: currentReferenceVoltage,
+          baselineVoltage: currentBaselineVoltage,
+        }
+      : undefined
+    const blob = new Blob([
+      buildVoltageHistoryCsv(liveHistory, absorbanceReference),
+    ], { type: 'text/csv;charset=utf-8' })
     const url = URL.createObjectURL(blob)
     const anchor = document.createElement('a')
     anchor.href = url
@@ -153,10 +293,12 @@ export default function Monitor() {
     URL.revokeObjectURL(url)
     toast({
       title: '电压历史已导出',
-      description: `共 ${liveHistory.length.toLocaleString()} 条原始样本`,
+      description: absorbanceReference
+        ? `共 ${liveHistory.length.toLocaleString()} 条原始样本；已按参考 ${absorbanceReference.referenceVoltage.toFixed(6)} V 重算吸光度。`
+        : `共 ${liveHistory.length.toLocaleString()} 条原始样本；当前无参考基线，未追加计算吸光度。`,
       variant: 'success',
     })
-  }, [liveHistory])
+  }, [currentBaselineVoltage, currentReferenceVoltage, liveHistory, spectrometerBaselineSet])
 
   const spectrometerHealth = systemHealth?.detector?.spectrometer
   const spikeTestCounters: SpikeTestCounters = useMemo(() => ({
@@ -283,7 +425,7 @@ export default function Monitor() {
                size="sm"
                variant="outline"
                onClick={() => handleSpectrometerCommand('start')}
-               disabled={spectroSubmitting !== null}
+               disabled={spectroSubmitting !== null || baselineActive}
              >
                <Play className="w-4 h-4 mr-2" />开始分光
              </Button>
@@ -292,18 +434,9 @@ export default function Monitor() {
                size="sm"
                variant="secondary"
                onClick={() => handleSpectrometerCommand('stop')}
-               disabled={spectroSubmitting !== null}
+               disabled={spectroSubmitting !== null || baselineActive}
              >
                <Square className="w-4 h-4 mr-2" />停止分光
-             </Button>
-             <Button
-               className="shrink-0"
-               size="sm"
-               variant="outline"
-               onClick={handleSetSpectrometerBaseline}
-               disabled={spectroSubmitting !== null || !hasSpectroSample}
-             >
-               <Target className="w-4 h-4 mr-2" />设定基线
              </Button>
              <div className={cn("flex shrink-0 items-center gap-2 rounded-full border px-3 py-1 text-xs font-medium whitespace-nowrap",
                 connected ? "bg-emerald-500/10 text-emerald-500 border-emerald-500/20" : "bg-red-500/10 text-red-500 border-red-500/20")}>
@@ -388,6 +521,16 @@ export default function Monitor() {
         </Card>
       </div>
 
+      <SpectrometerBaselineCard
+        summary={baselineSummary}
+        saving={baselineSaving}
+        canStart={connected && spectroSubmitting === null && !spikeTestActive}
+        baselineSet={spectrometerBaselineSet}
+        referenceVoltage={currentReferenceVoltage}
+        onStart={handleStartBaselineAcquisition}
+        onCancel={handleCancelBaselineAcquisition}
+      />
+
       <Card className="flex h-[440px] min-w-0 flex-col overflow-hidden lg:h-[500px]">
          <CardHeader className="grid min-w-0 gap-2 pb-2 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
             <CardTitle className="text-base">分光计电压</CardTitle>
@@ -403,7 +546,7 @@ export default function Monitor() {
                 size="sm"
                 variant="outline"
                 onClick={handleExportVoltageHistory}
-                disabled={liveHistory.length === 0}
+                disabled={liveHistory.length === 0 || baselineActive}
                 aria-label="导出全部分光计电压历史数据为 CSV"
               >
                 <Download className="mr-2 h-4 w-4" />
@@ -413,7 +556,7 @@ export default function Monitor() {
                 size="sm"
                 variant="outline"
                 onClick={handleClearVoltageHistory}
-                disabled={voltageHistory.length === 0 && !pausedHistory?.length}
+                disabled={baselineActive || (voltageHistory.length === 0 && !pausedHistory?.length)}
                 aria-label="清空分光计电压图表及历史数据"
               >
                 <Trash2 className="mr-2 h-4 w-4" />
@@ -435,7 +578,7 @@ export default function Monitor() {
       <div className="min-w-0 space-y-6">
         <SpectroSpikeTestCard
           summary={spikeTestSummary}
-          canStart={connected}
+          canStart={connected && !baselineActive}
           durationS={spikeTestDurationS}
           onDurationChange={setSpikeTestDurationS}
           onStart={handleStartSpikeTest}
