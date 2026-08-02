@@ -4838,12 +4838,40 @@ class WebConfigServer(object):
         @self.app.route('/api/spectrometer/baseline', methods=['POST'])
         def set_spectrometer_baseline():
             raw = self.latest_spectrometer_payload if isinstance(self.latest_spectrometer_payload, dict) else {}
-            reference_voltage = self.current_voltage
-            has_valid_sample = self.standalone or bool(raw.get('valid', False))
-            if not has_valid_sample or reference_voltage <= 0:
+            payload = request.get_json(silent=True)
+            has_explicit_reference = isinstance(payload, dict) and 'reference_voltage' in payload
+
+            if has_explicit_reference:
+                requested_reference = payload.get('reference_voltage')
+                try:
+                    if isinstance(requested_reference, bool):
+                        raise ValueError('boolean is not a voltage')
+                    reference_voltage = float(requested_reference)
+                except (TypeError, ValueError):
+                    return jsonify({
+                        "success": False,
+                        "message": "reference_voltage must be a finite positive number",
+                    }), 400
+                has_valid_sample = True
+            else:
+                reference_voltage = self.current_voltage
+                has_valid_sample = self.standalone or bool(raw.get('valid', False))
+
+            if not has_valid_sample or not math.isfinite(reference_voltage) or reference_voltage <= 0:
                 return jsonify({
                     "success": False,
                     "message": "No valid spectrometer sample is available for baseline reference",
+                }), 400
+
+            current = self.config_manager.get()
+            hw = normalize_hardware(
+                {},
+                current.get('hardware', dict(DEFAULT_CONFIG['hardware'])),
+            )
+            if reference_voltage - float(hw.get("baseline_voltage", 0.0) or 0.0) <= 1e-6:
+                return jsonify({
+                    "success": False,
+                    "message": "reference_voltage must be above baseline_voltage",
                 }), 400
 
             if self.standalone:
@@ -4857,10 +4885,9 @@ class WebConfigServer(object):
             if not ok:
                 return jsonify({"success": False, "message": message}), 500
 
-            current = self.config_manager.get()
             hw = normalize_hardware(
                 {"reference_voltage": reference_voltage},
-                current.get('hardware', dict(DEFAULT_CONFIG['hardware'])),
+                hw,
             )
             current['hardware'] = hw
             config_saved = self.config_manager.update(current)

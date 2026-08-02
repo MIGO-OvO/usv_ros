@@ -2900,6 +2900,59 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         })
         self.assertEqual(publishers["/usv/spectrometer_command"].messages, [])
 
+    def test_web_spectrometer_baseline_route_accepts_averaged_reference_voltage(self):
+        module, publishers, _ = _load_script(
+            "web_config_server_spectrometer_averaged_baseline_route_test",
+            "scripts/web_config_server.py",
+        )
+        control_calls = []
+        module.rospy.ServiceProxy = lambda name, *args, **kwargs: (
+            FakeControlCommandService(control_calls)
+            if name == "/usv/control_command"
+            else FakeTriggerService()
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            server.current_voltage = 0.0
+            server.latest_spectrometer_payload = {
+                "valid": False,
+                "voltage": 0.0,
+                "reference_voltage": 0.0,
+                "baseline_set": False,
+            }
+            client = server.app.test_client()
+
+            response = client.post(
+                "/api/spectrometer/baseline",
+                json={"reference_voltage": 1.456789},
+            )
+            invalid_response = client.post(
+                "/api/spectrometer/baseline",
+                json={"reference_voltage": "not-a-voltage"},
+            )
+
+        body = response.get_json()
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(body["success"])
+        self.assertAlmostEqual(body["reference_voltage"], 1.456789)
+        self.assertEqual(control_calls[-1]["action"], "spectrometer_baseline")
+        self.assertEqual(json.loads(control_calls[-1]["payload_json"]), {
+            "cmd": "set_baseline",
+            "reference_voltage": 1.456789,
+        })
+        self.assertEqual(len(control_calls), 1)
+        self.assertEqual(invalid_response.status_code, 400)
+        self.assertFalse(invalid_response.get_json()["success"])
+        self.assertEqual(publishers["/usv/spectrometer_command"].messages, [])
+
     def test_web_injection_on_with_speed_sends_set_command(self):
         module, publishers, _ = _load_script(
             "web_config_server_injection_on_speed_test",
