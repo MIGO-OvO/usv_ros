@@ -11,6 +11,11 @@ import { useAppStore } from '@/store'
 import { InjectionPumpCard } from '@/components/injection-pump-card'
 import { WaypointSamplingCard } from '@/components/waypoint-sampling-card'
 import { toast } from '@/hooks/use-toast'
+import {
+  getAutomationControlAvailability,
+  resolveAutomationAction,
+  type AutomationAction,
+} from '@/lib/automation-controls'
 
 interface PumpConfig {
   enable: string
@@ -75,7 +80,8 @@ const normalizeSteps = (rawSteps?: Partial<Step>[]): Step[] =>
 
 export default function Automation() {
   const { automationRunning, automationPaused } = useAppStore()
-  const automationActive = automationRunning || automationPaused
+  const automationState = { running: automationRunning, paused: automationPaused }
+  const controls = getAutomationControlAvailability(automationState)
   const [steps, setSteps] = useState<Step[]>([])
   const [loopCount, setLoopCount] = useState(1)
   const [pumpSettings, setPumpSettings] = useState<PumpSettings>({ ...DEFAULT_PUMP_SETTINGS })
@@ -132,7 +138,8 @@ export default function Automation() {
     }
   }
 
-  const handleAction = async (action: string) => {
+  const handleAction = async (requestedAction: AutomationAction) => {
+    const action = resolveAutomationAction(requestedAction, automationState)
     const options: RequestInit = { method: 'POST' }
 
     if (action === 'start') {
@@ -160,7 +167,15 @@ export default function Automation() {
       const result = await response.json()
       if (!response.ok || !result.success) {
         toast({ title: '操作失败', description: result.message || `任务${action}失败`, variant: 'destructive' })
+        return
       }
+      const successTitles: Record<AutomationAction, string> = {
+        start: '任务已启动',
+        pause: '任务已暂停',
+        resume: '任务已恢复',
+        stop: '任务已停止',
+      }
+      toast({ title: successTitles[action], description: result.message || undefined, variant: 'success' })
     } catch (error) {
       console.error(error)
       toast({ title: '请求失败', description: `任务${action}请求异常`, variant: 'destructive' })
@@ -277,16 +292,16 @@ export default function Automation() {
           <p className="text-muted-foreground">配置并执行采样序列任务。</p>
         </div>
         <div className="flex w-full flex-wrap items-center gap-2 md:w-auto">
-          <Button variant="outline" onClick={() => handleAction('start')} disabled={automationActive}>
+          <Button variant="outline" onClick={() => handleAction('start')} disabled={!controls.start}>
             <Play className="w-4 h-4 mr-2 text-emerald-500" /> 启动
           </Button>
-          <Button variant="outline" onClick={() => handleAction('pause')} disabled={!automationRunning}>
+          <Button variant="outline" onClick={() => handleAction('pause')} disabled={!controls.pause}>
             <Pause className="w-4 h-4 mr-2 text-amber-500" /> 暂停
           </Button>
-          <Button variant="outline" onClick={() => handleAction('resume')} disabled={!automationPaused}>
+          <Button variant="outline" onClick={() => handleAction('resume')} disabled={!controls.resume}>
             <Play className="w-4 h-4 mr-2 text-blue-500" /> 恢复
           </Button>
-          <Button variant="destructive" onClick={() => handleAction('stop')} disabled={!automationActive}>
+          <Button variant="destructive" onClick={() => handleAction('stop')} disabled={!controls.stop}>
             <Square className="w-4 h-4 mr-2" /> 停止
           </Button>
         </div>
