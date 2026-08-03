@@ -2,7 +2,8 @@ import { Play, Square, Target } from 'lucide-react'
 
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import type { BaselineAcquisitionSummary } from '@/lib/spectrometer-baseline'
+import { NumericInput } from '@/components/ui/numeric-input'
+import { formatBaselineDuration, type BaselineAcquisitionSummary } from '@/lib/spectrometer-baseline'
 import { cn } from '@/lib/utils'
 
 function formatRemaining(milliseconds: number): string {
@@ -26,6 +27,10 @@ export function SpectrometerBaselineCard({
   canStart,
   baselineSet,
   referenceVoltage,
+  stabilizationMin,
+  averagingMin,
+  onStabilizationChange,
+  onAveragingChange,
   onStart,
   onCancel,
 }: {
@@ -34,6 +39,10 @@ export function SpectrometerBaselineCard({
   readonly canStart: boolean
   readonly baselineSet: boolean
   readonly referenceVoltage: number | null
+  readonly stabilizationMin: number
+  readonly averagingMin: number
+  readonly onStabilizationChange: (minutes: number) => void
+  readonly onAveragingChange: (minutes: number) => void
   readonly onStart: () => void
   readonly onCancel: () => void
 }) {
@@ -65,10 +74,36 @@ export function SpectrometerBaselineCard({
             参考基线获取
           </CardTitle>
           <p className="mt-1 text-xs text-muted-foreground">
-            油相完全通入流通池后开始；自动启动分光，先稳定 5 分钟，再对随后 1 分钟的有效电压求平均。
+            油相完全通入流通池后开始；自动启动分光，先稳定 {formatBaselineDuration(Math.round(stabilizationMin * 60_000))}，再对随后 {formatBaselineDuration(Math.round(averagingMin * 60_000))} 的有效电压求平均。
           </p>
         </div>
         <div className="flex min-w-0 flex-wrap items-center gap-2 lg:justify-end">
+          <label className="flex h-9 items-center gap-1.5 rounded-md border border-input bg-background px-2.5 text-xs">
+            <span className="whitespace-nowrap text-muted-foreground">稳定</span>
+            <NumericInput
+              aria-label="稳定等待时长（分钟）"
+              className="h-8 min-h-0 w-14 border-0 bg-transparent px-1 text-right font-medium shadow-none focus-visible:ring-0"
+              value={stabilizationMin}
+              onValueChange={onStabilizationChange}
+              disabled={active || saving}
+              min={0}
+              step={0.5}
+            />
+            <span className="whitespace-nowrap text-muted-foreground">分钟</span>
+          </label>
+          <label className="flex h-9 items-center gap-1.5 rounded-md border border-input bg-background px-2.5 text-xs">
+            <span className="whitespace-nowrap text-muted-foreground">平均</span>
+            <NumericInput
+              aria-label="平均采集时长（分钟）"
+              className="h-8 min-h-0 w-14 border-0 bg-transparent px-1 text-right font-medium shadow-none focus-visible:ring-0"
+              value={averagingMin}
+              onValueChange={onAveragingChange}
+              disabled={active || saving}
+              min={0}
+              step={0.5}
+            />
+            <span className="whitespace-nowrap text-muted-foreground">分钟</span>
+          </label>
           <span className={cn('mr-1 text-xs font-medium', phaseClass)}>{phaseLabel}</span>
           <Button size="sm" variant="outline" onClick={onStart} disabled={!canStart || active || saving}>
             <Play className="mr-2 h-4 w-4" />

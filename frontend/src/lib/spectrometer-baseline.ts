@@ -1,6 +1,14 @@
 export const BASELINE_STABILIZATION_MS = 5 * 60 * 1000
 export const BASELINE_AVERAGING_MS = 60 * 1000
 
+export function formatBaselineDuration(milliseconds: number): string {
+  const totalSeconds = Math.max(0, Math.round(milliseconds / 1000))
+  if (totalSeconds < 60) return `${totalSeconds} 秒`
+  const minutes = totalSeconds / 60
+  if (minutes % 1 === 0) return `${minutes} 分钟`
+  return `${minutes.toFixed(1)} 分钟`
+}
+
 export interface BaselineVoltagePoint {
   readonly receivedAtMs: number
   readonly voltage: number
@@ -26,12 +34,16 @@ export interface AbsorbanceReference {
   readonly baselineVoltage: number
 }
 
-export function createBaselineAcquisitionSession(startedAtMs: number): BaselineAcquisitionSession {
-  const averagingStartedAtMs = startedAtMs + BASELINE_STABILIZATION_MS
+export function createBaselineAcquisitionSession(
+  startedAtMs: number,
+  stabilizationMs = BASELINE_STABILIZATION_MS,
+  averagingMs = BASELINE_AVERAGING_MS,
+): BaselineAcquisitionSession {
+  const averagingStartedAtMs = startedAtMs + stabilizationMs
   return {
     startedAtMs,
     averagingStartedAtMs,
-    endsAtMs: averagingStartedAtMs + BASELINE_AVERAGING_MS,
+    endsAtMs: averagingStartedAtMs + averagingMs,
   }
 }
 
