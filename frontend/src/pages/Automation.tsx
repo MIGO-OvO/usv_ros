@@ -74,7 +74,8 @@ const normalizeSteps = (rawSteps?: Partial<Step>[]): Step[] =>
   Array.isArray(rawSteps) ? rawSteps.map((step) => normalizeStep(step)) : []
 
 export default function Automation() {
-  const { automationRunning } = useAppStore()
+  const { automationRunning, automationPaused } = useAppStore()
+  const automationActive = automationRunning || automationPaused
   const [steps, setSteps] = useState<Step[]>([])
   const [loopCount, setLoopCount] = useState(1)
   const [pumpSettings, setPumpSettings] = useState<PumpSettings>({ ...DEFAULT_PUMP_SETTINGS })
@@ -276,16 +277,16 @@ export default function Automation() {
           <p className="text-muted-foreground">配置并执行采样序列任务。</p>
         </div>
         <div className="flex w-full flex-wrap items-center gap-2 md:w-auto">
-          <Button variant="outline" onClick={() => handleAction('start')} disabled={automationRunning}>
+          <Button variant="outline" onClick={() => handleAction('start')} disabled={automationActive}>
             <Play className="w-4 h-4 mr-2 text-emerald-500" /> 启动
           </Button>
           <Button variant="outline" onClick={() => handleAction('pause')} disabled={!automationRunning}>
             <Pause className="w-4 h-4 mr-2 text-amber-500" /> 暂停
           </Button>
-          <Button variant="outline" onClick={() => handleAction('resume')} disabled={!automationRunning}>
+          <Button variant="outline" onClick={() => handleAction('resume')} disabled={!automationPaused}>
             <Play className="w-4 h-4 mr-2 text-blue-500" /> 恢复
           </Button>
-          <Button variant="destructive" onClick={() => handleAction('stop')} disabled={!automationRunning}>
+          <Button variant="destructive" onClick={() => handleAction('stop')} disabled={!automationActive}>
             <Square className="w-4 h-4 mr-2" /> 停止
           </Button>
         </div>

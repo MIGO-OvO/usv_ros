@@ -63,6 +63,7 @@ class AutomationEngine(object):
         self._running = threading.Event()
         self._paused = threading.Event()
         self._lock = threading.Lock()
+        self._pause_generation = 0
 
         # 状态跟踪
         self._current_step = 0
@@ -150,6 +151,7 @@ class AutomationEngine(object):
         self._current_loop = 1
         self._running.set()
         self._paused.clear()
+        self._pause_generation = 0
         self._pending_pid_motors.clear()
         self._pid_complete_event.clear()
         self._failed = False
@@ -167,17 +169,18 @@ class AutomationEngine(object):
 
     def stop(self):
         """停止执行。"""
-        self._running.clear()
-        self._paused.clear()
+        with self._lock:
+            self._running.clear()
+            self._paused.clear()
 
-        # 发送停止指令
-        try:
-            # 先停止 PID
-            self.send_command(self.command_generator.generate_pid_stop_command())
-            # 再停止所有电机
-            self.send_command(self.command_generator.generate_stop_command())
-        except Exception:
-            pass
+            # 发送停止指令
+            try:
+                # 先停止 PID
+                self.send_command(self.command_generator.generate_pid_stop_command())
+                # 再停止所有电机
+                self.send_command(self.command_generator.generate_stop_command())
+            except Exception:
+                pass
 
         # 等待线程结束
         if self._thread and self._thread.is_alive():
@@ -185,17 +188,46 @@ class AutomationEngine(object):
 
         self.log("自动化流程已停止")
 
-    def pause(self):
-        """暂停执行。"""
-        self._paused.set()
+    def pause(self, halt_func=None):
+        """暂停执行，并在提供时同步停止正在运行的物理设备。"""
+        with self._lock:
+            if not self._running.is_set():
+                return False
+            self._paused.set()
+            self._pause_generation += 1
+            halted = True
+            if halt_func:
+                try:
+                    halted = bool(halt_func())
+                except Exception:
+                    halted = False
         self.log("自动化流程已暂停")
         self._update_status("paused")
+        return halted
 
     def resume(self):
         """恢复执行。"""
-        self._paused.clear()
+        with self._lock:
+            self._paused.clear()
         self.log("自动化流程已恢复")
         self._update_status("running")
+
+    def run_while_active(self, callback):
+        """在自动化未暂停时串行执行一次硬件操作。"""
+        with self._lock:
+            if self._paused.is_set():
+                return False
+            if self._thread and self._thread.is_alive() and not self._running.is_set():
+                return False
+            return callback()
+
+    def _pause_generation_snapshot(self):
+        with self._lock:
+            return self._pause_generation
+
+    def _was_paused_since(self, generation):
+        with self._lock:
+            return self._pause_generation != generation
 
     def is_running(self):
         """检查是否正在运行。"""
@@ -270,29 +302,48 @@ class AutomationEngine(object):
             if not self._running.is_set() or self._failed:
                 return False
 
-            # 处理暂停
-            self._wait_if_paused()
+            while self._running.is_set() and not self._failed:
+                # 处理暂停
+                self._wait_if_paused()
+                if not self._running.is_set() or self._failed:
+                    return False
 
-            self._current_step = step_idx
-            progress = int((step_idx + 1) / len(self.steps) * 100)
-            self._update_progress(progress)
+                pause_generation = self._pause_generation_snapshot()
+                self._current_step = step_idx
+                progress = int((step_idx + 1) / len(self.steps) * 100)
+                self._update_progress(progress)
 
-            # PID 模式：在发送指令之前就设好 pending_pid_motors，
-            # 避免指令发出后 PID 立刻完成（竞态），而 pending 还没设好导致永远等不到。
-            if self._pid_mode_enabled:
-                pid_motors = self._get_step_active_motors(step)
-                if pid_motors:
-                    self._pending_pid_motors = pid_motors.copy()
-                    self._pid_complete_event.clear()
-                else:
-                    self._pending_pid_motors.clear()
+                # PID 模式：在发送指令之前就设好 pending_pid_motors，
+                # 避免指令发出后 PID 立刻完成（竞态），而 pending 还没设好导致永远等不到。
+                if self._pid_mode_enabled:
+                    pid_motors = self._get_step_active_motors(step)
+                    if pid_motors:
+                        self._pending_pid_motors = pid_motors.copy()
+                        self._pid_complete_event.clear()
+                    else:
+                        self._pending_pid_motors.clear()
 
-            # 发送步骤指令
-            if not self._send_step_command(step):
-                return False
+                # 发送步骤指令
+                if not self._send_step_command(step):
+                    if self._running.is_set() and self._was_paused_since(pause_generation):
+                        continue
+                    return False
 
-            # 步骤执行完成等待
-            if not self._wait_for_step_execution(step):
+                # 暂停会发出物理停止指令；恢复后需要重放当前步骤，不能继续等待旧 PID。
+                if self._was_paused_since(pause_generation):
+                    continue
+
+                # 步骤执行完成等待
+                if not self._wait_for_step_execution(step):
+                    if self._running.is_set() and self._was_paused_since(pause_generation):
+                        continue
+                    return False
+
+                if self._was_paused_since(pause_generation):
+                    continue
+                break
+
+            if not self._running.is_set() or self._failed:
                 return False
 
             # 步骤完成回调
@@ -340,10 +391,12 @@ class AutomationEngine(object):
                 return False
 
             # 发送指令
-            success = self.send_command(command)
+            success = self.run_while_active(lambda: self.send_command(command))
             if success:
                 self.log("指令已发送: {}".format(command.strip()))
             else:
+                if self._paused.is_set() and self._running.is_set():
+                    return False
                 self._handle_error("指令发送失败")
                 return False
 
@@ -384,7 +437,8 @@ class AutomationEngine(object):
 
         while self._running.is_set() and self._pending_pid_motors:
             # 检查暂停
-            self._wait_if_paused()
+            if self._paused.is_set():
+                return False
 
             elapsed = time.time() - start_time
 
