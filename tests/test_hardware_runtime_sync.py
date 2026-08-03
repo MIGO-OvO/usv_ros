@@ -7,6 +7,7 @@ import os
 import re
 import sys
 import tempfile
+import threading
 import time
 import types
 import unittest
@@ -844,6 +845,127 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(web_manager.stopped, 1)
         self.assertEqual(trigger_manager.stopped, 0)
         self.assertFalse(server.automation_running)
+
+    def test_web_paused_automation_keeps_control_interlock_but_stops_runtime_recording(self):
+        module, _, string_cls = _load_script(
+            "web_config_server_paused_automation_status_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            server._automation_status_cb(string_cls(json.dumps({
+                "status": "running",
+                "running": True,
+                "paused": False,
+            })))
+            self.assertTrue(server.automation_running)
+            self.assertFalse(server.automation_paused)
+
+            server._automation_status_cb(string_cls(json.dumps({
+                "status": "paused",
+                "running": True,
+                "paused": True,
+            })))
+            server.socketio = RecordingSocket()
+            shutdown_checks = iter([False, True])
+            module.rospy.is_shutdown = lambda: next(shutdown_checks, True)
+            server._data_push_loop()
+            calibration_response = server.app.test_client().post(
+                "/api/calibration/start", json={"motors": "X"}
+            )
+
+        self.assertFalse(server.automation_running)
+        self.assertTrue(server.automation_paused)
+        status_payload = [payload for event, payload in server.socketio.events if event == "status"][-1]
+        self.assertFalse(status_payload["automation_running"])
+        self.assertTrue(status_payload["automation_paused"])
+        self.assertEqual(calibration_response.status_code, 409)
+
+    def test_pump_node_pause_halts_all_hardware_and_marks_paused(self):
+        module, _, _ = _load_script(
+            "pump_control_node_pause_halts_hardware_test",
+            "scripts/pump_control_node.py",
+        )
+        node = module.PumpControlNode()
+        sent = []
+        statuses = []
+        node.send_command = lambda command: sent.append(command) or True
+        node._send_injection_pump_command = (
+            lambda enabled=None, speed=None, wait=True: sent.append("PUMP:OFF") or True
+        )
+        node._publish_automation_status = lambda status: statuses.append(status)
+        node.automation_engine._running.set()
+        node.automation_engine.is_running = lambda: True
+
+        response = node._auto_pause_callback(None)
+
+        self.assertTrue(response.success)
+        self.assertTrue(node.automation_engine.is_paused())
+        self.assertTrue(any("PIDSTOP" in command for command in sent))
+        self.assertTrue(any("XDFV0J0" in command for command in sent))
+        self.assertIn("PUMP:OFF", sent)
+        self.assertEqual(statuses, ["paused"])
+
+    def test_automation_engine_replays_interrupted_step_after_pause_resume(self):
+        module = _load_script(
+            "automation_engine_pause_resume_replay_test",
+            "scripts/lib/automation_engine.py",
+        )[0]
+
+        class DummyCommandGenerator:
+            def reset_for_auto_mode(self):
+                pass
+
+            def generate_pid_stop_command(self):
+                return "PIDSTOP"
+
+            def generate_stop_command(self):
+                return "STOP"
+
+            def generate_command(self, step, mode="auto"):
+                return "MOVE"
+
+        sent = []
+        first_step_sent = threading.Event()
+        pause_observed = threading.Event()
+        wait_attempts = []
+        engine = module.AutomationEngine(
+            DummyCommandGenerator(),
+            lambda command: sent.append(command) or first_step_sent.set() or True,
+        )
+        engine.set_steps([{"interval": 0}])
+
+        def wait_for_step(_step):
+            wait_attempts.append(True)
+            if len(wait_attempts) > 1:
+                return True
+            while engine.is_running() and not engine.is_paused():
+                time.sleep(0.005)
+            pause_observed.set()
+            return False
+
+        engine.on_step_wait = wait_for_step
+        self.assertTrue(engine.start())
+        self.assertTrue(first_step_sent.wait(1.0))
+
+        engine.pause()
+        self.assertTrue(pause_observed.wait(1.0))
+        engine.resume()
+
+        deadline = time.time() + 1.0
+        while engine.is_running() and time.time() < deadline:
+            time.sleep(0.005)
+
+        self.assertFalse(engine.is_running())
+        self.assertEqual([command for command in sent if command == "MOVE"], ["MOVE", "MOVE"])
 
     def test_automation_engine_finished_callback_reports_not_running(self):
         module = _load_script(

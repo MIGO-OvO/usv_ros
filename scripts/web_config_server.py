@@ -1859,6 +1859,7 @@ class WebConfigServer(object):
         # 状态缓存
         self.pump_connected = False
         self.automation_running = False
+        self.automation_paused = False
         self.current_angles = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
         self.raw_angles = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
         self.latest_angle_telemetry = {
@@ -2307,12 +2308,19 @@ class WebConfigServer(object):
             automation_status = status.split('automation:', 1)[1].strip()
             if '运行' in automation_status or 'running' in automation_status:
                 self.automation_running = True
+                self.automation_paused = False
+            elif '暂停' in automation_status or 'paused' in automation_status:
+                self.automation_running = False
+                self.automation_paused = True
             elif '已完成' in automation_status or 'finished' in automation_status or '完成' in automation_status:
                 self.automation_running = False
+                self.automation_paused = False
             elif '已停止' in automation_status or 'stopped' in automation_status:
                 self.automation_running = False
+                self.automation_paused = False
         elif status == 'stopped':
             self.automation_running = False
+            self.automation_paused = False
 
     def _automation_status_cb(self, msg):
         """结构化自动化状态回调。"""
@@ -2323,10 +2331,9 @@ class WebConfigServer(object):
         if not isinstance(data, dict):
             return
         self.latest_automation_status = data
-        if 'running' in data:
-            self.automation_running = bool(data.get('running', False))
-        if 'paused' in data and data.get('paused'):
-            self.automation_running = False
+        if 'running' in data or 'paused' in data:
+            self.automation_paused = bool(data.get('paused', False))
+            self.automation_running = bool(data.get('running', False)) and not self.automation_paused
         status_text = str(data.get("status", "") or "").lower()
         terminal_status = (
             "finish" in status_text
@@ -2337,6 +2344,7 @@ class WebConfigServer(object):
         )
         if terminal_status:
             self.automation_running = False
+            self.automation_paused = False
             if self.data_recording_source == "web":
                 self._stop_data_recording_if_active()
 
@@ -4691,8 +4699,10 @@ class WebConfigServer(object):
             data = json_object()
             if data is None:
                 return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
-            if not self.standalone and getattr(self, 'automation_running', False):
-                return jsonify({"success": False, "message": "自动采样运行中，不能运动回零"}), 409
+            if not self.standalone and (
+                    getattr(self, 'automation_running', False)
+                    or getattr(self, 'automation_paused', False)):
+                return jsonify({"success": False, "message": "自动采样运行或暂停中，不能运动回零"}), 409
             motors = ''.join(dict.fromkeys(
                 ch for ch in clean_string(data.get('motors', 'XYZA'), 'XYZA', 4).upper() if ch in 'XYZA'
             ))
@@ -4724,6 +4734,7 @@ class WebConfigServer(object):
             emit('status', {
                 "pump_connected": self.pump_connected,
                 "automation_running": self.automation_running,
+                "automation_paused": self.automation_paused,
                 "mission_status": self.mission_status,
                 "spectrometer_status": self.spectrometer_status,
             })
@@ -5700,6 +5711,7 @@ class WebConfigServer(object):
                 self.socketio.emit('status', {
                     "pump_connected": self.pump_connected,
                     "automation_running": self.automation_running,
+                    "automation_paused": self.automation_paused,
                     "mission_status": self.mission_status,
                     "spectrometer_status": self.spectrometer_status,
                 })

@@ -1068,7 +1068,8 @@ class PumpControlNode(object):
         if speed <= 0:
             self._update_injection_pump_state(enabled=False, error="Injection pump policy speed is 0")
             return False
-        if not self._send_injection_pump_command(speed=speed):
+        if not self.automation_engine.run_while_active(
+                lambda: self._send_injection_pump_command(speed=speed)):
             return False
         lead_time_s = float(policy.get("lead_time_s", 0.0) or 0.0)
         if lead_time_s > 0:
@@ -1104,8 +1105,10 @@ class PumpControlNode(object):
             return False
 
         command = self.command_generator.generate_command(step, mode="auto")
-        if command and not self.send_command(command):
-            rospy.logerr("[Automation] 步骤发送失败: %s", step_name)
+        if command and not self.automation_engine.run_while_active(
+                lambda: self.send_command(command)):
+            if not self.automation_engine.is_paused():
+                rospy.logerr("[Automation] 步骤发送失败: %s", step_name)
             return False
         if command:
             rospy.loginfo("[Automation] 指令已发送: %s", command.strip())
@@ -1166,14 +1169,14 @@ class PumpControlNode(object):
     def _wait_seconds_with_pause(self, seconds):
         """支持暂停/停止的秒级等待。"""
         if seconds <= 0:
-            return self.automation_engine.is_running()
+            return (self.automation_engine.is_running()
+                    and not self.automation_engine.is_paused())
         end_time = time.time() + seconds
         while self.automation_engine.is_running() and time.time() < end_time:
-            while self.automation_engine.is_paused() and self.automation_engine.is_running():
-                time.sleep(0.1)
-                end_time += 0.1
+            if self.automation_engine.is_paused():
+                return False
             time.sleep(min(0.05, max(0.0, end_time - time.time())))
-        return self.automation_engine.is_running()
+        return self.automation_engine.is_running() and not self.automation_engine.is_paused()
 
     def _wait_for_new_spectro_sample(self, previous_timestamp):
         """ADS 采集中时等待一条新的有效分光样本。"""
@@ -1185,13 +1188,14 @@ class PumpControlNode(object):
         deadline = time.time() + timeout
         previous_timestamp = previous_timestamp or 0.0
         while self.automation_engine.is_running() and time.time() < deadline:
-            while self.automation_engine.is_paused() and self.automation_engine.is_running():
-                time.sleep(0.1)
-                deadline += 0.1
+            if self.automation_engine.is_paused():
+                return False
             if self.latest_spectro and self.latest_spectro.get('valid', False):
                 if self._latest_spectro_received_at > previous_timestamp:
                     return True
             time.sleep(0.02)
+        if self.automation_engine.is_paused():
+            return False
         rospy.logerr("[Automation] 分光有效样本等待超时: %.1fs", timeout)
         return False
 
@@ -2081,9 +2085,13 @@ class PumpControlNode(object):
 
     def _auto_pause_callback(self, req):
         """暂停自动化服务回调。"""
-        self.automation_engine.pause()
-        self._publish_automation_status("paused")
-        return TriggerResponse(success=True, message="Automation paused")
+        if not self.automation_engine.is_running():
+            return TriggerResponse(success=False, message="Automation is not running")
+        if self.automation_engine.is_paused():
+            return TriggerResponse(success=True, message="Automation already paused")
+        success = self.automation_engine.pause(self.stop_all_pumps)
+        message = "Automation paused and pumps halted" if success else "Automation paused but pump halt failed"
+        return TriggerResponse(success=success, message=message)
 
     def _injection_on_callback(self, req):
         """开启进样泵服务。"""
@@ -2113,8 +2121,11 @@ class PumpControlNode(object):
 
     def _auto_resume_callback(self, req):
         """恢复自动化服务回调。"""
+        if not self.automation_engine.is_running():
+            return TriggerResponse(success=False, message="Automation is not running")
+        if not self.automation_engine.is_paused():
+            return TriggerResponse(success=False, message="Automation is not paused")
         self.automation_engine.resume()
-        self._publish_automation_status("running")
         return TriggerResponse(success=True, message="Automation resumed")
 
     def _on_automation_status(self, status):

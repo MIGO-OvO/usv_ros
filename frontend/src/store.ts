@@ -185,6 +185,7 @@ interface ControlEvent {
 interface StatusPayload {
   pump_connected?: boolean
   automation_running?: boolean
+  automation_paused?: boolean
   mission_status?: string
   spectrometer_status?: string
 }
@@ -235,6 +236,7 @@ interface AppState {
   connected: boolean
   pumpConnected: boolean
   automationRunning: boolean
+  automationPaused: boolean
   missionStatus: string
   pumpAngles: PumpAngles
   rawAngles: PumpAngles
@@ -316,6 +318,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   connected: false,
   pumpConnected: false,
   automationRunning: false,
+  automationPaused: false,
   missionStatus: 'IDLE',
   pumpAngles: DEFAULT_ANGLES,
   rawAngles: DEFAULT_ANGLES,
@@ -460,6 +463,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       set({
         pumpConnected: data.pump_connected ?? false,
         automationRunning: data.automation_running ?? false,
+        automationPaused: data.automation_paused ?? false,
         missionStatus: data.mission_status || 'IDLE',
         spectrometerStatus: data.spectrometer_status || 'idle',
       })
