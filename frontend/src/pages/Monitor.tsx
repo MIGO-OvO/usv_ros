@@ -23,6 +23,7 @@ import {
 } from '@/lib/spectro-spike-test'
 import {
   createBaselineAcquisitionSession,
+  formatBaselineDuration,
   summarizeBaselineAcquisition,
   type BaselineAcquisitionSession,
 } from '@/lib/spectrometer-baseline'
@@ -124,6 +125,8 @@ export default function Monitor() {
   const [spikeTestDurationS, setSpikeTestDurationS] = useState(DEFAULT_SPIKE_TEST_DURATION_S)
   const [baselineSession, setBaselineSession] = useState<BaselineAcquisitionSession | null>(null)
   const [baselineSaving, setBaselineSaving] = useState(false)
+  const [baselineStabilizationMin, setBaselineStabilizationMin] = useState(5)
+  const [baselineAveragingMin, setBaselineAveragingMin] = useState(1)
   const baselineFinalizingRef = useRef(false)
 
   useEffect(() => {
@@ -175,17 +178,27 @@ export default function Monitor() {
 
   const handleStartBaselineAcquisition = useCallback(async () => {
     if (baselineActive || spikeTestActive) return
+    const stabilizationMs = Math.round(baselineStabilizationMin * 60_000)
+    const averagingMs = Math.round(baselineAveragingMin * 60_000)
+    if (stabilizationMs < 0 || averagingMs < 1000) {
+      toast({
+        title: '参考基线时长无效',
+        description: '稳定时长不能为负，平均采集时长至少 1 秒。',
+        variant: 'destructive',
+      })
+      return
+    }
     setSpectroSubmitting('baseline')
     try {
       await postSpectrometerCommand('/api/spectrometer/start')
       const startedAtMs = Date.now()
       baselineFinalizingRef.current = false
       setClock(startedAtMs)
-      setBaselineSession(createBaselineAcquisitionSession(startedAtMs))
+      setBaselineSession(createBaselineAcquisitionSession(startedAtMs, stabilizationMs, averagingMs))
       setTimeWindowMs(600_000)
       toast({
         title: '参考基线获取已开始',
-        description: '正在进行 5 分钟稳定等待，之后将自动采集 1 分钟平均值。',
+        description: `正在进行 ${formatBaselineDuration(stabilizationMs)} 稳定等待，之后将自动采集 ${formatBaselineDuration(averagingMs)} 平均值。`,
         variant: 'success',
       })
     } catch (error) {
@@ -197,7 +210,7 @@ export default function Monitor() {
     } finally {
       setSpectroSubmitting(null)
     }
-  }, [baselineActive, spikeTestActive])
+  }, [baselineActive, baselineAveragingMin, baselineStabilizationMin, spikeTestActive])
 
   const handleCancelBaselineAcquisition = useCallback(() => {
     baselineFinalizingRef.current = false
@@ -221,10 +234,11 @@ export default function Monitor() {
     setBaselineSaving(true)
     void (async () => {
       const averageVoltage = baselineSummary.averageVoltage
+      const averagingMs = baselineSession.endsAtMs - baselineSession.averagingStartedAtMs
       if (averageVoltage === null) {
         toast({
           title: '参考基线获取失败',
-          description: '1 分钟平均窗口内没有有效电压样本，请检查分光链路后重试。',
+          description: `在 ${formatBaselineDuration(averagingMs)} 的平均窗口内没有有效电压样本，请检查分光链路后重试。`,
           variant: 'destructive',
         })
         return
@@ -527,6 +541,10 @@ export default function Monitor() {
         canStart={connected && spectroSubmitting === null && !spikeTestActive}
         baselineSet={spectrometerBaselineSet}
         referenceVoltage={currentReferenceVoltage}
+        stabilizationMin={baselineStabilizationMin}
+        averagingMin={baselineAveragingMin}
+        onStabilizationChange={setBaselineStabilizationMin}
+        onAveragingChange={setBaselineAveragingMin}
         onStart={handleStartBaselineAcquisition}
         onCancel={handleCancelBaselineAcquisition}
       />

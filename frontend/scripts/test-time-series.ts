@@ -223,6 +223,20 @@ test('baseline acquisition waits five minutes and averages only the following mi
   assert.equal(complete.progressPercent, 100)
 })
 
+test('baseline acquisition honors custom stabilization and averaging durations', () => {
+  const session = createBaselineAcquisitionSession(1_000, 2 * 60_000, 30_000)
+  assert.equal(session.averagingStartedAtMs, 1_000 + 120_000)
+  assert.equal(session.endsAtMs, 1_000 + 150_000)
+
+  const averaging = summarizeBaselineAcquisition([
+    { receivedAtMs: 121_000, voltage: 1, valid: true },
+    { receivedAtMs: 129_999, voltage: 3, valid: true },
+  ], session, 130_000)
+  assert.equal(averaging.phase, 'averaging')
+  assert.equal(averaging.validSampleCount, 2)
+  assert.equal(averaging.averageVoltage, 2)
+})
+
 test('CSV recalculates absorbance from the active reference and baseline offset', () => {
   const reference = { referenceVoltage: 2, baselineVoltage: 0.2 }
   assert.equal(calculateAbsorbance(1.1, reference), 0.30103)
