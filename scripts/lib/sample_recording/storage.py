@@ -121,7 +121,7 @@ class SampleRecordingStorage(object):
         ]
 
     def read_raw_frames(self, mission_id: object, sample_id: object, limit: Optional[int] = None, offset: int = 0) -> list[dict[str, object]]:
-        limit = 2000 if limit is None else max(0, min(int(limit), 20000))
+        limit = 2000 if limit is None else max(0, min(int(limit), 200000))
         offset = max(0, int(offset))
         frames = []
         for index, frame in enumerate(self.iter_raw_frames(mission_id, sample_id)):
@@ -161,7 +161,7 @@ class SampleRecordingStorage(object):
         max_points: int = 2000,
     ) -> dict[str, object]:
         path = self._raw_abspath(self._raw_relpath(mission_id, sample_id))
-        max_points = max(4, min(int(max_points), 20000))
+        max_points = max(4, min(int(max_points), 200000))
         if not os.path.exists(path):
             return {"raw_count": 0, "returned_count": 0, "from_ms": from_ms, "to_ms": to_ms, "covered": True, "samples": []}
 
