@@ -35,10 +35,11 @@ import sys
 import tempfile
 import threading
 import time
+import zipfile
 from datetime import datetime
 
 try:
-    from flask import Flask, request, jsonify, send_from_directory, abort, Response
+    from flask import Flask, request, jsonify, send_file, send_from_directory, abort, Response
     from flask_cors import CORS
     from flask_socketio import SocketIO, emit
     FLASK_AVAILABLE = True
@@ -113,6 +114,7 @@ from scripts.lib.lab_sim.coordinates import (
 from scripts.lib.lab_sim.models import CoordinatePairRef, ModelParseError, SamplingEvent
 from scripts.lib.lab_sim.route_planner import RoutePlannerError, plan_coverage_route
 from scripts.lib.sample_recording import SampleRecordingStorage, normalize_raw_frame
+from scripts.lib.sample_recording.models import safe_id
 
 # 配置文件路径
 CONFIG_DIR = os.path.expanduser("~/usv_ws/config")
@@ -1049,32 +1051,86 @@ class MissionDataManager(object):
     """任务数据管理器。"""
 
     def __init__(self, data_dir=DATA_DIR):
-        self.data_dir = data_dir
+        self.data_dir = os.path.abspath(os.path.expanduser(data_dir))
         self.current_mission_file = None
         self.current_mission_data = []
+        self._write_lock = threading.RLock()
         self._ensure_dir()
+        self._recover_incomplete_missions()
 
     def _ensure_dir(self):
         if not os.path.exists(self.data_dir):
             os.makedirs(self.data_dir)
 
+    @staticmethod
+    def _atomic_write_json(path, data):
+        directory = os.path.dirname(os.path.abspath(path))
+        os.makedirs(directory, exist_ok=True)
+        fd, temp_path = tempfile.mkstemp(
+            prefix=".%s." % os.path.basename(path),
+            suffix=".tmp",
+            dir=directory,
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as file_obj:
+                json.dump(data, file_obj, ensure_ascii=False, indent=2)
+                file_obj.flush()
+                os.fsync(file_obj.fileno())
+            os.replace(temp_path, path)
+            if os.name == "posix":
+                try:
+                    directory_fd = os.open(directory, os.O_RDONLY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
+                except OSError:
+                    pass
+        finally:
+            if os.path.exists(temp_path):
+                os.remove(temp_path)
+
+    def _recover_incomplete_missions(self):
+        recovered_at = datetime.now().isoformat()
+        for filename in os.listdir(self.data_dir):
+            if not filename.startswith("mission_") or not filename.endswith(".json"):
+                continue
+            path = os.path.join(self.data_dir, filename)
+            try:
+                with open(path, "r", encoding="utf-8") as file_obj:
+                    data = json.load(file_obj)
+                if not isinstance(data, dict) or data.get("end_time") is not None:
+                    continue
+                state = str(data.get("state", "running") or "running").lower()
+                if state not in ("running", "open"):
+                    continue
+                data["state"] = "interrupted"
+                data["end_time"] = recovered_at
+                data["recovered_at"] = recovered_at
+                data["interruption_reason"] = "web_server_restarted"
+                self._atomic_write_json(path, data)
+            except (OSError, ValueError, TypeError):
+                continue
+
     def start_mission(self, mission_name=""):
         """开始新任务记录。"""
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"mission_{timestamp}.json"
-        self.current_mission_file = os.path.join(self.data_dir, filename)
-        self.current_mission_data = {
-            "mission_id": timestamp,
-            "name": mission_name or f"Mission {timestamp}",
-            "start_time": datetime.now().isoformat(),
-            "end_time": None,
-            "track_points": [],
-            "route_waypoints": [],
-            "sampling_events": [],
-            "data_points": []
-        }
-        self._save_current()
-        return filename
+        with self._write_lock:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            filename = f"mission_{timestamp}.json"
+            self.current_mission_file = os.path.join(self.data_dir, filename)
+            self.current_mission_data = {
+                "mission_id": timestamp,
+                "name": mission_name or f"Mission {timestamp}",
+                "state": "running",
+                "start_time": datetime.now().isoformat(),
+                "end_time": None,
+                "track_points": [],
+                "route_waypoints": [],
+                "sampling_events": [],
+                "data_points": []
+            }
+            self._save_current()
+            return filename
 
     def is_recording(self):
         """是否正在记录任务数据。"""
@@ -1082,11 +1138,13 @@ class MissionDataManager(object):
 
     def stop_mission(self):
         """停止任务记录。"""
-        if self.current_mission_file:
-            self.current_mission_data["end_time"] = datetime.now().isoformat()
-            self._save_current()
-            self.current_mission_file = None
-            self.current_mission_data = []
+        with self._write_lock:
+            if self.current_mission_file:
+                self.current_mission_data["state"] = "completed"
+                self.current_mission_data["end_time"] = datetime.now().isoformat()
+                self._save_current()
+                self.current_mission_file = None
+                self.current_mission_data = []
 
     def set_route_waypoints(self, waypoints):
         """缓存当前任务航线航点。"""
@@ -1270,15 +1328,16 @@ class MissionDataManager(object):
 
     def _save_current(self):
         """保存当前任务数据到文件。"""
-        if self.current_mission_file:
-            with open(self.current_mission_file, 'w', encoding='utf-8') as f:
-                json.dump(self.current_mission_data, f, ensure_ascii=False, indent=2)
+        with self._write_lock:
+            if self.current_mission_file:
+                self._atomic_write_json(self.current_mission_file, self.current_mission_data)
 
     @staticmethod
     def _with_summary(data):
         if not isinstance(data, dict):
             return data
         result = dict(data)
+        result.setdefault("state", "completed" if result.get("end_time") else "interrupted")
         result["summary"] = build_mission_summary(result)
         return result
 
@@ -1301,6 +1360,7 @@ class MissionDataManager(object):
                         mission = {
                             "id": data.get("mission_id", f),
                             "name": data.get("name", f),
+                            "state": data.get("state") or ("completed" if data.get("end_time") else "interrupted"),
                             "start_time": data.get("start_time"),
                             "end_time": data.get("end_time"),
                             "point_count": len(data.get("data_points", [])),
@@ -1345,8 +1405,7 @@ class MissionDataManager(object):
         path = os.path.join(self.data_dir, f"mission_{mission_id}.json")
         if not os.path.exists(path):
             return False
-        with open(path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
+        self._atomic_write_json(path, data)
         return True
 
     def delete_mission(self, mission_id):
@@ -1837,15 +1896,20 @@ class WebConfigServer(object):
         if not self.standalone:
             self.host = rospy.get_param('~host', '0.0.0.0')
             self.port = rospy.get_param('~port', 5000)
+            self.mission_data_dir = rospy.get_param(
+                '~data_dir',
+                os.environ.get('USV_MISSION_DATA_DIR', DATA_DIR),
+            )
         else:
             self.host = '0.0.0.0'
             self.port = 5000
+            self.mission_data_dir = os.environ.get('USV_MISSION_DATA_DIR', DATA_DIR)
 
         # 管理器
         self.config_manager = ConfigManager()
         self.config_manager.load()
         self.preset_manager = PresetManager()
-        self.data_manager = MissionDataManager()
+        self.data_manager = MissionDataManager(self.mission_data_dir)
         self.sample_storage = SampleRecordingStorage(self.data_manager.data_dir)
         self.current_sample_window = None
         self.calibration_manager = CalibrationManager()
@@ -3279,6 +3343,92 @@ class WebConfigServer(object):
             include_lab=include_lab,
         )
         return not bool(reason), reason
+
+    def _mission_csv_text(self, data):
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow([
+            "timestamp", "voltage", "absorbance", "concentration",
+            "concentration_unit", "metric_used", "wgs84_lat", "wgs84_lng",
+            "gcj02_lat", "gcj02_lng", "position_source", "lab_mode",
+            "waypoint_seq", "step_index", "loop_index", "pollutant_name",
+            "method_name", "calibration_id", "quality_flags",
+            "valid_for_surface", "excluded_reason",
+        ])
+        for point in data.get("data_points", []):
+            wgs84 = point.get("wgs84", {}) if isinstance(point.get("wgs84"), dict) else {}
+            gcj02 = point.get("gcj02", {}) if isinstance(point.get("gcj02"), dict) else {}
+            valid_for_surface, excluded_reason = self._point_surface_contract(
+                point,
+                "auto",
+                include_lab=False,
+            )
+            writer.writerow([
+                point.get("timestamp", ""), point.get("voltage", ""),
+                point.get("absorbance", ""), point.get("concentration", ""),
+                point.get("concentration_unit", ""), point.get("metric_used", ""),
+                wgs84.get("lat", ""), wgs84.get("lng", ""),
+                gcj02.get("lat", ""), gcj02.get("lng", ""),
+                point.get("position_source", ""), point.get("lab_mode", False),
+                point.get("waypoint_seq", ""), point.get("step_index", ""),
+                point.get("loop_index", ""), point.get("pollutant_name", ""),
+                point.get("method_name", ""), point.get("calibration_id", ""),
+                self._point_quality_flags(point),
+                "true" if valid_for_surface else "false",
+                excluded_reason,
+            ])
+        return output.getvalue()
+
+    def _iter_raw_csv_chunks(self, mission_id, sample_id):
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow((
+            "frame_index", "received_at_ms", "source_timestamp_ms", "voltage",
+            "absorbance", "raw_code", "valid", "status",
+        ))
+        yield output.getvalue()
+        for index, frame in enumerate(self.sample_storage.iter_raw_frames(mission_id, sample_id)):
+            output.seek(0)
+            output.truncate(0)
+            writer.writerow((
+                index,
+                frame.get("received_at_ms"),
+                frame.get("source_timestamp_ms", frame.get("timestamp_ms")),
+                frame.get("voltage"),
+                frame.get("absorbance"),
+                frame.get("raw_code"),
+                frame.get("valid"),
+                frame.get("status"),
+            ))
+            yield output.getvalue()
+
+    def _build_mission_archive(self, data):
+        mission_id = safe_id(data.get("mission_id"), "mission")
+        root = "mission_%s" % mission_id
+        archive_file = tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024, mode="w+b")
+        try:
+            with zipfile.ZipFile(archive_file, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                archive.writestr(
+                    root + "/mission.json",
+                    json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
+                )
+                archive.writestr(root + "/summary.csv", self._mission_csv_text(data).encode("utf-8"))
+                for window in self.sample_storage.list_windows(data):
+                    sample_id = safe_id(window.get("sample_id"), "sample")
+                    spectrometer = window.get("spectrometer")
+                    raw_file = spectrometer.get("raw_file") if isinstance(spectrometer, dict) else None
+                    if raw_file:
+                        raw_path = self.sample_storage._raw_abspath(str(raw_file))
+                        if os.path.isfile(raw_path):
+                            archive.write(raw_path, root + "/raw/%s.jsonl" % sample_id)
+                    with archive.open(root + "/raw_csv/%s.csv" % sample_id, "w") as csv_file:
+                        for chunk in self._iter_raw_csv_chunks(mission_id, sample_id):
+                            csv_file.write(chunk.encode("utf-8"))
+            archive_file.seek(0)
+            return archive_file
+        except Exception:
+            archive_file.close()
+            raise
 
     def _build_map_meta(self, mission_data, metric="auto", include_lab=False, surface=None):
         data = mission_data or {}
@@ -5024,19 +5174,8 @@ class WebConfigServer(object):
             if not any(str(window.get("sample_id")) == str(sample_id) for window in self.sample_storage.list_windows(data)):
                 return jsonify({"success": False, "error": "采样窗口不存在"}), 404
 
-            def generate_rows():
-                output = io.StringIO()
-                writer = csv.writer(output)
-                writer.writerow(("frame_index", "received_at_ms", "source_timestamp_ms", "voltage", "absorbance", "raw_code", "valid", "status"))
-                yield output.getvalue()
-                for index, frame in enumerate(self.sample_storage.iter_raw_frames(mission_id, sample_id)):
-                    output.seek(0)
-                    output.truncate(0)
-                    writer.writerow((index, frame.get("received_at_ms"), frame.get("source_timestamp_ms", frame.get("timestamp_ms")), frame.get("voltage"), frame.get("absorbance"), frame.get("raw_code"), frame.get("valid"), frame.get("status")))
-                    yield output.getvalue()
-
             return Response(
-                generate_rows(),
+                self._iter_raw_csv_chunks(mission_id, sample_id),
                 mimetype="text/csv",
                 headers={"Content-Disposition": 'attachment; filename="%s.csv"' % sample_id},
             )
@@ -5088,6 +5227,34 @@ class WebConfigServer(object):
                 return self._json_download_response(payload, f"mission_{mission_id}_surface.json")
             return jsonify(payload)
 
+        @self.app.route('/api/data/mission/<mission_id>/archive', methods=['GET'])
+        def download_mission_archive(mission_id):
+            data = self.data_manager.get_mission(mission_id)
+            if not data:
+                return jsonify({"success": False, "message": "mission not found"}), 404
+            archive_file = self._build_mission_archive(data)
+            filename = "mission_%s.zip" % safe_id(mission_id, "mission")
+            try:
+                try:
+                    response = send_file(
+                        archive_file,
+                        mimetype="application/zip",
+                        as_attachment=True,
+                        download_name=filename,
+                    )
+                except TypeError:
+                    response = send_file(
+                        archive_file,
+                        mimetype="application/zip",
+                        as_attachment=True,
+                        attachment_filename=filename,
+                    )
+            except Exception:
+                archive_file.close()
+                raise
+            response.call_on_close(archive_file.close)
+            return response
+
         @self.app.route('/api/data/mission/<mission_id>', methods=['DELETE'])
         def delete_mission_data(mission_id):
             if self.data_manager.delete_mission(mission_id):
@@ -5100,61 +5267,8 @@ class WebConfigServer(object):
             data = self.data_manager.get_mission(mission_id)
             if not data:
                 return jsonify({"success": False, "message": "任务不存在"}), 404
-            import io, csv
-            output = io.StringIO()
-            writer = csv.writer(output)
-            writer.writerow([
-                "timestamp",
-                "voltage",
-                "absorbance",
-                "concentration",
-                "concentration_unit",
-                "metric_used",
-                "wgs84_lat",
-                "wgs84_lng",
-                "gcj02_lat",
-                "gcj02_lng",
-                "position_source",
-                "lab_mode",
-                "waypoint_seq",
-                "step_index",
-                "loop_index",
-                "pollutant_name",
-                "method_name",
-                "calibration_id",
-                "quality_flags",
-                "valid_for_surface",
-                "excluded_reason",
-            ])
-            for pt in data.get("data_points", []):
-                wgs84 = pt.get("wgs84", {}) if isinstance(pt.get("wgs84"), dict) else {}
-                gcj02 = pt.get("gcj02", {}) if isinstance(pt.get("gcj02"), dict) else {}
-                valid_for_surface, excluded_reason = self._point_surface_contract(pt, "auto", include_lab=False)
-                writer.writerow([
-                    pt.get("timestamp", ""),
-                    pt.get("voltage", ""),
-                    pt.get("absorbance", ""),
-                    pt.get("concentration", ""),
-                    pt.get("concentration_unit", ""),
-                    pt.get("metric_used", ""),
-                    wgs84.get("lat", ""),
-                    wgs84.get("lng", ""),
-                    gcj02.get("lat", ""),
-                    gcj02.get("lng", ""),
-                    pt.get("position_source", ""),
-                    pt.get("lab_mode", False),
-                    pt.get("waypoint_seq", ""),
-                    pt.get("step_index", ""),
-                    pt.get("loop_index", ""),
-                    pt.get("pollutant_name", ""),
-                    pt.get("method_name", ""),
-                    pt.get("calibration_id", ""),
-                    self._point_quality_flags(pt),
-                    "true" if valid_for_surface else "false",
-                    excluded_reason,
-                ])
             return Response(
-                output.getvalue(),
+                self._mission_csv_text(data),
                 mimetype="text/csv",
                 headers={"Content-Disposition": f"attachment; filename=mission_{mission_id}.csv"}
             )

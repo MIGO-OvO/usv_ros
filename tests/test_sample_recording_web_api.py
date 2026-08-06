@@ -1,7 +1,11 @@
 import json
+import io
+import os
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
+from unittest import mock
 
 from scripts.lib.sample_recording.storage import SampleRecordingStorage
 from scripts.web_config_server import FLASK_AVAILABLE, MissionDataManager, String, WebConfigServer
@@ -51,6 +55,7 @@ class SampleRecordingWebApiTest(unittest.TestCase):
             raw = client.get("/api/data/mission/%s/sample/%s/raw" % (mission_id, sample_id)).get_json()
             series = client.get("/api/data/voltage-series?mission_id=%s&sample_id=%s&max_points=4" % (mission_id, sample_id)).get_json()
             raw_csv = client.get("/api/data/mission/%s/sample/%s/raw.csv" % (mission_id, sample_id))
+            archive = client.get("/api/data/mission/%s/archive" % mission_id)
             updated = client.post(
                 "/api/data/mission/%s/sample/%s/manual-result" % (mission_id, sample_id),
                 json={"analyte": "COD", "concentration": 0.84, "unit": "mg/L"},
@@ -66,8 +71,28 @@ class SampleRecordingWebApiTest(unittest.TestCase):
             self.assertEqual(3, series["data"]["raw_count"])
             self.assertEqual(3, series["data"]["returned_count"])
             self.assertEqual(4, len(raw_csv.get_data(as_text=True).splitlines()))
+            self.assertEqual(200, archive.status_code)
+            with zipfile.ZipFile(io.BytesIO(archive.data)) as archive_file:
+                root = "mission_%s" % mission_id
+                names = set(archive_file.namelist())
+                self.assertIn(root + "/mission.json", names)
+                self.assertIn(root + "/summary.csv", names)
+                self.assertIn(root + "/raw/%s.jsonl" % sample_id, names)
+                self.assertIn(root + "/raw_csv/%s.csv" % sample_id, names)
+                manifest = json.loads(archive_file.read(root + "/mission.json").decode("utf-8"))
+                raw_csv_text = archive_file.read(root + "/raw_csv/%s.csv" % sample_id).decode("utf-8")
+                self.assertEqual("completed", manifest["state"])
+                self.assertEqual(4, len(raw_csv_text.splitlines()))
+            archive.close()
             self.assertEqual("recorded", updated["data"]["manual_result"]["status"])
             self.assertEqual(0.84, reloaded["sample_windows"][0]["manual_result"]["concentration"])
+
+    def test_standalone_server_uses_explicit_mission_data_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(os.environ, {"USV_MISSION_DATA_DIR": tmp}):
+                server = WebConfigServer(standalone=True)
+
+            self.assertEqual(str(Path(tmp).resolve()), server.data_manager.data_dir)
 
     def test_sample_routes_report_missing_sample(self):
         with tempfile.TemporaryDirectory() as tmp:

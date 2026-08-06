@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts.lib.sample_recording.models import normalize_raw_frame
 from scripts.lib.sample_recording.storage import SampleRecordingStorage
@@ -109,6 +110,21 @@ class SampleRecordingStorageTest(unittest.TestCase):
             self.assertEqual(2.0, closed["spectrometer"]["voltage_mean"])
             self.assertEqual(10.0, closed["spectrometer"]["raw_code_min"])
             self.assertEqual(20.0, closed["spectrometer"]["raw_code_max"])
+
+    def test_raw_frames_are_periodically_synced_and_forced_on_close(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mission = {"mission_id": "mission_fsync"}
+            storage = SampleRecordingStorage(tmp, fsync_interval_s=1.0)
+            window = storage.start_window(mission, {"sample_id": "sample_fsync"})
+
+            with mock.patch("scripts.lib.sample_recording.storage.time.monotonic", side_effect=[10.0, 10.5, 11.1]), \
+                    mock.patch("scripts.lib.sample_recording.storage.os.fsync") as fsync:
+                storage.append_raw_frame(window, {"voltage": 1.0, "valid": True})
+                storage.append_raw_frame(window, {"voltage": 1.1, "valid": True})
+                storage.append_raw_frame(window, {"voltage": 1.2, "valid": True})
+                storage.close_window(mission, window)
+
+            self.assertEqual(3, fsync.call_count)
 
 
 if __name__ == "__main__":
