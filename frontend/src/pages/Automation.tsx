@@ -6,7 +6,7 @@ import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { Switch } from '@/components/ui/switch'
 import { NumericInput } from '@/components/ui/numeric-input'
-import { Play, Square, Pause, Save, FolderOpen, Plus, Trash2, ArrowUp, ArrowDown, Download, Upload } from 'lucide-react'
+import { Play, Square, Pause, Save, FolderOpen, Plus, Trash2, ArrowUp, ArrowDown, Download, Upload, Loader2 } from 'lucide-react'
 import { useAppStore } from '@/store'
 import { InjectionPumpCard } from '@/components/injection-pump-card'
 import { WaypointSamplingCard } from '@/components/waypoint-sampling-card'
@@ -79,7 +79,7 @@ const normalizeSteps = (rawSteps?: Partial<Step>[]): Step[] =>
   Array.isArray(rawSteps) ? rawSteps.map((step) => normalizeStep(step)) : []
 
 export default function Automation() {
-  const { automationRunning, automationPaused } = useAppStore()
+  const { automationRunning, automationPaused, automationStep, automationTotal, currentLoop, totalLoops } = useAppStore()
   const automationState = { running: automationRunning, paused: automationPaused }
   const controls = getAutomationControlAvailability(automationState)
   const [steps, setSteps] = useState<Step[]>([])
@@ -292,6 +292,19 @@ export default function Automation() {
           <p className="text-muted-foreground">配置并执行采样序列任务。</p>
         </div>
         <div className="flex w-full flex-wrap items-center gap-2 md:w-auto">
+          {(automationRunning || automationPaused) && automationTotal > 0 && (
+            <div className="flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2">
+              <Loader2 className="w-4 h-4 animate-spin text-emerald-500" />
+              <span className="text-sm font-semibold tabular-nums whitespace-nowrap">
+                {automationPaused ? '已暂停' : '运行中'}：步骤 {automationStep} / {automationTotal}
+              </span>
+              {(totalLoops === 0 || totalLoops > 1) && (
+                <span className="text-xs text-muted-foreground tabular-nums whitespace-nowrap">
+                  第 {currentLoop} / {totalLoops === 0 ? '∞' : totalLoops} 圈
+                </span>
+              )}
+            </div>
+          )}
           <Button variant="outline" onClick={() => handleAction('start')} disabled={!controls.start}>
             <Play className="w-4 h-4 mr-2 text-emerald-500" /> 启动
           </Button>
