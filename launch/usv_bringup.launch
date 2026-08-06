@@ -31,6 +31,7 @@
     <arg name="web_host" default="0.0.0.0" />
     <arg name="web_port" default="5000" />
     <arg name="web_ui" default="auto" />
+    <arg name="data_dir" default="$(find usv_ros)/../../data/missions" />
 
     <!-- MAVLink 触发参数 -->
     <arg name="mavros_timeout" default="30.0" />
@@ -98,6 +99,7 @@
         <param name="host" value="$(arg web_host)" />
         <param name="port" value="$(arg web_port)" />
         <param name="web_ui" value="$(arg web_ui)" />
+        <param name="data_dir" value="$(arg data_dir)" />
     </node>
 
     <!-- ==================== Laboratory Simulation ==================== -->

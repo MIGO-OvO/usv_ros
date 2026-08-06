@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from datetime import datetime, timezone
 from typing import Mapping, Optional
 
@@ -10,10 +11,12 @@ from .summary import SpectrometerSummaryBuilder
 
 
 class SampleRecordingStorage(object):
-    def __init__(self, missions_dir: str) -> None:
+    def __init__(self, missions_dir: str, fsync_interval_s: float = 1.0) -> None:
         self.missions_dir = os.path.abspath(os.path.expanduser(missions_dir))
         self.raw_root = os.path.join(self.missions_dir, "raw")
         self._builders = {}
+        self._fsync_interval_s = max(0.0, float(fsync_interval_s))
+        self._last_fsync_at = {}
 
     def _raw_relpath(self, mission_id: object, sample_id: object) -> str:
         mission = safe_id(mission_id, "mission")
@@ -68,9 +71,26 @@ class SampleRecordingStorage(object):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a", encoding="utf-8") as file_obj:
             file_obj.write(json.dumps(dict(frame), ensure_ascii=False, separators=(",", ":")) + "\n")
+            now = time.monotonic()
+            last_fsync_at = self._last_fsync_at.get(path)
+            if last_fsync_at is None or now - last_fsync_at >= self._fsync_interval_s:
+                file_obj.flush()
+                os.fsync(file_obj.fileno())
+                self._last_fsync_at[path] = now
         builder = self._builders.setdefault(sample_id, SpectrometerSummaryBuilder())
         builder.add_frame(frame)
         window["spectrometer"] = builder.to_dict(str(raw_file), self._duration_s(window))
+
+    def _force_sync_raw_file(self, raw_file: object) -> None:
+        if not raw_file:
+            return
+        path = self._raw_abspath(str(raw_file))
+        if not os.path.exists(path):
+            return
+        with open(path, "a", encoding="utf-8") as file_obj:
+            file_obj.flush()
+            os.fsync(file_obj.fileno())
+        self._last_fsync_at.pop(path, None)
 
     @staticmethod
     def _duration_s(window: Mapping[str, object]):
@@ -97,6 +117,7 @@ class SampleRecordingStorage(object):
         window["gps_end"] = gps
         window["gps_latest"] = gps or window.get("gps_latest")
         raw_file = window.get("spectrometer", {}).get("raw_file") if isinstance(window.get("spectrometer"), dict) else None
+        self._force_sync_raw_file(raw_file)
         builder = self._builders.pop(window.get("sample_id"), None)
         if builder is None:
             builder = SpectrometerSummaryBuilder()

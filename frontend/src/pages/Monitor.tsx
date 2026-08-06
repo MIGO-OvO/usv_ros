@@ -565,10 +565,10 @@ export default function Monitor() {
                 variant="outline"
                 onClick={handleExportVoltageHistory}
                 disabled={liveHistory.length === 0 || baselineActive}
-                aria-label="导出全部分光计电压历史数据为 CSV"
+                aria-label="导出当前浏览器缓存中的分光计电压数据为 CSV"
               >
                 <Download className="mr-2 h-4 w-4" />
-                导出 CSV
+                导出缓存 CSV
               </Button>
               <Button
                 size="sm"
@@ -586,6 +586,7 @@ export default function Monitor() {
               <span>绘制 {renderedCount}</span>
               <span>{receiveRateHz.toFixed(1)} Hz</span>
               {voltageIsStale && <span>数据陈旧，正在追赶实时</span>}
+              <span>完整历史数据请到“数据中心”下载 Jetson 本地任务包</span>
             </div>
          </CardHeader>
          <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden">

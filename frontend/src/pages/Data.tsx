@@ -5,7 +5,7 @@ import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import { Download, Trash2, RefreshCw, FileText, Calendar, Save } from 'lucide-react'
+import { Archive, Download, Trash2, RefreshCw, FileText, Calendar, Save } from 'lucide-react'
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts'
 import { cn } from "@/lib/utils"
 import { useConfirm } from '@/hooks/use-confirm'
@@ -13,6 +13,7 @@ import { useConfirm } from '@/hooks/use-confirm'
 type MissionMeta = {
   readonly id: string
   readonly name: string
+  readonly state?: 'running' | 'completed' | 'interrupted' | string
   readonly start_time: string
   readonly end_time: string | null
   readonly point_count: number
@@ -251,6 +252,11 @@ export default function Data() {
     window.open(`/api/data/mission/${encodeURIComponent(id)}/csv`, '_blank')
   }
 
+  const exportMissionArchive = (e: MouseEvent, id: string) => {
+    e.stopPropagation()
+    window.open(`/api/data/mission/${encodeURIComponent(id)}/archive`, '_blank')
+  }
+
   const exportRawCsv = () => {
     if (!selectedId || !sampleDetail) return
     window.open(`/api/data/mission/${encodeURIComponent(selectedId)}/sample/${encodeURIComponent(sampleDetail.sample_id)}/raw.csv`, '_blank')
@@ -323,10 +329,15 @@ export default function Data() {
                       <span className="flex items-center gap-2 text-xs text-muted-foreground">
                         <FileText className="w-3 h-3" />
                         <span>{mission.point_count} 数据点</span>
+                        {mission.state === 'running' && <span className="text-blue-600">记录中</span>}
+                        {mission.state === 'interrupted' && <span className="text-amber-600">异常中断</span>}
                       </span>
                     </button>
                     <div className="flex shrink-0 gap-1 pr-1 pt-2">
-                      <Button size="icon" variant="ghost" className="h-6 w-6" onClick={(e) => exportMission(e, mission.id)} title="导出" aria-label={`导出任务 ${mission.name}`}>
+                      <Button size="icon" variant="ghost" className="h-6 w-6" onClick={(e) => exportMissionArchive(e, mission.id)} title="下载完整任务包" aria-label={`下载完整任务包 ${mission.name}`}>
+                        <Archive className="w-3 h-3" />
+                      </Button>
+                      <Button size="icon" variant="ghost" className="h-6 w-6" onClick={(e) => exportMission(e, mission.id)} title="导出摘要 CSV" aria-label={`导出任务摘要 ${mission.name}`}>
                         <Download className="w-3 h-3" />
                       </Button>
                       <Button size="icon" variant="ghost" className="h-6 w-6 text-destructive hover:text-destructive" onClick={(e) => deleteMission(e, mission.id)} title="删除" aria-label={`删除任务 ${mission.name}`}>

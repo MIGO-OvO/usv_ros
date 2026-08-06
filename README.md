@@ -582,8 +582,10 @@ REST API 和 Socket.IO 实时事件。
 | `GET /api/data/mission/<id>/samples` | 任务下采样窗口列表，不返回 raw frames |
 | `GET /api/data/mission/<id>/sample/<sample_id>` | 单个采样窗口元数据和摘要 |
 | `GET /api/data/mission/<id>/sample/<sample_id>/raw` | 读取窗口 raw frames，支持 `limit`、`offset` |
+| `GET /api/data/mission/<id>/sample/<sample_id>/raw.csv` | 下载单个采样窗口的完整原始帧 CSV |
 | `POST /api/data/mission/<id>/sample/<sample_id>/manual-result` | 写入人工浓度、单位、方法、记录人和备注 |
 | `GET /api/data/mission/<id>/csv` | 历史任务 CSV 下载 |
+| `GET /api/data/mission/<id>/archive` | 下载整任务 ZIP，包含任务 JSON、摘要 CSV、各窗口 JSONL 与原始 CSV |
 | `GET /api/data/mission/<id>/geojson` | 历史污染物点位 GeoJSON；可带 `metric=concentration` 与 `download=true` |
 | `GET /api/data/mission/<id>/surface` | 历史污染物 IDW surface；可带 `metric`、`size`、`power` 与 `download=true` |
 | `GET /api/map/live` | 当前任务实时点位、轨迹、污染物 surface、走航门控状态 |
@@ -808,6 +810,13 @@ Web 的 `POST /api/hardware/test-pump-port` 使用同一握手逻辑，不能只
 | `~/usv_ws/data/missions/mission_*.json` | 任务采样数据和 `sample_windows[]` 摘要 |
 | `~/usv_ws/data/missions/raw/<mission_id>/<sample_id>.jsonl` | 采样窗口原始分光帧，一行一帧 |
 
+`web_config_server` 默认使用上述任务目录，也可通过 roslaunch 参数
+`data_dir:=/absolute/path/to/missions` 显式覆盖；直接运行 Web 节点或独立模式时也可使用
+环境变量 `USV_MISSION_DATA_DIR`。
+任务运行期间持续增量写盘；正常结束标记为 `completed`，Web 服务重启后发现未结束任务会标记为
+`interrupted`，避免把异常中断误认为完整任务。监控页“导出缓存 CSV”只包含浏览器已接收的数据，
+正式处理应从“数据中心”下载 Jetson 本地任务包。
+
 查看状态：
 
 ```bash
@@ -821,6 +830,7 @@ curl "http://127.0.0.1:5000/api/logs/usv_system.log?lines=100"
 
 ```bash
 curl http://127.0.0.1:5000/api/data/missions
+curl http://127.0.0.1:5000/api/data/mission/<mission_id>/archive > mission.zip
 curl http://127.0.0.1:5000/api/data/mission/<mission_id>/csv > mission.csv
 curl http://127.0.0.1:5000/api/data/mission/<mission_id>/samples
 curl http://127.0.0.1:5000/api/data/mission/<mission_id>/sample/<sample_id>/raw
