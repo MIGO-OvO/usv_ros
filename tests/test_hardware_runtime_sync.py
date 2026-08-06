@@ -3557,7 +3557,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertIn("socket.on('voltage_batch'", store_text)
         self.assertIn("voltageBatchSupported", store_text)
         self.assertIn("voltageServerBacklogMs", store_text)
-        self.assertIn("MAX_HISTORY_POINTS = 20_000", store_text)
+        self.assertIn("MAX_HISTORY_POINTS = 200_000", store_text)
         self.assertIn("RingBuffer<VoltagePoint>", store_text)
 
     def test_frontend_uses_single_angle_snapshot_committer_and_numeric_time_axis(self):

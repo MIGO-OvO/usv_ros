@@ -188,9 +188,13 @@ interface StatusPayload {
   automation_paused?: boolean
   mission_status?: string
   spectrometer_status?: string
+  automation_step?: number
+  automation_total?: number
+  current_loop?: number
+  total_loops?: number
 }
 
-const MAX_HISTORY_POINTS = 20_000
+const MAX_HISTORY_POINTS = 200_000
 const FAST_TELEMETRY_INTERVAL_MS = 100
 
 function createThrottledCommit<T>(intervalMs: number, commit: (data: T) => void) {
@@ -237,6 +241,10 @@ interface AppState {
   pumpConnected: boolean
   automationRunning: boolean
   automationPaused: boolean
+  automationStep: number
+  automationTotal: number
+  currentLoop: number
+  totalLoops: number
   missionStatus: string
   pumpAngles: PumpAngles
   rawAngles: PumpAngles
@@ -319,6 +327,10 @@ export const useAppStore = create<AppState>((set, get) => ({
   pumpConnected: false,
   automationRunning: false,
   automationPaused: false,
+  automationStep: 0,
+  automationTotal: 0,
+  currentLoop: 0,
+  totalLoops: 0,
   missionStatus: 'IDLE',
   pumpAngles: DEFAULT_ANGLES,
   rawAngles: DEFAULT_ANGLES,
@@ -464,6 +476,10 @@ export const useAppStore = create<AppState>((set, get) => ({
         pumpConnected: data.pump_connected ?? false,
         automationRunning: data.automation_running ?? false,
         automationPaused: data.automation_paused ?? false,
+        automationStep: data.automation_step ?? 0,
+        automationTotal: data.automation_total ?? 0,
+        currentLoop: data.current_loop ?? 0,
+        totalLoops: data.total_loops ?? 0,
         missionStatus: data.mission_status || 'IDLE',
         spectrometerStatus: data.spectrometer_status || 'idle',
       })
