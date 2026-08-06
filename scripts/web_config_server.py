@@ -4731,12 +4731,17 @@ class WebConfigServer(object):
         # ================= WebSocket 事件 =================
         @self.socketio.on('connect')
         def handle_connect():
+            automation = self.latest_automation_status if isinstance(self.latest_automation_status, dict) else {}
             emit('status', {
                 "pump_connected": self.pump_connected,
                 "automation_running": self.automation_running,
                 "automation_paused": self.automation_paused,
                 "mission_status": self.mission_status,
                 "spectrometer_status": self.spectrometer_status,
+                "automation_step": automation.get("automation_step", 0),
+                "automation_total": automation.get("automation_total", 0),
+                "current_loop": automation.get("current_loop", 0),
+                "total_loops": automation.get("total_loops", 0),
             })
             emit('angles', self.current_angles)
             emit('angle_telemetry', self.latest_angle_telemetry)
@@ -5708,12 +5713,17 @@ class WebConfigServer(object):
         rate = 2 # Hz
         while not rospy.is_shutdown():
             if self.socketio:
+                automation = self.latest_automation_status if isinstance(self.latest_automation_status, dict) else {}
                 self.socketio.emit('status', {
                     "pump_connected": self.pump_connected,
                     "automation_running": self.automation_running,
                     "automation_paused": self.automation_paused,
                     "mission_status": self.mission_status,
                     "spectrometer_status": self.spectrometer_status,
+                    "automation_step": automation.get("automation_step", 0),
+                    "automation_total": automation.get("automation_total", 0),
+                    "current_loop": automation.get("current_loop", 0),
+                    "total_loops": automation.get("total_loops", 0),
                 })
                 self.latest_angle_telemetry = self._build_angle_telemetry(self.latest_angle_telemetry)
                 self.socketio.emit('manual_status', self.manual_status)
