@@ -1533,7 +1533,8 @@ DEFAULT_CONFIG = {
         "gain": 1,
         "vref_mode": "AVDD",
         "adc_rate": 90,
-        "publish_rate": 20,
+        "publish_rate": 90,
+        "spectro_output_hz": 10,
         "continuous_mode": True,
         "auto_start": False,
         "reference_voltage": 0.0,
@@ -3868,7 +3869,8 @@ class WebConfigServer(object):
             "gain": int(hw.get("gain", 1)),
             "vref_mode": hw.get("vref_mode", "AVDD"),
             "adc_rate": int(hw.get("adc_rate", 90)),
-            "publish_rate": int(hw.get("publish_rate", 20)),
+            "publish_rate": int(hw.get("publish_rate", 90)),
+            "spectro_output_hz": int(hw.get("spectro_output_hz", 10)),
             "continuous_mode": bool(hw.get("continuous_mode", True)),
             "reference_voltage": float(hw.get("reference_voltage", 0.0)),
             "baseline_voltage": float(hw.get("baseline_voltage", 0.0)),
@@ -3917,7 +3919,8 @@ class WebConfigServer(object):
             "gain": int(hw.get("gain", 1)),
             "vref_mode": hw.get("vref_mode", "AVDD"),
             "adc_rate": int(hw.get("adc_rate", 90)),
-            "publish_rate": int(hw.get("publish_rate", 20)),
+            "publish_rate": int(hw.get("publish_rate", 90)),
+            "spectro_output_hz": int(hw.get("spectro_output_hz", 10)),
             "continuous_mode": bool(hw.get("continuous_mode", True)),
             "reference_voltage": float(hw.get("reference_voltage", 0.0)),
             "baseline_voltage": float(hw.get("baseline_voltage", 0.0)),
@@ -4044,7 +4047,8 @@ class WebConfigServer(object):
             hw['gain'] = normalize_gain(hw.get('gain'), 1)
             hw['vref_mode'] = normalize_vref(hw.get('vref_mode'))
             hw['adc_rate'] = to_int(hw.get('adc_rate'), 90, 1, 2000)
-            hw['publish_rate'] = to_int(hw.get('publish_rate'), 20, 1, 200)
+            hw['publish_rate'] = to_int(hw.get('publish_rate'), 90, 1, 200)
+            hw['spectro_output_hz'] = to_int(hw.get('spectro_output_hz'), 10, 1, 50)
             hw['continuous_mode'] = to_bool(hw.get('continuous_mode'), True)
             hw['auto_start'] = to_bool(hw.get('auto_start'), False)
             hw['reference_voltage'] = to_float(hw.get('reference_voltage'), 0.0, 0.0, 10.0)
