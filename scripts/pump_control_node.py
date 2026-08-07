@@ -104,7 +104,10 @@ DEFAULT_SPECTRO_CONFIG = {
     "continuous_mode": True,
     "vref_mode": "AVDD",
     "adc_rate": 90,
-    "publish_rate": 20,
+    # ESP32 上行原始帧率；应 >= adc_rate，保证 ROS 端平均窗口内有足够样本
+    "publish_rate": 90,
+    # ROS 端平均输出率：原始帧按 1/output_hz 秒窗口聚合后发布
+    "spectro_output_hz": 10,
     "reference_voltage": 0.0,
     "baseline_voltage": 0.0,
     "path_length_cm": 1.0,
@@ -543,6 +546,8 @@ class PumpControlNode(object):
         self.spectro_state = "idle"
         self._last_published_spectro_status = None
         self._spectro_sequence = 0
+        self._spectro_agg_frames = []
+        self._spectro_agg_started = None
         self.spectro_reference_voltage = float(self.spectro_config.get('reference_voltage', 0.0))
         self.spectro_baseline_voltage = float(self.spectro_config.get('baseline_voltage', 0.0))
         self.spectro_command_event = threading.Event()
@@ -748,8 +753,9 @@ class PumpControlNode(object):
         cfg['ads_address'] = str(cfg.get('ads_address', '0x40')).strip() or '0x40'
         cfg['mux'] = str(cfg.get('mux', 'AIN0')).strip().upper() or 'AIN0'
         cfg['gain'] = int(cfg.get('gain', 1) or 1)
-        cfg['publish_rate'] = max(1, int(cfg.get('publish_rate', 20) or 20))
+        cfg['publish_rate'] = max(1, int(cfg.get('publish_rate', 90) or 90))
         cfg['adc_rate'] = int(cfg.get('adc_rate', 90) or 90)
+        cfg['spectro_output_hz'] = max(1, min(50, int(cfg.get('spectro_output_hz', 10) or 10)))
         cfg['reference_voltage'] = float(cfg.get('reference_voltage', 0.0) or 0.0)
         cfg['baseline_voltage'] = float(cfg.get('baseline_voltage', 0.0) or 0.0)
         return cfg
@@ -891,7 +897,7 @@ class PumpControlNode(object):
         vref_raw = str(cfg.get('vref_mode', 'AVDD')).strip().upper()
         vref_mode = 'INT' if vref_raw in ('INT', 'INTERNAL', 'INT_2V048') else 'AVDD'
         adc_rate = int(cfg.get('adc_rate', 90) or 90)
-        publish_rate = max(1, int(cfg.get('publish_rate', 20) or 20))
+        publish_rate = max(1, int(cfg.get('publish_rate', 90) or 90))
         return (
             "ADSCFG:CH={ch},ADDR={addr},AIN={ain},REF={vref},GAIN={gain},DR={rate},MODE={mode},PR={pub}"
             .format(
@@ -931,6 +937,8 @@ class PumpControlNode(object):
 
     def _spectro_stop(self):
         self._begin_spectro_command_wait()
+        self._spectro_agg_frames = []
+        self._spectro_agg_started = None
         ok = self.send_command('ADSSTOP')
         if not ok:
             return False, 'Spectrometer stop command send failed'
@@ -1549,7 +1557,7 @@ class PumpControlNode(object):
 
 
     def _on_spectro_received(self, data):
-        """分光数据回调。"""
+        """分光数据回调：原始帧照发，有效帧按输出周期聚合平均后发布。"""
         received_at = time.time()
         self._spectro_sequence += 1
         data = dict(data)
@@ -1559,9 +1567,7 @@ class PumpControlNode(object):
             'received_at': received_at,
             'received_at_ms': int(received_at * 1000),
         })
-        self.latest_spectro = data
         if data.get('valid', False):
-            self._latest_spectro_received_at = received_at
             self.spectro_state = 'acquiring'
         elif data.get('i2c_error', False):
             self.spectro_state = 'i2c_error'
@@ -1569,34 +1575,71 @@ class PumpControlNode(object):
             self.spectro_state = 'not_configured'
         elif data.get('saturated', False):
             self.spectro_state = 'saturated'
-
-        absorbance = self._calculate_absorbance(data.get('voltage', 0.0))
-        payload = {
-            'voltage': data.get('voltage', 0.0),
-            'sample_voltage': data.get('voltage', 0.0),
-            'absorbance': absorbance,
-            'status': self.spectro_state,
-            'timestamp_ms': data.get('timestamp_ms', 0),
-            'source_timestamp_ms': data.get('source_timestamp_ms', 0),
-            'received_at': data.get('received_at'),
-            'received_at_ms': data.get('received_at_ms'),
-            'seq': data.get('seq'),
-            'tca_channel': data.get('tca_channel', -1),
-            'raw_code': data.get('raw_code', 0),
-            'valid': data.get('valid', False),
-            'i2c_error': data.get('i2c_error', False),
-            'not_configured': data.get('not_configured', False),
-            'saturated': data.get('saturated', False),
-            'reference_voltage': self.spectro_reference_voltage,
-            'baseline_voltage': self.spectro_baseline_voltage,
-            'baseline_set': self._spectro_reference_ready(),
-        }
         self._publish_spectro_status(self.spectro_state)
 
         raw_msg = String()
         raw_msg.data = json.dumps(data)
         self.spectro_raw_pub.publish(raw_msg)
 
+        if data.get('valid', False):
+            self._accumulate_spectro_sample(data, received_at)
+
+    def _accumulate_spectro_sample(self, data, received_at):
+        """把有效原始帧累积进输出窗口，窗口到点输出平均帧。"""
+        output_hz = max(1, int(self.spectro_config.get('spectro_output_hz', 10) or 10))
+        interval = 1.0 / output_hz
+        if self._spectro_agg_started is None:
+            self._spectro_agg_started = received_at
+            self._spectro_agg_frames = []
+        self._spectro_agg_frames.append(data)
+        if received_at - self._spectro_agg_started >= interval:
+            self._emit_spectro_average(self._spectro_agg_frames)
+            self._spectro_agg_frames = []
+            self._spectro_agg_started = None
+
+    def _emit_spectro_average(self, frames):
+        """输出一个平均周期：电压/吸光度按平均电压计算，latest_spectro 更新为平均帧。"""
+        voltages = [float(f.get('voltage', 0.0)) for f in frames]
+        avg_voltage = sum(voltages) / len(voltages)
+        if len(voltages) > 1:
+            variance = sum((v - avg_voltage) ** 2 for v in voltages) / len(voltages)
+            voltage_std = variance ** 0.5
+        else:
+            voltage_std = 0.0
+        emitted_at = time.time()
+        last = frames[-1]
+        self.latest_spectro = dict(last)
+        self.latest_spectro.update({
+            'voltage': round(avg_voltage, 9),
+            'voltage_std': round(voltage_std, 9),
+            'raw_count': len(frames),
+            'received_at': emitted_at,
+            'received_at_ms': int(emitted_at * 1000),
+        })
+        self._latest_spectro_received_at = emitted_at
+        absorbance = self._calculate_absorbance(avg_voltage)
+        payload = {
+            'voltage': round(avg_voltage, 9),
+            'sample_voltage': round(avg_voltage, 9),
+            'voltage_std': round(voltage_std, 9),
+            'raw_count': len(frames),
+            'absorbance': absorbance,
+            'status': self.spectro_state,
+            'timestamp_ms': last.get('timestamp_ms', 0),
+            'source_timestamp_ms': last.get('source_timestamp_ms', 0),
+            'received_at': emitted_at,
+            'received_at_ms': int(emitted_at * 1000),
+            'seq': last.get('seq'),
+            'tca_channel': last.get('tca_channel', -1),
+            'raw_code': last.get('raw_code', 0),
+            'valid': True,
+            'i2c_error': last.get('i2c_error', False),
+            'not_configured': last.get('not_configured', False),
+            'saturated': last.get('saturated', False),
+            'reference_voltage': self.spectro_reference_voltage,
+            'baseline_voltage': self.spectro_baseline_voltage,
+            'baseline_set': self._spectro_reference_ready(),
+        }
         voltage_msg = String()
         voltage_msg.data = json.dumps(payload)
         self.spectro_voltage_pub.publish(voltage_msg)
@@ -1606,7 +1649,7 @@ class PumpControlNode(object):
             'absorbance': absorbance,
             'reference_voltage': self.spectro_reference_voltage,
             'baseline_voltage': self.spectro_baseline_voltage,
-            'sample_voltage': data.get('voltage', 0.0),
+            'sample_voltage': round(avg_voltage, 9),
             'baseline_set': self._spectro_reference_ready(),
         })
         self.spectro_absorbance_pub.publish(absorbance_msg)

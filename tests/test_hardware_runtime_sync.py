@@ -3514,21 +3514,43 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         )
         node = module.PumpControlNode()
 
-        node._on_spectro_received({
-            "timestamp_ms": 1234,
-            "tca_channel": 2,
-            "raw_code": 42,
-            "voltage": 1.25,
-            "valid": True,
-        })
+        base = 1_000_000
+        with unittest.mock.patch.object(
+            module.time, "time", side_effect=[base, base + 0.05, base + 0.12, base + 0.12]
+        ):
+            node._on_spectro_received({
+                "timestamp_ms": 1234,
+                "tca_channel": 2,
+                "raw_code": 42,
+                "voltage": 1.25,
+                "valid": True,
+            })
+            node._on_spectro_received({
+                "timestamp_ms": 1235,
+                "tca_channel": 2,
+                "raw_code": 43,
+                "voltage": 1.45,
+                "valid": True,
+            })
+            node._on_spectro_received({
+                "timestamp_ms": 1236,
+                "tca_channel": 2,
+                "raw_code": 44,
+                "voltage": 1.35,
+                "valid": True,
+            })
 
         voltage = json.loads(publishers["/usv/spectrometer_voltage"].messages[-1].data)
         raw = json.loads(publishers["/usv/spectrometer_raw"].messages[-1].data)
-        self.assertEqual(voltage["seq"], 1)
-        self.assertEqual(voltage["source_timestamp_ms"], 1234)
+        self.assertEqual(voltage["seq"], 3)
+        self.assertEqual(voltage["source_timestamp_ms"], 1236)
+        self.assertEqual(voltage["raw_count"], 3)
+        self.assertEqual(voltage["voltage"], 1.35)
+        self.assertAlmostEqual(voltage["voltage_std"], 0.081649658, places=8)
         self.assertGreater(voltage["received_at_ms"], 0)
-        self.assertEqual(raw["seq"], 1)
-        self.assertEqual(raw["source_timestamp_ms"], 1234)
+        self.assertEqual(raw["seq"], 3)
+        self.assertEqual(raw["source_timestamp_ms"], 1236)
+        self.assertEqual(len(publishers["/usv/spectrometer_raw"].messages), 3)
 
     def test_config_manager_preserves_correct_zero_spectro_channel(self):
         module, _, _ = _load_script(
@@ -3827,7 +3849,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertTrue(success)
         self.assertEqual(message, "ADS_OK:START")
         self.assertEqual(sent[0], "I2CMAP:X=0,Y=3,Z=4,A=7,SPEC=2")
-        self.assertIn("ADSCFG:CH=2,ADDR=0x40,AIN=AIN0,REF=AVDD,GAIN=1,DR=90,MODE=CONT,PR=20", sent[1])
+        self.assertIn("ADSCFG:CH=2,ADDR=0x40,AIN=AIN0,REF=AVDD,GAIN=1,DR=90,MODE=CONT,PR=90", sent[1])
         self.assertEqual(sent[2], "ADSSTART")
         self.assertEqual(node.spectro_reference_voltage, 0.0)
 
