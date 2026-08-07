@@ -1055,6 +1055,7 @@ class MissionDataManager(object):
         self.current_mission_file = None
         self.current_mission_data = []
         self._write_lock = threading.RLock()
+        self._mission_list_cache = None
         self._ensure_dir()
         self._recover_incomplete_missions()
 
@@ -1341,8 +1342,28 @@ class MissionDataManager(object):
         result["summary"] = build_mission_summary(result)
         return result
 
+    def _mission_list_fingerprint(self):
+        """返回任务文件的 (名称, mtime, size) 摘要，用于列表缓存失效判断。"""
+        if not os.path.isdir(self.data_dir):
+            return None
+        try:
+            entries = []
+            for name in os.listdir(self.data_dir):
+                if not (name.endswith(".json") and name.startswith("mission_")):
+                    continue
+                stat = os.stat(os.path.join(self.data_dir, name))
+                entries.append((name, stat.st_mtime, stat.st_size))
+            return tuple(sorted(entries))
+        except OSError:
+            return None
+
     def list_missions(self):
-        """列出所有任务。"""
+        """列出所有任务。任务文件未变化时返回缓存，避免重复加载大 JSON。"""
+        fingerprint = self._mission_list_fingerprint()
+        if fingerprint is not None:
+            if self._mission_list_cache is not None and self._mission_list_cache[0] == fingerprint:
+                return self._mission_list_cache[1]
+
         missions = []
         if not os.path.exists(self.data_dir):
             return []
@@ -1356,6 +1377,8 @@ class MissionDataManager(object):
                         # 为了效率，这里假设文件较小，或者只读前几行
                         # 简单起见，这里读整个文件，但在生产环境中应该优化
                         data = json.load(file)
+                        if not isinstance(data, dict):
+                            continue
                         summary = build_mission_summary(data)
                         mission = {
                             "id": data.get("mission_id", f),
@@ -1373,7 +1396,9 @@ class MissionDataManager(object):
                 except Exception:
                     continue
         # 按时间倒序
-        return sorted(missions, key=lambda x: x["start_time"] or "", reverse=True)
+        missions = sorted(missions, key=lambda x: x["start_time"] or "", reverse=True)
+        self._mission_list_cache = (fingerprint, missions)
+        return missions
 
     def get_mission(self, mission_id):
         """获取指定任务详情。"""
@@ -5766,6 +5791,8 @@ class WebConfigServer(object):
                 self._publish_steps()
                 # 开始记录数据；若采样生命周期回调已建档则不重复创建。
                 self._start_data_recording_if_needed(source="web")
+                # Web 启动路径也打开采样窗口，确保原始分光帧 JSONL 落盘
+                self._start_sample_window_if_needed()
                 started_recording = True
 
             # 如果是停止，停止记录
