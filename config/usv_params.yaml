@@ -87,7 +87,8 @@ spectrometer:
   continuous_mode: true
   vref_mode: "AVDD"
   adc_rate: 90
-  publish_rate: 20
+  publish_rate: 90
+  spectro_output_hz: 10
   reference_voltage: 0.0
   baseline_voltage: 0.0
   path_length_cm: 1.0
