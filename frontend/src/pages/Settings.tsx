@@ -29,6 +29,7 @@ interface HardwareConfig {
   vref_mode: string
   adc_rate: number
   publish_rate: number
+  spectro_output_hz: number
   continuous_mode: boolean
   auto_start: boolean
   reference_voltage: number
@@ -76,7 +77,8 @@ const DEFAULT_HW: HardwareConfig = {
   gain: 1,
   vref_mode: 'AVDD',
   adc_rate: 90,
-  publish_rate: 20,
+  publish_rate: 90,
+  spectro_output_hz: 10,
   continuous_mode: true,
   auto_start: false,
   reference_voltage: 0.0,
@@ -627,8 +629,9 @@ export default function Settings() {
               <div className="space-y-2"><Label>AIN 通道</Label><select className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" value={hw.mux} onChange={e => setHw(p => ({ ...p, mux: e.target.value }))}><option value="AIN0">AIN0</option><option value="AIN1">AIN1</option><option value="AIN2">AIN2</option><option value="AIN3">AIN3</option></select></div>
               <div className="space-y-2"><Label>增益</Label><select className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" value={hw.gain} onChange={e => setHw(p => ({ ...p, gain: parseInt(e.target.value) || 1 }))}><option value="1">1</option><option value="2">2</option><option value="4">4</option><option value="8">8</option><option value="16">16</option><option value="32">32</option><option value="64">64</option><option value="128">128</option></select></div>
               <div className="space-y-2"><Label>参考电压</Label><select className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" value={hw.vref_mode} onChange={e => setHw(p => ({ ...p, vref_mode: e.target.value }))}><option value="AVDD">AVDD</option><option value="INTERNAL">INTERNAL</option><option value="EXTERNAL">EXTERNAL</option></select></div>
-              <div className="space-y-2"><Label>ADC 速率</Label><Input type="number" value={hw.adc_rate} onChange={e => setHw(p => ({ ...p, adc_rate: parseInt(e.target.value) || 90 }))} /></div>
-              <div className="space-y-2"><Label>发布频率</Label><Input type="number" value={hw.publish_rate} onChange={e => setHw(p => ({ ...p, publish_rate: parseInt(e.target.value) || 20 }))} /></div>
+              <div className="space-y-2"><Label>ADC 速率 (SPS)</Label><select className="flex h-10 w-full rounded-md border border-input bg-background px-3 py-2 text-sm" value={hw.adc_rate} onChange={e => setHw(p => ({ ...p, adc_rate: parseInt(e.target.value) || 90 }))}><option value="20">20</option><option value="45">45</option><option value="90">90</option><option value="175">175</option><option value="330">330</option><option value="600">600</option><option value="1000">1000</option></select></div>
+              <div className="space-y-2"><Label>发布频率 (Hz)</Label><Input type="number" min="1" max="200" value={hw.publish_rate} onChange={e => setHw(p => ({ ...p, publish_rate: parseInt(e.target.value) || 90 }))} /></div>
+              <div className="space-y-2"><Label>输出频率 (Hz)</Label><Input type="number" min="1" max="50" value={hw.spectro_output_hz} onChange={e => setHw(p => ({ ...p, spectro_output_hz: parseInt(e.target.value) || 10 }))} /></div>
               <div className="space-y-2"><Label>基线参考电压</Label><Input type="number" step="0.001" value={hw.reference_voltage} readOnly /></div>
               <div className="space-y-2"><Label>基线电压</Label><Input type="number" step="0.001" value={hw.baseline_voltage} onChange={e => setHw(p => ({ ...p, baseline_voltage: parseFloat(e.target.value) || 0 }))} /></div>
             </div>
