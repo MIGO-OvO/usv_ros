@@ -1,8 +1,10 @@
 # Product
 
-## Register
+<!-- impeccable:product-schema 1 -->
 
-product
+## Platform
+
+web
 
 ## Users
 
@@ -12,15 +14,34 @@ product
 
 `usv_ros` Web 控制台是水质监测无人船的船载任务工具，用于实时监控传感器与链路状态、控制检测装置、配置自动化采样、查看任务数据、规划 Web 侧实验航线和诊断现场问题。成功的界面应让用户在有限屏幕、有限网络和高压力调试场景下快速定位状态、执行命令并确认结果。
 
-## Brand Personality
+## Positioning
 
-克制、可靠、工程化。界面语气应像现场仪表盘：直接、稳定、少装饰，强调可扫读状态、清晰反馈和操作可预期性。
+`usv_ros` 是水质监测无人船的船载载荷集成层：它在 Jetson 上把 ESP32 检测装置、ROS 采样自动化、MAVROS/自定义 MAVLink 桥接，以及可部署的 Web 控制台组织为一套可联调、可运行、可追溯的系统。它不替代飞控固件或 QGC，而负责其间的载荷控制、状态汇聚与业务数据工作流。
 
-## Anti-references
+## Operating Context
 
-不要做营销式首页、过大的 hero、装饰性卡片堆叠或说明型文案。不要把 QGC 第一阶段职责搬到 Web 之外；污染物地图、采样点质量、GeoJSON/CSV 和 IDW surface 仍归 ROS/Web。不要使用会降低现场可读性的低对比灰、过度毛玻璃、过大圆角、花哨动效或不标准控件。
+目标运行环境为 Jetson Nano、Ubuntu 20.04 和 ROS Noetic。操作员通过局域网、船载热点或本机浏览器访问 Web 控制台，在有限网络和高压力调试条件下完成实时监控、手动控制、自动化采样、航点采样配置、任务数据查看、污染物地图与实验航线操作。
 
-## Design Principles
+## Capabilities and Constraints
+
+- 控制 ESP32 检测装置主控，包括 X/Y/Z/A 四路步进泵、进样泵 PWM、角度流和 ADS 分光采样。
+- 通过 Flask + Socket.IO 提供实时状态、REST API 和 React/Vite Web 控制台；前端构建产物位于 `static/dist/`。
+- 管理多步骤采样、暂停/恢复/停止、航点采样规则、任务 JSON 记录和 CSV/GeoJSON/IDW surface 数据输出。
+- 通过 MAVROS 与 `mavlink-routerd` 接入飞控任务链路；MAVLink 字段与命令变更必须以固件源码为准，并同步核对 QGC 定制面板。
+- 飞控固件和 QGC UI 不在本仓库维护；污染物地图、采样点质量和历史数据可视化保持在 ROS/Web 侧。
+
+## Brand Commitments
+
+产品语气保持克制、可靠、工程化，如现场仪表盘般直接、稳定、少装饰，优先呈现可扫读状态、清晰反馈和可预期操作。它是现场任务工具而非营销式产品页。
+
+## Evidence on Hand
+
+- `README.md`：船载部署、ROS 接口、Web API、任务与数据工作流说明。
+- `frontend/src/App.tsx` 与 `frontend/src/pages/`：监控、自动化、手动控制、数据、地图、实验航线和设置等已实现页面。
+- `scripts/web_config_server.py`：Flask、Socket.IO、配置、任务记录与数据 API 的实现。
+- `launch/usv_bringup.launch` 与 `scripts/`：ROS 主链路、检测装置控制、系统健康和 MAVLink bridge 实现。
+
+## Product Principles
 
 1. 现场优先：把连接、任务、泵组、分光、地图和日志状态放在用户能立刻扫到的位置。
 2. 低装饰高密度：每个面板服务一个调试或运行任务，避免营销式留白和纯装饰元素。
