@@ -113,7 +113,7 @@ from scripts.lib.lab_sim.coordinates import (
 )
 from scripts.lib.lab_sim.models import CoordinatePairRef, ModelParseError, SamplingEvent
 from scripts.lib.lab_sim.route_planner import RoutePlannerError, plan_coverage_route
-from scripts.lib.sample_recording import SampleRecordingStorage, normalize_raw_frame
+from scripts.lib.sample_recording import MIN_RAW_RECORD_HZ, SampleRecordingStorage, normalize_raw_frame
 from scripts.lib.sample_recording.models import safe_id
 
 # 配置文件路径
@@ -130,6 +130,9 @@ SOCKET_VOLTAGE_EMIT_INTERVAL_S = 0.05
 SOCKET_ANGLE_EMIT_INTERVAL_S = 0.1
 SOCKET_HEALTH_EMIT_INTERVAL_S = 1.0
 MISSION_DATA_POINT_INTERVAL_S = 0.5
+MISSION_DATA_POINT_CHECKPOINT_INTERVAL = 10
+# 抵消短暂磁盘阻塞，避免原始帧在 ROS 回调队列中被提前丢弃。
+RAW_RECORDING_QUEUE_SIZE = 256
 REALTIME_BUFFER_CAPACITY = 512
 MAX_REALTIME_SAMPLE_AGE_MS = 1000
 REALTIME_INPUT_DROP_THRESHOLD_V = 0.020
@@ -1244,7 +1247,9 @@ class MissionDataManager(object):
             if spectrometer_raw is not None:
                 point["raw"] = spectrometer_raw
             self.current_mission_data["data_points"].append(point)
-            if point.get("lab_mode") or len(self.current_mission_data["data_points"]) % 10 == 0:
+            # 摘要点仅供地图和前端趋势展示。原始分光帧由独立存储层高频落盘，
+            # 不能被每个实验模式摘要点的全量任务 JSON 写入阻塞。
+            if len(self.current_mission_data["data_points"]) % MISSION_DATA_POINT_CHECKPOINT_INTERVAL == 0:
                 self._save_current()
 
     @staticmethod
@@ -1771,6 +1776,7 @@ class ConfigManager(object):
             self.config['lab_mode'] = self._normalize_lab_mode(
                 self.config.get('lab_mode', {})
             )
+            self._migrate_legacy_hardware_defaults()
             self.config['updated_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(self.config_file, 'w', encoding='utf-8') as f:
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
@@ -1833,12 +1839,18 @@ class ConfigManager(object):
         return left_copy == right_copy
 
     def _migrate_legacy_hardware_defaults(self):
-        """Reserved for hardware default migrations."""
+        """Normalize persisted rates so raw spectrometer capture meets the minimum target."""
         hardware = self.config.get('hardware', {})
         if not isinstance(hardware, dict):
-            return
-        # No-op: current detector firmware defaults are preserved by DEFAULT_CONFIG.
-        # Keep method stub for forward compatibility.
+            hardware = {}
+            self.config['hardware'] = hardware
+        for key, maximum in (('adc_rate', 2000), ('publish_rate', 200)):
+            default = DEFAULT_CONFIG['hardware'][key]
+            try:
+                value = int(float(hardware.get(key, default) or default))
+            except (TypeError, ValueError):
+                value = default
+            hardware[key] = max(MIN_RAW_RECORD_HZ, min(maximum, value))
 
     def update(self, data):
         """更新配置。"""
@@ -1873,6 +1885,7 @@ class ConfigManager(object):
 
     def get(self):
         """获取当前配置。"""
+        self._migrate_legacy_hardware_defaults()
         config = self.config.copy()
         config['sampling_sequence'] = self._normalize_sampling_sequence(
             config.get('sampling_sequence', {})
@@ -2057,7 +2070,12 @@ class WebConfigServer(object):
                 self._voltage_cb,
                 queue_size=1,
             )
-            self.spectrometer_raw_sub = rospy.Subscriber('/usv/spectrometer_raw', String, self._spectrometer_raw_cb)
+            self.spectrometer_raw_sub = rospy.Subscriber(
+                '/usv/spectrometer_raw',
+                String,
+                self._spectrometer_raw_cb,
+                queue_size=RAW_RECORDING_QUEUE_SIZE,
+            )
             self.spectro_status_sub = rospy.Subscriber('/usv/spectrometer_status', String, self._spectro_status_cb)
             self.mission_sub = rospy.Subscriber('/usv/mission_status', String, self._mission_status_cb)
             self.trigger_status_sub = rospy.Subscriber('/usv/trigger_status', String, self._trigger_status_cb)
@@ -3405,28 +3423,62 @@ class WebConfigServer(object):
             ])
         return output.getvalue()
 
+    @staticmethod
+    def _raw_csv_columns(include_sample_id=False):
+        columns = [
+            "frame_index", "received_at", "received_at_ms", "source_timestamp_ms",
+            "timestamp_ms", "seq", "tca_channel", "voltage", "absorbance",
+            "raw_code", "valid", "status", "i2c_error", "not_configured", "saturated",
+        ]
+        return (["sample_id"] + columns) if include_sample_id else columns
+
+    @staticmethod
+    def _raw_csv_row(frame, frame_index, sample_id=None):
+        row = [
+            frame_index,
+            frame.get("received_at"),
+            frame.get("received_at_ms"),
+            frame.get("source_timestamp_ms"),
+            frame.get("timestamp_ms"),
+            frame.get("seq"),
+            frame.get("tca_channel"),
+            frame.get("voltage"),
+            frame.get("absorbance"),
+            frame.get("raw_code"),
+            frame.get("valid"),
+            frame.get("status"),
+            frame.get("i2c_error"),
+            frame.get("not_configured"),
+            frame.get("saturated"),
+        ]
+        return ([sample_id] + row) if sample_id is not None else row
+
     def _iter_raw_csv_chunks(self, mission_id, sample_id):
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow((
-            "frame_index", "received_at_ms", "source_timestamp_ms", "voltage",
-            "absorbance", "raw_code", "valid", "status",
-        ))
+        writer.writerow(self._raw_csv_columns())
         yield output.getvalue()
         for index, frame in enumerate(self.sample_storage.iter_raw_frames(mission_id, sample_id)):
             output.seek(0)
             output.truncate(0)
-            writer.writerow((
-                index,
-                frame.get("received_at_ms"),
-                frame.get("source_timestamp_ms", frame.get("timestamp_ms")),
-                frame.get("voltage"),
-                frame.get("absorbance"),
-                frame.get("raw_code"),
-                frame.get("valid"),
-                frame.get("status"),
-            ))
+            writer.writerow(self._raw_csv_row(frame, index))
             yield output.getvalue()
+
+    def _iter_mission_raw_csv_chunks(self, data):
+        mission_id = safe_id(data.get("mission_id"), "mission")
+        output = io.StringIO()
+        writer = csv.writer(output)
+        writer.writerow(self._raw_csv_columns(include_sample_id=True))
+        yield output.getvalue()
+        for window in self.sample_storage.list_windows(data):
+            sample_id = safe_id(window.get("sample_id"), "sample")
+            if sample_id != str(window.get("sample_id")):
+                continue
+            for index, frame in enumerate(self.sample_storage.iter_raw_frames(mission_id, sample_id)):
+                output.seek(0)
+                output.truncate(0)
+                writer.writerow(self._raw_csv_row(frame, index, sample_id=sample_id))
+                yield output.getvalue()
 
     def _build_mission_archive(self, data):
         mission_id = safe_id(data.get("mission_id"), "mission")
@@ -3439,6 +3491,9 @@ class WebConfigServer(object):
                     json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
                 )
                 archive.writestr(root + "/summary.csv", self._mission_csv_text(data).encode("utf-8"))
+                with archive.open(root + "/raw.csv", "w") as csv_file:
+                    for chunk in self._iter_mission_raw_csv_chunks(data):
+                        csv_file.write(chunk.encode("utf-8"))
                 for window in self.sample_storage.list_windows(data):
                     sample_id = safe_id(window.get("sample_id"), "sample")
                     spectrometer = window.get("spectrometer")
@@ -3868,8 +3923,8 @@ class WebConfigServer(object):
             "mux": hw.get("mux", "AIN0"),
             "gain": int(hw.get("gain", 1)),
             "vref_mode": hw.get("vref_mode", "AVDD"),
-            "adc_rate": int(hw.get("adc_rate", 90)),
-            "publish_rate": int(hw.get("publish_rate", 90)),
+            "adc_rate": max(MIN_RAW_RECORD_HZ, int(hw.get("adc_rate", 90))),
+            "publish_rate": max(MIN_RAW_RECORD_HZ, int(hw.get("publish_rate", 90))),
             "spectro_output_hz": int(hw.get("spectro_output_hz", 10)),
             "continuous_mode": bool(hw.get("continuous_mode", True)),
             "reference_voltage": float(hw.get("reference_voltage", 0.0)),
@@ -3918,8 +3973,8 @@ class WebConfigServer(object):
             "mux": hw.get("mux", "AIN0"),
             "gain": int(hw.get("gain", 1)),
             "vref_mode": hw.get("vref_mode", "AVDD"),
-            "adc_rate": int(hw.get("adc_rate", 90)),
-            "publish_rate": int(hw.get("publish_rate", 90)),
+            "adc_rate": max(MIN_RAW_RECORD_HZ, int(hw.get("adc_rate", 90))),
+            "publish_rate": max(MIN_RAW_RECORD_HZ, int(hw.get("publish_rate", 90))),
             "spectro_output_hz": int(hw.get("spectro_output_hz", 10)),
             "continuous_mode": bool(hw.get("continuous_mode", True)),
             "reference_voltage": float(hw.get("reference_voltage", 0.0)),
@@ -4046,8 +4101,8 @@ class WebConfigServer(object):
             hw['mux'] = mux if mux.startswith('AIN') else 'AIN0'
             hw['gain'] = normalize_gain(hw.get('gain'), 1)
             hw['vref_mode'] = normalize_vref(hw.get('vref_mode'))
-            hw['adc_rate'] = to_int(hw.get('adc_rate'), 90, 1, 2000)
-            hw['publish_rate'] = to_int(hw.get('publish_rate'), 90, 1, 200)
+            hw['adc_rate'] = to_int(hw.get('adc_rate'), 90, MIN_RAW_RECORD_HZ, 2000)
+            hw['publish_rate'] = to_int(hw.get('publish_rate'), 90, MIN_RAW_RECORD_HZ, 200)
             hw['spectro_output_hz'] = to_int(hw.get('spectro_output_hz'), 10, 1, 50)
             hw['continuous_mode'] = to_bool(hw.get('continuous_mode'), True)
             hw['auto_start'] = to_bool(hw.get('auto_start'), False)
@@ -5209,6 +5264,19 @@ class WebConfigServer(object):
                 headers={"Content-Disposition": 'attachment; filename="%s.csv"' % sample_id},
             )
 
+        @self.app.route('/api/data/mission/<mission_id>/raw.csv', methods=['GET'])
+        def export_mission_raw_csv(mission_id):
+            """下载全任务高频原始分光帧；地图摘要 CSV 仍使用 /csv。"""
+            data = self.data_manager.get_mission(mission_id)
+            if not data:
+                return jsonify({"success": False, "error": "任务不存在"}), 404
+            filename = "mission_%s_raw.csv" % safe_id(mission_id, "mission")
+            return Response(
+                self._iter_mission_raw_csv_chunks(data),
+                mimetype="text/csv",
+                headers={"Content-Disposition": 'attachment; filename="%s"' % filename},
+            )
+
         @self.app.route('/api/data/mission/<mission_id>/sample/<sample_id>/manual-result', methods=['POST'])
         def update_mission_sample_manual_result(mission_id, sample_id):
             data = self.data_manager.get_mission(mission_id)
@@ -6014,6 +6082,8 @@ class WebConfigServer(object):
             rospy.logerr(f"Server error: {e}")
         except KeyboardInterrupt:
             rospy.loginfo("Server stopped by user")
+        finally:
+            self.sample_storage.close()
 
 def main():
     """主函数"""

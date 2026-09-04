@@ -8,6 +8,9 @@ from typing import Mapping, Optional
 
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
+# 原始分光帧是可追溯数据，不能随前端/地图展示的降采样设置一起降低。
+MIN_RAW_RECORD_HZ = 20
+
 
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="milliseconds") + "Z"

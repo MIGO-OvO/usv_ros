@@ -61,6 +61,19 @@ class MissionDataReliabilityTest(unittest.TestCase):
             self.assertEqual(previous, json.loads(mission_path.read_text(encoding="utf-8")))
             self.assertEqual([], list(Path(tmp).glob("*.tmp")))
 
+    def test_lab_summary_points_checkpoint_in_batches_not_every_point(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            manager = MissionDataManager(tmp)
+            manager.start_mission("lab-checkpoint")
+
+            with mock.patch.object(manager, "_save_current") as save_current:
+                for _ in range(9):
+                    manager.add_data_point(1.0, 0.2, lab_mode=True)
+                self.assertEqual(0, save_current.call_count)
+                manager.add_data_point(1.0, 0.2, lab_mode=True)
+
+            self.assertEqual(1, save_current.call_count)
+
 
 if __name__ == "__main__":
     unittest.main()

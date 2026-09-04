@@ -88,6 +88,9 @@ SPECTRO_STATUS_I2C_ERROR = 0x02
 SPECTRO_STATUS_NOT_CONFIG = 0x04
 SPECTRO_STATUS_SATURATED = 0x08
 
+# 原始分光帧的最小上行频率。前端聚合输出可更低，但落盘链路不得低于此值。
+MIN_RAW_RECORD_HZ = 20
+
 DEFAULT_I2C_MAPPING = {
     "angles": {"X": 0, "Y": 3, "Z": 4, "A": 7},
     "spectro_channel": 2,
@@ -104,7 +107,7 @@ DEFAULT_SPECTRO_CONFIG = {
     "continuous_mode": True,
     "vref_mode": "AVDD",
     "adc_rate": 90,
-    # ESP32 上行原始帧率；应 >= adc_rate，保证 ROS 端平均窗口内有足够样本
+    # ESP32 上行原始帧率；不得低于 MIN_RAW_RECORD_HZ，保障后端原始记录。
     "publish_rate": 90,
     # ROS 端平均输出率：原始帧按 1/output_hz 秒窗口聚合后发布
     "spectro_output_hz": 10,
@@ -569,7 +572,7 @@ class PumpControlNode(object):
         self.manual_status_pub = rospy.Publisher('/usv/manual_status', String, queue_size=10, latch=True)
         self.spectro_voltage_pub = rospy.Publisher('/usv/spectrometer_voltage', String, queue_size=20)
         self.spectro_status_pub = rospy.Publisher('/usv/spectrometer_status', String, queue_size=20, latch=True)
-        self.spectro_raw_pub = rospy.Publisher('/usv/spectrometer_raw', String, queue_size=20)
+        self.spectro_raw_pub = rospy.Publisher('/usv/spectrometer_raw', String, queue_size=256)
         self.spectro_absorbance_pub = rospy.Publisher('/usv/spectrometer_absorbance', String, queue_size=20)
         self.detector_health_pub = rospy.Publisher('/usv/detector_health', String, queue_size=5)
         self.angle_telemetry_pub = rospy.Publisher('/usv/pump_angle_telemetry', String, queue_size=10)
@@ -753,8 +756,8 @@ class PumpControlNode(object):
         cfg['ads_address'] = str(cfg.get('ads_address', '0x40')).strip() or '0x40'
         cfg['mux'] = str(cfg.get('mux', 'AIN0')).strip().upper() or 'AIN0'
         cfg['gain'] = int(cfg.get('gain', 1) or 1)
-        cfg['publish_rate'] = max(1, int(cfg.get('publish_rate', 90) or 90))
-        cfg['adc_rate'] = int(cfg.get('adc_rate', 90) or 90)
+        cfg['publish_rate'] = max(MIN_RAW_RECORD_HZ, int(cfg.get('publish_rate', 90) or 90))
+        cfg['adc_rate'] = max(MIN_RAW_RECORD_HZ, int(cfg.get('adc_rate', 90) or 90))
         cfg['spectro_output_hz'] = max(1, min(50, int(cfg.get('spectro_output_hz', 10) or 10)))
         cfg['reference_voltage'] = float(cfg.get('reference_voltage', 0.0) or 0.0)
         cfg['baseline_voltage'] = float(cfg.get('baseline_voltage', 0.0) or 0.0)
@@ -896,8 +899,8 @@ class PumpControlNode(object):
         ain = mux.split('_', 1)[0] if mux.startswith('AIN') else 'AIN0'
         vref_raw = str(cfg.get('vref_mode', 'AVDD')).strip().upper()
         vref_mode = 'INT' if vref_raw in ('INT', 'INTERNAL', 'INT_2V048') else 'AVDD'
-        adc_rate = int(cfg.get('adc_rate', 90) or 90)
-        publish_rate = max(1, int(cfg.get('publish_rate', 90) or 90))
+        adc_rate = max(MIN_RAW_RECORD_HZ, int(cfg.get('adc_rate', 90) or 90))
+        publish_rate = max(MIN_RAW_RECORD_HZ, int(cfg.get('publish_rate', 90) or 90))
         return (
             "ADSCFG:CH={ch},ADDR={addr},AIN={ain},REF={vref},GAIN={gain},DR={rate},MODE={mode},PR={pub}"
             .format(
@@ -1889,7 +1892,9 @@ class PumpControlNode(object):
         if action == "spectrometer_configure":
             updated = dict(payload)
             updated.pop("cmd", None)
-            self.spectro_config.update(updated)
+            self.spectro_config = self._normalize_lower_device_spectro_config(
+                dict(self.spectro_config, **updated)
+            )
             self.spectro_reference_voltage = float(self.spectro_config.get('reference_voltage', self.spectro_reference_voltage))
             self.spectro_baseline_voltage = float(self.spectro_config.get('baseline_voltage', self.spectro_baseline_voltage))
             success = self._apply_spectro_config()
@@ -1979,7 +1984,9 @@ class PumpControlNode(object):
         elif cmd == 'configure':
             updated = dict(payload)
             updated.pop('cmd', None)
-            self.spectro_config.update(updated)
+            self.spectro_config = self._normalize_lower_device_spectro_config(
+                dict(self.spectro_config, **updated)
+            )
             self.spectro_reference_voltage = float(self.spectro_config.get('reference_voltage', self.spectro_reference_voltage))
             self.spectro_baseline_voltage = float(self.spectro_config.get('baseline_voltage', self.spectro_baseline_voltage))
             self._apply_spectro_config()

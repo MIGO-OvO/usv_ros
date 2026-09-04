@@ -1570,6 +1570,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
                 "baseline_set": True,
             })))
             server._record_latest_mission_point()
+            server._stop_data_recording_if_active()
             persisted = json.loads(mission_file.read_text(encoding="utf-8"))
 
         point = persisted["data_points"][-1]
@@ -3832,6 +3833,38 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
 
         self.assertEqual(sent[0], "I2CMAP:X=2,Y=3,Z=6,A=7,SPEC=2")
         self.assertIn("ADSCFG:CH=2,ADDR=0x40,AIN=AIN0,REF=INT,GAIN=4,DR=90,MODE=CONT,PR=200", sent[1])
+
+        node._spectro_cmd_callback(string_cls(json.dumps({
+            "cmd": "configure",
+            "adc_rate": 1,
+            "publish_rate": 1,
+        })))
+        self.assertIn("DR=20,MODE=CONT,PR=20", sent[-1])
+
+    def test_web_hardware_config_clamps_raw_capture_rates_to_20hz(self):
+        module, _, _ = _load_script(
+            "web_config_server_raw_rate_floor_test",
+            "scripts/web_config_server.py",
+        )
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_file = str(Path(tmpdir) / "sampling_config.json")
+
+            class TempConfigManager(module.ConfigManager):
+                def __init__(self, _config_file=config_file):
+                    super().__init__(_config_file)
+
+            module.ConfigManager = TempConfigManager
+            server = module.WebConfigServer(standalone=False)
+            response = server.app.test_client().post(
+                "/api/hardware/config",
+                json={"adc_rate": 1, "publish_rate": 1},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        saved = response.get_json()["data"]
+        self.assertEqual(20, saved["adc_rate"])
+        self.assertEqual(20, saved["publish_rate"])
 
     def test_pump_node_spectrometer_start_reapplies_i2c_and_ads_before_adsstart(self):
         module, _, _ = _load_script(

@@ -583,9 +583,10 @@ REST API 和 Socket.IO 实时事件。
 | `GET /api/data/mission/<id>/sample/<sample_id>` | 单个采样窗口元数据和摘要 |
 | `GET /api/data/mission/<id>/sample/<sample_id>/raw` | 读取窗口 raw frames，支持 `limit`、`offset` |
 | `GET /api/data/mission/<id>/sample/<sample_id>/raw.csv` | 下载单个采样窗口的完整原始帧 CSV |
+| `GET /api/data/mission/<id>/raw.csv` | 下载全任务、跨采样窗口的高频原始分光 CSV |
 | `POST /api/data/mission/<id>/sample/<sample_id>/manual-result` | 写入人工浓度、单位、方法、记录人和备注 |
-| `GET /api/data/mission/<id>/csv` | 历史任务 CSV 下载 |
-| `GET /api/data/mission/<id>/archive` | 下载整任务 ZIP，包含任务 JSON、摘要 CSV、各窗口 JSONL 与原始 CSV |
+| `GET /api/data/mission/<id>/csv` | 下载低频任务摘要 CSV（地图和趋势展示） |
+| `GET /api/data/mission/<id>/archive` | 下载整任务 ZIP，包含任务 JSON、摘要 CSV、全任务原始 CSV、各窗口 JSONL 与原始 CSV |
 | `GET /api/data/mission/<id>/geojson` | 历史污染物点位 GeoJSON；可带 `metric=concentration` 与 `download=true` |
 | `GET /api/data/mission/<id>/surface` | 历史污染物 IDW surface；可带 `metric`、`size`、`power` 与 `download=true` |
 | `GET /api/map/live` | 当前任务实时点位、轨迹、污染物 surface、走航门控状态 |
@@ -809,6 +810,8 @@ Web 的 `POST /api/hardware/test-pump-port` 使用同一握手逻辑，不能只
 | `~/usv_ws/config/calibration.json` | 校准 offset |
 | `~/usv_ws/data/missions/mission_*.json` | 任务采样数据和 `sample_windows[]` 摘要 |
 | `~/usv_ws/data/missions/raw/<mission_id>/<sample_id>.jsonl` | 采样窗口原始分光帧，一行一帧 |
+
+原始分光帧独立于地图/前端摘要写入，配置和运行时上行频率均强制不低于 20 Hz；前端图表可按需降采样，但应从数据中心的“高频原始分光 CSV”下载完整帧。
 
 `web_config_server` 默认使用上述任务目录，也可通过 roslaunch 参数
 `data_dir:=/absolute/path/to/missions` 显式覆盖；直接运行 Web 节点或独立模式时也可使用

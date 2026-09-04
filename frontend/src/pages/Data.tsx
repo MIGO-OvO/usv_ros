@@ -29,6 +29,8 @@ type SpectrometerSummary = {
   readonly frame_count?: number
   readonly valid_count?: number
   readonly invalid_count?: number
+  readonly target_rate_hz?: number | null
+  readonly observed_rate_hz?: number | null
   readonly voltage_mean?: number | null
   readonly voltage_min?: number | null
   readonly voltage_max?: number | null
@@ -75,6 +77,13 @@ type RawFrame = {
   readonly valid?: boolean
   readonly status?: string | number | null
   readonly received_at_ms?: number | null
+}
+
+type RawSeries = {
+  readonly raw_count: number
+  readonly returned_count: number
+  readonly covered: boolean
+  readonly samples: readonly RawFrame[]
 }
 
 type MissionData = {
@@ -135,6 +144,7 @@ export default function Data() {
   const [selectedSampleId, setSelectedSampleId] = useState<string | null>(null)
   const [sampleDetail, setSampleDetail] = useState<SampleWindow | null>(null)
   const [rawFrames, setRawFrames] = useState<readonly RawFrame[]>([])
+  const [rawSeries, setRawSeries] = useState<RawSeries | null>(null)
   const [manualDraft, setManualDraft] = useState<ManualDraft>(emptyManualDraft)
   const [loading, setLoading] = useState(false)
   const [saving, setSaving] = useState(false)
@@ -164,6 +174,7 @@ export default function Data() {
     } else {
       setSampleDetail(null)
       setRawFrames([])
+      setRawSeries(null)
     }
   }, [selectedId, selectedSampleId])
 
@@ -204,10 +215,11 @@ export default function Data() {
   const fetchSample = async (missionId: string, sampleId: string) => {
     const [detail, raw] = await Promise.all([
       fetchJson<SampleWindow>(`/api/data/mission/${missionId}/sample/${sampleId}`),
-      fetchJson<{ readonly samples: readonly RawFrame[] }>(`/api/data/voltage-series?mission_id=${encodeURIComponent(missionId)}&sample_id=${encodeURIComponent(sampleId)}&max_points=2000`),
+      fetchJson<RawSeries>(`/api/data/voltage-series?mission_id=${encodeURIComponent(missionId)}&sample_id=${encodeURIComponent(sampleId)}&max_points=2000`),
     ])
     setSampleDetail(detail.success ? detail.data : null)
     setRawFrames(raw.success ? raw.data.samples : [])
+    setRawSeries(raw.success ? raw.data : null)
   }
 
   const deleteMission = async (e: MouseEvent, id: string) => {
@@ -247,19 +259,25 @@ export default function Data() {
     }
   }
 
-  const exportMission = (e: MouseEvent, id: string) => {
-    e.stopPropagation()
-    window.open(`/api/data/mission/${encodeURIComponent(id)}/csv`, '_blank')
+  const openDownload = (path: string) => {
+    window.open(path, '_blank', 'noopener,noreferrer')
   }
 
-  const exportMissionArchive = (e: MouseEvent, id: string) => {
-    e.stopPropagation()
-    window.open(`/api/data/mission/${encodeURIComponent(id)}/archive`, '_blank')
+  const exportMissionSummaryCsv = (id: string) => {
+    openDownload(`/api/data/mission/${encodeURIComponent(id)}/csv`)
+  }
+
+  const exportMissionRawCsv = (id: string) => {
+    openDownload(`/api/data/mission/${encodeURIComponent(id)}/raw.csv`)
+  }
+
+  const exportMissionArchive = (id: string) => {
+    openDownload(`/api/data/mission/${encodeURIComponent(id)}/archive`)
   }
 
   const exportRawCsv = () => {
     if (!selectedId || !sampleDetail) return
-    window.open(`/api/data/mission/${encodeURIComponent(selectedId)}/sample/${encodeURIComponent(sampleDetail.sample_id)}/raw.csv`, '_blank')
+    openDownload(`/api/data/mission/${encodeURIComponent(selectedId)}/sample/${encodeURIComponent(sampleDetail.sample_id)}/raw.csv`)
   }
 
   const chartStats = useMemo(() => {
@@ -279,6 +297,12 @@ export default function Data() {
   const selectedMission = missions.find(m => m.id === selectedId)
   const spectrometer = sampleDetail?.spectrometer
   const manual = sampleDetail?.manual_result
+  const rawRateBelowTarget = spectrometer?.quality_flags?.includes('raw_rate_below_target') ?? false
+  const rawChartNotice = !rawSeries
+    ? '正在加载原始帧；CSV 始终包含全部原始帧。'
+    : rawSeries.raw_count > rawSeries.returned_count
+      ? `图表为性能显示 ${rawSeries.returned_count}/${rawSeries.raw_count} 帧（保留峰值）；CSV 包含全部原始帧。`
+      : `图表显示全部 ${rawSeries.raw_count} 帧；CSV 始终包含全部原始帧。`
 
   const tooltipStyle = {
     backgroundColor: 'hsl(var(--card))',
@@ -289,12 +313,28 @@ export default function Data() {
 
   return (
     <div className="mx-auto flex min-h-[calc(100vh-5rem)] max-w-[1600px] flex-col gap-6 p-4 pb-24 md:p-8 xl:h-[calc(100vh-4rem)] xl:pb-8">
-      <header className="flex flex-col sm:flex-row sm:items-center sm:justify-between shrink-0 gap-4">
+      <header className="flex shrink-0 flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-3xl font-bold tracking-tight">数据中心</h1>
           <p className="text-muted-foreground">历史任务、采样窗口与分光原始信号。</p>
         </div>
-        <Button className="self-start sm:self-auto" variant="outline" onClick={fetchMissions}><RefreshCw className="w-4 h-4 mr-2" />刷新列表</Button>
+        <div className="flex flex-col items-start gap-2 sm:items-end">
+          {selectedMission && (
+            <div className="flex flex-wrap items-center gap-2">
+              <Button size="sm" onClick={() => exportMissionRawCsv(selectedMission.id)}>
+                <Download className="mr-2 h-4 w-4" />下载高频原始分光 CSV
+              </Button>
+              <Button size="sm" variant="outline" onClick={() => exportMissionSummaryCsv(selectedMission.id)}>
+                <FileText className="mr-2 h-4 w-4" />下载任务摘要 CSV
+              </Button>
+              <Button size="sm" variant="outline" onClick={() => exportMissionArchive(selectedMission.id)}>
+                <Archive className="mr-2 h-4 w-4" />完整任务 ZIP
+              </Button>
+            </div>
+          )}
+          {selectedMission && <p className="max-w-md text-xs text-muted-foreground sm:text-right">原始 CSV 是目标至少 20 Hz 的逐帧数据；任务摘要 CSV 仅用于地图和趋势展示。</p>}
+          <Button className="self-start sm:self-auto" variant="outline" onClick={fetchMissions}><RefreshCw className="w-4 h-4 mr-2" />刷新列表</Button>
+        </div>
       </header>
 
       <div className="grid grid-cols-1 gap-4 xl:min-h-0 xl:flex-1 xl:grid-cols-[minmax(18rem,22rem)_minmax(0,1fr)]">
@@ -328,18 +368,12 @@ export default function Data() {
                       </span>
                       <span className="flex items-center gap-2 text-xs text-muted-foreground">
                         <FileText className="w-3 h-3" />
-                        <span>{mission.point_count} 数据点</span>
+                        <span>{mission.point_count} 个摘要点</span>
                         {mission.state === 'running' && <span className="text-blue-600">记录中</span>}
                         {mission.state === 'interrupted' && <span className="text-amber-600">异常中断</span>}
                       </span>
                     </button>
                     <div className="flex shrink-0 gap-1 pr-1 pt-2">
-                      <Button size="icon" variant="ghost" className="h-6 w-6" onClick={(e) => exportMissionArchive(e, mission.id)} title="下载完整任务包" aria-label={`下载完整任务包 ${mission.name}`}>
-                        <Archive className="w-3 h-3" />
-                      </Button>
-                      <Button size="icon" variant="ghost" className="h-6 w-6" onClick={(e) => exportMission(e, mission.id)} title="导出摘要 CSV" aria-label={`导出任务摘要 ${mission.name}`}>
-                        <Download className="w-3 h-3" />
-                      </Button>
                       <Button size="icon" variant="ghost" className="h-6 w-6 text-destructive hover:text-destructive" onClick={(e) => deleteMission(e, mission.id)} title="删除" aria-label={`删除任务 ${mission.name}`}>
                         <Trash2 className="w-3 h-3" />
                       </Button>
@@ -393,7 +427,7 @@ export default function Data() {
           <CardHeader className="pb-2 border-b">
             <div className="flex items-center justify-between gap-3">
               <CardTitle className="truncate">{sampleDetail ? sampleDetail.sample_id : selectedMission?.name ?? '请选择任务'}</CardTitle>
-              {sampleDetail && <Button size="sm" variant="outline" onClick={exportRawCsv}><Download className="w-4 h-4 mr-2" />导出窗口 CSV</Button>}
+              {sampleDetail && <Button size="sm" variant="outline" onClick={exportRawCsv}><Download className="w-4 h-4 mr-2" />下载该窗口原始分光 CSV</Button>}
             </div>
           </CardHeader>
           <CardContent className="flex-1 min-h-0 pt-4 overflow-auto">
@@ -411,6 +445,8 @@ export default function Data() {
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-3 rounded-lg border p-3 text-sm">
                   <div><div className="text-muted-foreground">帧数</div><div>{spectrometer?.frame_count ?? 0}</div></div>
                   <div><div className="text-muted-foreground">有效</div><div>{spectrometer?.valid_count ?? 0}</div></div>
+                  <div><div className="text-muted-foreground">目标记录率</div><div>{spectrometer?.target_rate_hz == null ? '未记录' : `≥ ${fmt(spectrometer.target_rate_hz, 3)} Hz`}</div></div>
+                  <div><div className="text-muted-foreground">实测帧率</div><div className={rawRateBelowTarget ? 'text-amber-600 dark:text-amber-400' : undefined}>{spectrometer?.observed_rate_hz == null ? '未记录' : `${fmt(spectrometer.observed_rate_hz, 3)} Hz`}{rawRateBelowTarget && '（低于目标）'}</div></div>
                   <div><div className="text-muted-foreground">电压均值</div><div>{fmt(spectrometer?.voltage_mean)} V</div></div>
                   <div><div className="text-muted-foreground">吸光度均值</div><div>{fmt(spectrometer?.absorbance_mean)}</div></div>
                   <div><div className="text-muted-foreground">电压范围</div><div>{fmt(spectrometer?.voltage_min)} ~ {fmt(spectrometer?.voltage_max)}</div></div>
@@ -418,9 +454,11 @@ export default function Data() {
                   <div className="col-span-2"><div className="text-muted-foreground">质量标记</div><div>{spectrometer?.quality_flags?.join(', ') || '-'}</div></div>
                 </div>
 
-                <div className="h-80 rounded-lg border p-3">
+                <div className="space-y-2">
+                  <p className="text-xs text-muted-foreground">{rawChartNotice}</p>
+                  <div className="h-80 rounded-lg border p-3">
                   {rawChartData.length === 0 ? (
-                    <div className="h-full flex items-center justify-center text-muted-foreground">该窗口暂无 raw frames</div>
+                    <div className="h-full flex items-center justify-center text-muted-foreground">该窗口暂无原始分光帧</div>
                   ) : (
                     <ResponsiveContainer width="100%" height="100%">
                       <LineChart data={rawChartData}>
@@ -435,6 +473,7 @@ export default function Data() {
                       </LineChart>
                     </ResponsiveContainer>
                   )}
+                  </div>
                 </div>
 
                 <div className="rounded-lg border p-3 space-y-3">
@@ -454,17 +493,20 @@ export default function Data() {
                 </div>
               </div>
             ) : chartData.length > 0 ? (
-              <div className="h-[clamp(320px,48vh,520px)] min-h-80">
-                <ResponsiveContainer width="100%" height="100%">
-                  <LineChart data={chartData}>
-                    <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
-                    <XAxis dataKey="timestamp" tickFormatter={(t) => new Date(String(t)).toLocaleTimeString()} fontSize={11} tickLine={false} axisLine={false} />
-                    <YAxis yAxisId="voltage" domain={chartStats ? [chartStats.yMin, chartStats.yMax] : ['auto', 'auto']} fontSize={11} tickLine={false} axisLine={false} tickFormatter={fmtAxis} width={48} />
-                    <Tooltip contentStyle={tooltipStyle} labelFormatter={(t) => new Date(String(t)).toLocaleString()} formatter={formatTooltipValue} />
-                    <Legend />
-                    <Line yAxisId="voltage" type="monotone" dataKey="voltage" name="电压" stroke="hsl(var(--chart-1))" dot={false} isAnimationActive={false} />
-                  </LineChart>
-                </ResponsiveContainer>
+              <div className="space-y-2">
+                <p className="text-xs text-muted-foreground">任务摘要趋势：{chartStats?.count ?? 0} 个低频地图点。需要逐帧数据请使用“下载高频原始分光 CSV”。</p>
+                <div className="h-[clamp(320px,48vh,520px)] min-h-80">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={chartData}>
+                      <CartesianGrid strokeDasharray="3 3" opacity={0.2} />
+                      <XAxis dataKey="timestamp" tickFormatter={(t) => new Date(String(t)).toLocaleTimeString()} fontSize={11} tickLine={false} axisLine={false} />
+                      <YAxis yAxisId="voltage" domain={chartStats ? [chartStats.yMin, chartStats.yMax] : ['auto', 'auto']} fontSize={11} tickLine={false} axisLine={false} tickFormatter={fmtAxis} width={48} />
+                      <Tooltip contentStyle={tooltipStyle} labelFormatter={(t) => new Date(String(t)).toLocaleString()} formatter={formatTooltipValue} />
+                      <Legend />
+                      <Line yAxisId="voltage" type="monotone" dataKey="voltage" name="电压" stroke="hsl(var(--chart-1))" dot={false} isAnimationActive={false} />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
               </div>
             ) : (
               <div className="h-full flex items-center justify-center text-muted-foreground flex-col gap-2">

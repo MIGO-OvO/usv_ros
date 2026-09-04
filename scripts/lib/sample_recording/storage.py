@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Mapping, Optional
@@ -17,6 +18,31 @@ class SampleRecordingStorage(object):
         self._builders = {}
         self._fsync_interval_s = max(0.0, float(fsync_interval_s))
         self._last_fsync_at = {}
+        self._raw_file_handles = {}
+        self._write_lock = threading.RLock()
+
+    def close(self) -> None:
+        """Flush and close any still-open raw files (primarily for orderly service shutdown)."""
+        with self._write_lock:
+            for path, file_obj in list(self._raw_file_handles.items()):
+                try:
+                    file_obj.flush()
+                    os.fsync(file_obj.fileno())
+                except (OSError, ValueError):
+                    pass
+                finally:
+                    try:
+                        file_obj.close()
+                    except OSError:
+                        pass
+                    self._last_fsync_at.pop(path, None)
+            self._raw_file_handles.clear()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def _raw_relpath(self, mission_id: object, sample_id: object) -> str:
         mission = safe_id(mission_id, "mission")
@@ -54,13 +80,22 @@ class SampleRecordingStorage(object):
         context: Optional[Mapping[str, object]] = None,
         gps_latest: Optional[Mapping[str, object]] = None,
     ) -> dict[str, object]:
-        mission_id = mission_data.get("mission_id")
-        window = make_window(mission_id, context, gps_latest)
-        raw_file = self._raw_relpath(window["mission_id"], window["sample_id"])
-        window["spectrometer"] = SpectrometerSummaryBuilder().to_dict(raw_file)
-        self._sample_windows(mission_data).append(window)
-        self._builders[window["sample_id"]] = SpectrometerSummaryBuilder()
-        return window
+        with self._write_lock:
+            mission_id = mission_data.get("mission_id")
+            window = make_window(mission_id, context, gps_latest)
+            raw_file = self._raw_relpath(window["mission_id"], window["sample_id"])
+            window["spectrometer"] = SpectrometerSummaryBuilder().to_dict(raw_file)
+            self._sample_windows(mission_data).append(window)
+            self._builders[window["sample_id"]] = SpectrometerSummaryBuilder()
+            return window
+
+    def _open_raw_file(self, path: str):
+        file_obj = self._raw_file_handles.get(path)
+        if file_obj is None or file_obj.closed:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            file_obj = open(path, "a", encoding="utf-8")
+            self._raw_file_handles[path] = file_obj
+        return file_obj
 
     def append_raw_frame(self, window: dict[str, object], frame: Mapping[str, object]) -> None:
         sample_id = window.get("sample_id")
@@ -68,29 +103,40 @@ class SampleRecordingStorage(object):
         if not raw_file:
             raise ValueError("sample window has no raw_file")
         path = self._raw_abspath(str(raw_file))
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        with open(path, "a", encoding="utf-8") as file_obj:
+        with self._write_lock:
+            file_obj = self._open_raw_file(path)
             file_obj.write(json.dumps(dict(frame), ensure_ascii=False, separators=(",", ":")) + "\n")
+            # 让进行中的窗口也能被读取；持久化屏障仍按间隔执行，避免每帧 fsync。
+            file_obj.flush()
             now = time.monotonic()
             last_fsync_at = self._last_fsync_at.get(path)
             if last_fsync_at is None or now - last_fsync_at >= self._fsync_interval_s:
-                file_obj.flush()
                 os.fsync(file_obj.fileno())
                 self._last_fsync_at[path] = now
-        builder = self._builders.setdefault(sample_id, SpectrometerSummaryBuilder())
-        builder.add_frame(frame)
-        window["spectrometer"] = builder.to_dict(str(raw_file), self._duration_s(window))
+            builder = self._builders.setdefault(sample_id, SpectrometerSummaryBuilder())
+            builder.add_frame(frame)
+            window["spectrometer"] = builder.to_dict(str(raw_file), self._duration_s(window))
 
     def _force_sync_raw_file(self, raw_file: object) -> None:
         if not raw_file:
             return
         path = self._raw_abspath(str(raw_file))
-        if not os.path.exists(path):
-            return
-        with open(path, "a", encoding="utf-8") as file_obj:
-            file_obj.flush()
-            os.fsync(file_obj.fileno())
-        self._last_fsync_at.pop(path, None)
+        with self._write_lock:
+            file_obj = self._raw_file_handles.pop(path, None)
+            if file_obj is not None:
+                try:
+                    file_obj.flush()
+                    os.fsync(file_obj.fileno())
+                finally:
+                    file_obj.close()
+                    self._last_fsync_at.pop(path, None)
+                return
+            if not os.path.exists(path):
+                return
+            with open(path, "a", encoding="utf-8") as file_obj:
+                file_obj.flush()
+                os.fsync(file_obj.fileno())
+            self._last_fsync_at.pop(path, None)
 
     @staticmethod
     def _duration_s(window: Mapping[str, object]):
@@ -109,30 +155,31 @@ class SampleRecordingStorage(object):
         window: dict[str, object],
         gps_latest: Optional[Mapping[str, object]] = None,
     ) -> dict[str, object]:
-        window["state"] = "closed"
-        window["end_time"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="milliseconds") + "Z"
-        duration = self._duration_s(window)
-        window["duration_s"] = duration
-        gps = normalize_gps_payload(gps_latest)
-        window["gps_end"] = gps
-        window["gps_latest"] = gps or window.get("gps_latest")
-        raw_file = window.get("spectrometer", {}).get("raw_file") if isinstance(window.get("spectrometer"), dict) else None
-        self._force_sync_raw_file(raw_file)
-        builder = self._builders.pop(window.get("sample_id"), None)
-        if builder is None:
-            builder = SpectrometerSummaryBuilder()
-            if raw_file:
-                path = self._raw_abspath(str(raw_file))
-                if os.path.exists(path):
-                    with open(path, "r", encoding="utf-8") as file_obj:
-                        for line in file_obj:
-                            if line.strip():
-                                builder.add_frame(json.loads(line))
-        window["spectrometer"] = builder.to_dict(str(raw_file or ""), duration)
-        stored = self._find_window(mission_data, window.get("sample_id"))
-        if stored is not None and stored is not window:
-            stored.update(window)
-        return window
+        with self._write_lock:
+            window["state"] = "closed"
+            window["end_time"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="milliseconds") + "Z"
+            duration = self._duration_s(window)
+            window["duration_s"] = duration
+            gps = normalize_gps_payload(gps_latest)
+            window["gps_end"] = gps
+            window["gps_latest"] = gps or window.get("gps_latest")
+            raw_file = window.get("spectrometer", {}).get("raw_file") if isinstance(window.get("spectrometer"), dict) else None
+            self._force_sync_raw_file(raw_file)
+            builder = self._builders.pop(window.get("sample_id"), None)
+            if builder is None:
+                builder = SpectrometerSummaryBuilder()
+                if raw_file:
+                    path = self._raw_abspath(str(raw_file))
+                    if os.path.exists(path):
+                        with open(path, "r", encoding="utf-8") as file_obj:
+                            for line in file_obj:
+                                if line.strip():
+                                    builder.add_frame(json.loads(line))
+            window["spectrometer"] = builder.to_dict(str(raw_file or ""), duration)
+            stored = self._find_window(mission_data, window.get("sample_id"))
+            if stored is not None and stored is not window:
+                stored.update(window)
+            return window
 
     def list_windows(self, mission_data: Mapping[str, object]) -> list[dict[str, object]]:
         return [

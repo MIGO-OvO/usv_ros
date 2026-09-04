@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from typing import Iterable, Mapping
 
+from .models import MIN_RAW_RECORD_HZ
+
 
 class SpectrometerSummaryBuilder(object):
     def __init__(self) -> None:
@@ -19,6 +21,7 @@ class SpectrometerSummaryBuilder(object):
         self._raw_code_max = None
         self.first_timestamp_ms = None
         self.last_timestamp_ms = None
+        self._timed_frame_count = 0
         self._flags = set()
 
     @staticmethod
@@ -36,6 +39,19 @@ class SpectrometerSummaryBuilder(object):
         if current_max is None or value > current_max:
             current_max = value
         return current_min, current_max
+
+    @classmethod
+    def _frame_timestamp_ms(cls, frame: Mapping[str, object]):
+        for key, multiplier in (
+            ("source_timestamp_ms", 1.0),
+            ("timestamp_ms", 1.0),
+            ("received_at_ms", 1.0),
+            ("received_at", 1000.0),
+        ):
+            timestamp = cls._number(frame.get(key))
+            if timestamp is not None:
+                return timestamp * multiplier
+        return None
 
     def add_frame(self, frame: Mapping[str, object]) -> None:
         self.frame_count += 1
@@ -65,8 +81,9 @@ class SpectrometerSummaryBuilder(object):
         if raw_code is not None:
             self._raw_code_min, self._raw_code_max = self._add_range(self._raw_code_min, self._raw_code_max, raw_code)
 
-        timestamp_ms = self._number(frame.get("timestamp_ms"))
+        timestamp_ms = self._frame_timestamp_ms(frame)
         if timestamp_ms is not None:
+            self._timed_frame_count += 1
             if self.first_timestamp_ms is None:
                 self.first_timestamp_ms = timestamp_ms
             self.last_timestamp_ms = timestamp_ms
@@ -77,6 +94,19 @@ class SpectrometerSummaryBuilder(object):
 
     def to_dict(self, raw_file: str, duration_s=None) -> dict[str, object]:
         flags = set(self._flags)
+        observed_rate_hz = None
+        if (
+            self._timed_frame_count >= 2
+            and self.first_timestamp_ms is not None
+            and self.last_timestamp_ms is not None
+            and self.last_timestamp_ms > self.first_timestamp_ms
+        ):
+            observed_rate_hz = (
+                float(self._timed_frame_count - 1) * 1000.0 /
+                (self.last_timestamp_ms - self.first_timestamp_ms)
+            )
+            if observed_rate_hz + 1e-9 < MIN_RAW_RECORD_HZ:
+                flags.add("raw_rate_below_target")
         if self.frame_count == 0:
             flags.add("no_frames")
         if self.frame_count > 0 and self.valid_count == 0:
@@ -100,5 +130,7 @@ class SpectrometerSummaryBuilder(object):
             "raw_code_max": self._raw_code_max,
             "first_timestamp_ms": self.first_timestamp_ms,
             "last_timestamp_ms": self.last_timestamp_ms,
+            "target_rate_hz": MIN_RAW_RECORD_HZ,
+            "observed_rate_hz": observed_rate_hz,
             "quality_flags": sorted(flags),
         }
