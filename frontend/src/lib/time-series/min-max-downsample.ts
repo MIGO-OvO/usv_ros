@@ -1,9 +1,29 @@
-type NumericPoint = { readonly receivedAtMs: number; readonly voltage: number }
+import { isFiniteTimeSeriesValue, type TimeSeriesPoint, type TimeSeriesValueAccessor } from './chart-utils.ts'
 
-export function minMaxDownsample<T extends NumericPoint>(points: readonly T[], pixelWidth: number): T[] {
-  const valid = points
-    .map((point, index) => ({ point, index }))
-    .filter(({ point }) => Number.isFinite(point.receivedAtMs) && Number.isFinite(point.voltage))
+type NumericPoint = TimeSeriesPoint & { readonly voltage: number }
+
+interface ValidEntry<T> {
+  readonly point: T
+  readonly index: number
+  readonly value: number
+}
+
+export function minMaxDownsample<T extends TimeSeriesPoint>(
+  points: readonly T[],
+  pixelWidth: number,
+  valueAccessor?: TimeSeriesValueAccessor<T>,
+): T[] {
+  const readValue: TimeSeriesValueAccessor<T> = valueAccessor
+    ?? ((point) => (point as unknown as NumericPoint).voltage)
+  const valid: ValidEntry<T>[] = []
+  for (let index = 0; index < points.length; index += 1) {
+    const point = points[index]
+    const value = readValue(point)
+    if (Number.isFinite(point.receivedAtMs) && isFiniteTimeSeriesValue(value)) {
+      valid.push({ point, index, value })
+    }
+  }
+
   const bucketCount = Math.max(1, Math.floor(pixelWidth))
   if (valid.length <= bucketCount * 2 + 2) return valid.map(({ point }) => point)
 
@@ -17,8 +37,8 @@ export function minMaxDownsample<T extends NumericPoint>(points: readonly T[], p
     const current = buckets.get(bucket)
     if (!current) buckets.set(bucket, { min: entry, max: entry })
     else {
-      if (entry.point.voltage < current.min.point.voltage) current.min = entry
-      if (entry.point.voltage > current.max.point.voltage) current.max = entry
+      if (entry.value < current.min.value) current.min = entry
+      if (entry.value > current.max.value) current.max = entry
     }
   }
 

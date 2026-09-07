@@ -9,6 +9,14 @@ import { SystemHealthCard } from '@/components/system-health-card'
 import { SpectroSpikeTestCard } from '@/components/spectro-spike-test-card'
 import { SpectrometerBaselineCard } from '@/components/spectrometer-baseline-card'
 import { VoltageCanvasChart } from '@/components/voltage-canvas-chart'
+import { TimeSeriesCanvasChart } from '@/components/time-series-canvas-chart'
+import { ScrollArea } from '@/components/ui/scroll-area'
+import {
+  getTimeSeriesRange,
+  isFiniteTimeSeriesValue,
+  selectTimeWindow,
+  type TimeSeriesValueAccessor,
+} from '@/lib/time-series/chart-utils'
 import { toast } from '@/hooks/use-toast'
 import { buildVoltageHistoryCsv, voltageHistoryFilename } from '@/lib/voltage-history-csv'
 import {
@@ -24,6 +32,7 @@ import {
 import {
   createBaselineAcquisitionSession,
   formatBaselineDuration,
+  getAbsorbanceEmptyState,
   summarizeBaselineAcquisition,
   type BaselineAcquisitionSession,
 } from '@/lib/spectrometer-baseline'
@@ -63,6 +72,20 @@ const TIME_WINDOWS = [
 ] as const
 
 const VOLTAGE_STALE_AFTER_MS = 2000
+const ABSORBANCE_TABLE_LIMIT = 500
+const ABSORBANCE_FALLBACK_DOMAIN: readonly [number, number] = [0, 1]
+
+const absorbanceValueAccessor: TimeSeriesValueAccessor<VoltagePoint> = (point) => point.absorbance
+const formatAbsorbanceValue = (value: number) => value.toFixed(4)
+const absorbanceHoverDetails = (point: VoltagePoint) => [
+  `${Number.isFinite(point.voltage) ? point.voltage.toPrecision(5) : '--'} V`,
+  `seq ${point.seq} · source ${point.sourceTimestampMs} ms`,
+]
+
+function formatSampleTime(timestampMs: number) {
+  if (!Number.isFinite(timestampMs)) return '--'
+  return new Date(timestampMs).toLocaleTimeString([], { fractionalSecondDigits: 3 })
+}
 
 interface SpectrometerApiResponse {
   readonly success?: boolean
@@ -88,6 +111,70 @@ async function postSpectrometerCommand(
     throw new Error(data.message || `请求失败 (${response.status})`)
   }
   return data
+}
+
+function AbsorbanceHistoryTable({ points, baselineSet }: {
+  readonly points: readonly VoltagePoint[]
+  readonly baselineSet: boolean
+}) {
+  const rows = useMemo(
+    () => points.slice(Math.max(0, points.length - ABSORBANCE_TABLE_LIMIT)),
+    [points],
+  )
+  const validCount = useMemo(
+    () => points.reduce((count, point) => count + (isFiniteTimeSeriesValue(point.absorbance) ? 1 : 0), 0),
+    [points],
+  )
+  const emptyState = getAbsorbanceEmptyState(baselineSet)
+
+  return (
+    <div className="flex h-full min-h-0 flex-col gap-2">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-muted-foreground">
+        <span>显示 {rows.length.toLocaleString()} / {points.length.toLocaleString()} 条</span>
+        <span>有效吸光度 {validCount.toLocaleString()}</span>
+      </div>
+      {validCount === 0 && (
+        <div className="rounded-md border border-dashed px-3 py-2 text-xs" role="status">
+          <div className="font-medium text-muted-foreground">{emptyState.title}</div>
+          <div className="mt-1 text-muted-foreground/80">{emptyState.description}</div>
+        </div>
+      )}
+      {rows.length === 0 ? (
+        <div className="flex min-h-0 flex-1 items-center justify-center rounded-md border border-dashed px-4 text-center text-sm text-muted-foreground">
+          暂无分光计历史样本
+        </div>
+      ) : (
+        <ScrollArea className="min-h-0 flex-1 rounded-md border">
+          <div className="min-w-[520px] overflow-x-auto">
+            <table className="w-full table-fixed text-xs">
+              <thead className="sticky top-0 z-10 bg-card text-muted-foreground">
+                <tr className="border-b">
+                  <th className="w-[35%] px-2 py-2 text-left font-medium">时间</th>
+                  <th className="w-[15%] px-2 py-2 text-left font-medium">seq</th>
+                  <th className="w-[25%] px-2 py-2 text-right font-medium">电压</th>
+                  <th className="w-[25%] px-2 py-2 text-right font-medium">吸光度</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y">
+                {rows.map((point, index) => (
+                  <tr key={`${point.seq}-${point.receivedAtMs}-${index}`}>
+                    <td className="truncate px-2 py-2 font-mono">{formatSampleTime(point.receivedAtMs)}</td>
+                    <td className="px-2 py-2 font-mono">{Number.isFinite(point.seq) ? point.seq : '--'}</td>
+                    <td className="px-2 py-2 text-right font-mono">
+                      {Number.isFinite(point.voltage) ? `${point.voltage.toFixed(4)} V` : '--'}
+                    </td>
+                    <td className="px-2 py-2 text-right font-mono">
+                      {isFiniteTimeSeriesValue(point.absorbance) ? `${formatAbsorbanceValue(point.absorbance)} Abs` : '--'}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </ScrollArea>
+      )}
+    </div>
+  )
 }
 
 export default function Monitor() {
@@ -118,7 +205,9 @@ export default function Monitor() {
   const [spectroSubmitting, setSpectroSubmitting] = useState<'start' | 'stop' | 'baseline' | null>(null)
   const [timeWindowMs, setTimeWindowMs] = useState(600_000)
   const [pausedHistory, setPausedHistory] = useState<VoltagePoint[] | null>(null)
-  const [renderedCount, setRenderedCount] = useState(0)
+  const [absorbanceView, setAbsorbanceView] = useState<'chart' | 'data'>('chart')
+  const [renderedVoltageCount, setRenderedVoltageCount] = useState(0)
+  const [renderedAbsorbanceCount, setRenderedAbsorbanceCount] = useState(0)
   const [clock, setClock] = useState(Date.now())
   const [spikeTestSession, setSpikeTestSession] = useState<SpikeTestSession | null>(null)
   const [spikeTestSessionId, setSpikeTestSessionId] = useState('')
@@ -158,23 +247,32 @@ export default function Monitor() {
   ), [baselineSession, clock, liveHistory])
   const baselineActive = baselineSession !== null || baselineSaving
   const spikeTestActive = spikeTestSession?.endedAtMs === null
-  const displayedVoltageHistory = useMemo(() => {
-    const points = pausedHistory ?? liveHistory
-    if (timeWindowMs === 0 || points.length === 0) return points
-    const cutoff = points[points.length - 1].receivedAtMs - timeWindowMs
-    let start = 0
-    while (start < points.length && points[start].receivedAtMs < cutoff) start += 1
-    return points.slice(start)
-  }, [liveHistory, pausedHistory, timeWindowMs])
+  const displayedHistory = useMemo(
+    () => selectTimeWindow(pausedHistory ?? liveHistory, timeWindowMs),
+    [liveHistory, pausedHistory, timeWindowMs],
+  )
+  const displayedTimeRange = useMemo(() => {
+    const first = displayedHistory[0]
+    const last = displayedHistory[displayedHistory.length - 1]
+    if (
+      first
+      && last
+      && Number.isFinite(first.receivedAtMs)
+      && Number.isFinite(last.receivedAtMs)
+    ) {
+      return { startMs: first.receivedAtMs, endMs: last.receivedAtMs }
+    }
+    return getTimeSeriesRange(displayedHistory)
+  }, [displayedHistory])
   const latestPoint = liveHistory[liveHistory.length - 1]
   const latestAgeMs = latestPoint ? Math.max(0, Date.now() - latestPoint.receivedAtMs) : null
   const voltageIsStale = connected && latestAgeMs !== null && latestAgeMs > VOLTAGE_STALE_AFTER_MS
   const receiveRateHz = useMemo(() => {
-    const recent = displayedVoltageHistory.slice(-100)
+    const recent = displayedHistory.slice(-100)
     if (recent.length < 2) return 0
     const elapsed = recent[recent.length - 1].receivedAtMs - recent[0].receivedAtMs
     return elapsed > 0 ? (recent.length - 1) * 1000 / elapsed : 0
-  }, [displayedVoltageHistory])
+  }, [displayedHistory])
 
   const handleStartBaselineAcquisition = useCallback(async () => {
     if (baselineActive || spikeTestActive) return
@@ -278,11 +376,13 @@ export default function Monitor() {
     })
   }, [baselineSession, baselineSummary, currentBaselineVoltage])
 
-  const handleRenderedCount = useCallback((count: number) => setRenderedCount(count), [])
+  const handleRenderedVoltageCount = useCallback((count: number) => setRenderedVoltageCount(count), [])
+  const handleRenderedAbsorbanceCount = useCallback((count: number) => setRenderedAbsorbanceCount(count), [])
   const handleClearVoltageHistory = useCallback(() => {
     clearVoltageHistory()
     setPausedHistory(null)
-    setRenderedCount(0)
+    setRenderedVoltageCount(0)
+    setRenderedAbsorbanceCount(0)
     setSpikeTestSession(null)
     setSpikeTestSessionId('')
   }, [clearVoltageHistory])
@@ -354,7 +454,8 @@ export default function Monitor() {
     const startedAtMs = Date.now()
     clearVoltageHistory()
     setPausedHistory(null)
-    setRenderedCount(0)
+    setRenderedVoltageCount(0)
+    setRenderedAbsorbanceCount(0)
     setSpikeTestSession(createSpikeTestSession(
       startedAtMs,
       spikeTestCounters,
@@ -419,6 +520,10 @@ export default function Monitor() {
   const spectroStatusLabel = spectroStatusLabels[spectrometerStatus] ?? spectrometerStatus
   const hasSpectroSample = voltageHistory.length > 0
   const showSpectroPlaceholder = !hasSpectroSample
+  const currentAbsorbanceLabel = spectrometerBaselineSet && isFiniteTimeSeriesValue(currentAbsorbance)
+    ? `${currentAbsorbance.toFixed(4)} Abs`
+    : '--'
+  const absorbanceEmptyState = getAbsorbanceEmptyState(spectrometerBaselineSet)
   const angleStatusLabel = !angleTelemetry.valid ? '未收到' : angleTelemetry.stale ? '陈旧' : '实时'
   const angleStatusClass = !angleTelemetry.valid
     ? 'text-muted-foreground'
@@ -488,7 +593,7 @@ export default function Monitor() {
             <Activity className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{showSpectroPlaceholder ? '--' : currentAbsorbance.toFixed(4)}</div>
+            <div className="text-2xl font-bold">{showSpectroPlaceholder ? '--' : currentAbsorbanceLabel}</div>
             <div className="text-xs text-muted-foreground mt-1">{spectroStatusLabel}</div>
           </CardContent>
         </Card>
@@ -550,48 +655,107 @@ export default function Monitor() {
       />
 
       <Card className="flex h-[440px] min-w-0 flex-col overflow-hidden lg:h-[500px]">
-         <CardHeader className="grid min-w-0 gap-2 pb-2 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
-            <CardTitle className="text-base">分光计电压</CardTitle>
-            <div className="flex min-w-0 flex-wrap items-center gap-2 lg:justify-end">
-              {TIME_WINDOWS.map((window) => (
-                <Button key={window.label} size="sm" variant={timeWindowMs === window.value ? 'secondary' : 'ghost'} onClick={() => setTimeWindowMs(window.value)}>{window.label}</Button>
-              ))}
-              <Button size="sm" variant="outline" onClick={() => setPausedHistory(pausedHistory ? null : liveHistory)}>
-                {pausedHistory ? <Play className="mr-2 h-4 w-4" /> : <Pause className="mr-2 h-4 w-4" />}
-                {pausedHistory ? '回到实时' : '暂停视图'}
+        <CardHeader className="grid min-w-0 gap-2 pb-2 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
+          <CardTitle className="text-base">分光计电压</CardTitle>
+          <div className="flex min-w-0 flex-wrap items-center gap-2 lg:justify-end">
+            {TIME_WINDOWS.map((window) => (
+              <Button key={window.label} size="sm" variant={timeWindowMs === window.value ? 'secondary' : 'ghost'} onClick={() => setTimeWindowMs(window.value)}>{window.label}</Button>
+            ))}
+            <Button size="sm" variant="outline" onClick={() => setPausedHistory(pausedHistory ? null : liveHistory)}>
+              {pausedHistory ? <Play className="mr-2 h-4 w-4" /> : <Pause className="mr-2 h-4 w-4" />}
+              {pausedHistory ? '回到实时' : '暂停视图'}
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleExportVoltageHistory}
+              disabled={liveHistory.length === 0 || baselineActive}
+              aria-label="导出当前浏览器缓存中的分光计电压数据为 CSV"
+            >
+              <Download className="mr-2 h-4 w-4" />
+              导出缓存 CSV
+            </Button>
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={handleClearVoltageHistory}
+              disabled={baselineActive || (voltageHistory.length === 0 && !pausedHistory?.length)}
+              aria-label="清空分光计电压图表及历史数据"
+            >
+              <Trash2 className="mr-2 h-4 w-4" />
+              清空数据
+            </Button>
+          </div>
+          <div className={cn("flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs leading-relaxed text-muted-foreground lg:col-span-2", voltageIsStale && "text-amber-600 dark:text-amber-400")}>
+            <span>原始 {displayedHistory.length}/{voltageHistory.length}</span>
+            <span>绘制 {renderedVoltageCount}</span>
+            <span>{receiveRateHz.toFixed(1)} Hz</span>
+            {voltageIsStale && <span>数据陈旧，正在追赶实时</span>}
+            <span>完整历史数据请到“数据中心”下载 Jetson 本地任务包</span>
+          </div>
+        </CardHeader>
+        <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden">
+          <VoltageCanvasChart
+            points={displayedHistory}
+            timeRange={displayedTimeRange}
+            onRenderedCount={handleRenderedVoltageCount}
+          />
+        </CardContent>
+      </Card>
+
+      <Card className="flex h-[440px] min-w-0 flex-col overflow-hidden lg:h-[500px]">
+        <CardHeader className="grid min-w-0 gap-2 pb-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
+          <div className="flex min-w-0 items-center justify-between gap-3">
+            <CardTitle className="text-base">吸光度</CardTitle>
+            <div className="flex shrink-0 items-center rounded-md border p-0.5" role="tablist" aria-label="吸光度视图">
+              <Button
+                className="min-h-9 px-3"
+                size="sm"
+                variant={absorbanceView === 'chart' ? 'secondary' : 'ghost'}
+                role="tab"
+                aria-selected={absorbanceView === 'chart'}
+                onClick={() => setAbsorbanceView('chart')}
+              >
+                曲线
               </Button>
               <Button
+                className="min-h-9 px-3"
                 size="sm"
-                variant="outline"
-                onClick={handleExportVoltageHistory}
-                disabled={liveHistory.length === 0 || baselineActive}
-                aria-label="导出当前浏览器缓存中的分光计电压数据为 CSV"
+                variant={absorbanceView === 'data' ? 'secondary' : 'ghost'}
+                role="tab"
+                aria-selected={absorbanceView === 'data'}
+                onClick={() => setAbsorbanceView('data')}
               >
-                <Download className="mr-2 h-4 w-4" />
-                导出缓存 CSV
-              </Button>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={handleClearVoltageHistory}
-                disabled={baselineActive || (voltageHistory.length === 0 && !pausedHistory?.length)}
-                aria-label="清空分光计电压图表及历史数据"
-              >
-                <Trash2 className="mr-2 h-4 w-4" />
-                清空数据
+                数据
               </Button>
             </div>
-            <div className={cn("flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs leading-relaxed text-muted-foreground lg:col-span-2", voltageIsStale && "text-amber-600 dark:text-amber-400")}>
-              <span>原始 {displayedVoltageHistory.length}/{voltageHistory.length}</span>
-              <span>绘制 {renderedCount}</span>
-              <span>{receiveRateHz.toFixed(1)} Hz</span>
-              {voltageIsStale && <span>数据陈旧，正在追赶实时</span>}
-              <span>完整历史数据请到“数据中心”下载 Jetson 本地任务包</span>
-            </div>
-         </CardHeader>
-         <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden">
-            <VoltageCanvasChart points={displayedVoltageHistory} onRenderedCount={handleRenderedCount} />
-         </CardContent>
+          </div>
+          <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs leading-relaxed text-muted-foreground sm:justify-end">
+            <span>原始 {displayedHistory.length}/{voltageHistory.length}</span>
+            {absorbanceView === 'chart' && <span>绘制 {renderedAbsorbanceCount}</span>}
+            <span>{spectrometerBaselineSet ? '基线已设定' : '未设定基线'}</span>
+          </div>
+        </CardHeader>
+        <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden">
+          {absorbanceView === 'chart' ? (
+            <TimeSeriesCanvasChart
+              points={displayedHistory}
+              valueAccessor={absorbanceValueAccessor}
+              valueLabel="吸光度"
+              unit="Abs"
+              ariaLabel="吸光度时序图"
+              emptyState={absorbanceEmptyState}
+              formatValue={formatAbsorbanceValue}
+              hoverDetails={absorbanceHoverDetails}
+              timeRange={displayedTimeRange}
+              fallbackDomain={ABSORBANCE_FALLBACK_DOMAIN}
+              lineColor="--chart-2"
+              onRenderedCount={handleRenderedAbsorbanceCount}
+            />
+          ) : (
+            <AbsorbanceHistoryTable points={displayedHistory} baselineSet={spectrometerBaselineSet} />
+          )}
+        </CardContent>
       </Card>
 
       <div className="min-w-0 space-y-6">

@@ -2,12 +2,18 @@ import assert from 'node:assert/strict'
 import test from 'node:test'
 import { RingBuffer } from '../src/lib/time-series/ring-buffer.ts'
 import { minMaxDownsample } from '../src/lib/time-series/min-max-downsample.ts'
+import {
+  calculateTimeSeriesDomain,
+  isFiniteTimeSeriesValue,
+  selectTimeWindow,
+} from '../src/lib/time-series/chart-utils.ts'
 import { buildVoltageHistoryCsv, voltageHistoryFilename } from '../src/lib/voltage-history-csv.ts'
 import {
   BASELINE_AVERAGING_MS,
   BASELINE_STABILIZATION_MS,
   calculateAbsorbance,
   createBaselineAcquisitionSession,
+  getAbsorbanceEmptyState,
   summarizeBaselineAcquisition,
 } from '../src/lib/spectrometer-baseline.ts'
 import {
@@ -67,6 +73,94 @@ test('one hundred thousand samples stay within a 1000px canvas budget', () => {
   const sampled = minMaxDownsample(points, 1000)
   assert.ok(sampled.length <= 2002)
   assert.ok(sampled.some((point) => point.voltage === 12))
+})
+
+test('absorbance downsampling filters null, NaN, and Infinity without creating zero values', () => {
+  const points = [
+    { receivedAtMs: 0, voltage: 2.1, absorbance: null },
+    { receivedAtMs: 1, voltage: 2.2, absorbance: Number.NaN },
+    { receivedAtMs: 2, voltage: 2.3, absorbance: Number.POSITIVE_INFINITY },
+    { receivedAtMs: 3, voltage: 2.4, absorbance: 0.1837 },
+    { receivedAtMs: 4, voltage: 2.5, absorbance: 0.1841 },
+  ]
+
+  const sampled = minMaxDownsample(points, 100, (point) => point.absorbance)
+  assert.deepEqual(sampled, points.slice(3))
+  assert.ok(sampled.every((point) => isFiniteTimeSeriesValue(point.absorbance)))
+  assert.ok(sampled.every((point) => point.absorbance !== 0))
+
+  const domain = calculateTimeSeriesDomain(points, (point) => point.absorbance, [0, 1])
+  assert.ok(domain[0] > 0.1)
+  assert.ok(domain[1] < 0.3)
+  assert.deepEqual(
+    calculateTimeSeriesDomain(points.slice(0, 3), (point) => point.absorbance, [0, 1]),
+    [0, 1],
+  )
+})
+
+test('30 seconds, 2 minutes, 10 minutes, and all use the same shared sample window', () => {
+  const points = Array.from({ length: 61 }, (_, index) => ({
+    receivedAtMs: index * 10_000,
+    seq: index,
+    voltage: 2 + index / 1000,
+    absorbance: index / 1000,
+  }))
+
+  const thirtySeconds = selectTimeWindow(points, 30_000)
+  const twoMinutes = selectTimeWindow(points, 120_000)
+  const tenMinutes = selectTimeWindow(points, 600_000)
+  const all = selectTimeWindow(points, 0)
+
+  assert.equal(thirtySeconds[0].receivedAtMs, 570_000)
+  assert.equal(thirtySeconds.length, 4)
+  assert.equal(twoMinutes[0].receivedAtMs, 480_000)
+  assert.equal(twoMinutes.length, 13)
+  assert.equal(tenMinutes[0].receivedAtMs, 0)
+  assert.equal(tenMinutes.length, 61)
+  assert.strictEqual(all, points)
+  assert.deepEqual(
+    thirtySeconds.map((point) => [point.seq, point.voltage, point.absorbance]),
+    Array.from({ length: 4 }, (_, offset) => {
+      const point = points[57 + offset]
+      return [point.seq, point.voltage, point.absorbance]
+    }),
+  )
+
+  const pausedSnapshot = points.slice(0, 31)
+  const pausedWindow = selectTimeWindow(pausedSnapshot, 30_000)
+  assert.equal(pausedWindow[pausedWindow.length - 1].receivedAtMs, 300_000)
+  assert.equal(pausedWindow[0].receivedAtMs, 270_000)
+  assert.deepEqual(pausedWindow.map((point) => point.voltage), [2.027, 2.028, 2.029, 2.03])
+  assert.deepEqual(pausedWindow.map((point) => point.absorbance), [0.027, 0.028, 0.029, 0.03])
+})
+
+test('clearing shared spectrometer history empties both voltage and absorbance views', () => {
+  const buffer = new RingBuffer<{
+    receivedAtMs: number
+    voltage: number
+    absorbance: number | null
+  }>(10)
+  buffer.appendBatch([
+    { receivedAtMs: 1, voltage: 2.1, absorbance: 0.1 },
+    { receivedAtMs: 2, voltage: 2.2, absorbance: null },
+  ])
+  buffer.clear()
+
+  const history = buffer.toArray()
+  assert.deepEqual(history, [])
+  assert.deepEqual(minMaxDownsample(history, 100), [])
+  assert.deepEqual(minMaxDownsample(history, 100, (point) => point.absorbance), [])
+})
+
+test('absorbance empty state explains the missing baseline or missing history', () => {
+  assert.deepEqual(getAbsorbanceEmptyState(false), {
+    title: '暂无吸光度数据',
+    description: '请先完成分光计参考基线获取',
+  })
+  assert.deepEqual(getAbsorbanceEmptyState(true), {
+    title: '暂无吸光度历史数据',
+    description: '新数据到达后将自动恢复绘制',
+  })
 })
 
 test('voltage history CSV exports complete raw samples with an Excel-compatible BOM', () => {

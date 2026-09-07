@@ -250,7 +250,7 @@ interface AppState {
   rawAngles: PumpAngles
   angleTelemetry: AngleTelemetry
   currentVoltage: number
-  currentAbsorbance: number
+  currentAbsorbance: number | null
   currentReferenceVoltage: number | null
   currentBaselineVoltage: number
   spectrometerBaselineSet: boolean
@@ -336,7 +336,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   rawAngles: DEFAULT_ANGLES,
   angleTelemetry: DEFAULT_ANGLE_TELEMETRY,
   currentVoltage: 0,
-  currentAbsorbance: 0,
+  currentAbsorbance: null,
   currentReferenceVoltage: null,
   currentBaselineVoltage: 0,
   spectrometerBaselineSet: false,
@@ -448,7 +448,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         state.voltageHistory.appendBatch(points)
         return {
         currentVoltage: latest.voltage,
-        currentAbsorbance: latest.absorbance ?? state.currentAbsorbance,
+        currentAbsorbance: latest.absorbance,
         currentReferenceVoltage: typeof latest.reference_voltage === 'number' ? latest.reference_voltage : state.currentReferenceVoltage,
         currentBaselineVoltage: typeof latest.baseline_voltage === 'number' ? latest.baseline_voltage : state.currentBaselineVoltage,
         spectrometerBaselineSet: typeof latest.baseline_set === 'boolean' ? latest.baseline_set : state.spectrometerBaselineSet,

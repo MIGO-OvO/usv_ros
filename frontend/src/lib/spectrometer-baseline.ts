@@ -34,6 +34,23 @@ export interface AbsorbanceReference {
   readonly baselineVoltage: number
 }
 
+export interface AbsorbanceEmptyState {
+  readonly title: string
+  readonly description: string
+}
+
+export function getAbsorbanceEmptyState(baselineSet: boolean): AbsorbanceEmptyState {
+  return baselineSet
+    ? {
+        title: '暂无吸光度历史数据',
+        description: '新数据到达后将自动恢复绘制',
+      }
+    : {
+        title: '暂无吸光度数据',
+        description: '请先完成分光计参考基线获取',
+      }
+}
+
 export function createBaselineAcquisitionSession(
   startedAtMs: number,
   stabilizationMs = BASELINE_STABILIZATION_MS,
