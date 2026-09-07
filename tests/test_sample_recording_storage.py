@@ -73,6 +73,7 @@ class SampleRecordingStorageTest(unittest.TestCase):
             self.assertFalse(series["covered"])
             self.assertIn(9.0, [frame["voltage"] for frame in series["samples"]])
             self.assertIn(-4.0, [frame["voltage"] for frame in series["samples"]])
+            storage.close()
 
     def test_window_lifecycle_accepts_web_position_shape(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -110,6 +111,7 @@ class SampleRecordingStorageTest(unittest.TestCase):
             self.assertEqual(2.0, closed["spectrometer"]["voltage_mean"])
             self.assertEqual(10.0, closed["spectrometer"]["raw_code_min"])
             self.assertEqual(20.0, closed["spectrometer"]["raw_code_max"])
+            storage.close()
 
     def test_raw_frames_are_periodically_synced_and_forced_on_close(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -125,6 +127,35 @@ class SampleRecordingStorageTest(unittest.TestCase):
                 storage.close_window(mission, window)
 
             self.assertEqual(3, fsync.call_count)
+
+    def test_raw_summary_reports_20hz_target_and_detects_slow_source(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mission = {"mission_id": "mission_rate"}
+            storage = SampleRecordingStorage(tmp)
+
+            on_target = storage.start_window(mission, {"sample_id": "sample_20hz"})
+            for index in range(40):
+                storage.append_raw_frame(on_target, {
+                    "timestamp_ms": index * 50,
+                    "voltage": 1.0,
+                    "valid": True,
+                })
+            on_target = storage.close_window(mission, on_target)
+
+            slow = storage.start_window(mission, {"sample_id": "sample_10hz"})
+            for index in range(40):
+                storage.append_raw_frame(slow, {
+                    "timestamp_ms": index * 100,
+                    "voltage": 1.0,
+                    "valid": True,
+                })
+            slow = storage.close_window(mission, slow)
+
+            self.assertEqual(20, on_target["spectrometer"]["target_rate_hz"])
+            self.assertAlmostEqual(20.0, on_target["spectrometer"]["observed_rate_hz"])
+            self.assertNotIn("raw_rate_below_target", on_target["spectrometer"]["quality_flags"])
+            self.assertAlmostEqual(10.0, slow["spectrometer"]["observed_rate_hz"])
+            self.assertIn("raw_rate_below_target", slow["spectrometer"]["quality_flags"])
 
 
 if __name__ == "__main__":

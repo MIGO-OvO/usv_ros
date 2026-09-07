@@ -7,7 +7,7 @@ const ScrollArea = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDiv
     className={cn("relative overflow-hidden", className)}
     {...props}
   >
-    <div className="h-full w-full rounded-[inherit] overflow-y-auto">
+    <div className="h-full max-h-[inherit] w-full rounded-[inherit] overflow-y-auto">
         {children}
     </div>
   </div>
