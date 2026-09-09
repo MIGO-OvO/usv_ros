@@ -535,11 +535,15 @@ class AutomationEngine(object):
         except Exception:
             pass
 
-        self._running.clear()
-        self._paused.clear()
+        with self._lock:
+            stopped = not self._running.is_set()
+            self._running.clear()
+            self._paused.clear()
 
         if self._failed and self._last_error:
             self._update_status("failed")
+        elif stopped:
+            self._update_status("stopped")
         else:
             self._update_status("finished")
 

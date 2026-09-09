@@ -528,6 +528,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
     def test_manual_stop_returns_idle_without_auto_resume(self):
         module = _load_script("mavlink_trigger_node_manual_stop_idle_test", "scripts/mavlink_trigger_node.py")
         node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node.state_lock = threading.Lock()
         node.is_sampling = True
         node.current_waypoint = 0
         node.current_sampling_context = {"source": "manual"}
@@ -550,7 +551,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
     def test_fcu_sample_publishes_sampling_started_after_automation_start_accepts(self):
         module = _load_script("mavlink_trigger_node_fcu_started_test", "scripts/mavlink_trigger_node.py")
-        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node = module.MAVLinkTriggerNode()
         node.is_sampling = False
         node.current_waypoint = 4
         node.steps_pub = RecordingPublisher()
@@ -568,9 +569,10 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         self.assertEqual(calls[:2], [("on", "fcu"), ("automation", "start")])
         self.assertEqual([msg.data for msg in node.status_pub.messages], ["sampling_started"])
 
-    def test_fcu_sample_injection_start_failure_publishes_sampling_stopped_for_usv_done(self):
+    def test_fcu_sample_injection_start_failure_reports_failed_and_closes_recording(self):
         module = _load_script("mavlink_trigger_node_fcu_injection_fail_test", "scripts/mavlink_trigger_node.py")
-        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node = module.MAVLinkTriggerNode()
+        node.set_mode = lambda mode: True
         node.is_sampling = False
         node.current_sampling_context = None
         node.current_waypoint = 4
@@ -589,13 +591,15 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         self.assertFalse(accepted)
         self.assertFalse(node.is_sampling)
         self.assertIsNone(node.current_sampling_context)
-        self.assertEqual(calls, [("on", "fcu")])
+        self.assertEqual(calls, [("on", "fcu"), ("off", "fcu", "fcu_injection_start_failed")])
         self.assertEqual([msg.data for msg in node.status_pub.messages], ["sampling_stopped"])
-        self.assertEqual(states[-1], (module.MissionState.FAILED, "fcu_injection_start_failed"))
+        self.assertEqual(states[-1], (module.MissionState.FAILED, "4:fcu_injection_start_failed"))
+        self.assertEqual(json.loads(node.sampling_result_pub.messages[0].data)['outcome'], 'failed')
 
-    def test_fcu_sample_automation_start_failure_publishes_sampling_stopped_for_usv_done(self):
+    def test_fcu_sample_automation_start_failure_reports_failed_and_closes_recording(self):
         module = _load_script("mavlink_trigger_node_fcu_automation_fail_test", "scripts/mavlink_trigger_node.py")
-        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node = module.MAVLinkTriggerNode()
+        node.set_mode = lambda mode: True
         node.is_sampling = False
         node.current_sampling_context = None
         node.current_waypoint = 4
@@ -614,9 +618,10 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         self.assertFalse(accepted)
         self.assertFalse(node.is_sampling)
         self.assertIsNone(node.current_sampling_context)
-        self.assertEqual(calls, [("on", "fcu"), ("automation", "start"), ("off", "fcu", "automation_start_failed")])
+        self.assertEqual(calls, [("on", "fcu"), ("automation", "start"), ("off", "fcu", "fcu_sample_start_failed")])
         self.assertEqual([msg.data for msg in node.status_pub.messages], ["sampling_stopped"])
-        self.assertEqual(states[-1], (module.MissionState.FAILED, "fcu_sample_start_failed"))
+        self.assertEqual(states[-1], (module.MissionState.FAILED, "4:fcu_sample_start_failed"))
+        self.assertEqual(json.loads(node.sampling_result_pub.messages[0].data)['outcome'], 'failed')
 
     def test_nav_sampling_sequence_publishes_sampling_started_after_automation_start_accepts(self):
         module = _load_script("mavlink_trigger_node_nav_started_test", "scripts/mavlink_trigger_node.py")
@@ -1190,7 +1195,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         self.assertIn('<arg name="survey_require_gps" default="false" />', launch_text)
         self.assertIn('<arg name="survey_require_valid_spectrometer" default="false" />', launch_text)
 
-    def test_sampling_failure_publishes_sampling_stopped_for_bridge_completion(self):
+    def test_sampling_failure_publishes_sampling_stopped_for_recording_lifecycle(self):
         module = _load_script("mavlink_trigger_node_failure_stopped_test", "scripts/mavlink_trigger_node.py")
         node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
         node.state_lock = threading.Lock()

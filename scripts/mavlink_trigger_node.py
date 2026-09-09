@@ -234,6 +234,7 @@ class MAVLinkTriggerNode(object):
 
         # Publishers
         self.status_pub = rospy.Publisher('/usv/trigger_status', String, queue_size=10)
+        self.sampling_result_pub = rospy.Publisher('/usv/sampling_result', String, queue_size=10)
         self.mission_status_pub = rospy.Publisher('/usv/mission_status', String, queue_size=10)
         self.steps_pub = rospy.Publisher('/usv/automation_steps', String, queue_size=1)
         self.pump_command_pub = rospy.Publisher('/usv/pump_command', String, queue_size=10)
@@ -623,10 +624,12 @@ class MAVLinkTriggerNode(object):
             command = {"cmd": "mission_complete", "waypoint_seq": int(seq)}
             self.lab_command_pub.publish(String(json.dumps(command)))
 
-    def _handle_completion(self, success=True, reason='finished'):
+    def _handle_completion(self, success=True, reason='finished', expected_context=None, cancelled=False):
         with self.state_lock:
             if not self.is_sampling:
                 return
+            if expected_context is not None and self.current_sampling_context is not expected_context:
+                return  # callback queued for a previous sampling attempt
             was_survey_sample = getattr(self, "_survey_sample_active", False)
             if was_survey_sample:
                 self._survey_sample_active = False
@@ -634,8 +637,18 @@ class MAVLinkTriggerNode(object):
             is_manual_sample = sampling_context.get("source") == "manual"
             source = str(sampling_context.get("source", "waypoint") or "waypoint")
             self.is_sampling = False
+            if source == 'fcu':
+                self.current_sampling_context = None
         rospy.loginfo("Handling sampling completion: success=%s reason=%s", success, reason)
         wp_seq = self.current_waypoint
+        if cancelled:
+            self._stop_injection_session(source, reason)
+            self._publish_sampling_result(sampling_context, 'cancelled', reason)
+            self._publish_status("sampling_stopped")
+            self._set_mission_state(MissionState.HOLD_NO_MISSION if source == 'fcu' else MissionState.IDLE)
+            if source == 'fcu':
+                self.set_mode('HOLD')
+            return
         if success:
             self._set_waypoint_state(wp_seq, WaypointSamplingState.DONE)
             if is_manual_sample:
@@ -654,7 +667,10 @@ class MAVLinkTriggerNode(object):
                 return
             self._set_mission_state(MissionState.SAMPLING_DONE, str(wp_seq))
             self._stop_injection_session(source, reason)
+            self._publish_sampling_result(sampling_context, 'succeeded', reason)
             self._publish_status("sampling_stopped")
+            if source == 'fcu':
+                return  # mode transitions belong to the FCU, not a delayed ROS callback
             rospy.sleep(1.0)
             self._resume_auto_if_mission_exists()
         else:
@@ -667,19 +683,34 @@ class MAVLinkTriggerNode(object):
                 return
             self._stop_injection_session(source, reason)
             self._publish_status("sampling_stopped")
-            self._handle_failure_action(reason)
+            if source == 'fcu':
+                self._handle_failure_action(reason, context=sampling_context)
+            else:
+                self._handle_failure_action(reason)
 
     def _pump_status_cb(self, msg):
         data = (msg.data or '').lower()
-        if 'automation: finished' in data:
+        if data.strip() == 'automation: stopped':
             with self.state_lock:
                 if self.is_sampling:
-                    threading.Thread(target=self._handle_completion, kwargs={'success': True, 'reason': 'finished'}, daemon=True).start()
+                    threading.Thread(target=self._handle_completion, kwargs={
+                        'success': False, 'reason': 'automation_stopped', 'cancelled': True,
+                        'expected_context': self.current_sampling_context}, daemon=True).start()
+            return
+        if data.strip() == 'automation: finished':
+            with self.state_lock:
+                context = self.current_sampling_context or {}
+                if self.is_sampling and (context.get('source') != 'fcu' or context.get('started', False)):
+                    threading.Thread(target=self._handle_completion, kwargs={
+                        'success': True, 'reason': 'finished',
+                        'expected_context': self.current_sampling_context}, daemon=True).start()
             return
         if 'automation:' in data and ('error' in data or 'fail' in data or 'timeout' in data):
             with self.state_lock:
                 if self.is_sampling:
-                    threading.Thread(target=self._handle_completion, kwargs={'success': False, 'reason': data[:80]}, daemon=True).start()
+                    threading.Thread(target=self._handle_completion, kwargs={
+                        'success': False, 'reason': data[:80],
+                        'expected_context': self.current_sampling_context}, daemon=True).start()
 
     def _spectrometer_voltage_cb(self, msg):
         try:
@@ -766,11 +797,15 @@ class MAVLinkTriggerNode(object):
     def _stop_sampling_sequence(self):
         """停止采样序列。"""
         rospy.loginfo("Stopping sampling sequence...")
-        sampling_context = dict(getattr(self, "current_sampling_context", {}) or {})
+        with self.state_lock:
+            sampling_context = dict(getattr(self, "current_sampling_context", {}) or {})
+            # Claim cancellation before a stop-service callback can report Finished.
+            self.is_sampling = False
+            self.current_sampling_context = None
         self._call_automation_service('stop')
         source = str(sampling_context.get("source", "waypoint") or "waypoint")
         self._stop_injection_session(source, "{}_stop".format(source))
-        self.is_sampling = False
+        self._publish_sampling_result(sampling_context, 'cancelled', 'operator_stop')
         if sampling_context.get("source") == "manual":
             self.current_sampling_context = None
             self._set_mission_state(MissionState.IDLE, "manual_stopped")
@@ -778,14 +813,28 @@ class MAVLinkTriggerNode(object):
             return
         self._set_mission_state(MissionState.HOLD_NO_MISSION, str(self.current_waypoint))
         self._publish_status("sampling_stopped")
-        rospy.sleep(1.0)
-        self._resume_auto_if_mission_exists()
+        if source == 'fcu':
+            self.set_mode('HOLD')
 
-    def _handle_failure_action(self, reason):
-        ctx = self.current_sampling_context or {}
+    def _handle_failure_action(self, reason, context=None):
+        ctx = context if context is not None else (self.current_sampling_context or {})
         retries_left = int(ctx.get('retry_count', 0) or 0)
         on_fail = str(ctx.get('on_fail', self.default_on_fail) or self.default_on_fail).upper()
         waypoint_seq = int(ctx.get('waypoint_seq', self.current_waypoint) or self.current_waypoint)
+
+        if ctx.get('source') == 'fcu':
+            # FCU attempts have no legacy waypoint retry context. Never retry them
+            # through _start_sampling_sequence(), which loses the script ID.
+            if on_fail == 'SKIP':
+                self._set_waypoint_state(waypoint_seq, WaypointSamplingState.SKIPPED)
+                self._publish_sampling_result(ctx, 'skipped', reason)
+            else:
+                self._publish_sampling_result(ctx, 'failed', reason)
+                if on_fail == 'ABORT':
+                    self._set_mission_state(MissionState.ABORTED, str(waypoint_seq))
+                if not self.set_mode('HOLD'):
+                    rospy.logerr("FCU sampling failed; HOLD request failed, operator intervention required")
+            return
 
         if retries_left > 0:
             ctx['retry_count'] = retries_left - 1
@@ -1084,6 +1133,17 @@ class MAVLinkTriggerNode(object):
         msg.data = status
         self.status_pub.publish(msg)
 
+    def _publish_sampling_result(self, context, outcome, reason):
+        """Separate the FCU result contract from uncorrelated recording lifecycle."""
+        if context.get('source') != 'fcu':
+            return
+        msg = String()
+        msg.data = json.dumps({
+            'source': 'fcu', 'sample_id': int(context['sample_id']),
+            'outcome': outcome, 'reason': str(reason),
+        })
+        self.sampling_result_pub.publish(msg)
+
     def _send_command_ack(self, command, result, target_system, target_component):
         """发布 COMMAND_ACK 请求，由 usv_mavlink_router_bridge.py 统一封装发送。"""
         msg = Float32MultiArray()
@@ -1251,15 +1311,24 @@ class MAVLinkTriggerNode(object):
         """
         if self.is_sampling:
             rospy.logwarn("Sampling already in progress")
+            self._publish_sampling_result(
+                {'source': 'fcu', 'sample_id': sample_id}, 'failed', 'sampling_busy')
             return False
 
         config = self._load_config() or self._get_default_config()
         steps_data = self._build_steps_payload(config, self.current_waypoint)
+        context = {
+            'waypoint_seq': int(self.current_waypoint),
+            'source': 'fcu', 'sample_id': int(sample_id),
+            'on_fail': self.default_on_fail, 'started': False,
+        }
+        self.current_sampling_context = context
+        self.is_sampling = True
         if not self._start_injection_session("fcu", config):
-            self.is_sampling = False
-            self.current_sampling_context = None
-            self._set_mission_state(MissionState.FAILED, "fcu_injection_start_failed")
-            self._publish_status("sampling_stopped")
+            self._handle_completion(False, 'fcu_injection_start_failed', expected_context=context)
+            return False
+        if self.current_sampling_context is not context:
+            self._stop_injection_session('fcu', 'start_cancelled')
             return False
 
         msg = String()
@@ -1267,20 +1336,15 @@ class MAVLinkTriggerNode(object):
         self.steps_pub.publish(msg)
 
         self._set_mission_state(MissionState.SAMPLING, str(self.current_waypoint))
-        self.is_sampling = True
-        self.current_sampling_context = {
-            'waypoint_seq': int(self.current_waypoint),
-            'source': 'fcu',
-            'sample_id': int(sample_id),
-        }
         if not self._call_automation_service('start'):
-            self.is_sampling = False
-            self.current_sampling_context = None
-            self._stop_injection_session("fcu", "automation_start_failed")
-            self._set_mission_state(MissionState.FAILED, "fcu_sample_start_failed")
-            self._publish_status("sampling_stopped")
+            self._handle_completion(False, 'fcu_sample_start_failed', expected_context=context)
+            return False
+        if self.current_sampling_context is not context:
+            self._call_automation_service('stop')
+            self._stop_injection_session('fcu', 'start_cancelled')
             return False
 
+        context['started'] = True
         self._publish_status("sampling_started")
         rospy.loginfo("FCU-triggered sampling started (id=%d, no HOLD, no stable wait)", sample_id)
         return True

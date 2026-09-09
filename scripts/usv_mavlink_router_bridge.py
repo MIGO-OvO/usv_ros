@@ -88,6 +88,7 @@ class USVMavlinkRouterBridge(object):
         self._pending_acks = deque(maxlen=MAX_PENDING_SENDS)          # [(command, result, target_sys, target_comp), ...]
         self._pending_usv_done = deque(maxlen=MAX_PENDING_SENDS)      # [sample_id, ...]
         self._fcu_sample_id = 0          # current sampling id from FCU NAV_SCRIPT_TIME
+        self._last_fcu_sample_id = 0     # suppress retransmitted triggers, including terminal ones
         self._cmd_rx_pub = rospy.Publisher("/usv/mavlink_cmd_rx", Float32MultiArray, queue_size=5)
         self._radio_status_pub = rospy.Publisher("/usv/radio_status", String, queue_size=5)
         rospy.Subscriber("/usv/mavlink_cmd_ack", Float32MultiArray, self._cmd_ack_cb)
@@ -96,6 +97,7 @@ class USVMavlinkRouterBridge(object):
         rospy.Subscriber("/usv/pump_status", String, self._pump_status_cb)
         rospy.Subscriber("/usv/automation_status", String, self._automation_status_cb)
         rospy.Subscriber("/usv/trigger_status", String, self._trigger_status_cb)
+        rospy.Subscriber("/usv/sampling_result", String, self._sampling_result_cb)
         rospy.Subscriber("/usv/mission_status", String, self._mission_status_cb)
         rospy.Subscriber("/usv/pump_pid_error", String, self._pid_error_cb)
         rospy.Subscriber("/usv/system_health", String, self._system_health_cb)
@@ -260,22 +262,47 @@ class USVMavlinkRouterBridge(object):
                 self._status_code = self._MISSION_STATE_CODES.get(last_state, 0)
 
     def _trigger_status_cb(self, msg):
-        data = msg.data.lower()
+        data = msg.data.strip().lower()
         with self._lock:
             if "sampling_started" in data:
                 self._sample_count = (self._sample_count + 1) % 65536
                 self._pending_statustexts.append(("USV: Sampling Started", mavutil.mavlink.MAV_SEVERITY_NOTICE))
-            elif "sampling_stopped" in data:
-                self._pending_statustexts.append(("USV: Sampling Completed", mavutil.mavlink.MAV_SEVERITY_NOTICE))
-                # notify FCU that sampling is done (for NAV_SCRIPT_TIME)
-                if self._fcu_sample_id > 0:
-                    sample_id = self._fcu_sample_id
-                    self._fcu_sample_id = 0
-                    self._pending_usv_done.append(sample_id)
+            elif data == "sampling_stopped":
+                # Lifecycle only: failure/cancellation also closes Web recording.
+                # Never infer a successful FCU result from this uncorrelated event.
+                self._pending_statustexts.append(("USV: Sampling Stopped", mavutil.mavlink.MAV_SEVERITY_NOTICE))
             elif "sampling_paused" in data:
                 self._pending_statustexts.append(("USV: Sampling Paused", mavutil.mavlink.MAV_SEVERITY_NOTICE))
             elif "calibrate" in data:
                 self._pending_statustexts.append(("USV: Calibrating", mavutil.mavlink.MAV_SEVERITY_NOTICE))
+
+    def _sampling_result_cb(self, msg):
+        """Only a matching, explicit FCU success/skip may release NAV_SCRIPT_TIME."""
+        try:
+            result = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        if not isinstance(result, dict) or result.get("source") != "fcu":
+            return
+        sample_id = result.get("sample_id")
+        outcome = result.get("outcome")
+        if type(sample_id) is not int or not 1 <= sample_id <= 65535:
+            return
+        labels = {"succeeded": "Completed", "failed": "Failed",
+                  "cancelled": "Cancelled", "skipped": "Skipped"}
+        if not isinstance(outcome, str) or outcome not in labels:
+            return
+        with self._lock:
+            if sample_id != self._fcu_sample_id:
+                return  # stale, duplicate, or unrelated sampling result
+            self._fcu_sample_id = 0
+            if outcome in ("succeeded", "skipped"):
+                self._pending_usv_done.append(sample_id)
+            self._pending_statustexts.append((
+                "USV: Sampling %s id=%d" % (labels[outcome], sample_id),
+                mavutil.mavlink.MAV_SEVERITY_NOTICE))
+        rospy.loginfo("FCU sampling result id=%d outcome=%s reason=%s",
+                      sample_id, outcome, str(result.get("reason", ""))[:120])
 
     # 任务阶段 → USV_STAT 扩展编码映射
     _MISSION_STATE_CODES = {
@@ -429,13 +456,20 @@ class USVMavlinkRouterBridge(object):
                     name = msg.name.rstrip('\x00')
                     if name == "USV_SMPL":
                         sample_id = int(msg.value)
+                        if msg.value != sample_id or not 1 <= sample_id <= 65535:
+                            continue
+                        with self._lock:
+                            if sample_id == self._last_fcu_sample_id:
+                                continue
+                            self._last_fcu_sample_id = sample_id
+                            self._fcu_sample_id = sample_id
+                            # A newer script supersedes any not-yet-sent old completion.
+                            self._pending_usv_done.clear()
                         rospy.loginfo("FCU triggered point sampling id=%d", sample_id)
                         rx = Float32MultiArray()
                         # param1=0, param2=sample_id — trigger uses param2>0 to detect FCU origin
                         rx.data = [float(CMD_START_SAMPLING), 0.0, float(sample_id), 0.0, 0.0, 0.0, 0.0]
                         self._cmd_rx_pub.publish(rx)
-                        with self._lock:
-                            self._fcu_sample_id = sample_id
                     elif name == "USV_SURV":
                         survey_on = int(msg.value)
                         cmd = CMD_START_SURVEY if survey_on else CMD_STOP_SURVEY

@@ -677,7 +677,20 @@ curl -X POST http://127.0.0.1:5000/api/hardware/apply \
 
 bridge 兼容飞控以 `NAMED_VALUE_FLOAT` 发出的原生任务触发：
 
-- `USV_SMPL=<sample_id>`：触发一次定点采样，完成后 bridge 发送 `USV_DONE=<sample_id>`。
+- `USV_SMPL=<sample_id>`：触发一次定点采样；只有匹配 ID 的成功结果或明确 SKIP，bridge 才发送 `USV_DONE=<sample_id>`。
+
+### FCU 采样结果与安全边界
+
+- trigger 通过 `/usv/sampling_result`（`std_msgs/String` JSON，非 latched）发布 `source=fcu`、`sample_id`（整数 1..65535）、`outcome`、`reason`。
+- `outcome=succeeded` 表示正常完成；`skipped` 仅由 FCU 采样失败且 `sampling_on_fail=SKIP` 产生。二者允许 bridge 发送匹配 ID 的 `USV_DONE`，但 SKIP 提示为 Skipped，不冒充成功。
+- `failed` / `cancelled` 不发送 `USV_DONE`。HOLD/ABORT 失败策略、FCU 主动取消请求 HOLD；启动失败同样进入失败策略。FCU 忙碌拒绝只报告失败，不中断正在运行的其他采样。
+- `sampling_stopped` 仅表示记录生命周期结束，仍关闭 Web 采样窗口，不能作为采样成功或飞控放行依据。自动化引擎正常结束报 `finished`，直接停止报 `stopped`，失败报 `failed`。
+- bridge 在下发内部命令前登记 ID；忽略最近同 ID 重复触发、重复结果、ID 不匹配结果、非 FCU 结果和非法结果。新 ID 会清除尚未发送的旧完成通知。
+- FCU 采样仍不启用旧 waypoint 自动重试路径，避免重试丢失脚本 ID。成功完成不由 ROS 延迟切换模式；既有 22 个遥测字段、MAVLink 命令号、固件和 QGC 均不变。
+- **部署要求**：停止系统后，成套更新并重启 trigger、bridge 和 pump（自动化引擎），不要混用新旧进程。旧 bridge 仍会把 `sampling_stopped` 当成完成；新 bridge 配旧 trigger 则不会发送完成通知。
+- **剩余边界**：HOLD 请求不是模式确认；飞控 `NAV_SCRIPT_TIME` 自身超时仍可结束等待，本修复不修改该 P1 行为。结果队列不保证端到端可靠送达；飞控重启/16 位 ID 回绕没有跨启动会话标识，重启后应协调重启 ROS 并重新确认任务，不将本修复视为完整的跨重启事务协议。
+
+离线回归：`python3 -m unittest discover -s tests -p 'test_fcu_sampling_result.py'`。现场必须验证成功、启动失败、PID 超时、QGC/Web 停止、HOLD/ABORT/SKIP、重复和迟到消息，并同时采集 `/usv/sampling_result`、`/usv/trigger_status`、`/mavros/state` 与 MAVLink 日志。
 - `USV_SURV=1/0`：开启或停止走航采样。
 
 ### 上行遥测
