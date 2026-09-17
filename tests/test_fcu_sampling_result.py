@@ -31,12 +31,15 @@ class FCUSamplingResultTests(unittest.TestCase):
         self.node._start_injection_session = lambda *args: True
         self.node._stop_injection_session = lambda *args: True
         self.node._call_automation_service = lambda action: True
+        self.node._call_control_transaction = lambda action, payload=None: (
+            True, {'cleanup': 'stopped', 'attempt_id': (payload or {}).get('attempt_id')})
         self.node.status_pub = ForwardPublisher(self.bridge._trigger_status_cb)
         self.node.sampling_result_pub = ForwardPublisher(
             lambda msg: self.bridge._sampling_result_cb(msg))
 
     def trigger(self, sample_id=42):
         msg = types.SimpleNamespace(name='USV_SMPL', value=sample_id,
+                                    get_srcSystem=lambda: 1, get_srcComponent=lambda: 1,
                                     get_type=lambda: 'NAMED_VALUE_FLOAT')
         self.bridge._conn = FakeConnection([msg])
         self.bridge._cmd_rx_pub = ForwardPublisher(self.node._mavlink_cmd_rx_cb)
@@ -192,7 +195,9 @@ class FCUSamplingResultTests(unittest.TestCase):
             return types.SimpleNamespace(start=lambda: queued.append((target, kwargs)))
         with patch.object(self.trigger_module.threading, 'Thread', side_effect=capture_thread):
             for status in statuses:
-                self.node._pump_status_cb(types.SimpleNamespace(data='automation: ' + status))
+                self.node._automation_status_cb(types.SimpleNamespace(data=json.dumps({
+                    'status': status, 'sampling_context': dict(self.node.current_sampling_context),
+                })))
         for target, kwargs in queued:
             target(**kwargs)
         self.assert_no_done()
@@ -215,7 +220,11 @@ class FCUSamplingResultTests(unittest.TestCase):
         def capture_thread(target, kwargs, daemon):
             return types.SimpleNamespace(start=lambda: queued.append((target, kwargs)))
         def reject_start(action):
-            self.node._pump_status_cb(types.SimpleNamespace(data='automation: finished'))
+            if action != 'start':
+                return True
+            self.node._automation_status_cb(types.SimpleNamespace(data=json.dumps({
+                'status': 'finished', 'sampling_context': dict(self.node.current_sampling_context),
+            })))
             return False
         self.node._call_automation_service = reject_start
         with patch.object(self.trigger_module.threading, 'Thread', side_effect=capture_thread):

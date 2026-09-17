@@ -144,6 +144,7 @@ def make_window(
         "schema_version": 1,
         "mode": str(mode),
         "source": str(context.get("source") or mode),
+        "attempt_id": _trim(context.get('attempt_id'), 64),
         "state": "open",
         "waypoint_seq": int(waypoint_seq) if _finite_float(waypoint_seq) is not None else None,
         "mavlink_sample_id": int(context["mavlink_sample_id"]) if _finite_float(context.get("mavlink_sample_id")) is not None else None,

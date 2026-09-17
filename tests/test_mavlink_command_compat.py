@@ -228,6 +228,8 @@ class FailingOnceNamedValueMav(RecordingMav):
 class MavlinkCommandCompatibilityTests(unittest.TestCase):
     def _install_injection_session_recorder(self, node, accepted=True):
         calls = []
+        if not hasattr(node, 'state_lock'):
+            node.state_lock = threading.Lock()
 
         def start(source, config=None):
             calls.append(("on", source))
@@ -239,6 +241,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
         node._start_injection_session = start
         node._stop_injection_session = stop
+        node._cleanup_sampling_attempt = lambda context, reason: (stop(context.get('source', 'waypoint'), reason), False)
         return calls
 
     def test_trigger_node_constructs_without_auto_trigger_attr_crash(self):
@@ -271,7 +274,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
             [31010.0, 1.5, 2.5, 1.0, 191.0, 255.0, 190.0],
         )
 
-    def test_router_bridge_sends_command_ack_immediately_on_ack_request(self):
+    def test_router_bridge_queues_command_ack_for_single_socket_writer(self):
         module = _load_script("usv_mavlink_router_bridge_ack_fast_path_test", "scripts/usv_mavlink_router_bridge.py")
         bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
         bridge._lock = threading.Lock()
@@ -286,8 +289,10 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
         bridge._cmd_ack_cb(msg)
 
+        self.assertEqual(mav.command_acks, [])
+        self.assertEqual(bridge._pending_acks, [(31018, 0, 255, 190)])
+        self.assertTrue(bridge._send_command_ack(*bridge._pending_acks.pop()))
         self.assertEqual(mav.command_acks, [(31018, 0, 0xFF, 0, 255, 190)])
-        self.assertEqual(bridge._pending_acks, [])
 
     def test_trigger_node_accepts_forwarded_internal_command_bus(self):
         module = _load_script("mavlink_trigger_node_test", "scripts/mavlink_trigger_node.py")
@@ -409,7 +414,8 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
         self.assertTrue(accepted)
         self.assertEqual(calls[:2], [("on", "manual"), ("automation", "start")])
-        self.assertEqual([msg.data for msg in node.status_pub.messages], ["sampling_started"])
+        self.assertTrue(node.status_pub.messages[0].data.startswith('sampling_context:'))
+        self.assertEqual([msg.data for msg in node.status_pub.messages[1:]], ["sampling_started"])
 
     def test_manual_sample_rejects_when_injection_start_fails_before_steps_or_automation(self):
         module = _load_script("mavlink_trigger_node_manual_injection_reject_test", "scripts/mavlink_trigger_node.py")
@@ -535,7 +541,8 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         states = []
         statuses = []
         resumed = []
-        node._call_automation_service = lambda name: True
+        automation_calls = []
+        node._call_automation_service = lambda name: automation_calls.append(name) or True
         node._set_mission_state = lambda state, context=None: states.append((state, context))
         node._publish_status = lambda status: statuses.append(status)
         node._resume_auto_if_mission_exists = lambda: resumed.append(True)
@@ -546,7 +553,8 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         self.assertFalse(node.is_sampling)
         self.assertEqual(states[-1], (module.MissionState.IDLE, "manual_stopped"))
         self.assertEqual(statuses, ["sampling_stopped"])
-        self.assertIn(("off", "manual", "manual_stop"), injection_calls)
+        self.assertEqual(automation_calls, ['stop'])
+        self.assertEqual(injection_calls, [])  # stop is one all-output transaction
         self.assertEqual(resumed, [])
 
     def test_fcu_sample_publishes_sampling_started_after_automation_start_accepts(self):
@@ -567,7 +575,8 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
         self.assertTrue(accepted)
         self.assertEqual(calls[:2], [("on", "fcu"), ("automation", "start")])
-        self.assertEqual([msg.data for msg in node.status_pub.messages], ["sampling_started"])
+        self.assertTrue(node.status_pub.messages[0].data.startswith('sampling_context:'))
+        self.assertEqual([msg.data for msg in node.status_pub.messages[1:]], ["sampling_started"])
 
     def test_fcu_sample_injection_start_failure_reports_failed_and_closes_recording(self):
         module = _load_script("mavlink_trigger_node_fcu_injection_fail_test", "scripts/mavlink_trigger_node.py")
@@ -611,7 +620,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         states = []
         node._set_mission_state = lambda state, context=None: states.append((state, context))
         calls = self._install_injection_session_recorder(node)
-        node._call_automation_service = lambda name: calls.append(("automation", name)) or False
+        node._call_automation_service = lambda name: calls.append(("automation", name)) or name == 'stop'
 
         accepted = node._do_fcu_sample(42)
 
@@ -653,7 +662,8 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
         self.assertTrue(accepted)
         self.assertEqual(calls[:2], [("on", "waypoint"), ("automation", "start")])
-        self.assertEqual([msg.data for msg in node.status_pub.messages], ["sampling_started"])
+        self.assertTrue(node.status_pub.messages[0].data.startswith('sampling_context:'))
+        self.assertEqual([msg.data for msg in node.status_pub.messages[1:]], ["sampling_started"])
 
     def test_router_bridge_updates_automation_named_values_from_structured_status(self):
         module = _load_script("usv_mavlink_router_bridge_automation_test", "scripts/usv_mavlink_router_bridge.py")
@@ -1209,6 +1219,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         node._set_mission_state = lambda state, context=None: states.append((state, context))
         node._publish_status = lambda status: statuses.append(status)
         node._handle_failure_action = lambda reason: failures.append(reason)
+        node._cleanup_sampling_attempt = lambda context, reason: (True, False)
 
         node._handle_completion(success=False, reason="automation_timeout")
 

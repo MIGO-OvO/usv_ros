@@ -36,6 +36,7 @@ import tempfile
 import threading
 import time
 import zipfile
+import uuid
 from collections import OrderedDict
 from datetime import datetime
 
@@ -2074,6 +2075,12 @@ class WebConfigServer(object):
         self.route_source = "none"
         self.current_waypoint_seq = None
         self.latest_automation_status = {}
+        self._sampling_context = {}
+        self._web_attempt_id = None
+        self._web_start_lock = threading.Lock()
+        self._web_state_lock = threading.Lock()
+        self._sample_lifecycle_lock = threading.RLock()
+        self._web_stop_generation = 0
         self.latest_system_health = {}
         self.system_health_history = []
         self.system_health_history_max = 300
@@ -2170,6 +2177,7 @@ class WebConfigServer(object):
                 self.waypoints_sub = None
                 rospy.logwarn("mavros_msgs WaypointList not available, route map tracking disabled")
             self.steps_pub = rospy.Publisher('/usv/automation_steps', String, queue_size=1)
+            self.owner_pub = rospy.Publisher('/usv/sampling_owner', String, queue_size=1)
             self.command_pub = rospy.Publisher('/usv/pump_command', String, queue_size=10)
             self.spectro_cmd_pub = rospy.Publisher('/usv/spectrometer_command', String, queue_size=10)
             self.lab_sim_command_pub = rospy.Publisher('/usv/lab_sim/command', String, queue_size=5)
@@ -2374,16 +2382,15 @@ class WebConfigServer(object):
         return data if isinstance(data, dict) else None
 
     def _current_sample_context(self):
-        mission_status = str(getattr(self, "mission_status", "") or "")
-        waypoint_seq = self.current_waypoint_seq
-        mode = "survey" if self.data_recording_source == "survey" or "survey" in mission_status.lower() else "manual"
-        if waypoint_seq is not None:
-            mode = "waypoint"
-        automation = self.latest_automation_status if isinstance(self.latest_automation_status, dict) else {}
-        mavlink_sample_id = automation.get("sample_id")
+        context = dict(getattr(self, '_sampling_context', {}) or {})
+        source = context.get('source', 'unknown')
+        mode = 'waypoint' if source in ('fcu', 'waypoint') else ('survey' if source == 'survey' else 'manual')
+        waypoint_seq = context.get('waypoint_seq') if mode == 'waypoint' else None
+        mavlink_sample_id = context.get('sample_id') if source == 'fcu' else None
         return {
             "mode": mode,
-            "source": "fcu" if mode == "waypoint" else (self.data_recording_source or "trigger"),
+            "source": source,
+            "attempt_id": context.get('attempt_id'),
             "waypoint_seq": waypoint_seq,
             "mavlink_sample_id": mavlink_sample_id,
             "route_ref": {
@@ -2391,6 +2398,23 @@ class WebConfigServer(object):
                 "route_source": self.route_source,
             },
         }
+
+    def _expire_spectrometer_measurement(self):
+        raw = self.latest_spectrometer_payload
+        if not isinstance(raw, dict) or not raw.get('valid') or raw.get('received_at') is None:
+            return
+        try:
+            age = time.time() - float(raw['received_at'])
+            fresh = math.isfinite(age) and 0.0 <= age <= 2.0
+        except (TypeError, ValueError):
+            fresh = False
+        if not fresh:
+            self.latest_spectrometer_payload = dict(raw, valid=False, stale=True, status='stale')
+            self.spectrometer_status = 'stale'
+            if self.socketio:
+                self.socketio.emit('spectrometer_status', 'stale')
+                self.socketio.emit('voltage', {'value': self.current_voltage, 'sample': False,
+                                              'status': 'stale', 'raw': self.latest_spectrometer_payload})
 
     def _start_sample_window_if_needed(self):
         if self.current_sample_window is not None:
@@ -2434,6 +2458,9 @@ class WebConfigServer(object):
         if not isinstance(payload, dict):
             rospy.logwarn("Invalid spectrometer raw payload skipped")
             return
+        if payload.get('simulated') or (isinstance(payload.get('status'), int) and payload['status'] & 0x10):
+            rospy.logwarn('Detector test frame excluded from real sample recording')
+            return
         try:
             frame = normalize_raw_frame(payload, latest_voltage=self.latest_spectrometer_payload)
             self.sample_storage.append_raw_frame(self.current_sample_window, frame)
@@ -2471,6 +2498,10 @@ class WebConfigServer(object):
         self._add_log("走航进样泵联动: %s" % message, "success" if ok else "error")
 
     def _status_cb(self, msg):
+        with self._sample_lifecycle_lock:
+            self._status_cb_locked(msg)
+
+    def _status_cb_locked(self, msg):
         """泵状态回调。"""
         status_raw = msg.data or ""
         status = status_raw.lower()
@@ -2480,6 +2511,9 @@ class WebConfigServer(object):
             self.pump_connected = True
         elif 'disconnected' in status or status.startswith('error:'):
             self.pump_connected = False
+
+        if self._recording_attempt_id() and ('automation:' in status or status == 'stopped'):
+            return  # uncorrelated legacy messages cannot end a newer owned job
 
         # automation_running 从 automation: 前缀中提取
         # 注意：mission_status 已由 /usv/mission_status（mavlink_trigger_node）统一驱动，
@@ -2502,7 +2536,38 @@ class WebConfigServer(object):
             self.automation_running = False
             self.automation_paused = False
 
+    def _recording_attempt_id(self):
+        window = getattr(self, 'current_sample_window', None)
+        if isinstance(window, dict) and window.get('attempt_id'):
+            return window['attempt_id']
+        return (getattr(self, '_sampling_context', None) or {}).get('attempt_id')
+
+    @staticmethod
+    def _automation_terminal(data):
+        status = str(data.get('status', '') or '').lower()
+        return any(token in status for token in ('finish', 'done', 'stop', 'error', 'fail', 'owner_lost'))
+
+    def _finish_owned_recording(self, data):
+        if not isinstance(data, dict) or self.current_sample_window is None:
+            return False
+        context = data.get('sampling_context')
+        expected = self._recording_attempt_id()
+        if (not expected or not isinstance(context, dict) or context.get('attempt_id') != expected
+                or not self._automation_terminal(data)):
+            return False
+        self.automation_running = False
+        self.automation_paused = False
+        self._close_sample_window_if_open()
+        if self.data_recording_source not in ('survey', 'lab'):
+            self._stop_data_recording_if_active()
+        self._sampling_context = {}
+        return True
+
     def _automation_status_cb(self, msg):
+        with self._sample_lifecycle_lock:
+            self._automation_status_cb_locked(msg)
+
+    def _automation_status_cb_locked(self, msg):
         """结构化自动化状态回调。"""
         try:
             data = json.loads(msg.data)
@@ -2510,27 +2575,37 @@ class WebConfigServer(object):
             return
         if not isinstance(data, dict):
             return
+        expected = self._recording_attempt_id()
+        context = data.get('sampling_context')
+        if expected and (not isinstance(context, dict) or context.get('attempt_id') != expected):
+            return
         self.latest_automation_status = data
         if 'running' in data or 'paused' in data:
             self.automation_paused = bool(data.get('paused', False))
             self.automation_running = bool(data.get('running', False)) and not self.automation_paused
-        status_text = str(data.get("status", "") or "").lower()
-        terminal_status = (
-            "finish" in status_text
-            or "done" in status_text
-            or "stop" in status_text
-            or "error" in status_text
-            or "fail" in status_text
-        )
+        terminal_status = self._automation_terminal(data)
         if terminal_status:
             self.automation_running = False
             self.automation_paused = False
-            if self.data_recording_source == "web":
+            if self._finish_owned_recording(data):
+                return
+            if not expected and self.data_recording_source == "web":
                 self._stop_data_recording_if_active()
 
     def _trigger_status_cb(self, msg):
+        with self._sample_lifecycle_lock:
+            self._trigger_status_cb_locked(msg)
+
+    def _trigger_status_cb_locked(self, msg):
         """采样生命周期回调，用于 Web 数据中心自动建档。"""
         raw_status = str(getattr(msg, "data", "") or "")
+        if raw_status.startswith('sampling_context:'):
+            try:
+                context = json.loads(raw_status.split(':', 1)[1])
+                self._sampling_context = context if isinstance(context, dict) else {}
+            except (TypeError, ValueError):
+                self._sampling_context = {}
+            return
         status = raw_status.lower()
         received_at = datetime.now().isoformat()
         self.latest_trigger_status = {
@@ -2556,14 +2631,18 @@ class WebConfigServer(object):
             source = "lab" if self._lab_mission_recording_active() else "trigger"
             self._start_data_recording_if_needed(source=source)
             self._start_sample_window_if_needed()
+            self._finish_owned_recording(self.latest_automation_status)
         elif (
             'sampling_stopped' in status
             or 'survey_stopped' in status
             or 'manual_start_rejected' in status
             or 'start_failed' in status
         ):
+            if self._recording_attempt_id() and not self._finish_owned_recording(self.latest_automation_status):
+                return
             if 'sampling_stopped' in status or 'survey_stopped' in status:
                 self._close_sample_window_if_open()
+                self._sampling_context = {}
             self.automation_running = False
             keep_recording = (
                 'sampling_stopped' in status
@@ -3965,6 +4044,15 @@ class WebConfigServer(object):
         except Exception as e:
             return False, str(e), {}
 
+    def _cancel_pending_web_start(self):
+        with self._web_state_lock:
+            self._web_stop_generation += 1
+            self._web_attempt_id = None
+
+    def _stop_all_control(self):
+        self._cancel_pending_web_start()
+        return self._call_control_command('manual_stop_all', {})
+
     def _publish_spectrometer_command(self, payload):
         """Send a spectrometer runtime command through the synchronous control transaction service."""
         action_map = {
@@ -4084,10 +4172,11 @@ class WebConfigServer(object):
         # 禁用浏览器缓存 (开发模式)
         self.app.config['SEND_FILE_MAX_AGE_DEFAULT'] = 0
 
-        CORS(self.app)
+        from scripts.lib.web_access import install_control_access
+        install_control_access(self.app)
 
         # 使用 threading 模式以兼容 ROS
-        self.socketio = SocketIO(self.app, cors_allowed_origins="*", async_mode='threading')
+        self.socketio = SocketIO(self.app, async_mode='threading')
 
         @self.app.after_request
         def prevent_stale_frontend_cache(response):
@@ -4906,6 +4995,9 @@ class WebConfigServer(object):
                 return jsonify({"success": True, "message": "指令已发送 (模拟模式)"})
 
             try:
+                if command.strip().upper() in ('STOP', 'STOPALL', 'XDFV0J0YDFV0J0ZDFV0J0ADFV0J0'):
+                    ok, message, _ = self._stop_all_control()
+                    return jsonify(success=ok, message=message), (200 if ok else 500)
                 # 通过 ROS 服务发送指令
                 if hasattr(self, 'command_pub') and self.command_pub:
                     self.command_pub.publish(command)
@@ -4919,17 +5011,14 @@ class WebConfigServer(object):
         @self.app.route('/api/motor/stop', methods=['POST'])
         def stop_all_motors():
             """紧急停止所有电机"""
-            stop_command = "XDFV0J0YDFV0J0ZDFV0J0ADFV0J0\r\n"
             if self.standalone:
                 self._add_log("[模拟] 紧急停止所有电机", "warning")
                 return jsonify({"success": True, "message": "已停止 (模拟模式)"})
 
             try:
-                if hasattr(self, 'command_pub') and self.command_pub:
-                    self.command_pub.publish(stop_command)
-                    self._add_log("紧急停止所有电机", "warning")
-                    return jsonify({"success": True, "message": "已停止"})
-                return jsonify({"success": False, "message": "ROS Publisher 未初始化"})
+                ok, message, _ = self._stop_all_control()
+                self._add_log('紧急停止: ' + message, 'warning' if ok else 'error')
+                return jsonify(success=ok, message=message)
             except Exception as e:
                 return jsonify({"success": False, "message": str(e)}), 500
 
@@ -5116,7 +5205,7 @@ class WebConfigServer(object):
         def manual_stop_all():
             if self.standalone:
                 return jsonify({"success": True, "message": "standalone stop all"})
-            ok, message, result = self._call_control_command("manual_stop_all", {})
+            ok, message, result = self._stop_all_control()
             return jsonify({"success": ok, "message": message, "data": result}), (200 if ok else 500)
 
         @self.app.route('/api/spectrometer/start', methods=['POST'])
@@ -5159,6 +5248,7 @@ class WebConfigServer(object):
         # ================= Spectrometer API =================
         @self.app.route('/api/spectrometer/baseline', methods=['POST'])
         def set_spectrometer_baseline():
+            self._expire_spectrometer_measurement()
             raw = self.latest_spectrometer_payload if isinstance(self.latest_spectrometer_payload, dict) else {}
             payload = request.get_json(silent=True)
             has_explicit_reference = isinstance(payload, dict) and 'reference_voltage' in payload
@@ -5913,6 +6003,18 @@ class WebConfigServer(object):
             )
 
     def _trigger_mission(self, action):
+        if action == 'stop':
+            self._cancel_pending_web_start()
+        if action != 'start':
+            return self._trigger_mission_locked(action)
+        if not self._web_start_lock.acquire(blocking=False):
+            return jsonify(success=False, message='Start transaction already pending'), 409
+        try:
+            return self._trigger_mission_locked(action)
+        finally:
+            self._web_start_lock.release()
+
+    def _trigger_mission_locked(self, action):
         """触发任务动作。"""
         if self.standalone:
             msg = "独立模式下无法触发任务 (需要 ROS 集成)"
@@ -5933,50 +6035,89 @@ class WebConfigServer(object):
             return jsonify({"success": False, "message": msg}), 400
 
         started_recording = False
+        previous_context = {}
+        created_window = None
+        created_mission_file = None
+        steps_payload = {}
+        stopping_window = self.current_sample_window
+        stopping_file = self.data_manager.current_mission_file
+        with self._web_state_lock:
+            stop_generation = self._web_stop_generation
         try:
             request_data = request.get_json(silent=True) or {}
 
             # 如果是启动，优先使用请求中携带的最新配置
             if action == 'start':
-                sampling_sequence = request_data.get('sampling_sequence')
-                waypoint_sampling = request_data.get('waypoint_sampling')
-                config_patch = {}
-                if isinstance(sampling_sequence, dict):
-                    normalized_sequence = ConfigManager._normalize_sampling_sequence(sampling_sequence)
-                    config_patch['sampling_sequence'] = normalized_sequence
-                if isinstance(waypoint_sampling, dict):
-                    config_patch['waypoint_sampling'] = ConfigManager._normalize_waypoint_sampling(waypoint_sampling)
-                if config_patch:
-                    self.config_manager.update(config_patch)
-                self._publish_steps()
-                # 开始记录数据；若采样生命周期回调已建档则不重复创建。
-                self._start_data_recording_if_needed(source="web")
-                # Web 启动路径也打开采样窗口，确保原始分光帧 JSONL 落盘
-                self._start_sample_window_if_needed()
-                started_recording = True
-
-            # 如果是停止，停止记录
-            if action == 'stop':
-                self._stop_data_recording_if_active()
+                with self._sample_lifecycle_lock:
+                    if self.automation_running or self.automation_paused or self.current_sample_window is not None:
+                        return jsonify(success=False, message='Sampling already active'), 409
+                    previous_context = dict(self._sampling_context)
+                    sampling_sequence = request_data.get('sampling_sequence')
+                    waypoint_sampling = request_data.get('waypoint_sampling')
+                    config_patch = {}
+                    if isinstance(sampling_sequence, dict):
+                        normalized_sequence = ConfigManager._normalize_sampling_sequence(sampling_sequence)
+                        config_patch['sampling_sequence'] = normalized_sequence
+                    if isinstance(waypoint_sampling, dict):
+                        config_patch['waypoint_sampling'] = ConfigManager._normalize_waypoint_sampling(waypoint_sampling)
+                    if config_patch:
+                        self.config_manager.update(config_patch)
+                    steps_payload = self._publish_steps(transaction_only=True)
+                    self._sampling_context = {'source': 'web', 'attempt_id': steps_payload['attempt_id']}
+                    started_recording = not bool(self.data_manager.current_mission_file)
+                    self._start_data_recording_if_needed(source="web")
+                    if started_recording:
+                        created_mission_file = self.data_manager.current_mission_file
+                    self._start_sample_window_if_needed()
+                    created_window = self.current_sample_window
 
             # 调用服务
-            rospy.wait_for_service(service_name, timeout=2.0)
-            service = rospy.ServiceProxy(service_name, Trigger)
-            resp = service()
-            if action == 'start' and started_recording and not resp.success:
-                self._stop_data_recording_if_active()
+            if action == 'start':
+                ok, message, _ = self._call_control_command('automation_start', steps_payload)
+                with self._web_state_lock:
+                    cancelled = stop_generation != self._web_stop_generation
+                    if ok and not cancelled:
+                        self._web_attempt_id = steps_payload['attempt_id']
+                if cancelled:
+                    self._call_control_command('manual_stop_all', {})
+                    ok, message = False, 'Start cancelled by stop request'
+                resp = type('StartResult', (), {'success': ok, 'message': message})()
+            else:
+                rospy.wait_for_service(service_name, timeout=2.0)
+                service = rospy.ServiceProxy(service_name, Trigger)
+                resp = service()
+            if action == 'start' and not resp.success:
+                self._rollback_web_start(steps_payload, created_window, created_mission_file, previous_context)
+            if action == 'stop':
+                # Dispatch the physical stop before waiting for recording I/O.
+                with self._sample_lifecycle_lock:
+                    if self.current_sample_window is stopping_window and self.data_manager.current_mission_file == stopping_file:
+                        self._stop_data_recording_if_active()
 
             self._add_log(f"任务 {action}: {resp.message}", "success" if resp.success else "error")
             return jsonify({"success": resp.success, "message": resp.message})
 
         except Exception as e:
-            if action == 'start' and started_recording:
-                self._stop_data_recording_if_active()
+            if action == 'start':
+                self._rollback_web_start(steps_payload, created_window, created_mission_file, previous_context)
             msg = f"服务调用失败: {str(e)}"
             self._add_log(msg, "error")
             return jsonify({"success": False, "message": msg})
 
-    def _publish_steps(self):
+    def _rollback_web_start(self, payload, window, mission_file, previous_context):
+        with self._sample_lifecycle_lock:
+            attempt = payload.get('attempt_id') if isinstance(payload, dict) else None
+            owns_context = bool(attempt) and self._sampling_context.get('attempt_id') == attempt
+            owns_window = window is not None and self.current_sample_window is window
+            if owns_window:
+                self._close_sample_window_if_open()
+            if (mission_file and owns_context and self.current_sample_window is None
+                    and self.data_manager.current_mission_file == mission_file):
+                self._stop_data_recording_if_active()
+            if owns_context:
+                self._sampling_context = previous_context
+
+    def _publish_steps(self, transaction_only=False):
         """发布采样步骤到 ROS。"""
         if self.standalone or not self.steps_pub:
             return
@@ -5987,6 +6128,9 @@ class WebConfigServer(object):
         if lab_config.get("enabled") and lab_config.get("bypass_pid_wait"):
             pid_mode = False
         steps_data = {
+            'source': 'web',
+            'attempt_id': uuid.uuid4().hex if transaction_only else None,
+            'transaction_only': bool(transaction_only),
             "steps": config.get('sampling_sequence', {}).get('steps', []),
             "loop_count": config.get('sampling_sequence', {}).get('loop_count', 1),
             "pid_mode": pid_mode,
@@ -6008,11 +6152,18 @@ class WebConfigServer(object):
         msg.data = json.dumps(steps_data)
         self.steps_pub.publish(msg)
         self._add_log("配置已发送到控制节点")
+        return steps_data
 
     def _data_push_loop(self):
         """后台线程：定时推送实时数据"""
         rate = 2 # Hz
         while not rospy.is_shutdown():
+            self._expire_spectrometer_measurement()
+            if (not self.standalone and self._web_attempt_id
+                    and (self.automation_running or self.automation_paused)):
+                owner = String()
+                owner.data = json.dumps({'attempt_id': self._web_attempt_id})
+                self.owner_pub.publish(owner)
             if self.socketio:
                 automation = self.latest_automation_status if isinstance(self.latest_automation_status, dict) else {}
                 self.socketio.emit('status', {

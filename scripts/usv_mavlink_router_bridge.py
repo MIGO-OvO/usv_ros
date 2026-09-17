@@ -6,6 +6,7 @@
 from __future__ import print_function
 
 import json
+import math
 import threading
 import time
 from collections import deque
@@ -58,6 +59,8 @@ class USVMavlinkRouterBridge(object):
         self._reference_voltage = 0.0
         self._baseline_voltage = 0.0
         self._spectrometer_valid = 0.0
+        self._spectrometer_received_at = None
+        self._measurement_timeout = max(0.1, float(rospy.get_param('~measurement_timeout', 2.0)))
         self._pump_angles = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
         self._status_code = 0
         self._last_mission_state = "IDLE"
@@ -71,6 +74,7 @@ class USVMavlinkRouterBridge(object):
         self._pid_error = 0.0
         self._pid_mode = 0.0
         self._health_fields = DEFAULT_HEALTH_FIELDS.copy()
+        self._health_received_at = None
         self._boot_time = time.time()
         self._last_heartbeat = 0.0
         self._last_reconnect_attempt = 0.0
@@ -87,6 +91,7 @@ class USVMavlinkRouterBridge(object):
         self._pending_statustexts = deque(maxlen=MAX_PENDING_SENDS)   # [(text, severity), ...]
         self._pending_acks = deque(maxlen=MAX_PENDING_SENDS)          # [(command, result, target_sys, target_comp), ...]
         self._pending_usv_done = deque(maxlen=MAX_PENDING_SENDS)      # [sample_id, ...]
+        self._pending_usv_fail = deque(maxlen=MAX_PENDING_SENDS)
         self._fcu_sample_id = 0          # current sampling id from FCU NAV_SCRIPT_TIME
         self._last_fcu_sample_id = 0     # suppress retransmitted triggers, including terminal ones
         self._cmd_rx_pub = rospy.Publisher("/usv/mavlink_cmd_rx", Float32MultiArray, queue_size=5)
@@ -169,15 +174,24 @@ class USVMavlinkRouterBridge(object):
     def _voltage_cb(self, msg):
         try:
             data = json.loads(msg.data)
+            if not isinstance(data, dict):
+                raise ValueError('expected object')
+            voltage = float(data.get('voltage', data.get('sample_voltage', 0.0)) or 0.0)
+            valid = (bool(data.get('valid')) and math.isfinite(voltage)
+                     and not data.get('stale') and not data.get('simulated'))
+            if data.get('received_at') is not None:
+                age = time.time() - float(data['received_at'])
+                valid = valid and 0.0 <= age <= self._measurement_timeout
         except Exception:
-            data = {"voltage": 0.0, "absorbance": 0.0}
+            data, voltage, valid = {}, 0.0, False
         with self._lock:
-            self._voltage = float(data.get("voltage", data.get("sample_voltage", 0.0)) or 0.0)
-            self._absorbance = float(data.get("absorbance", 0.0) or 0.0)
+            self._voltage = voltage if math.isfinite(voltage) else 0.0
+            self._absorbance = self._finite_float(data.get("absorbance"), 0.0)
             self._baseline_set = 1.0 if data.get("baseline_set", False) else 0.0
-            self._reference_voltage = float(data.get("reference_voltage", 0.0) or 0.0)
-            self._baseline_voltage = float(data.get("baseline_voltage", 0.0) or 0.0)
-            self._spectrometer_valid = 1.0 if data.get("valid", False) else 0.0
+            self._reference_voltage = self._finite_float(data.get("reference_voltage"), 0.0)
+            self._baseline_voltage = self._finite_float(data.get("baseline_voltage"), 0.0)
+            self._spectrometer_valid = 1.0 if valid else 0.0
+            self._spectrometer_received_at = time.monotonic()
 
     def _angles_cb(self, msg):
         try:
@@ -215,6 +229,12 @@ class USVMavlinkRouterBridge(object):
 
         with self._lock:
             self._apply_automation_status_locked(data_dict)
+            if (isinstance(data_dict, dict) and data_dict.get('controller_fault') == 'owner_lost'
+                    and data_dict.get('source') == 'fcu' and self._fcu_sample_id > 0
+                    and data_dict.get('sample_id') == self._fcu_sample_id):
+                self._pending_usv_fail.append(self._fcu_sample_id)
+                self._pending_usv_done.clear()
+                self._fcu_sample_id = 0
 
     def _apply_automation_status_locked(self, data_dict):
         if not isinstance(data_dict, dict):
@@ -298,6 +318,8 @@ class USVMavlinkRouterBridge(object):
             self._fcu_sample_id = 0
             if outcome in ("succeeded", "skipped"):
                 self._pending_usv_done.append(sample_id)
+            else:
+                self._pending_usv_fail.append(sample_id)
             self._pending_statustexts.append((
                 "USV: Sampling %s id=%d" % (labels[outcome], sample_id),
                 mavutil.mavlink.MAV_SEVERITY_NOTICE))
@@ -347,6 +369,7 @@ class USVMavlinkRouterBridge(object):
             fields["USV_EHEAP"] = self._finite_float(detector.get("heap_percent_free"), -1.0)
             with self._lock:
                 self._health_fields = fields
+                self._health_received_at = time.monotonic()
         except Exception:
             pass
 
@@ -356,7 +379,7 @@ class USVMavlinkRouterBridge(object):
             result = float(value)
         except (TypeError, ValueError):
             return float(default)
-        if result != result:
+        if not math.isfinite(result):
             return float(default)
         return result
 
@@ -371,9 +394,8 @@ class USVMavlinkRouterBridge(object):
         try:
             command, result, target_sys, target_comp = msg.data
             ack = (int(command), int(result), int(target_sys), int(target_comp))
-            if not self._send_command_ack(*ack):
-                with self._lock:
-                    self._pending_acks.append(ack)
+            with self._lock:
+                self._pending_acks.append(ack)
         except Exception as exc:
             rospy.logwarn("Failed to queue COMMAND_ACK: %s", str(exc))
 
@@ -453,8 +475,17 @@ class USVMavlinkRouterBridge(object):
             # USV_SMPL / USV_SURV: 飞控 mission 原生采样触发
             if msg_type == "NAMED_VALUE_FLOAT":
                 try:
+                    if (msg.get_srcSystem() != self._sys_id or msg.get_srcComponent() != 1):
+                        continue
                     name = msg.name.rstrip('\x00')
-                    if name == "USV_SMPL":
+                    if name == 'USV_FAIL':
+                        sample_id = int(msg.value)
+                        if msg.value != sample_id or sample_id != self._fcu_sample_id or sample_id <= 0:
+                            continue
+                        rx = Float32MultiArray()
+                        rx.data = [31011.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+                        self._cmd_rx_pub.publish(rx)
+                    elif name == "USV_SMPL":
                         sample_id = int(msg.value)
                         if msg.value != sample_id or not 1 <= sample_id <= 65535:
                             continue
@@ -465,6 +496,7 @@ class USVMavlinkRouterBridge(object):
                             self._fcu_sample_id = sample_id
                             # A newer script supersedes any not-yet-sent old completion.
                             self._pending_usv_done.clear()
+                            self._pending_usv_fail.clear()
                         rospy.loginfo("FCU triggered point sampling id=%d", sample_id)
                         rx = Float32MultiArray()
                         # param1=0, param2=sample_id — trigger uses param2>0 to detect FCU origin
@@ -613,6 +645,11 @@ class USVMavlinkRouterBridge(object):
             # 不依赖 MAVROS 连接状态。MAVROS 状态仅影响诊断统计。
             # 回调线程只入队，所有 socket 发送都在本主循环执行。
             with self._lock:
+                measured_at = self._spectrometer_received_at
+                if measured_at is None or time.monotonic() - measured_at > self._measurement_timeout:
+                    self._spectrometer_valid = 0.0
+                if self._health_received_at is None or time.monotonic() - self._health_received_at > 5.0:
+                    self._health_fields = DEFAULT_HEALTH_FIELDS.copy()
                 voltage = self._voltage
                 absorbance = self._absorbance
                 angles = self._pump_angles.copy()
@@ -633,13 +670,21 @@ class USVMavlinkRouterBridge(object):
                 self._pending_acks.clear()
                 pending_done = list(self._pending_usv_done)
                 self._pending_usv_done.clear()
+                pending_fail = list(self._pending_usv_fail)
+                self._pending_usv_fail.clear()
 
-            for text, severity in pending_st:
-                self._send_statustext(text, severity)
-            for command, result, target_sys, target_comp in pending_ack:
-                self._send_command_ack(command, result, target_sys, target_comp)
+            # Safety outcomes precede routine ACKs, logs and bulk telemetry.
+            for sample_id in pending_fail:
+                t = int((time.time() - self._boot_time) * 1000) & 0xFFFFFFFF
+                self._mav_send_with_retry(
+                    lambda: self._conn.mav.named_value_float_send(t, b'USV_FAIL\x00\x00', float(sample_id)),
+                    'USV_FAIL')
             for sample_id in pending_done:
                 self._send_usv_done(sample_id)
+            for command, result, target_sys, target_comp in pending_ack:
+                self._send_command_ack(command, result, target_sys, target_comp)
+            for text, severity in pending_st:
+                self._send_statustext(text, severity)
 
             self._send_payload(voltage, absorbance, angles, status, automation_step, automation_total, sample_count, pid_error, pid_mode, baseline_set, reference_voltage, baseline_voltage, spectrometer_valid, health_fields)
 

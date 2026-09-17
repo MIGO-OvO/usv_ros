@@ -1,5 +1,19 @@
 # usv_ros
 
+## safety1 成套升级注意
+
+本版本需匹配带 `CAP=WATCHDOG1` 的 DetFirmware，旧固件会拒绝连接；ROS 每 500 ms 续约设备心跳，设备超过 3 秒失联停机且不因迟到心跳恢复。所有停止入口取消自动化；重连先取消旧事务。Web/trigger 通过 `ControlCommand.automation_start` 原子装载并启动本次步骤，`sampling_context` 和 `attempt_id` 用于归档及 5 秒 owner 续约。
+
+终态通过结构化 `automation_status` 的 attempt/source/sample_id 关联，快任务提前终态缓存到启动确认后消费。内部清理通过 `ControlCommand.automation_cleanup` 在同一控制锁内校验 attempt 并停止全部输出，结果为 `stopped/failed/superseded`；旧 owner 清理不能干扰新任务。失败或已锁存的会话故障不算清理成功，人工 31011/STOPALL 仍为全局停止。走航间隔保持进样 owner 续约，停止会取消整个调度，MANUAL/RTL 接管不被迟到失败覆盖。
+
+飞控需更新为采样超时默认 HOLD、支持 `USV_FAIL` 的匹配版本。22 个显示遥测名称及 31010..31019 命令号不变；分光超过 2 秒未更新时置无效。`USV_DONE/USV_FAIL` 尚无端到端 ACK 或跨飞控重启会话保证，不能以本地发送成功当作船态证明。
+
+远程 API 写操作默认关闭。设置进程环境 `USV_WEB_CONTROL_TOKEN`（至少 16 字符）后支持 Bearer 认证或 HTTP Basic（用户名 `operator`，密码为令牌）；浏览器先访问 `/api/control/auth`。不把令牌保存到源码或配置 JSON；非可信网络必须使用 HTTPS/VPN。配置令牌后本机写操作也须认证；跨源写请求默认拒绝。
+
+安全测试：`python -B -m unittest discover -s tests -p 'test_system_safety_contract.py'`、`test_sampling_context_contract.py`、`test_web_control_access.py`；完整验收与整船版本检查见总仓库 `docs/current/70_verification.md`。
+
+提交前审计新增回归：`test_sampling_terminal_contract.py`、`test_sampling_cleanup_ownership.py`，覆盖跨任务终态、早到响应、旧清理 RPC、显式停止和走航租约。Web 记录窗口按 attempt 串行化建立/清理，拒绝启动只回滚自身资源。
+
 [![ROS Noetic](https://img.shields.io/badge/ROS-Noetic-22314E?logo=ros&logoColor=white)](https://wiki.ros.org/noetic)
 [![Python](https://img.shields.io/badge/Python-3.8-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![MAVLink](https://img.shields.io/badge/MAVLink-v2-0B7285)](https://mavlink.io/)
