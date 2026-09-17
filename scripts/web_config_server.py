@@ -36,6 +36,7 @@ import tempfile
 import threading
 import time
 import zipfile
+from collections import OrderedDict
 from datetime import datetime
 
 try:
@@ -115,6 +116,7 @@ from scripts.lib.lab_sim.models import CoordinatePairRef, ModelParseError, Sampl
 from scripts.lib.lab_sim.route_planner import RoutePlannerError, plan_coverage_route
 from scripts.lib.sample_recording import MIN_RAW_RECORD_HZ, SampleRecordingStorage, normalize_raw_frame
 from scripts.lib.sample_recording.models import safe_id
+from scripts.lib.sample_recording.downsampling import MinMaxSeries
 
 # 配置文件路径
 CONFIG_DIR = os.path.expanduser("~/usv_ws/config")
@@ -1053,12 +1055,16 @@ class CalibrationManager(object):
 class MissionDataManager(object):
     """任务数据管理器。"""
 
-    def __init__(self, data_dir=DATA_DIR):
+    def __init__(self, data_dir=DATA_DIR, cache_capacity=4, cache_max_bytes=128 * 1024 * 1024):
         self.data_dir = os.path.abspath(os.path.expanduser(data_dir))
         self.current_mission_file = None
         self.current_mission_data = []
         self._write_lock = threading.RLock()
         self._mission_list_cache = None
+        self._mission_cache = OrderedDict()
+        self._cache_capacity = max(1, int(cache_capacity))
+        # File bytes are a proxy, not the decoded Python heap size.
+        self._cache_max_bytes = max(0, int(cache_max_bytes))
         self._ensure_dir()
         self._recover_incomplete_missions()
 
@@ -1357,13 +1363,17 @@ class MissionDataManager(object):
                 if not (name.endswith(".json") and name.startswith("mission_")):
                     continue
                 stat = os.stat(os.path.join(self.data_dir, name))
-                entries.append((name, stat.st_mtime, stat.st_size))
+                entries.append((name, stat.st_mtime_ns, stat.st_size))
             return tuple(sorted(entries))
         except OSError:
             return None
 
     def list_missions(self):
         """列出所有任务。任务文件未变化时返回缓存，避免重复加载大 JSON。"""
+        with self._write_lock:
+            return self._list_missions_locked()
+
+    def _list_missions_locked(self):
         fingerprint = self._mission_list_fingerprint()
         if fingerprint is not None:
             if self._mission_list_cache is not None and self._mission_list_cache[0] == fingerprint:
@@ -1373,31 +1383,27 @@ class MissionDataManager(object):
         if not os.path.exists(self.data_dir):
             return []
 
-        for f in os.listdir(self.data_dir):
+        # Load newest last so likely first-page selections remain in the LRU.
+        for f in sorted(os.listdir(self.data_dir)):
             if f.endswith(".json") and f.startswith("mission_"):
-                path = os.path.join(self.data_dir, f)
                 try:
-                    with open(path, 'r', encoding='utf-8') as file:
-                        # 只读取元数据，不读取所有数据点
-                        # 为了效率，这里假设文件较小，或者只读前几行
-                        # 简单起见，这里读整个文件，但在生产环境中应该优化
-                        data = json.load(file)
-                        if not isinstance(data, dict):
-                            continue
-                        summary = build_mission_summary(data)
-                        mission = {
-                            "id": data.get("mission_id", f),
-                            "name": data.get("name", f),
-                            "state": data.get("state") or ("completed" if data.get("end_time") else "interrupted"),
-                            "start_time": data.get("start_time"),
-                            "end_time": data.get("end_time"),
-                            "point_count": len(data.get("data_points", [])),
-                            "track_count": len(data.get("track_points", [])),
-                            "route_count": len(data.get("route_waypoints", [])),
-                            "summary": summary,
-                        }
-                        mission.update(summary)
-                        missions.append(mission)
+                    data = self.get_mission(f[len("mission_"):-len(".json")])
+                    if not isinstance(data, dict):
+                        continue
+                    summary = data["summary"]
+                    mission = {
+                        "id": data.get("mission_id", f),
+                        "name": data.get("name", f),
+                        "state": data.get("state"),
+                        "start_time": data.get("start_time"),
+                        "end_time": data.get("end_time"),
+                        "point_count": len(data.get("data_points", [])),
+                        "track_count": len(data.get("track_points", [])),
+                        "route_count": len(data.get("route_waypoints", [])),
+                        "summary": summary,
+                    }
+                    mission.update(summary)
+                    missions.append(mission)
                 except Exception:
                     continue
         # 按时间倒序
@@ -1406,7 +1412,15 @@ class MissionDataManager(object):
         return missions
 
     def get_mission(self, mission_id):
-        """获取指定任务详情。"""
+        """Borrow a read-only mission snapshot; mutations must use save/update APIs.
+
+        History and summary are parsed once per file version. Read-through is
+        serialized with saves/deletes so concurrent HTTP requests share the load.
+        """
+        with self._write_lock:
+            return self._get_mission_locked(str(mission_id))
+
+    def _get_mission_locked(self, mission_id):
         if (
             self.current_mission_file
             and isinstance(self.current_mission_data, dict)
@@ -1415,12 +1429,64 @@ class MissionDataManager(object):
             return self._with_summary(self.current_mission_data)
         filename = f"mission_{mission_id}.json"
         path = os.path.join(self.data_dir, filename)
-        if os.path.exists(path):
+        try:
+            stat = os.stat(path)
+        except FileNotFoundError:
+            self._mission_cache.pop(mission_id, None)
+            return None
+        fingerprint = (stat.st_mtime_ns, stat.st_size)
+        cached = self._mission_cache.get(mission_id)
+        if cached is not None and cached[0] == fingerprint:
+            self._mission_cache.move_to_end(mission_id)
+            return cached[1]
+        self._mission_cache.pop(mission_id, None)
+        # An external atomic replacement during parsing must not poison the cache.
+        for _ in range(3):
             with open(path, 'r', encoding='utf-8') as f:
-                return self._with_summary(json.load(f))
-        return None
+                opened = os.fstat(f.fileno())
+                data = json.load(f)
+            after = os.stat(path)
+            fingerprint = (opened.st_mtime_ns, opened.st_size)
+            if (after.st_mtime_ns, after.st_size, after.st_ino) == (opened.st_mtime_ns, opened.st_size, opened.st_ino):
+                data = self._with_summary(data)
+                if opened.st_size <= self._cache_max_bytes:
+                    self._mission_cache[mission_id] = [fingerprint, data, None]
+                    while (len(self._mission_cache) > self._cache_capacity or
+                           sum(entry[0][1] for entry in self._mission_cache.values()) > self._cache_max_bytes):
+                        self._mission_cache.popitem(last=False)
+                return data
+        raise OSError("mission changed repeatedly while reading")
+
+    def get_mission_overview(self, mission_id):
+        """Data-center projection; full mission/export/map APIs stay lossless."""
+        with self._write_lock:
+            data = self.get_mission(mission_id)
+            if not data:
+                return None
+            cached = self._mission_cache.get(str(mission_id))
+            if cached is not None and cached[1] is data and cached[2] is not None:
+                return cached[2]
+            points = data.get("data_points", [])
+            reducer = MinMaxSeries(1500)
+            for point in points:
+                reducer.add({key: point[key] for key in ("timestamp", "voltage", "absorbance") if key in point})
+            overview = {key: data.get(key) for key in ("mission_id", "name", "state", "start_time", "end_time", "summary")}
+            overview.update(data_points=reducer.samples(),
+                            samples=[window for window in data.get("sample_windows", []) or [] if isinstance(window, dict)],
+                            point_count=len(points), trend_method="minmax")
+            if cached is not None and cached[1] is data:
+                cached[2] = overview
+            return overview
 
     def save_mission(self, mission_id, data):
+        with self._write_lock:
+            try:
+                return self._save_mission_locked(mission_id, data)
+            finally:
+                self._mission_cache.pop(str(mission_id), None)
+                self._mission_list_cache = None
+
+    def _save_mission_locked(self, mission_id, data):
         if isinstance(data, dict) and "summary" in data:
             data = dict(data)
             data.pop("summary", None)
@@ -1440,6 +1506,12 @@ class MissionDataManager(object):
 
     def delete_mission(self, mission_id):
         """删除任务。"""
+        with self._write_lock:
+            self._mission_cache.pop(str(mission_id), None)
+            self._mission_list_cache = None
+            return self._delete_mission_locked(mission_id)
+
+    def _delete_mission_locked(self, mission_id):
         filename = f"mission_{mission_id}.json"
         path = os.path.join(self.data_dir, filename)
         if os.path.exists(path):
@@ -5176,7 +5248,9 @@ class WebConfigServer(object):
 
         @self.app.route('/api/data/mission/<mission_id>', methods=['GET'])
         def get_mission_data(mission_id):
-            data = self.data_manager.get_mission(mission_id)
+            data = (self.data_manager.get_mission_overview(mission_id)
+                    if request.args.get("view") == "data-center"
+                    else self.data_manager.get_mission(mission_id))
             if data:
                 return jsonify({"success": True, "data": data})
             return jsonify({"success": False, "message": "任务不存在"}), 404
@@ -5279,16 +5353,30 @@ class WebConfigServer(object):
 
         @self.app.route('/api/data/mission/<mission_id>/sample/<sample_id>/manual-result', methods=['POST'])
         def update_mission_sample_manual_result(mission_id, sample_id):
+            # Keep read/modify/save in one transaction. History uses copy-on-write
+            # windows, so concurrent readers never see an uncommitted result.
+            with self.data_manager._write_lock:
+                return save_manual_result_locked(mission_id, sample_id)
+
+        def save_manual_result_locked(mission_id, sample_id):
             data = self.data_manager.get_mission(mission_id)
             if not data:
                 return jsonify({"success": False, "error": "任务不存在"}), 404
+            data = dict(data)
+            if not (self.data_manager.current_mission_file and
+                    str(self.data_manager.current_mission_data.get("mission_id")) == str(mission_id)):
+                data["sample_windows"] = copy.deepcopy(data.get("sample_windows", []))
             try:
                 window = self.sample_storage.update_manual_result(data, sample_id, request.get_json(silent=True) or {})
             except ValueError as exc:
                 return jsonify({"success": False, "error": str(exc)}), 400
             if window is None:
                 return jsonify({"success": False, "error": "采样窗口不存在"}), 404
-            if not self.data_manager.save_mission(mission_id, data):
+            try:
+                saved = self.data_manager.save_mission(mission_id, data)
+            except OSError:
+                saved = False
+            if not saved:
                 return jsonify({"success": False, "error": "保存失败"}), 500
             return jsonify({"success": True, "data": window})
 
