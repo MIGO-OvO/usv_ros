@@ -87,6 +87,7 @@ SPECTRO_STATUS_VALID = 0x01
 SPECTRO_STATUS_I2C_ERROR = 0x02
 SPECTRO_STATUS_NOT_CONFIG = 0x04
 SPECTRO_STATUS_SATURATED = 0x08
+SPECTRO_STATUS_TEST = 0x10
 
 # 原始分光帧的最小上行频率。前端聚合输出可更低，但落盘链路不得低于此值。
 MIN_RAW_RECORD_HZ = 20
@@ -253,8 +254,11 @@ class PumpSerialReader(object):
             header_info = self._find_header()
 
             if header_info is None:
-                self._process_text(bytes(self.binary_buffer))
-                self.binary_buffer.clear()
+                # A read may end between 0x55 and the packet type byte.
+                keep = 1 if self.binary_buffer[-1] == HEADER1 else 0
+                text_end = len(self.binary_buffer) - keep
+                self._process_text(bytes(self.binary_buffer[:text_end]))
+                del self.binary_buffer[:text_end]
                 break
 
             header_pos, packet_type, packet_size = header_info
@@ -402,7 +406,8 @@ class PumpSerialReader(object):
             "status": status,
             "raw_code": struct.unpack("<i", data[8:12])[0],
             "voltage": struct.unpack("<f", data[12:16])[0],
-            "valid": bool(status & SPECTRO_STATUS_VALID),
+            "valid": bool(status & SPECTRO_STATUS_VALID) and not bool(status & 0x1E),
+            "simulated": bool(status & SPECTRO_STATUS_TEST),
             "i2c_error": bool(status & SPECTRO_STATUS_I2C_ERROR),
             "not_configured": bool(status & SPECTRO_STATUS_NOT_CONFIG),
             "saturated": bool(status & SPECTRO_STATUS_SATURATED),
@@ -493,7 +498,13 @@ class PumpControlNode(object):
         # 串口连接
         self.serial_conn = None
         self.serial_reader = None
+        self._last_control_keepalive = 0.0
         self.serial_lock = threading.Lock()
+        self._control_lock = threading.RLock()
+        self.sampling_context = {}
+        self._controller_fault = None
+        self._owner_last_seen = None
+        self._configuration_ready = False
 
         # 指令生成器
         self.command_generator = CommandGenerator()
@@ -551,6 +562,9 @@ class PumpControlNode(object):
         self._spectro_sequence = 0
         self._spectro_agg_frames = []
         self._spectro_agg_started = None
+        self._last_valid_spectro_at = None
+        self._spectro_invalid_published = False
+        self.measurement_timeout = max(0.1, float(rospy.get_param('~measurement_timeout', 2.0)))
         self.spectro_reference_voltage = float(self.spectro_config.get('reference_voltage', 0.0))
         self.spectro_baseline_voltage = float(self.spectro_config.get('baseline_voltage', 0.0))
         self.spectro_command_event = threading.Event()
@@ -581,6 +595,7 @@ class PumpControlNode(object):
         self.cmd_sub = rospy.Subscriber('/usv/pump_command', String, self._cmd_callback)
         self.step_sub = rospy.Subscriber('/usv/pump_step', String, self._step_callback)
         self.steps_sub = rospy.Subscriber('/usv/automation_steps', String, self._steps_callback)
+        self.owner_sub = rospy.Subscriber('/usv/sampling_owner', String, self._owner_heartbeat_cb)
         self.spectro_cmd_sub = rospy.Subscriber('/usv/spectrometer_command', String, self._spectro_cmd_callback)
 
         # Services
@@ -628,6 +643,12 @@ class PumpControlNode(object):
                 self.serial_conn.close()
                 raise serial.SerialException("detector handshake failed: %s" % identity)
             rospy.loginfo("Detector handshake: %s", identity)
+            if 'CAP=WATCHDOG1' not in identity:
+                self.serial_conn.close()
+                raise serial.SerialException('detector firmware lacks WATCHDOG1; update the matched firmware')
+            self.serial_conn.write(b'WATCHDOG:ARM\r\n')
+            self._controller_fault = None
+            self._last_control_keepalive = time.monotonic()
             self._publish_injection_pump_status()
 
             # 启动读取器
@@ -670,7 +691,10 @@ class PumpControlNode(object):
     def _on_serial_reader_error(self, error):
         """读取线程异常后异步重连，避免在读取线程内 join 自身。"""
         rospy.logwarn("Serial reader stopped: %s", str(error))
+        self._controller_fault = 'disconnected'
         self._publish_status("error: " + str(error))
+        self._invalidate_spectro('disconnected')
+        self._auto_stop_callback(None)
         threading.Thread(target=self._reconnect_after_reader_error, daemon=True).start()
 
     def _reconnect_after_reader_error(self):
@@ -685,6 +709,8 @@ class PumpControlNode(object):
     def _reconnect_callback(self, req):
         """运行时重连串口服务回调。从 ROS 参数读取最新配置并重连。"""
         try:
+            self._controller_fault = 'reconnecting'
+            self._auto_stop_callback(None)
             new_port = rospy.get_param('~serial_port', self.serial_port)
             new_baud = rospy.get_param('~baudrate', self.baudrate)
             new_timeout = rospy.get_param('~timeout', self.timeout)
@@ -936,9 +962,12 @@ class PumpControlNode(object):
         if not ok:
             return False, 'Spectrometer start command send failed'
         success, message = self._wait_for_spectro_command_result(timeout=2.0)
+        if success:
+            self._last_valid_spectro_at = time.monotonic()
         return success, message if message != 'timeout' else 'Spectrometer start timeout'
 
     def _spectro_stop(self):
+        self._invalidate_spectro('stopped')
         self._begin_spectro_command_wait()
         self._spectro_agg_frames = []
         self._spectro_agg_started = None
@@ -1194,7 +1223,7 @@ class PumpControlNode(object):
         if not self.spectro_config.get('enabled', True):
             return True
         if self.spectro_state != 'acquiring':
-            return True
+            return bool(self.lab_mode_enabled)
         timeout = max(0.1, self.spectro_sample_wait_timeout)
         deadline = time.time() + timeout
         previous_timestamp = previous_timestamp or 0.0
@@ -1288,14 +1317,17 @@ class PumpControlNode(object):
     def stop_all_pumps(self):
         """紧急停止所有泵。"""
         # 先停止 PID
-        self.send_command(self.command_generator.generate_pid_stop_command())
+        all_success = self.send_command('STOPALL\r\n')
+        pid_success = self.send_command(self.command_generator.generate_pid_stop_command())
+        test_success = self.send_command('PIDTESTSTOP\r\n')
+        calibration_success = self.send_command('CALSTOP\r\n')
         # 再停止电机
         success = self.send_command(self.command_generator.generate_stop_command())
         injection_success = self._send_injection_pump_command(enabled=False)
         if success:
             rospy.logwarn("All pumps stopped!")
             self._publish_status("stopped")
-        return success and injection_success
+        return all_success and success and injection_success and pid_success and calibration_success and test_success
 
     def _build_angle_telemetry_payload(self, source="detector_angle_frame"):
         with self.angles_lock:
@@ -1377,6 +1409,12 @@ class PumpControlNode(object):
 
     def _on_text_received(self, text):
         """文本响应回调。"""
+        if text == 'WATCHDOG_TRIPPED' or text.startswith('WATCHDOG_ERR:'):
+            self._controller_fault = 'watchdog_tripped'
+            self._invalidate_spectro('watchdog_tripped')
+            if self._automation_is_active():
+                self._auto_stop_callback(None)
+            return
         # 自动化运行时提升日志级别，便于排查 PID_DONE 等固件消息
         if self.automation_engine.is_running():
             rospy.loginfo("MCU text: %s", text)
@@ -1570,7 +1608,11 @@ class PumpControlNode(object):
             'received_at': received_at,
             'received_at_ms': int(received_at * 1000),
         })
+        data['valid'] = (bool(data.get('valid')) and not data.get('simulated')
+                         and math.isfinite(float(data.get('voltage', 0.0))))
         if data.get('valid', False):
+            self._last_valid_spectro_at = time.monotonic()
+            self._spectro_invalid_published = False
             self.spectro_state = 'acquiring'
         elif data.get('i2c_error', False):
             self.spectro_state = 'i2c_error'
@@ -1586,6 +1628,47 @@ class PumpControlNode(object):
 
         if data.get('valid', False):
             self._accumulate_spectro_sample(data, received_at)
+        else:
+            self._invalidate_spectro('test_data' if data.get('simulated') else self.spectro_state)
+
+    def _invalidate_spectro(self, reason):
+        self._spectro_agg_frames = []
+        self._spectro_agg_started = None
+        self.latest_spectro = dict(self.latest_spectro or {})
+        self.latest_spectro.update(valid=False, stale=True, status=reason)
+        if self._spectro_invalid_published:
+            return
+        self._spectro_invalid_published = True
+        payload = dict(self.latest_spectro, received_at=time.time(), baseline_set=self._spectro_reference_ready())
+        msg = String()
+        msg.data = json.dumps(payload)
+        self.spectro_voltage_pub.publish(msg)
+        self._publish_spectro_status(reason)
+
+    def _check_spectro_freshness(self):
+        if self._last_valid_spectro_at is not None and time.monotonic() - self._last_valid_spectro_at > self.measurement_timeout:
+            self._invalidate_spectro('stale')
+            if self._automation_is_active() and self.spectro_config.get('enabled', True):
+                self._auto_stop_callback(None)
+
+    def _owner_heartbeat_cb(self, msg):
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError):
+            return
+        with self._control_lock:
+            attempt = self.sampling_context.get('attempt_id')
+            if isinstance(payload, dict) and attempt and payload.get('attempt_id') == attempt:
+                self._owner_last_seen = time.monotonic()
+
+    def _check_sampling_owner(self):
+        with self._control_lock:
+            if ((self._automation_is_active() or self.inject_pump_enabled) and self.sampling_context.get('attempt_id')
+                    and self._owner_last_seen is not None
+                    and time.monotonic() - self._owner_last_seen > 5.0):
+                self._controller_fault = 'owner_lost'
+                self._auto_stop_callback(None)
+                self._publish_automation_status('owner_lost')
 
     def _accumulate_spectro_sample(self, data, received_at):
         """把有效原始帧累积进输出窗口，窗口到点输出平均帧。"""
@@ -1706,9 +1789,13 @@ class PumpControlNode(object):
         self.spectro_status_pub.publish(msg)
 
     def _automation_is_active(self):
+        worker = getattr(self.automation_engine, '_thread', None)
         return bool(
             self.automation_engine.is_running()
             or getattr(self.automation_engine, "is_paused", lambda: False)()
+            # running is cleared before the worker's terminal callbacks finish.
+            # Do not relabel those callbacks by loading the next transaction.
+            or (worker is not None and worker.is_alive())
         )
 
     def _spectrometer_is_active(self):
@@ -1835,6 +1922,43 @@ class PumpControlNode(object):
         return self._control_response(success, message, result)
 
     def _execute_control_action(self, action, payload):
+        with self._control_lock:
+            return self._execute_control_action_locked(action, payload)
+
+    def _execute_control_action_locked(self, action, payload):
+        if self._controller_fault and action not in ('manual_stop_all', 'automation_cleanup', 'injection_off', 'injection_status', 'spectrometer_stop'):
+            return False, 'Controller fault: reconnect required', {}
+        if action == 'automation_cleanup':
+            attempt = payload.get('attempt_id')
+            if not isinstance(attempt, str) or not attempt:
+                return False, 'Cleanup requires attempt_id', {'cleanup': 'failed'}
+            if attempt != self.sampling_context.get('attempt_id'):
+                return False, 'Cleanup owner was superseded', {'cleanup': 'superseded', 'attempt_id': attempt}
+            response = self._auto_stop_locked(None)
+            if not response.success:
+                self._controller_fault = self._controller_fault or 'cleanup_failed'
+            cleaned = bool(response.success and not self._controller_fault)
+            if not cleaned:
+                self._publish_automation_status('cleanup_failed')
+            message = response.message if cleaned else 'Cleanup failed or controller session fault is latched'
+            return cleaned, message, {
+                'cleanup': 'stopped' if cleaned else 'failed', 'attempt_id': attempt,
+            }
+        if self._automation_is_active() and action in ('injection_on', 'injection_set_speed',
+                                                     'spectrometer_configure', 'spectrometer_i2c_map', 'spectrometer_start'):
+            return False, 'Configuration/manual output rejected during automation', {}
+        if action == 'automation_start':
+            if self._automation_is_active() or self.manual_mode_enabled:
+                return False, 'Automation start rejected: controller busy', {}
+            config = dict(payload)
+            config.pop('transaction_only', None)
+            msg = String()
+            msg.data = json.dumps(config)
+            if not self._steps_callback(msg):
+                return False, 'Invalid automation configuration', {}
+            response = self._auto_start_callback(None)
+            return response.success, response.message, dict(self.sampling_context)
+
         if action == "manual_mode":
             success, message = self._set_manual_mode(bool(payload.get("enabled", False)))
             return success, message, self._manual_status_payload()
@@ -1857,10 +1981,21 @@ class PumpControlNode(object):
             }
 
         if action == "manual_stop_all":
-            success = self.stop_all_pumps()
+            success = self._auto_stop_callback(None).success
             return success, "All pumps stopped" if success else "Stop all pumps failed", {}
 
         if action == "injection_on":
+            attempt = payload.get('attempt_id')
+            if attempt is not None and (not isinstance(attempt, str) or not 1 <= len(attempt) <= 64):
+                return False, 'Invalid injection owner attempt_id', {}
+            # Claim pre-start output under the same lock used by scoped cleanup.
+            # Unowned manual commands also supersede a previous task's output.
+            self.sampling_context = {
+                'attempt_id': attempt, 'source': str(payload.get('source', 'manual')),
+                'sample_id': payload.get('sample_id'), 'waypoint_seq': payload.get('waypoint_seq'),
+            }
+            self._configuration_ready = False
+            self._owner_last_seen = time.monotonic()
             speed = payload.get("speed")
             if speed is not None:
                 success = self._send_injection_pump_command(speed=speed)
@@ -1930,12 +2065,30 @@ class PumpControlNode(object):
         }
 
     def _cmd_callback(self, msg):
+        with self._control_lock:
+            self._raw_command_locked(msg)
+
+    def _raw_command_locked(self, msg):
         """直接指令回调。"""
         cmd = msg.data.strip()
         cmd_upper = cmd.upper()
 
-        if cmd_upper == "STOP":
-            self.stop_all_pumps()
+        if cmd_upper in ('STOP', 'STOPALL', self.command_generator.generate_stop_command().strip().upper()):
+            self._auto_stop_callback(None)
+            return
+
+        if '\n' in cmd_upper or '\r' in cmd_upper or cmd_upper.startswith('WATCHDOG:'):
+            rospy.logwarn('Raw control-session command rejected')
+            return
+
+        read_only = cmd_upper in ('HELLO?', 'DET?', 'PIDQUERY', 'CALSTATUS', 'I2CMAP?',
+                                 'ADSSTATUS?', 'PUMP:STATUS', 'STRESS:STATUS?')
+        if self._controller_fault and not read_only:
+            rospy.logwarn('Raw command rejected: reconnect required')
+            return
+
+        if self._automation_is_active() and not read_only:
+            rospy.logwarn('Raw command rejected during automation: %s', cmd_upper)
             return
 
         if self._is_injection_pump_command(cmd_upper):
@@ -1945,10 +2098,17 @@ class PumpControlNode(object):
         self.send_command(cmd_upper)
 
     def _step_callback(self, msg):
+        with self._control_lock:
+            self._manual_step_locked(msg)
+
+    def _manual_step_locked(self, msg):
         """
         单步骤执行回调。
         接收 JSON 格式的步骤参数。
         """
+        if self._controller_fault or self._automation_is_active():
+            rospy.logwarn('Manual step rejected during automation')
+            return
         try:
             step = json.loads(msg.data)
             command = self.command_generator.generate_command(step, mode="manual")
@@ -1969,6 +2129,10 @@ class PumpControlNode(object):
             rospy.logerr("Invalid step JSON: %s", str(e))
 
     def _spectro_cmd_callback(self, msg):
+        with self._control_lock:
+            self._spectro_cmd_locked(msg)
+
+    def _spectro_cmd_locked(self, msg):
         """分光控制指令回调，支持 JSON 指令。"""
         try:
             payload = json.loads(msg.data)
@@ -1976,7 +2140,15 @@ class PumpControlNode(object):
             rospy.logerr("Invalid spectrometer command JSON: %s", msg.data)
             return
 
+        if not isinstance(payload, dict):
+            return
         cmd = str(payload.get('cmd', '')).strip().lower()
+        if self._controller_fault and cmd not in ('stop', 'query_status', 'angle_stream_stop'):
+            rospy.logwarn('Spectrometer command rejected: reconnect required')
+            return
+        if self._automation_is_active() and cmd in ('start', 'configure', 'set_i2c_map'):
+            rospy.logwarn('Spectrometer configuration rejected during automation')
+            return
         if cmd == 'start':
             self._spectro_start()
         elif cmd == 'stop':
@@ -2023,28 +2195,45 @@ class PumpControlNode(object):
             rospy.logwarn("Unknown spectrometer command: %s", cmd)
 
     def _spectro_start_callback(self, req):
-        success, message = self._spectro_start()
+        success, message, _ = self._execute_control_action('spectrometer_start', {})
         return TriggerResponse(success=success, message=message)
 
     def _spectro_stop_callback(self, req):
-        success, message = self._spectro_stop()
+        success, message, _ = self._execute_control_action('spectrometer_stop', {})
         return TriggerResponse(success=success, message=message)
 
     def _i2c_map_apply_callback(self, req):
-        success = self._apply_i2c_mapping()
-        return TriggerResponse(success=success, message='I2C mapping applied' if success else 'I2C mapping apply failed')
+        success, message, _ = self._execute_control_action('spectrometer_i2c_map', {})
+        return TriggerResponse(success=success, message=message)
 
     def _steps_callback(self, msg):
+        with self._control_lock:
+            return self._load_steps_locked(msg)
+
+    def _load_steps_locked(self, msg):
         """
         设置自动化步骤回调。
         接收 JSON 格式的步骤列表。
         """
         try:
             data = json.loads(msg.data)
+            if not isinstance(data, dict) or data.get('transaction_only') or self._automation_is_active():
+                return False
             steps = data.get("steps", [])
             loop_count = data.get("loop_count", 1)
             pid_mode = bool(data.get("pid_mode", self.pid_mode))
             pid_precision = float(data.get("pid_precision", self.pid_precision))
+            if (not isinstance(steps, list) or not all(isinstance(step, dict) for step in steps)
+                    or type(loop_count) is not int or loop_count < 0
+                    or not math.isfinite(pid_precision) or pid_precision <= 0):
+                return False
+            source = str(data.get('source', 'unknown'))
+            sample_id = data.get('sample_id')
+            if source == 'fcu' and (type(sample_id) is not int or not 1 <= sample_id <= 65535):
+                return False
+            attempt_id = data.get('attempt_id')
+            if attempt_id is not None and (not isinstance(attempt_id, str) or not 1 <= len(attempt_id) <= 64):
+                return False
             lab_options = data.get("lab_options", {}) if isinstance(data.get("lab_options", {}), dict) else {}
             self.lab_mode_enabled = bool(data.get("lab_mode", False))
             self.lab_options = {
@@ -2076,37 +2265,49 @@ class PumpControlNode(object):
                           step_names)
             if not steps:
                 rospy.logwarn("Automation steps payload received but step list is empty")
+            self.sampling_context = {
+                'source': source,
+                'sample_id': sample_id if source == 'fcu' else None,
+                'waypoint_seq': data.get('waypoint_seq'),
+                'attempt_id': data.get('attempt_id'),
+            }
+            self._owner_last_seen = time.monotonic()
+            self._configuration_ready = bool(attempt_id)
+            return True
 
         except (TypeError, ValueError) as e:
             rospy.logerr("Invalid automation step config: %s", str(e))
         except json.JSONDecodeError as e:
             rospy.logerr("Invalid steps JSON: %s", str(e))
+        return False
 
     def _stop_callback(self, req):
-        """停止服务回调。"""
-        # 停止自动化
-        if self.automation_engine.is_running():
-            self.automation_engine.stop()
-
-        success = self.stop_all_pumps()
-        return TriggerResponse(
-            success=success,
-            message="All pumps stopped" if success else "Stop failed"
-        )
+        return self._auto_stop_callback(req)
 
     def _auto_start_callback(self, req):
+        with self._control_lock:
+            return self._auto_start_locked(req)
+
+    def _auto_start_locked(self, req):
         """启动自动化服务回调。"""
+        if self._controller_fault:
+            return TriggerResponse(success=False, message='Controller fault: reconnect required')
         rejected = self._reject_if_manual_mode("Automation start")
         if rejected:
             return rejected
         step_count = len(self.automation_engine.steps)
-        if self.automation_engine.is_running():
+        if self._automation_is_active():
             rospy.logwarn("Automation start rejected: already running")
             return TriggerResponse(success=False, message="Automation already running")
 
         if step_count == 0:
             rospy.logwarn("Automation start rejected: no steps loaded")
             return TriggerResponse(success=False, message="No automation steps loaded")
+
+        if (not self._configuration_ready or self._owner_last_seen is None
+                or time.monotonic() - self._owner_last_seen > 5.0):
+            return TriggerResponse(success=False, message='Fresh configuration with attempt_id and owner heartbeat required')
+        self._configuration_ready = False
 
         rospy.loginfo("Automation start requested: %d steps, loop_count=%s, pid_mode=%s, pid_precision=%.3f",
                       step_count,
@@ -2123,7 +2324,12 @@ class PumpControlNode(object):
         return TriggerResponse(success=success, message=message)
 
     def _auto_stop_callback(self, req):
+        with self._control_lock:
+            return self._auto_stop_locked(req)
+
+    def _auto_stop_locked(self, req):
         """停止自动化服务回调。"""
+        self._configuration_ready = False
         rospy.loginfo("Automation stop requested")
         if self.automation_engine.is_running() or self.automation_engine.is_paused():
             self.automation_engine.stop()
@@ -2131,6 +2337,7 @@ class PumpControlNode(object):
         self._stop_injection_for_automation_policy()
         message = "Automation stopped and pumps halted" if success else "Automation stopped but pump halt failed"
         self._publish_automation_status("stopped")
+        self._publish_status('automation: stopped')
         return TriggerResponse(success=success, message=message)
 
     def _auto_pause_callback(self, req):
@@ -2145,6 +2352,12 @@ class PumpControlNode(object):
 
     def _injection_on_callback(self, req):
         """开启进样泵服务。"""
+        with self._control_lock:
+            if self._controller_fault or self._automation_is_active():
+                return TriggerResponse(success=False, message='Controller fault or automation active')
+            return self._injection_on_locked(req)
+
+    def _injection_on_locked(self, req):
         if self.inject_pump_speed <= 0:
             message = "Injection pump speed is 0; set speed first"
             self._update_injection_pump_state(enabled=False, error=message)
@@ -2285,6 +2498,10 @@ class PumpControlNode(object):
 
         payload = {
             "status": status_text,
+            "sampling_context": dict(self.sampling_context),
+            "sample_id": self.sampling_context.get('sample_id'),
+            "source": self.sampling_context.get('source', 'unknown'),
+            "controller_fault": self._controller_fault,
             "running": running,
             "paused": paused,
             "automation_step": automation_step,
@@ -2317,6 +2534,11 @@ class PumpControlNode(object):
         rate = rospy.Rate(10)
 
         while not rospy.is_shutdown():
+            if not self._controller_fault and time.monotonic() - self._last_control_keepalive >= 0.5:
+                self.send_command('WATCHDOG:KEEPALIVE\r\n')
+                self._last_control_keepalive = time.monotonic()
+            self._check_spectro_freshness()
+            self._check_sampling_owner()
             # 周期性状态日志
             angles = self.get_current_angles()
             rospy.logdebug_throttle(5, "Angles: %s", angles)

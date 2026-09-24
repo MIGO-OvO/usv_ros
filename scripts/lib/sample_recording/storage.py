@@ -9,6 +9,7 @@ from typing import Mapping, Optional
 
 from .models import make_window, normalize_gps_payload, normalize_manual_result, safe_id
 from .summary import SpectrometerSummaryBuilder
+from .downsampling import MinMaxSeries
 
 
 class SampleRecordingStorage(object):
@@ -236,7 +237,7 @@ class SampleRecordingStorage(object):
         raw_count = 0
         first_time = None
         last_time = None
-        small = []
+        reducer = MinMaxSeries(max_points)
         with open(path, "r", encoding="utf-8") as file_obj:
             for line in file_obj:
                 if not line.strip():
@@ -248,48 +249,9 @@ class SampleRecordingStorage(object):
                 raw_count += 1
                 first_time = timestamp if first_time is None else min(first_time, timestamp)
                 last_time = timestamp if last_time is None else max(last_time, timestamp)
-                if len(small) <= max_points:
-                    small.append((raw_count - 1, timestamp, frame))
+                reducer.add(frame)
 
-        if raw_count <= max_points:
-            samples = [frame for _, _, frame in small]
-        else:
-            bucket_count = max(1, (max_points - 2) // 2)
-            span = max(1.0, last_time - first_time)
-            buckets = {}
-            first = last = None
-            selected_index = 0
-            with open(path, "r", encoding="utf-8") as file_obj:
-                for line in file_obj:
-                    if not line.strip():
-                        continue
-                    frame = json.loads(line)
-                    timestamp = self._frame_time_ms(frame)
-                    if timestamp is None or (from_ms is not None and timestamp < from_ms) or (to_ms is not None and timestamp > to_ms):
-                        continue
-                    entry = (selected_index, frame)
-                    first = first or entry
-                    last = entry
-                    selected_index += 1
-                    voltage = frame.get("voltage")
-                    try:
-                        voltage = float(voltage)
-                    except (TypeError, ValueError):
-                        continue
-                    bucket = min(bucket_count - 1, int((timestamp - first_time) * bucket_count / span))
-                    current = buckets.get(bucket)
-                    if current is None:
-                        buckets[bucket] = [entry, entry, voltage, voltage]
-                    else:
-                        if voltage < current[2]:
-                            current[0], current[2] = entry, voltage
-                        if voltage > current[3]:
-                            current[1], current[3] = entry, voltage
-            selected = {entry[0]: entry[1] for entry in (first, last) if entry is not None}
-            for minimum, maximum, _, _ in buckets.values():
-                selected[minimum[0]] = minimum[1]
-                selected[maximum[0]] = maximum[1]
-            samples = [selected[index] for index in sorted(selected)]
+        samples = reducer.samples()
 
         return {
             "raw_count": raw_count,

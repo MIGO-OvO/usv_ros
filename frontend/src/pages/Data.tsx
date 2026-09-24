@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import type { MouseEvent } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
@@ -88,6 +88,8 @@ type RawSeries = {
 
 type MissionData = {
   readonly data_points?: readonly MissionPoint[]
+  readonly samples?: readonly SampleWindow[]
+  readonly point_count?: number
 }
 
 type ApiResponse<T> = {
@@ -117,7 +119,9 @@ const emptyManualDraft: ManualDraft = {
 
 async function fetchJson<T>(url: string, init?: RequestInit): Promise<ApiResponse<T>> {
   const res = await fetch(url, init)
-  return await res.json() as ApiResponse<T>
+  const json = await res.json() as ApiResponse<T>
+  if (!res.ok || !json.success) throw new Error(json.error ?? json.message ?? '请求失败')
+  return json
 }
 
 function fmt(value: number | null | undefined, digits = 4): string {
@@ -147,36 +151,56 @@ export default function Data() {
   const [rawSeries, setRawSeries] = useState<RawSeries | null>(null)
   const [manualDraft, setManualDraft] = useState<ManualDraft>(emptyManualDraft)
   const [loading, setLoading] = useState(false)
+  const [listLoading, setListLoading] = useState(true)
+  const [sampleLoading, setSampleLoading] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [pointCount, setPointCount] = useState(0)
+  const [missionVersion, setMissionVersion] = useState(0)
+  const [sampleVersion, setSampleVersion] = useState(0)
   const [saving, setSaving] = useState(false)
+  const sampleRequest = useRef<AbortController | null>(null)
+
+  const selectMission = (id: string | null) => {
+    sampleRequest.current?.abort()
+    setSelectedId(id)
+    setMissionVersion(version => version + 1)
+    setSelectedSampleId(null)
+    setSampleDetail(null)
+    setSamples([])
+    setChartData([])
+    setError(null)
+    setLoading(id !== null)
+  }
 
   useEffect(() => {
     void fetchMissions()
   }, [])
 
   useEffect(() => {
+    const controller = new AbortController()
     if (selectedId) {
-      void fetchMissionData(selectedId)
+      void fetchMissionData(selectedId, controller.signal)
     } else {
       setChartData([])
       setSamples([])
       setSelectedSampleId(null)
     }
-  }, [selectedId])
+    return () => controller.abort()
+  }, [selectedId, missionVersion])
 
   useEffect(() => {
-    const selected = samples[0]?.sample_id ?? null
-    setSelectedSampleId(selected)
-  }, [samples])
-
-  useEffect(() => {
+    const controller = new AbortController()
+    sampleRequest.current = controller
+    setSampleDetail(null)
+    setRawFrames([])
+    setRawSeries(null)
+    setSampleLoading(false)
+    setSaving(false)
     if (selectedId && selectedSampleId) {
-      void fetchSample(selectedId, selectedSampleId)
-    } else {
-      setSampleDetail(null)
-      setRawFrames([])
-      setRawSeries(null)
+      void fetchSample(selectedId, selectedSampleId, controller.signal)
     }
-  }, [selectedId, selectedSampleId])
+    return () => controller.abort()
+  }, [selectedId, selectedSampleId, sampleVersion])
 
   useEffect(() => {
     const result = sampleDetail?.manual_result
@@ -191,51 +215,71 @@ export default function Data() {
   }, [sampleDetail])
 
   const fetchMissions = async () => {
-    const json = await fetchJson<readonly MissionMeta[]>('/api/data/missions')
-    if (json.success) {
-      setMissions(json.data)
-      if (json.data.length > 0 && !selectedId) setSelectedId(json.data[0].id)
-    }
-  }
-
-  const fetchMissionData = async (id: string) => {
-    setLoading(true)
+    setListLoading(true)
     try {
-      const [mission, sampleList] = await Promise.all([
-        fetchJson<MissionData>(`/api/data/mission/${id}`),
-        fetchJson<{ readonly samples: readonly SampleWindow[] }>(`/api/data/mission/${id}/samples`),
-      ])
-      setChartData(mission.success ? mission.data.data_points ?? [] : [])
-      setSamples(sampleList.success ? sampleList.data.samples : [])
+      const json = await fetchJson<readonly MissionMeta[]>('/api/data/missions')
+      setMissions(json.data)
+      if (json.data.length > 0 && !selectedId) selectMission(json.data[0].id)
+    } catch {
+      setError('任务列表加载失败，请刷新列表重试。')
     } finally {
-      setLoading(false)
+      setListLoading(false)
     }
   }
 
-  const fetchSample = async (missionId: string, sampleId: string) => {
-    const [detail, raw] = await Promise.all([
-      fetchJson<SampleWindow>(`/api/data/mission/${missionId}/sample/${sampleId}`),
-      fetchJson<RawSeries>(`/api/data/voltage-series?mission_id=${encodeURIComponent(missionId)}&sample_id=${encodeURIComponent(sampleId)}&max_points=2000`),
-    ])
-    setSampleDetail(detail.success ? detail.data : null)
-    setRawFrames(raw.success ? raw.data.samples : [])
-    setRawSeries(raw.success ? raw.data : null)
+  const fetchMissionData = async (id: string, signal: AbortSignal) => {
+    setLoading(true)
+    setError(null)
+    try {
+      const mission = await fetchJson<MissionData>(`/api/data/mission/${encodeURIComponent(id)}?view=data-center`, { signal })
+      if (signal.aborted) return
+      setChartData(mission.data.data_points ?? [])
+      setPointCount(mission.data.point_count ?? mission.data.data_points?.length ?? 0)
+      setSamples(mission.data.samples ?? [])
+    } catch {
+      if (!signal.aborted) setError('任务加载失败，请重新点击任务重试。')
+    } finally {
+      if (!signal.aborted) setLoading(false)
+    }
+  }
+
+  const fetchSample = async (missionId: string, sampleId: string, signal: AbortSignal) => {
+    setSampleLoading(true)
+    setError(null)
+    try {
+      const [detail, raw] = await Promise.all([
+        fetchJson<SampleWindow>(`/api/data/mission/${encodeURIComponent(missionId)}/sample/${encodeURIComponent(sampleId)}`, { signal }),
+        fetchJson<RawSeries>(`/api/data/voltage-series?mission_id=${encodeURIComponent(missionId)}&sample_id=${encodeURIComponent(sampleId)}&max_points=2000`, { signal }),
+      ])
+      if (signal.aborted) return
+      setSampleDetail(detail.data)
+      setRawFrames(raw.data.samples)
+      setRawSeries(raw.data)
+    } catch {
+      if (!signal.aborted) setError('采样窗口加载失败，请重新点击窗口重试。')
+    } finally {
+      if (!signal.aborted) setSampleLoading(false)
+    }
   }
 
   const deleteMission = async (e: MouseEvent, id: string) => {
     e.stopPropagation()
     const ok = await confirm({ title: '删除任务', description: '确定要删除此任务记录吗？此操作不可撤销。' })
     if (!ok) return
-    const json = await fetchJson<{ readonly message?: string }>(`/api/data/mission/${id}`, { method: 'DELETE' })
-    if (json.success) {
+    try {
+      await fetchJson<{ readonly message?: string }>(`/api/data/mission/${encodeURIComponent(id)}`, { method: 'DELETE' })
       setMissions(prev => prev.filter(m => m.id !== id))
-      if (selectedId === id) setSelectedId(null)
+      if (selectedId === id) selectMission(null)
+    } catch {
+      setError('任务删除失败，请重试。')
     }
   }
 
   const saveManualResult = async () => {
     if (!selectedId || !selectedSampleId) return
+    const signal = sampleRequest.current?.signal
     setSaving(true)
+    setError(null)
     try {
       const payload = {
         analyte: manualDraft.analyte,
@@ -249,13 +293,16 @@ export default function Data() {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
+        signal,
       })
-      if (json.success) {
+      if (!signal?.aborted && json.success) {
         setSampleDetail(json.data)
         setSamples(prev => prev.map(sample => sample.sample_id === json.data.sample_id ? json.data : sample))
       }
+    } catch {
+      if (!signal?.aborted) setError('结果保存失败，请重试。')
     } finally {
-      setSaving(false)
+      if (!signal?.aborted) setSaving(false)
     }
   }
 
@@ -333,7 +380,7 @@ export default function Data() {
             </div>
           )}
           {selectedMission && <p className="max-w-md text-xs text-muted-foreground sm:text-right">原始 CSV 是目标至少 20 Hz 的逐帧数据；任务摘要 CSV 仅用于地图和趋势展示。</p>}
-          <Button className="self-start sm:self-auto" variant="outline" onClick={fetchMissions}><RefreshCw className="w-4 h-4 mr-2" />刷新列表</Button>
+          <Button className="self-start sm:self-auto" variant="outline" onClick={fetchMissions} disabled={listLoading}><RefreshCw className="w-4 h-4 mr-2" />刷新列表</Button>
         </div>
       </header>
 
@@ -346,7 +393,8 @@ export default function Data() {
           <CardContent className="flex-1 min-h-0 p-0">
             <ScrollArea className="h-full">
               <div className="flex flex-col gap-1 p-3">
-                {missions.length === 0 && <div className="text-center text-muted-foreground py-8 text-sm">暂无数据记录</div>}
+                {listLoading && <div role="status" className="text-center text-muted-foreground py-8 text-sm">正在加载任务列表…</div>}
+                {!listLoading && missions.length === 0 && <div className="text-center text-muted-foreground py-8 text-sm">暂无数据记录</div>}
                 {missions.map((mission) => (
                   <div
                     key={mission.id}
@@ -357,7 +405,7 @@ export default function Data() {
                   >
                     <button
                       type="button"
-                      onClick={() => setSelectedId(mission.id)}
+                      onClick={() => selectMission(mission.id)}
                       aria-pressed={selectedId === mission.id}
                       className="flex min-w-0 flex-1 flex-col gap-1 rounded-md p-2 text-left outline-none focus-visible:ring-2 focus-visible:ring-ring"
                     >
@@ -393,14 +441,22 @@ export default function Data() {
             <ScrollArea className="h-full">
               <div className="flex flex-col gap-2 p-3">
                 {loading && <div className="text-sm text-muted-foreground py-6 text-center">加载中...</div>}
-                {!loading && samples.length === 0 && (
+                {!loading && !error && samples.length === 0 && (
                   <div className="text-sm text-muted-foreground py-6 text-center">该任务暂无航点级分光切片</div>
                 )}
                 {samples.map(sample => (
                   <button
                     key={sample.sample_id}
                     type="button"
-                    onClick={() => setSelectedSampleId(sample.sample_id)}
+                    onClick={() => {
+                      sampleRequest.current?.abort()
+                      setSampleDetail(null)
+                      setSampleLoading(true)
+                      setError(null)
+                      setSelectedSampleId(sample.sample_id)
+                      setSampleVersion(version => version + 1)
+                    }}
+                    aria-pressed={selectedSampleId === sample.sample_id}
                     className={cn(
                       "text-left rounded-lg border p-3 transition-colors",
                       selectedSampleId === sample.sample_id ? "border-primary bg-primary/10" : "border-border hover:bg-muted"
@@ -431,7 +487,15 @@ export default function Data() {
             </div>
           </CardHeader>
           <CardContent className="flex-1 min-h-0 pt-4 overflow-auto">
-            {sampleDetail ? (
+            {error && sampleDetail && <p role="alert" className="mb-4 text-sm text-destructive">{error}</p>}
+            {loading || sampleLoading ? (
+              <div role="status" aria-live="polite" aria-busy="true" className="min-h-80 space-y-4 py-6">
+                <p className="text-sm text-muted-foreground">{loading ? '正在加载任务趋势与采样窗口…' : '正在加载所选窗口的原始分光数据…'}</p>
+                <div aria-hidden="true" className="h-64 rounded-lg bg-muted motion-safe:animate-pulse" />
+              </div>
+            ) : error && !sampleDetail ? (
+              <div role="alert" className="py-6 text-sm text-destructive">{error}</div>
+            ) : sampleDetail ? (
               <div className="space-y-4">
                 <div className="grid grid-cols-2 md:grid-cols-4 gap-3 text-sm">
                   <div><div className="text-muted-foreground">模式/来源</div><div>{sampleDetail.mode ?? '-'} / {sampleDetail.source ?? '-'}</div></div>
@@ -494,7 +558,7 @@ export default function Data() {
               </div>
             ) : chartData.length > 0 ? (
               <div className="space-y-2">
-                <p className="text-xs text-muted-foreground">任务摘要趋势：{chartStats?.count ?? 0} 个低频地图点。需要逐帧数据请使用“下载高频原始分光 CSV”。</p>
+                <p className="text-xs text-muted-foreground">任务摘要趋势：显示 {chartStats?.count ?? 0}/{pointCount} 个摘要点（保留峰值）。点击采样窗口后加载原始曲线；CSV 包含全部原始帧。</p>
                 <div className="h-[clamp(320px,48vh,520px)] min-h-80">
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={chartData}>
