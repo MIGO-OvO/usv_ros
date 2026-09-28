@@ -6,6 +6,8 @@ import unittest
 from unittest.mock import patch
 
 from scripts.web_config_server import FLASK_AVAILABLE, WebConfigServer, String
+from gps_fixtures import gps_position
+from scripts.lib.sample_recording.record import bind_context
 
 
 def msg(value):
@@ -23,6 +25,7 @@ class SamplingContextContractTests(unittest.TestCase):
             self.server = WebConfigServer(standalone=True)
         self.addCleanup(self.server.sample_storage.close)
         self.server.current_waypoint_seq = 9
+        self.server._latest_real_gps = gps_position()
 
     def test_fcu_context_reaches_window_without_automation_topic_ordering(self):
         context = {'source': 'fcu', 'sample_id': 42, 'waypoint_seq': 3, 'attempt_id': 'attempt-42'}
@@ -35,6 +38,55 @@ class SamplingContextContractTests(unittest.TestCase):
         self.assertEqual(window['waypoint_seq'], 3)
         self.assertEqual(window['attempt_id'], 'attempt-42')
         self.assertEqual(window['source'], 'fcu')
+
+    def test_frozen_context_survives_moving_web_position_and_real_archive(self):
+        context = {'source': 'fcu', 'sample_id': 42, 'waypoint_seq': 3, 'attempt_id': 'bound-A'}
+        bind_context(context, gps_position())
+        self.server.current_position = {'lat': 31.0, 'lng': 121.0}
+        self.server._trigger_status_cb(msg('sampling_context:' + json.dumps(context)))
+        self.server._trigger_status_cb(msg('sampling_started'))
+        window = self.server.current_sample_window
+        self.server._spectrometer_raw_cb(msg(json.dumps({'voltage': 1.2, 'valid': True})))
+        self.server._voltage_cb(msg(json.dumps({'voltage': 1.2, 'valid': True})))
+        self.assertTrue(self.server._record_latest_mission_point())
+        point = self.server.data_manager.current_mission_data['data_points'][-1]
+        self.assertEqual(point['wgs84']['lat'], 30)
+        self.assertEqual(point['sample_id'], context['record_id'])
+        self.assertEqual(point['position_age_s'], context['gps_snapshot']['position_age_s'])
+        self.server._automation_status_cb(msg(json.dumps({
+            'status': 'finished', 'running': False, 'sampling_context': context})))
+        self.assertEqual(window['latitude'], 30)
+        self.assertEqual(window['gps_start']['lng'], 120)
+        self.assertEqual(window['gps_end']['lng'], 121)
+        self.assertEqual(window['sample_id'], context['record_id'])
+        self.assertEqual(window['spectrometer']['frame_count'], 1)
+        self.assertIsNotNone(window['timestamp_end'])
+
+    def test_web_direct_start_rejects_stale_or_missing_hardware_gps(self):
+        self.server.standalone = False
+        for position in (None, gps_position(age=3)):
+            self.server._latest_real_gps = position
+            self.server.current_position = {'lat': 25, 'lng': 110, 'position_source': 'lab_sim'}
+            with patch.object(self.server, '_call_control_command') as control:
+                result = self.server.app.test_client().post('/api/mission/start')
+            self.assertEqual(result.status_code, 409)
+            control.assert_not_called()
+            self.assertIsNone(self.server.current_sample_window)
+
+    def test_simulated_measurement_persisted_on_ordered_lifecycle_stream(self):
+        context = {'source': 'lab_sim', 'waypoint_seq': 3}
+        bind_context(context, {'lat': 25, 'lng': 110}, simulated=True)
+        self.server._trigger_status_cb(msg('sampling_context:' + json.dumps(context)))
+        self.server._trigger_status_cb(msg('sampling_started'))
+        window = self.server.current_sample_window
+        self.server._trigger_status_cb(msg('sampling_measurement:' + json.dumps({
+            'sample_id': context['record_id'], 'spectrometer': {'voltage': 2.0},
+            'water_quality': {'concentration': 1.5, 'unit': 'mg/L'}})))
+        self.server._trigger_status_cb(msg('sampling_stopped'))
+        self.assertEqual(window['spectrometer']['measurement']['voltage'], 2.0)
+        self.assertEqual(window['water_quality']['concentration'], 1.5)
+        self.assertEqual(window['latitude'], 25)
+        self.assertTrue(window['simulated'])
 
     def test_manual_sample_with_existing_waypoint_is_not_fcu(self):
         self.server._trigger_status_cb(msg('sampling_context:' + json.dumps({'source': 'manual', 'waypoint_seq': 9})))

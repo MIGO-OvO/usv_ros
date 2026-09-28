@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 import test_fcu_sampling_result as fcu_results
 from test_hardware_runtime_sync import _load_script
+from gps_fixtures import gps_position
 
 
 class SamplingCleanupOwnershipTests(unittest.TestCase):
@@ -101,6 +102,7 @@ class SamplingCleanupOwnershipTests(unittest.TestCase):
 
     def test_prestart_injection_claim_is_cleaned_when_start_is_rejected(self):
         node = self.case.trigger_module.MAVLinkTriggerNode()
+        node._latest_global_position = gps_position()
         node.set_mode = lambda mode: True
         node._load_config = lambda: {'steps': []}
         node._build_steps_payload = lambda *args: {'steps': []}

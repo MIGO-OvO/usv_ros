@@ -142,6 +142,7 @@ def _install_fake_ros_modules():
     rospy.ServiceProxy = service_proxy
     rospy.init_node = lambda *args, **kwargs: None
     rospy.get_param = lambda name, default=None: default
+    rospy.Time = types.SimpleNamespace(now=lambda: types.SimpleNamespace(to_sec=time.time))
     rospy.set_param = lambda *args, **kwargs: None
     rospy.wait_for_service = lambda *args, **kwargs: None
     rospy.loginfo = lambda *args, **kwargs: None

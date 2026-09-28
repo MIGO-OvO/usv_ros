@@ -3,8 +3,10 @@ from __future__ import annotations
 import math
 import re
 import time
+import uuid
 from datetime import datetime, timezone
 from typing import Mapping, Optional
+from .record import sample_record
 
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
@@ -44,15 +46,19 @@ def _gps_payload(position: Optional[Mapping[str, object]]) -> Optional[dict[str,
     wgs84 = position.get("wgs84")
     source = wgs84 if isinstance(wgs84, Mapping) else position
     lat = _finite_float(source.get("lat"))
-    lng = _finite_float(source.get("lng"))
+    lng = _finite_float(source.get("lng", source.get("lon")))
     if lat is None or lng is None:
         return None
-    return {
+    result = {
         "lat": lat,
         "lng": lng,
         "alt": _finite_float(source.get("alt")),
         "received_at": _finite_float(position.get("received_at")),
     }
+    for key in ('gps_timestamp', 'position_age_s', 'position_source', 'fix_status'):
+        if key in position:
+            result[key] = position[key]
+    return result
 
 
 def normalize_gps_payload(position: Optional[Mapping[str, object]]) -> Optional[dict[str, object]]:
@@ -74,7 +80,7 @@ def make_sample_id(
         suffix = "survey%03d" % int(survey)
     elif mode:
         suffix = safe_id(mode)
-    return "%s_%s_%d" % (safe_id(mission_id, "mission"), suffix, int(time.time() * 1000))
+    return "%s_%s_%s" % (safe_id(mission_id, "mission"), suffix, uuid.uuid4().hex)
 
 
 def default_manual_result() -> dict[str, object]:
@@ -135,10 +141,12 @@ def make_window(
     mode = context.get("mode") or "manual"
     waypoint_seq = context.get("waypoint_seq")
     survey_index = context.get("survey_index")
-    sample_id = context.get("sample_id") or make_sample_id(mission_id, mode, waypoint_seq, survey_index)
-    gps = _gps_payload(gps_latest)
+    sample_id = context.get("record_id") or context.get("sample_id") or make_sample_id(mission_id, mode, waypoint_seq, survey_index)
+    gps = _gps_payload(context.get('gps_snapshot') if context.get('record_id') else gps_latest)
+    if gps and context.get('record_id'):
+        gps['frozen_at_start'] = True
     now = utc_now_iso()
-    return {
+    window = {
         "sample_id": safe_id(sample_id, "sample"),
         "mission_id": safe_id(mission_id, "mission"),
         "schema_version": 1,
@@ -160,6 +168,18 @@ def make_window(
         "manual_result": default_manual_result(),
         "processing": default_processing(),
     }
+    acquisition = dict(context)
+    acquisition['record_id'] = sample_id
+    acquisition.setdefault('timestamp_start', time.time())
+    if not acquisition.get('gps_snapshot'):
+        acquisition['gps_snapshot'] = dict(gps or {}, position_source='legacy_unknown')
+    acquisition['mission_id'] = window['mission_id']
+    record = sample_record(acquisition)
+    record['waypoint_id'] = context.get('waypoint_id', waypoint_seq)
+    record['mavlink_sample_id'] = window['mavlink_sample_id']
+    window.update(record)
+    window['start_time'] = datetime.fromtimestamp(record['timestamp_start'], timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
+    return window
 
 
 def normalize_raw_frame(

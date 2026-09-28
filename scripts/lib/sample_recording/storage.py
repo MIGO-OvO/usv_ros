@@ -84,6 +84,11 @@ class SampleRecordingStorage(object):
         with self._write_lock:
             mission_id = mission_data.get("mission_id")
             window = make_window(mission_id, context, gps_latest)
+            existing = self._find_window(mission_data, window['sample_id'])
+            if existing is not None:
+                if existing.get('state') == 'open':
+                    return existing
+                raise ValueError('sample record already closed')
             raw_file = self._raw_relpath(window["mission_id"], window["sample_id"])
             window["spectrometer"] = SpectrometerSummaryBuilder().to_dict(raw_file)
             self._sample_windows(mission_data).append(window)
@@ -116,7 +121,10 @@ class SampleRecordingStorage(object):
                 self._last_fsync_at[path] = now
             builder = self._builders.setdefault(sample_id, SpectrometerSummaryBuilder())
             builder.add_frame(frame)
+            measurement = window.get('spectrometer', {}).get('measurement')
             window["spectrometer"] = builder.to_dict(str(raw_file), self._duration_s(window))
+            if measurement is not None:
+                window['spectrometer']['measurement'] = measurement
 
     def _force_sync_raw_file(self, raw_file: object) -> None:
         if not raw_file:
@@ -159,6 +167,7 @@ class SampleRecordingStorage(object):
         with self._write_lock:
             window["state"] = "closed"
             window["end_time"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="milliseconds") + "Z"
+            window['timestamp_end'] = time.time()
             duration = self._duration_s(window)
             window["duration_s"] = duration
             gps = normalize_gps_payload(gps_latest)
@@ -176,7 +185,10 @@ class SampleRecordingStorage(object):
                             for line in file_obj:
                                 if line.strip():
                                     builder.add_frame(json.loads(line))
+            measurement = window.get('spectrometer', {}).get('measurement')
             window["spectrometer"] = builder.to_dict(str(raw_file or ""), duration)
+            if measurement is not None:
+                window['spectrometer']['measurement'] = measurement
             stored = self._find_window(mission_data, window.get("sample_id"))
             if stored is not None and stored is not window:
                 stored.update(window)
@@ -273,4 +285,5 @@ class SampleRecordingStorage(object):
         if window is None:
             return None
         window["manual_result"] = normalize_manual_result(payload)
+        window['water_quality'] = dict(window['manual_result'])
         return window

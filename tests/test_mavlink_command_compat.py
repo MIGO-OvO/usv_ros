@@ -5,6 +5,8 @@ import sys
 import threading
 import types
 import unittest
+import time
+from gps_fixtures import gps_position
 from pathlib import Path
 
 
@@ -94,7 +96,7 @@ def _install_fake_ros_modules():
     rospy.sleep = lambda *args, **kwargs: None
     rospy.is_shutdown = lambda: True
     rospy.Rate = lambda hz: types.SimpleNamespace(sleep=lambda: None)
-    rospy.Time = types.SimpleNamespace(now=lambda: 0)
+    rospy.Time = types.SimpleNamespace(now=lambda: types.SimpleNamespace(to_sec=time.time))
     rospy.ROSException = type("ROSException", (Exception,), {})
     rospy.ROSInterruptException = type("ROSInterruptException", (Exception,), {})
     rospy.ServiceException = type("ServiceException", (Exception,), {})
@@ -228,6 +230,7 @@ class FailingOnceNamedValueMav(RecordingMav):
 class MavlinkCommandCompatibilityTests(unittest.TestCase):
     def _install_injection_session_recorder(self, node, accepted=True):
         calls = []
+        node._latest_global_position = gps_position()
         if not hasattr(node, 'state_lock'):
             node.state_lock = threading.Lock()
 
@@ -1003,6 +1006,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         module.rospy.ServiceProxy = lambda *args, **kwargs: ControlService()
         try:
             node = module.MAVLinkTriggerNode()
+            node._latest_global_position = gps_position()
             accepted = node.handle_mavlink_command(31015, 5.0, 0.0)
         finally:
             module.threading.Thread = original_thread
@@ -1119,11 +1123,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
                 "survey_max_position_age_s": 5.0,
             }
         })
-        node._latest_global_position = {
-            "lat": 30.0,
-            "lon": 120.0,
-            "received_at": module.time.time() - 10.0,
-        }
+        node._latest_global_position = gps_position(age=10.0)
 
         result = node._start_survey_sample_once(node._load_config())
 
@@ -1139,6 +1139,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
             }
         })
         node.last_linear_speed = 0.1
+        node._latest_global_position = gps_position()
 
         low_result = node._start_survey_sample_once(node._load_config())
 
@@ -1162,14 +1163,14 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         })
         now = module.time.time()
         node._last_survey_sample_position = {"lat": 30.0, "lon": 120.0, "received_at": now - 1.0}
-        node._latest_global_position = {"lat": 30.0, "lon": 120.0, "received_at": now}
+        node._latest_global_position = gps_position()
 
         skipped = node._start_survey_sample_once(node._load_config())
 
         self.assertEqual(skipped, "skipped")
         self.assertEqual(node.status_pub.messages[-1].data, "survey_gate_skipped:distance_too_short")
 
-        node._latest_global_position = {"lat": 30.0001, "lon": 120.0, "received_at": now}
+        node._latest_global_position = gps_position(lat=30.0001)
         started = node._start_survey_sample_once(node._load_config())
 
         self.assertEqual(started, "started")
@@ -1202,7 +1203,8 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
         self.assertIn('<arg name="survey_interval_s" default="5.0" />', launch_text)
         self.assertIn('<arg name="survey_min_distance_m" default="0.0" />', launch_text)
-        self.assertIn('<arg name="survey_require_gps" default="false" />', launch_text)
+        self.assertIn('<arg name="survey_require_gps" default="true" />', launch_text)
+        self.assertIn('<arg name="sampling_max_position_age_s" default="2.0" />', launch_text)
         self.assertIn('<arg name="survey_require_valid_spectrometer" default="false" />', launch_text)
 
     def test_sampling_failure_publishes_sampling_stopped_for_recording_lifecycle(self):

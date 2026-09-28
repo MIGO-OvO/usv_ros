@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from test_mavlink_command_compat import _load_script, FakeConnection, RecordingMav
+from gps_fixtures import gps_position
 
 
 class ForwardPublisher:
@@ -24,6 +25,7 @@ class FCUSamplingResultTests(unittest.TestCase):
         with patch.object(self.bridge_module.USVMavlinkRouterBridge, '_connect_router'):
             self.bridge = self.bridge_module.USVMavlinkRouterBridge()
         self.node = self.trigger_module.MAVLinkTriggerNode()
+        self.node._latest_global_position = gps_position()
         self.modes = []
         self.node.set_mode = lambda mode: self.modes.append(mode) or True
         self.node._load_config = lambda: {'steps': []}
