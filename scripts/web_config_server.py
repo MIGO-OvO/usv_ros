@@ -117,7 +117,7 @@ from scripts.lib.lab_sim.models import CoordinatePairRef, ModelParseError, Sampl
 from scripts.lib.lab_sim.route_planner import RoutePlannerError, plan_coverage_route
 from scripts.lib.sample_recording import MIN_RAW_RECORD_HZ, SampleRecordingStorage, normalize_raw_frame
 from scripts.lib.sample_recording.models import safe_id
-from scripts.lib.sample_recording.record import bind_web_context, freeze_position, navsat_position, finite
+from scripts.lib.sample_recording.record import bind_web_context, freeze_position, navsat_position, position_local_age_s, finite
 from scripts.lib.gps_diagnostics import diagnose
 from scripts.lib.sample_recording.downsampling import MinMaxSeries
 
@@ -178,6 +178,7 @@ DEFAULT_MAPPING_PROFILE = {
 SURVEY_GATE_REASON_LABELS = {
     "no_gps": "GPS unavailable",
     "gps_stale": "GPS stale",
+    "gps_missing_receive_time": "GPS receive time missing",
     "distance_too_short": "distance too short",
     "speed_too_low": "speed too low",
     "speed_too_high": "speed too high",
@@ -3278,7 +3279,7 @@ class WebConfigServer(object):
         避免真实 GPS 与虚拟船位同时写入导致地图船位跳变。
         """
         # Separate hardware fix from the display position, even in lab_real mode.
-        self._latest_real_gps = navsat_position(msg, rospy.Time.now().to_sec())
+        self._latest_real_gps = navsat_position(msg)
         if not self._gps_diagnostics_snapshot()['map_position_valid']:
             return
         self._last_valid_gps_at = self._latest_real_gps['received_at']
@@ -4787,9 +4788,8 @@ class WebConfigServer(object):
                     valid, reason = True, None
                 except ValueError as exc:
                     reason = str(exc)
-            received = finite(position.get('received_monotonic'))
-            source_age = finite(position.get('source_age_at_receive_s'))
-            age = source_age + time.monotonic() - received if received is not None and source_age is not None else None
+            received = position.get('received_monotonic')
+            age = position_local_age_s(position) if received is not None else None
             return jsonify(valid=valid, reason=reason, latitude=finite(position.get('lat')),
                            longitude=finite(position.get('lon')), altitude=finite(position.get('alt')),
                            fix_status=position.get('fix_status'), position_age_s=age,
@@ -5327,21 +5327,40 @@ class WebConfigServer(object):
                 self.spectrometer_status = "acquiring"
                 return jsonify({"success": True, "message": "模拟模式已启动分光采集"})
 
+            # Single authoritative transaction: sync the saved hardware config
+            # into the ROS runtime params, then run the same verified
+            # prepare-and-start chain that QGC 31018 triggers.
             current = self.config_manager.get()
             hw = normalize_hardware({}, current.get('hardware', DEFAULT_CONFIG['hardware']))
-            results = self._publish_hardware_runtime_config(hw, force_start=True)
-            ok = bool(
-                results["i2c_mapping"]["success"]
-                and results["spectrometer"]
-                and results["spectrometer"]["success"]
-            )
-            message = results["spectrometer"]["message"] if results["spectrometer"] else "分光启动失败"
+            self._set_pump_runtime_params(hw)
+            payload = {
+                "mapping": {
+                    "angles": dict(hw.get("i2c_mapping", {})),
+                    "spectro_channel": int(hw.get("spectro_channel", 2)),
+                },
+                "spectro": {
+                    "ads_address": hw.get("ads_address", "0x40"),
+                    "mux": hw.get("mux", "AIN0"),
+                    "gain": int(hw.get("gain", 1)),
+                    "vref_mode": hw.get("vref_mode", "AVDD"),
+                    "adc_rate": max(MIN_RAW_RECORD_HZ, int(hw.get("adc_rate", 90))),
+                    "publish_rate": max(MIN_RAW_RECORD_HZ, int(hw.get("publish_rate", 90))),
+                    "spectro_output_hz": int(hw.get("spectro_output_hz", 10)),
+                    "continuous_mode": bool(hw.get("continuous_mode", True)),
+                    "reference_voltage": float(hw.get("reference_voltage", 0.0)),
+                    "baseline_voltage": float(hw.get("baseline_voltage", 0.0)),
+                },
+            }
+            ok, message, _ = self._call_control_command("spectrometer_start", payload)
             if ok:
                 self.spectrometer_status = "starting"
             return jsonify({
                 "success": ok,
                 "message": "分光配置已下发并启动" if ok else message,
-                "results": results,
+                "results": {
+                    "i2c_mapping": {"success": ok},
+                    "spectrometer": {"success": ok, "message": message},
+                },
             })
 
         @self.app.route('/api/spectrometer/stop', methods=['POST'])

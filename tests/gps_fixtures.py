@@ -14,9 +14,15 @@ def gps_evidence():
 
 
 def gps_position(lat=30.0, lon=120.0, age=0.0):
+    """Fresh hardware fix aged ``age`` seconds on the Jetson-local receive clock.
+
+    ``gps_timestamp`` mirrors the same age so the header.clock offset stays
+    realistic; it remains diagnostic-only and never gates admission.
+    """
     return dict(lat=lat, lon=lon, alt=4.5, fix_status=0,
                 gps_timestamp=time.time() - age, received_at=time.time(),
-                received_monotonic=time.monotonic(), source_age_at_receive_s=age,
+                received_monotonic=time.monotonic() - age,
+                header_clock_offset_s=age,
                 position_source='gps')
 
 

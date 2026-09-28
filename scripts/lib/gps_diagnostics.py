@@ -11,6 +11,9 @@ from scripts.lib.sample_recording.record import finite, freeze_position
 PARAMETERS = ('GPS1_TYPE', 'GPS_AUTO_CONFIG', 'SERIAL3_PROTOCOL')
 FIX_LABELS = {0: '未识别接收机', 1: '尚未定位', 2: '2D Fix', 3: '3D Fix',
               4: 'DGPS', 5: 'RTK Float', 6: 'RTK Fixed', 7: 'Static', 8: 'PPP'}
+# FCU/MAVROS header.stamp and the Jetson wall clock are separate domains; a
+# large offset is surfaced as a warning but never gates sampling admission.
+HEADER_CLOCK_OFFSET_WARN_S = 2.0
 
 
 def age(record, now):
@@ -122,12 +125,18 @@ def diagnose(evidence=None, position=None, mavros=None, max_age_s=2.0, now=None)
             valid, reason = True, None
         except ValueError as exc:
             reason = str(exc)
-    source_age = finite(position.get('source_age_at_receive_s'))
     elapsed = age(position, now)
+    clock_offset = finite(position.get('header_clock_offset_s'))
+    if clock_offset is None:
+        stamp = finite(position.get('gps_timestamp'))
+        received_at = finite(position.get('received_at'))
+        clock_offset = received_at - stamp if stamp is not None and received_at is not None else None
     navsat = {'available': bool(position), 'valid_navsat_fix': valid,
               'status': position.get('fix_status'), 'latitude': finite(position.get('lat')),
               'longitude': finite(position.get('lon')), 'altitude': finite(position.get('alt')),
-              'age_s': source_age + elapsed if source_age is not None and elapsed is not None else None,
+              'age_s': elapsed,
+              'gps_timestamp': finite(position.get('gps_timestamp')),
+              'header_clock_offset_s': clock_offset,
               'received_at': position.get('received_at')}
     params = evidence.get('parameters', {})
     config = {key: params.get(name, {}).get('value') for key, name in
@@ -161,6 +170,8 @@ def diagnose(evidence=None, position=None, mavros=None, max_age_s=2.0, now=None)
     if state == 'raw_missing':
         warnings.append('GPS已启用但无原始GPS数据' if config['fresh'] and config['gps1_type'] not in (None, 0) else 'GPS配置未知；缺帧不能单独证明接收机未识别。')
         warnings.append('检查 GPS 配置、接线及 MAVLink GPS_RAW_INT 消息流；本面板不修改飞控参数或消息速率。')
+    if clock_offset is not None and abs(clock_offset) > HEADER_CLOCK_OFFSET_WARN_S:
+        warnings.append('NavSatFix 时间戳与本机时钟偏差 %.1fs（跨时钟域信息仅作诊断，不影响采样准入）' % clock_offset)
     sys_status, version = section('SYS_STATUS'), section('AUTOPILOT_VERSION')
     for key in ('gps_present', 'gps_enabled', 'gps_health'):
         sys_status.setdefault(key, None)
