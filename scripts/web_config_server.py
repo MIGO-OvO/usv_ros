@@ -117,7 +117,7 @@ from scripts.lib.lab_sim.models import CoordinatePairRef, ModelParseError, Sampl
 from scripts.lib.lab_sim.route_planner import RoutePlannerError, plan_coverage_route
 from scripts.lib.sample_recording import MIN_RAW_RECORD_HZ, SampleRecordingStorage, normalize_raw_frame
 from scripts.lib.sample_recording.models import safe_id
-from scripts.lib.sample_recording.record import bind_context, navsat_position
+from scripts.lib.sample_recording.record import bind_web_context, freeze_position, navsat_position, finite
 from scripts.lib.sample_recording.downsampling import MinMaxSeries
 
 # 配置文件路径
@@ -4735,6 +4735,25 @@ class WebConfigServer(object):
             return jsonify({"success": False, "message": "保存失败"}), 500
 
         # 任务控制 API
+        @self.app.route('/api/gps', methods=['GET'])
+        def gps_status():
+            position = copy.deepcopy(self._latest_real_gps or {})
+            limit = rospy.get_param('/mavlink_trigger_node/sampling_max_position_age_s', 2.0) if not self.standalone else 2.0
+            valid, reason = False, 'gps_missing'
+            if position:
+                try:
+                    freeze_position(position, limit)
+                    valid, reason = True, None
+                except ValueError as exc:
+                    reason = str(exc)
+            received = finite(position.get('received_monotonic'))
+            source_age = finite(position.get('source_age_at_receive_s'))
+            age = source_age + time.monotonic() - received if received is not None and source_age is not None else None
+            return jsonify(valid=valid, reason=reason, latitude=finite(position.get('lat')),
+                           longitude=finite(position.get('lon')), altitude=finite(position.get('alt')),
+                           fix_status=position.get('fix_status'), position_age_s=age,
+                           gps_timestamp=finite(position.get('gps_timestamp')), position_source='gps')
+
         @self.app.route('/api/mission/start', methods=['POST'])
         def start_mission(): return self._trigger_mission('start')
 
@@ -6107,8 +6126,9 @@ class WebConfigServer(object):
                     previous_context = dict(self._sampling_context)
                     acquisition = {'source': 'web'}
                     try:
-                        bind_context(acquisition, self._latest_real_gps,
-                                     rospy.get_param('/mavlink_trigger_node/sampling_max_position_age_s', 2.0))
+                        bind_web_context(acquisition, self._latest_real_gps,
+                                         rospy.get_param('/mavlink_trigger_node/sampling_max_position_age_s', 2.0),
+                                         require_gps=request_data.get('require_gps', True))
                     except ValueError as exc:
                         return jsonify(success=False, message=str(exc)), 409
                     sampling_sequence = request_data.get('sampling_sequence')
