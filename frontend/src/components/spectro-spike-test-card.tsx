@@ -14,7 +14,7 @@ function counter(value: number | null | undefined): string {
 
 function Metric({ label, value }: { readonly label: string; readonly value: string }) {
   return (
-    <div className="min-w-0 rounded-md border bg-muted/20 px-3 py-2">
+    <div className="min-w-0 border-b px-3 py-2">
       <div className="truncate text-[11px] text-muted-foreground">{label}</div>
       <div className="mt-0.5 font-mono text-sm font-semibold tabular-nums">{value}</div>
     </div>
@@ -48,9 +48,9 @@ export function SpectroSpikeTestCard({
     && (summary?.durationS ?? 0) >= (summary?.targetDurationS ?? Number.POSITIVE_INFINITY)
   const status = active ? '测试中' : autoCompleted ? '已完成' : completed ? '已结束' : '未开始'
   const statusClass = active
-    ? 'text-emerald-500'
+    ? 'text-blue-700 dark:text-blue-400'
     : completed
-      ? 'text-blue-500'
+      ? 'text-emerald-700 dark:text-emerald-400'
       : 'text-muted-foreground'
 
   return (

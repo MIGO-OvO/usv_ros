@@ -2,11 +2,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { useAppStore, type VoltagePoint } from '@/store'
-import { Activity, Zap, Play, Square, Anchor, Navigation, Pause, AlertTriangle, CheckCircle, Download, Loader, Trash2 } from 'lucide-react'
+import { Activity, Play, Square, Anchor, Navigation, Pause, AlertTriangle, CheckCircle, Download, Loader, Trash2 } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { LinkDiagnosticsCard } from '@/components/link-diagnostics-card'
 import { SystemHealthCard } from '@/components/system-health-card'
+import { summarizeGps } from '@/lib/monitor-gps'
 import { GpsStatusCard } from '@/components/gps-status-card'
+import { useGpsDiagnostics } from '@/hooks/use-gps-diagnostics'
 import { SpectroSpikeTestCard } from '@/components/spectro-spike-test-card'
 import { SpectrometerBaselineCard } from '@/components/spectrometer-baseline-card'
 import { VoltageCanvasChart } from '@/components/voltage-canvas-chart'
@@ -44,14 +46,14 @@ const MISSION_STATUS_MAP: Record<string, { label: string; color: string; icon: t
   WAYPOINT_REACHED: { label: '到达航点',   color: 'text-amber-500',       icon: Anchor },
   HOLDING:          { label: '保持',       color: 'text-amber-500',       icon: Pause },
   WAITING_STABLE:   { label: '稳定等待',   color: 'text-amber-500',       icon: Loader },
-  SAMPLING:         { label: '采样中',     color: 'text-emerald-500',     icon: Play },
+  SAMPLING:         { label: '采样中',     color: 'text-blue-500',     icon: Play },
   SAMPLING_DONE:    { label: '采样完成',   color: 'text-emerald-500',     icon: CheckCircle },
   RESUMING_AUTO:    { label: '恢复航行',   color: 'text-blue-500',        icon: Navigation },
   HOLD_NO_MISSION:  { label: '无任务保持', color: 'text-muted-foreground', icon: Square },
   FAILED:           { label: '失败',       color: 'text-red-500',         icon: AlertTriangle },
   PAUSED:           { label: '已暂停',     color: 'text-amber-500',       icon: Pause },
   ABORTED:          { label: '已中止',     color: 'text-red-500',         icon: AlertTriangle },
-  RUNNING:          { label: '运行中',     color: 'text-emerald-500',     icon: Play },
+  RUNNING:          { label: '运行中',     color: 'text-blue-500',     icon: Play },
   COMPLETED:        { label: '已完成',     color: 'text-emerald-500',     icon: CheckCircle },
   STOPPED:          { label: '已停止',     color: 'text-muted-foreground', icon: Square },
 }
@@ -179,6 +181,9 @@ function AbsorbanceHistoryTable({ points, baselineSet }: {
 }
 
 export default function Monitor() {
+  const { gps, failed: gpsFailed } = useGpsDiagnostics()
+  const gpsSummary = summarizeGps(gps)
+  const [chartTab, setChartTab] = useState<'voltage' | 'absorbance'>('voltage')
   const connected = useAppStore((state) => state.connected)
   const pumpConnected = useAppStore((state) => state.pumpConnected)
   const missionStatus = useAppStore((state) => state.missionStatus)
@@ -521,6 +526,10 @@ export default function Monitor() {
   const spectroStatusLabel = spectroStatusLabels[spectrometerStatus] ?? spectrometerStatus
   const hasSpectroSample = voltageHistory.length > 0
   const showSpectroPlaceholder = !hasSpectroSample
+  const spectroTone = !connected || showSpectroPlaceholder ? 'text-muted-foreground'
+    : spectrometerStatus === 'i2c_error' ? 'text-red-700 dark:text-red-400'
+    : voltageIsStale || spectrometerStatus === 'saturated' ? 'text-amber-700 dark:text-amber-400'
+    : 'text-emerald-700 dark:text-emerald-400'
   const currentAbsorbanceLabel = spectrometerBaselineSet && isFiniteTimeSeriesValue(currentAbsorbance)
     ? `${currentAbsorbance.toFixed(4)} Abs`
     : '--'
@@ -533,11 +542,11 @@ export default function Monitor() {
       : 'text-emerald-500'
 
   return (
-    <div className="max-w-7xl mx-auto space-y-6 overflow-x-hidden p-4 md:p-8">
-      <header className="flex flex-col md:flex-row md:items-center justify-between gap-4">
+    <div className="max-w-7xl mx-auto monitor-page min-w-0 space-y-5 p-4 md:p-6">
+      <header className="sticky top-0 z-30 flex flex-wrap items-center justify-between gap-2 border-b bg-background py-3">
         <div>
-            <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">系统监控</h1>
-            <p className="text-muted-foreground">实时遥测数据与系统状态</p>
+            <h1 className="text-xl font-semibold tracking-tight">系统监控</h1>
+            <p className="text-xs text-muted-foreground">USV / 当前设备</p>
         </div>
         <div className="flex w-full min-w-0 flex-wrap items-center gap-2 sm:gap-3 md:w-auto md:justify-end">
              <Button
@@ -558,30 +567,35 @@ export default function Monitor() {
              >
                <Square className="w-4 h-4 mr-2" />停止分光
              </Button>
-             <div className={cn("flex shrink-0 items-center gap-2 rounded-full border px-3 py-1 text-xs font-medium whitespace-nowrap",
-                connected ? "bg-emerald-500/10 text-emerald-500 border-emerald-500/20" : "bg-red-500/10 text-red-500 border-red-500/20")}>
-                <div className={cn("w-2 h-2 rounded-full", connected ? "bg-emerald-500" : "bg-red-500")} />
-                {connected ? "已连接" : "未连接"}
-             </div>
-             <div className={cn("flex shrink-0 items-center gap-2 rounded-full border px-3 py-1 text-xs font-medium whitespace-nowrap",
-                pumpConnected ? "bg-blue-500/10 text-blue-500 border-blue-500/20" : "bg-orange-500/10 text-orange-500 border-orange-500/20")}>
-                <Zap className="w-3 h-3" />
-                {pumpConnected ? "泵组在线" : "泵组离线"}
+             <div className="flex flex-wrap gap-x-3 gap-y-1 text-xs">
+               <span className={connected ? 'text-emerald-700 dark:text-emerald-400' : 'text-red-700 dark:text-red-400'}>● Web {connected ? '在线' : '断开'}</span>
+               <span className={!connected || !systemHealth?.ros_nodes?.length ? 'text-muted-foreground' : systemHealth.ros_nodes.every(n => n.alive) ? 'text-emerald-700 dark:text-emerald-400' : 'text-red-700 dark:text-red-400'}>● ROS {connected ? `${systemHealth?.ros_nodes?.filter(n => n.alive).length ?? '—'}/${systemHealth?.ros_nodes?.length ?? '—'}` : '未知'}</span>
+               <span className={!gps ? 'text-muted-foreground' : gps.fcu.heartbeat_valid ? 'text-emerald-700 dark:text-emerald-400' : 'text-red-700 dark:text-red-400'}>● FCU {gps ? gps.fcu.heartbeat_valid ? '正常' : '超时' : '未知'}</span>
+               <span className={gpsSummary.tone === 'warning' ? 'text-amber-700 dark:text-amber-400' : gpsSummary.tone === 'error' ? 'text-red-700 dark:text-red-400' : gpsSummary.tone === 'success' ? 'text-emerald-700 dark:text-emerald-400' : 'text-muted-foreground'}>● GPS {gpsSummary.label.replace('定位', '')}</span>
+               <span className={!connected ? 'text-muted-foreground' : pumpConnected ? 'text-emerald-700 dark:text-emerald-400' : 'text-red-700 dark:text-red-400'}>● ESP32 {!connected ? '未知' : pumpConnected ? '在线' : '离线'}</span>
              </div>
         </div>
       </header>
 
-      <GpsStatusCard />
+
 
       {/* Status Summary Cards */}
-      <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
-        <Card className="min-w-0 bg-card/50 backdrop-blur-sm">
+      <div className="grid grid-cols-2 gap-3 lg:grid-cols-3 xl:grid-cols-5">
+        <Card className="min-w-0 shadow-none">
+          <CardHeader className="pb-2"><CardTitle className="text-sm font-medium">GPS / GNSS</CardTitle></CardHeader>
+          <CardContent>
+            <div className={cn('text-lg font-semibold', gpsSummary.tone === 'warning' ? 'text-amber-700 dark:text-amber-400' : gpsSummary.tone === 'error' ? 'text-red-700 dark:text-red-400' : gpsSummary.tone === 'success' ? 'text-emerald-700 dark:text-emerald-400' : 'text-muted-foreground')}>{gpsSummary.label}</div>
+            <div className="mt-1 break-words text-xs tabular-nums text-muted-foreground">{gpsSummary.position ? `${gpsSummary.position.latitude?.toFixed(7)} / ${gpsSummary.position.longitude?.toFixed(7)}` : '等待有效坐标'}</div>
+          </CardContent>
+        </Card>
+        <Card className="min-w-0 shadow-none">
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
             <CardTitle className="text-sm font-medium">分光计电压</CardTitle>
             <Activity className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{showSpectroPlaceholder ? '--' : `${currentVoltage.toFixed(3)} V`}</div>
+            <div className={cn('text-xl font-semibold tabular-nums', spectroTone)}>{showSpectroPlaceholder ? '--' : `${currentVoltage.toFixed(3)} V`}</div>
+            <div className={cn('mt-1 text-xs', spectroTone)}>{!connected ? '连接断开 · 缓存值' : showSpectroPlaceholder ? '暂无数据' : voltageIsStale ? '数据较旧' : spectroStatusLabel}</div>
             <div className="text-xs text-muted-foreground mt-1">
               {spectrometerBaselineSet && currentReferenceVoltage !== null
                 ? `参考 ${currentReferenceVoltage.toFixed(3)} V`
@@ -590,13 +604,13 @@ export default function Monitor() {
           </CardContent>
         </Card>
 
-        <Card className="min-w-0 bg-card/50 backdrop-blur-sm">
+        <Card className="min-w-0 shadow-none">
           <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
             <CardTitle className="text-sm font-medium">吸光度</CardTitle>
             <Activity className="h-4 w-4 text-muted-foreground" />
           </CardHeader>
           <CardContent>
-            <div className="text-2xl font-bold">{showSpectroPlaceholder ? '--' : currentAbsorbanceLabel}</div>
+            <div className={cn('text-xl font-semibold tabular-nums', spectrometerBaselineSet ? spectroTone : 'text-muted-foreground')}>{showSpectroPlaceholder ? '--' : currentAbsorbanceLabel}</div>
             <div className="text-xs text-muted-foreground mt-1">{spectroStatusLabel}</div>
           </CardContent>
         </Card>
@@ -606,7 +620,7 @@ export default function Monitor() {
           const info = MISSION_STATUS_MAP[parsed.state] ?? { label: parsed.state, color: 'text-muted-foreground', icon: Square }
           const StatusIcon = info.icon
           return (
-            <Card className="min-w-0 bg-card/50 backdrop-blur-sm">
+            <Card className="min-w-0 shadow-none">
               <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
                 <CardTitle className="text-sm font-medium">任务阶段</CardTitle>
                 <StatusIcon className={cn("h-4 w-4", info.color)} />
@@ -621,48 +635,44 @@ export default function Monitor() {
           )
         })()}
 
-        <Card className="min-w-0 bg-card/50 backdrop-blur-sm">
-            <CardHeader className="flex flex-row items-center justify-between space-y-0 pb-2">
-                 <CardTitle className="text-sm font-medium">泵组角度</CardTitle>
-            </CardHeader>
-            <CardContent>
-              <div className={cn("mb-2 text-xs font-medium", angleStatusClass)}>{angleStatusLabel}</div>
-              <div className="grid grid-cols-4 gap-1">
-                {Object.entries(pumpAngles).map(([axis, angle]) => (
-                    <div key={axis} className="min-w-0 text-center">
-                        <div className="text-xs text-muted-foreground">{axis}</div>
-                        <div className="font-mono text-xs font-semibold sm:text-sm">{angle.toFixed(1)}°</div>
-                    </div>
-                ))}
-              </div>
-              <div className="mt-3 grid grid-cols-2 gap-2 text-[11px] text-muted-foreground">
-                <div>ROS {angleTelemetry.age_ms ?? '--'} ms</div>
-                <div>I2C {angleTelemetry.detector_angle_age_ms ?? '--'} ms</div>
-              </div>
-            </CardContent>
+        <Card className="min-w-0 shadow-none">
+          <CardHeader className="pb-2"><CardTitle className="text-sm font-medium">系统健康</CardTitle></CardHeader>
+          <CardContent><div className={cn('text-xl font-semibold', !connected || !systemHealth ? 'text-muted-foreground' : systemHealth.health?.level === 'ok' ? 'text-emerald-700 dark:text-emerald-400' : systemHealth.health?.level === 'warn' ? 'text-amber-700 dark:text-amber-400' : 'text-red-700 dark:text-red-400')}>
+            {connected && systemHealth?.ros_nodes?.length ? `${systemHealth.ros_nodes.filter(n => n.alive).length} / ${systemHealth.ros_nodes.length}` : '未知'}
+          </div><p className="mt-1 text-xs text-muted-foreground">{connected ? systemHealth?.health?.summary ?? '等待健康数据' : '连接已断开'}</p></CardContent>
         </Card>
       </div>
 
-      <SpectrometerBaselineCard
-        summary={baselineSummary}
-        saving={baselineSaving}
-        canStart={connected && spectroSubmitting === null && !spikeTestActive}
-        baselineSet={spectrometerBaselineSet}
-        referenceVoltage={currentReferenceVoltage}
-        stabilizationMin={baselineStabilizationMin}
-        averagingMin={baselineAveragingMin}
-        onStabilizationChange={setBaselineStabilizationMin}
-        onAveragingChange={setBaselineAveragingMin}
-        onStart={handleStartBaselineAcquisition}
-        onCancel={handleCancelBaselineAcquisition}
-      />
+      <GpsStatusCard gps={gps} failed={gpsFailed} />
 
-      <Card className="flex h-[440px] min-w-0 flex-col overflow-hidden lg:h-[500px]">
-        <CardHeader className="grid min-w-0 gap-2 pb-2 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
-          <CardTitle className="text-base">分光计电压</CardTitle>
+
+      <section className="min-w-0 rounded-xl border bg-card" aria-labelledby="realtime-title">
+        <div className="space-y-3 p-4 pb-2">
+          <h2 id="realtime-title" className="text-base font-semibold">实时数据</h2>
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div role="tablist" aria-label="实时波形" className="flex gap-1">
+              {(['voltage', 'absorbance'] as const).map((tab, index) => (
+                <Button key={tab} id={`chart-tab-${tab}`} role="tab" size="sm"
+                  aria-selected={chartTab === tab} aria-controls="chart-panel" tabIndex={chartTab === tab ? 0 : -1}
+                  className={chartTab === tab ? 'bg-blue-700 text-white hover:bg-blue-800' : ''}
+                  variant="ghost" onClick={() => setChartTab(tab)}
+                  onKeyDown={(event) => {
+                    if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return
+                    event.preventDefault()
+                    const next = event.key === 'Home' ? 'voltage' : event.key === 'End' ? 'absorbance' : index === 0 ? 'absorbance' : 'voltage'
+                    setChartTab(next)
+                    document.getElementById(`chart-tab-${next}`)?.focus()
+                  }}>{tab === 'voltage' ? '分光计电压' : '吸光度'}</Button>
+              ))}
+            </div>
+            <div className="flex gap-1" aria-label="吸光度视图">
+              <Button size="sm" variant="ghost" disabled={chartTab !== 'absorbance'} aria-pressed={absorbanceView === 'chart'} onClick={() => setAbsorbanceView('chart')}>曲线</Button>
+              <Button size="sm" variant="ghost" disabled={chartTab !== 'absorbance'} aria-pressed={absorbanceView === 'data'} onClick={() => setAbsorbanceView('data')}>数据</Button>
+            </div>
+          </div>
           <div className="flex min-w-0 flex-wrap items-center gap-2 lg:justify-end">
             {TIME_WINDOWS.map((window) => (
-              <Button key={window.label} size="sm" variant={timeWindowMs === window.value ? 'secondary' : 'ghost'} onClick={() => setTimeWindowMs(window.value)}>{window.label}</Button>
+              <Button key={window.label} size="sm" aria-pressed={timeWindowMs === window.value} className={timeWindowMs === window.value ? 'text-blue-700 dark:text-blue-400' : ''} variant={timeWindowMs === window.value ? 'secondary' : 'ghost'} onClick={() => setTimeWindowMs(window.value)}>{window.label}</Button>
             ))}
             <Button size="sm" variant="outline" onClick={() => setPausedHistory(pausedHistory ? null : liveHistory)}>
               {pausedHistory ? <Play className="mr-2 h-4 w-4" /> : <Pause className="mr-2 h-4 w-4" />}
@@ -689,58 +699,20 @@ export default function Monitor() {
               清空数据
             </Button>
           </div>
-          <div className={cn("flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs leading-relaxed text-muted-foreground lg:col-span-2", voltageIsStale && "text-amber-600 dark:text-amber-400")}>
-            <span>原始 {displayedHistory.length}/{voltageHistory.length}</span>
-            <span>绘制 {renderedVoltageCount}</span>
-            <span>{receiveRateHz.toFixed(1)} Hz</span>
-            {voltageIsStale && <span>数据陈旧，正在追赶实时</span>}
-            <span>完整历史数据请到“数据中心”下载 Jetson 本地任务包</span>
-          </div>
-        </CardHeader>
-        <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden">
-          <VoltageCanvasChart
-            points={displayedHistory}
-            timeRange={displayedTimeRange}
-            onRenderedCount={handleRenderedVoltageCount}
-          />
-        </CardContent>
-      </Card>
 
-      <Card className="flex h-[440px] min-w-0 flex-col overflow-hidden lg:h-[500px]">
-        <CardHeader className="grid min-w-0 gap-2 pb-2 sm:grid-cols-[minmax(0,1fr)_auto] sm:items-center">
-          <div className="flex min-w-0 items-center justify-between gap-3">
-            <CardTitle className="text-base">吸光度</CardTitle>
-            <div className="flex shrink-0 items-center rounded-md border p-0.5" role="tablist" aria-label="吸光度视图">
-              <Button
-                className="min-h-9 px-3"
-                size="sm"
-                variant={absorbanceView === 'chart' ? 'secondary' : 'ghost'}
-                role="tab"
-                aria-selected={absorbanceView === 'chart'}
-                onClick={() => setAbsorbanceView('chart')}
-              >
-                曲线
-              </Button>
-              <Button
-                className="min-h-9 px-3"
-                size="sm"
-                variant={absorbanceView === 'data' ? 'secondary' : 'ghost'}
-                role="tab"
-                aria-selected={absorbanceView === 'data'}
-                onClick={() => setAbsorbanceView('data')}
-              >
-                数据
-              </Button>
-            </div>
-          </div>
-          <div className="flex min-w-0 flex-wrap items-center gap-x-3 gap-y-1 text-xs leading-relaxed text-muted-foreground sm:justify-end">
-            <span>原始 {displayedHistory.length}/{voltageHistory.length}</span>
-            {absorbanceView === 'chart' && <span>绘制 {renderedAbsorbanceCount}</span>}
+          <div className={cn('flex flex-wrap gap-x-3 gap-y-1 text-xs text-muted-foreground', voltageIsStale && 'text-amber-700 dark:text-amber-400')}>
+            <span>最新 {showSpectroPlaceholder ? '--' : chartTab === 'voltage' ? `${currentVoltage.toFixed(3)} V` : currentAbsorbanceLabel}</span>
+            <span>{receiveRateHz.toFixed(1)} Hz</span>
+            <span>原始 {displayedHistory.length}/{voltageHistory.length} 点</span>
+            <span>绘制 {chartTab === 'voltage' ? renderedVoltageCount : renderedAbsorbanceCount}</span>
+            <span>数据年龄 {latestAgeMs === null ? '--' : (latestAgeMs / 1000).toFixed(1)} s</span>
+            <span>{pausedHistory ? '视图已暂停 · 后台继续接收' : voltageIsStale ? '数据陈旧，正在追赶实时' : '实时视图'}</span>
             <span>{spectrometerBaselineSet ? '基线已设定' : '未设定基线'}</span>
           </div>
-        </CardHeader>
-        <CardContent className="min-h-0 min-w-0 flex-1 overflow-hidden">
-          {absorbanceView === 'chart' ? (
+        </div>
+        <div id="chart-panel" role="tabpanel" aria-labelledby={`chart-tab-${chartTab}`} tabIndex={0} className="h-[320px] min-w-0 overflow-hidden px-2 pb-3 sm:h-[360px] lg:h-[380px]">
+          {chartTab === 'voltage' ? <VoltageCanvasChart points={displayedHistory} timeRange={displayedTimeRange} onRenderedCount={handleRenderedVoltageCount} />
+            : absorbanceView === 'chart' ? (
             <TimeSeriesCanvasChart
               points={displayedHistory}
               valueAccessor={absorbanceValueAccessor}
@@ -755,13 +727,36 @@ export default function Monitor() {
               lineColor="--chart-2"
               onRenderedCount={handleRenderedAbsorbanceCount}
             />
-          ) : (
-            <AbsorbanceHistoryTable points={displayedHistory} baselineSet={spectrometerBaselineSet} />
-          )}
-        </CardContent>
-      </Card>
 
-      <div className="min-w-0 space-y-6">
+            ) : <AbsorbanceHistoryTable points={displayedHistory} baselineSet={spectrometerBaselineSet} />}
+        </div>
+        <p className="border-t px-4 py-2 text-xs text-muted-foreground">完整历史数据请到“数据中心”下载 Jetson 本地任务包</p>
+      </section>
+
+      <SpectrometerBaselineCard
+        summary={baselineSummary}
+        saving={baselineSaving}
+        canStart={connected && spectroSubmitting === null && !spikeTestActive}
+        baselineSet={spectrometerBaselineSet}
+        referenceVoltage={currentReferenceVoltage}
+        stabilizationMin={baselineStabilizationMin}
+        averagingMin={baselineAveragingMin}
+        onStabilizationChange={setBaselineStabilizationMin}
+        onAveragingChange={setBaselineAveragingMin}
+        onStart={handleStartBaselineAcquisition}
+        onCancel={handleCancelBaselineAcquisition}
+      />
+
+      <SystemHealthCard compact />
+
+      <section className="monitor-diagnostics min-w-0 space-y-2" aria-labelledby="diagnostics-title">
+        <h2 id="diagnostics-title" className="text-base font-semibold">高级诊断与维护</h2>
+        <details id="gps-diagnostics" className="scroll-mt-44 rounded-lg border">
+          <summary className="cursor-pointer p-4 text-sm font-medium">GPS / MAVLink 详细诊断 · {gpsSummary.label}</summary>
+          <GpsStatusCard gps={gps} failed={gpsFailed} detailed />
+        </details>
+        <details className="rounded-lg border">
+          <summary className="cursor-pointer p-4 text-sm font-medium">毛刺测试{spikeTestActive ? ' · 运行中' : ''}</summary>
         <SpectroSpikeTestCard
           summary={spikeTestSummary}
           canStart={connected && !baselineActive}
@@ -771,7 +766,32 @@ export default function Monitor() {
           onStop={handleStopSpikeTest}
           onExport={handleExportSpikeTest}
         />
-        <LinkDiagnosticsCard />
+        </details>
+        <details className="rounded-lg border">
+          <summary className="cursor-pointer p-4 text-sm font-medium">通信链路诊断</summary>
+          <LinkDiagnosticsCard />
+        </details>
+        <details className="rounded-lg border">
+          <summary className="cursor-pointer p-4 text-sm font-medium">ADS / ESP32 诊断 · CRC {spectrometerHealth?.crc_error ?? '—'} / 重复 {spectrometerHealth?.duplicate ?? '—'}</summary>
+        <Card className="min-w-0 shadow-none">
+            <CardHeader><CardTitle className="text-sm font-medium">泵组角度</CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className={cn("mb-2 text-xs font-medium", angleStatusClass)}>{angleStatusLabel}</div>
+              <div className="grid grid-cols-4 gap-1">
+                {Object.entries(pumpAngles).map(([axis, angle]) => (
+                    <div key={axis} className="min-w-0 text-center">
+                        <div className="text-xs text-muted-foreground">{axis}</div>
+                        <div className="font-mono text-xs font-semibold sm:text-sm">{angle.toFixed(1)}°</div>
+                    </div>
+                ))}
+              </div>
+              <div className="mt-3 grid grid-cols-2 gap-2 text-[11px] text-muted-foreground">
+                <div>ROS {angleTelemetry.age_ms ?? '--'} ms</div>
+                <div>I2C {angleTelemetry.detector_angle_age_ms ?? '--'} ms</div>
+              </div>
+            </CardContent>
+        </Card>
         <SystemHealthCard
           voltageDiagnostics={{
             latestAgeMs,
@@ -785,7 +805,8 @@ export default function Monitor() {
             nonDetectorSamples: voltageNonDetectorSamples,
           }}
         />
-      </div>
+        </details>
+      </section>
     </div>
   )
 }
