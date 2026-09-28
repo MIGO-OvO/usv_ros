@@ -1,15 +1,14 @@
 """Write access for the vessel console; no secrets are persisted or logged."""
 import hmac
-import ipaddress
 import os
-from urllib.parse import urlsplit
 
 
 def install_control_access(app):
     from flask import jsonify, request
 
-    token = os.environ.get('USV_WEB_CONTROL_TOKEN', '')
-    if token and len(token) < 16:
+    require_auth = os.environ.get('USV_WEB_REQUIRE_AUTH', '') == '1'
+    token = os.environ.get('USV_WEB_CONTROL_TOKEN', '') if require_auth else ''
+    if require_auth and len(token) < 16:
         raise ValueError('USV_WEB_CONTROL_TOKEN must contain at least 16 characters')
 
     @app.before_request
@@ -34,15 +33,6 @@ def install_control_access(app):
                 response.status_code = 401
                 response.headers['WWW-Authenticate'] = 'Basic realm="USV control", charset="UTF-8"'
                 return response
-        else:
-            try:
-                peer_local = ipaddress.ip_address(request.remote_addr or '').is_loopback
-                host = urlsplit(request.host_url).hostname
-                host_local = host == 'localhost' or ipaddress.ip_address(host or '').is_loopback
-            except ValueError:
-                peer_local = host_local = False
-            if not (peer_local and host_local):
-                return jsonify(success=False, message='Remote control is disabled; configure USV_WEB_CONTROL_TOKEN'), 403
         return None
 
     @app.route('/api/control/auth', methods=['GET'])
