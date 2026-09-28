@@ -73,6 +73,46 @@ class SamplingContextContractTests(unittest.TestCase):
             control.assert_not_called()
             self.assertIsNone(self.server.current_sample_window)
 
+    def test_web_opt_out_records_no_coordinates_even_with_display_position(self):
+        self.server.standalone = False
+        self.server._latest_real_gps = None
+        self.server.current_position = {'lat': 25, 'lng': 110, 'position_source': 'lab_sim'}
+        with patch.object(self.server, '_publish_steps', return_value={'attempt_id': 'indoor'}), \
+                patch.object(self.server, '_call_control_command', return_value=(True, 'accepted', {})) as control:
+            response = self.server.app.test_client().post('/api/mission/start', json={'require_gps': False})
+        self.assertTrue(response.get_json()['success'])
+        control.assert_called_once()
+        window = self.server.current_sample_window
+        self.assertIsNone(window['latitude'])
+        self.assertIsNone(window['longitude'])
+        self.assertIsNone(window['gps_start'])
+        self.assertEqual(window['position_source'], 'web_no_gps')
+        self.assertFalse(window['simulated'])
+        self.server._latest_real_gps = gps_position()
+        self.server._close_sample_window_if_open()
+        self.assertIsNone(window['latitude'])
+
+    def test_web_opt_out_rejects_non_boolean(self):
+        self.server.standalone = False
+        with patch.object(self.server, '_call_control_command') as control:
+            for value in ('false', 0, None, {}):
+                response = self.server.app.test_client().post('/api/mission/start', json={'require_gps': value})
+                self.assertEqual(response.status_code, 409)
+        control.assert_not_called()
+
+    def test_gps_status_uses_hardware_and_expires_without_new_messages(self):
+        client = self.server.app.test_client()
+        self.assertTrue(client.get('/api/gps').get_json()['valid'])
+        self.server._latest_real_gps = gps_position(age=3)
+        stale = client.get('/api/gps').get_json()
+        self.assertFalse(stale['valid'])
+        self.assertEqual(stale['reason'], 'gps_stale')
+        self.assertEqual(stale['latitude'], 30)
+        self.server._latest_real_gps = dict(gps_position(), fix_status=-1)
+        self.assertEqual(client.get('/api/gps').get_json()['reason'], 'gps_no_fix')
+        self.server._latest_real_gps = None
+        self.assertEqual(client.get('/api/gps').get_json()['reason'], 'gps_missing')
+
     def test_simulated_measurement_persisted_on_ordered_lifecycle_stream(self):
         context = {'source': 'lab_sim', 'waypoint_seq': 3}
         bind_context(context, {'lat': 25, 'lng': 110}, simulated=True)
@@ -182,6 +222,36 @@ class SamplingContextContractTests(unittest.TestCase):
         self.assertIsNone(self.server.current_sample_window)
         self.assertEqual(self.server.data_manager.current_mission_file, existing)
         self.assertEqual(self.server.data_recording_source, 'survey')
+
+    def test_immediate_owned_failure_is_not_reported_as_success(self):
+        self.server.standalone = False
+
+        def control(*args, **kwargs):
+            self.server._automation_status_cb(msg(json.dumps({
+                'status': 'failed', 'running': False,
+                'sampling_context': {'attempt_id': 'fast-failure'},
+                'last_error': 'first step failed',
+            })))
+            return True, 'Automation started', {}
+
+        with patch.object(self.server, '_publish_steps', return_value={'attempt_id': 'fast-failure'}), \
+                patch.object(self.server, '_call_control_command', side_effect=control):
+            response = self.server.app.test_client().post('/api/mission/start').get_json()
+        self.assertFalse(response['success'])
+        self.assertIn('first step failed', response['message'])
+        self.assertIsNone(self.server._web_attempt_id)
+        self.assertIsNone(self.server.current_sample_window)
+
+    def test_old_failure_cannot_reject_new_start(self):
+        self.server.standalone = False
+        self.server.latest_automation_status = {
+            'status': 'failed', 'running': False, 'last_error': 'old failure',
+            'sampling_context': {'attempt_id': 'old'},
+        }
+        with patch.object(self.server, '_publish_steps', return_value={'attempt_id': 'new'}), \
+                patch.object(self.server, '_call_control_command', return_value=(True, 'started', {})):
+            response = self.server.app.test_client().post('/api/mission/start').get_json()
+        self.assertTrue(response['success'])
 
     def test_terminal_cleanup_cannot_interleave_with_new_window_start(self):
         self.server.standalone = False

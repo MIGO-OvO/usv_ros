@@ -146,6 +146,8 @@ interface MapCoordinate {
 }
 
 interface GeoPoint {
+  last_valid?: boolean
+  age_s?: number | null
   wgs84?: MapCoordinate
   gcj02: MapCoordinate
 }
@@ -487,7 +489,7 @@ export default function MapPage() {
           color: '#ffffff',
           weight: 2,
         })
-        marker.bindPopup('当前飞控定位')
+        marker.bindPopup(String(feature.properties?.positionLabel || '最后有效 GPS 位置'))
         marker.addTo(group)
         bounds.extend([lat, lng])
         return
@@ -579,7 +581,7 @@ export default function MapPage() {
       features.push({
         type: 'Feature',
         geometry: { type: 'Point', coordinates: [livePosition.lng, livePosition.lat] },
-        properties: { layer: 'position' },
+        properties: { layer: 'position', positionLabel: live.position?.last_valid ? '最后有效 GPS 位置' : '当前有效 GPS 位置' },
       })
     }
     const trackPoints = live.track_points || []
@@ -628,7 +630,8 @@ export default function MapPage() {
     } else if (liveSurface?.reason) {
       setStatusText(gateText ? `${liveSurface.reason} · 走航门控: ${gateText}` : liveSurface.reason)
     } else {
-      const positionText = livePosition ? `实时船位 ${livePosition.lat.toFixed(6)}, ${livePosition.lng.toFixed(6)}` : '等待 GPS 船位'
+      const positionLabel = live.position?.last_valid ? `最后有效 GPS 位置（${live.position.age_s?.toFixed(1) ?? '—'} s 前）` : '实时船位'
+      const positionText = livePosition ? `${positionLabel} ${livePosition.lat.toFixed(6)}, ${livePosition.lng.toFixed(6)}` : '等待有效 GPS 船位'
       setStatusText(gateText ? `${positionText} · 走航门控: ${gateText}` : positionText)
     }
   }, [idwPower, idwSize, metric, includeLab])

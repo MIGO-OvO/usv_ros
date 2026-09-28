@@ -1229,14 +1229,11 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             })
 
             server._start_data_recording_if_needed()
-            server._gps_cb(types.SimpleNamespace(
-                latitude=30.0,
-                longitude=120.0,
-                altitude=4.5,
-                fix_type=3,
-                hdop=0.8,
-                speed_mps=1.1,
-            ))
+            from gps_fixtures import gps_message, gps_evidence
+            server._gps_evidence = gps_evidence()
+            fix = gps_message()
+            fix.fix_type, fix.hdop, fix.speed_mps = 3, 0.8, 1.1
+            server._gps_cb(fix)
             server.current_position["received_at"] = module.time.time() - 2.0
             server.route_snapshot_id = "route-test"
             server.route_source = "mavros"
@@ -1332,7 +1329,9 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             })
 
             server._start_data_recording_if_needed()
-            server._gps_cb(types.SimpleNamespace(latitude=30.0, longitude=120.0, altitude=4.5))
+            from gps_fixtures import gps_message, gps_evidence
+            server._gps_evidence = gps_evidence()
+            server._gps_cb(gps_message())
             server.current_position["received_at"] = module.time.time() - (module.POSITION_STALE_AFTER_S + 1.0)
             server._mission_status_cb(string_cls("SAMPLING:2"))
             server._automation_status_cb(string_cls(json.dumps({"running": True})))

@@ -106,7 +106,7 @@ mission:
 
 # ==================== MAVROS 参数 (参考) ====================
 mavros:
-  fcu_url: "/dev/ttyTHS1:57600"  # Pixhawk TELEM2 串口
+  fcu_url: "udp://127.0.0.1:14550@"  # router 独占 TELEM2；MAVROS 不直接打开串口
   gcs_url: ""
   target_system_id: 1
   target_component_id: 1

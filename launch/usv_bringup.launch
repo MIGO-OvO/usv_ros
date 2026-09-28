@@ -117,6 +117,8 @@
         <param name="source_system_id" value="$(arg mavlink_source_system)" />
         <param name="source_component_id" value="$(arg mavlink_source_component)" />
         <param name="router_url" value="$(arg mavlink_router_url)" />
+        <param name="target_system_id" value="$(arg mavros_tgt_system)" />
+        <param name="target_component_id" value="$(arg mavros_tgt_component)" />
     </node>
 
     <!-- ==================== MAVLink Trigger Node ==================== -->

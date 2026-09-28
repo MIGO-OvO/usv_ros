@@ -6,6 +6,7 @@ import { Activity, Zap, Play, Square, Anchor, Navigation, Pause, AlertTriangle, 
 import { cn } from '@/lib/utils'
 import { LinkDiagnosticsCard } from '@/components/link-diagnostics-card'
 import { SystemHealthCard } from '@/components/system-health-card'
+import { GpsStatusCard } from '@/components/gps-status-card'
 import { SpectroSpikeTestCard } from '@/components/spectro-spike-test-card'
 import { SpectrometerBaselineCard } from '@/components/spectrometer-baseline-card'
 import { VoltageCanvasChart } from '@/components/voltage-canvas-chart'
@@ -569,6 +570,8 @@ export default function Monitor() {
              </div>
         </div>
       </header>
+
+      <GpsStatusCard />
 
       {/* Status Summary Cards */}
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 xl:grid-cols-4">
