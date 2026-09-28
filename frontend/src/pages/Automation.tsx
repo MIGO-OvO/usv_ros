@@ -10,7 +10,6 @@ import { Play, Square, Pause, Save, FolderOpen, Plus, Trash2, ArrowUp, ArrowDown
 import { useAppStore } from '@/store'
 import { InjectionPumpCard } from '@/components/injection-pump-card'
 import { WaypointSamplingCard } from '@/components/waypoint-sampling-card'
-import { GpsStatusCard } from '@/components/gps-status-card'
 import { toast } from '@/hooks/use-toast'
 import {
   getAutomationControlAvailability,
@@ -325,7 +324,6 @@ export default function Automation() {
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(18rem,22rem)_minmax(0,1fr)] xl:items-start">
         <div className="space-y-6">
-          <GpsStatusCard />
           <Card className="h-fit">
             <CardHeader>
               <CardTitle>全局配置</CardTitle>

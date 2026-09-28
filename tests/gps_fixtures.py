@@ -3,6 +3,16 @@ import time
 import types
 
 
+def gps_evidence():
+    """Fresh direct-FCU evidence for map consumers (independent of NavSatFix)."""
+    now = time.monotonic()
+    return {'records': {
+        'HEARTBEAT': {'system_id': 1, 'component_id': 1, 'received_monotonic': now},
+        'GPS_RAW_INT': {'fix_type': 3, 'satellites': 14, 'latitude': 30., 'longitude': 120.,
+                        'received_monotonic': now, 'received_at': time.time()},
+    }}
+
+
 def gps_position(lat=30.0, lon=120.0, age=0.0):
     return dict(lat=lat, lon=lon, alt=4.5, fix_status=0,
                 gps_timestamp=time.time() - age, received_at=time.time(),

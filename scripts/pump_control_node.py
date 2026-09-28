@@ -1483,14 +1483,17 @@ class PumpControlNode(object):
             return
 
         if text.startswith("ADS_OK:START"):
-            self.spectro_state = 'acquiring'
+            self.spectro_state = 'starting'
+            self._last_valid_spectro_at = time.monotonic()
+            self._spectro_invalid_published = False
             self.spectro_command_result = (True, text)
             self.spectro_command_event.set()
-            self._publish_spectro_status('acquiring')
+            self._publish_spectro_status('starting')
             return
 
         if text.startswith("ADS_OK:STOP"):
             self.spectro_state = 'stopped'
+            self._last_valid_spectro_at = None
             self.spectro_command_result = (True, text)
             self.spectro_command_event.set()
             self._publish_spectro_status('stopped')
@@ -1649,6 +1652,7 @@ class PumpControlNode(object):
 
     def _check_spectro_freshness(self):
         if self._last_valid_spectro_at is not None and time.monotonic() - self._last_valid_spectro_at > self.measurement_timeout:
+            self.spectro_state = 'stale'
             self._invalidate_spectro('stale')
             if self._automation_is_active() and self.spectro_config.get('enabled', True):
                 self._auto_stop_callback(None)

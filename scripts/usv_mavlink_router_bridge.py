@@ -9,7 +9,14 @@ import json
 import math
 import threading
 import time
+import os
+import sys
 from collections import deque
+
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO_ROOT not in sys.path:
+    sys.path.insert(0, REPO_ROOT)
+from scripts.lib.gps_diagnostics import GPSDiagnosticsCache, PARAMETERS
 
 import rospy
 from std_msgs.msg import String, Float32MultiArray
@@ -51,6 +58,12 @@ class USVMavlinkRouterBridge(object):
         self._sys_id = int(rospy.get_param("~source_system_id", SYS_ID))
         self._comp_id = int(rospy.get_param("~source_component_id", COMP_ID))
         self._router_url = rospy.get_param("~router_url", ROUTER_URL)
+        self._gps_cache = GPSDiagnosticsCache(
+            int(rospy.get_param('~target_system_id', 1)),
+            int(rospy.get_param('~target_component_id', 1)))
+        self._gps_pub = rospy.Publisher('/usv/gps_diagnostics', String, queue_size=1)
+        self._gps_request_at = 0.0
+        self._gps_request_index = 0
         self._wait_heartbeat_timeout = float(rospy.get_param("~wait_heartbeat_timeout", WAIT_HEARTBEAT_TIMEOUT))
         self._lock = threading.Lock()
         self._voltage = 0.0
@@ -128,6 +141,7 @@ class USVMavlinkRouterBridge(object):
         if hb is None:
             rospy.logwarn("Router bridge: no FCU heartbeat within %.1fs, continue anyway", self._wait_heartbeat_timeout)
         else:
+            self._gps_cache.ingest(hb)
             rospy.loginfo("Router bridge: FCU heartbeat detected sys=%s comp=%s", self._conn.target_system, self._conn.target_component)
 
     def _record_send_error(self):
@@ -454,6 +468,12 @@ class USVMavlinkRouterBridge(object):
             if msg_type == "BAD_DATA":
                 continue
 
+            if hasattr(self, '_gps_cache'):
+                try:
+                    self._gps_cache.ingest(msg)
+                except (ValueError, TypeError, AttributeError, OverflowError) as exc:
+                    rospy.logwarn_throttle(10.0, 'GPS evidence rejected: %s', str(exc))
+
             # RADIO_STATUS: 电台链路质量数据
             if msg_type == "RADIO_STATUS":
                 try:
@@ -575,6 +595,26 @@ class USVMavlinkRouterBridge(object):
         except Exception:
             pass
 
+    def _publish_gps_evidence(self):
+        """Same TCP owner; bounded read-only requests, never PARAM_SET or stream changes."""
+        message = String()
+        message.data = json.dumps(self._gps_cache.snapshot(), allow_nan=False)
+        self._gps_pub.publish(message)
+        now = time.monotonic()
+        heartbeat = self._gps_cache.records.get('HEARTBEAT', {})
+        if now - heartbeat.get('received_monotonic', -100) > 3 or now - self._gps_request_at < 5:
+            return
+        self._gps_request_at = now
+        index = self._gps_request_index % 4
+        self._gps_request_index += 1
+        system, component = self._gps_cache.system_id, self._gps_cache.component_id
+        if index < 3:
+            self._mav_send_with_retry(lambda: self._conn.mav.param_request_read_send(
+                system, component, PARAMETERS[index].encode('ascii'), -1), 'GPS parameter read')
+        elif 'AUTOPILOT_VERSION' not in self._gps_cache.records:
+            self._mav_send_with_retry(lambda: self._conn.mav.command_long_send(
+                system, component, 512, 0, 148, 0, 0, 0, 0, 0, 0), 'AUTOPILOT_VERSION request')
+
     def _send_heartbeat(self):
         sent = self._mav_send_with_retry(
             lambda: self._conn.mav.heartbeat_send(
@@ -687,6 +727,12 @@ class USVMavlinkRouterBridge(object):
                 self._send_statustext(text, severity)
 
             self._send_payload(voltage, absorbance, angles, status, automation_step, automation_total, sample_count, pid_error, pid_mode, baseline_set, reference_voltage, baseline_voltage, spectrometer_valid, health_fields)
+
+            try:
+                self._publish_gps_evidence()
+            except Exception as exc:
+                # Diagnostics must never interrupt control, ACK or sampling outcomes.
+                rospy.logwarn_throttle(10.0, 'GPS diagnostics unavailable: %s', str(exc))
 
             if now - self._diag_last_report >= DIAG_REPORT_INTERVAL:
                 self._publish_diagnostics()

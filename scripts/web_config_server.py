@@ -118,6 +118,7 @@ from scripts.lib.lab_sim.route_planner import RoutePlannerError, plan_coverage_r
 from scripts.lib.sample_recording import MIN_RAW_RECORD_HZ, SampleRecordingStorage, normalize_raw_frame
 from scripts.lib.sample_recording.models import safe_id
 from scripts.lib.sample_recording.record import bind_web_context, freeze_position, navsat_position, finite
+from scripts.lib.gps_diagnostics import diagnose
 from scripts.lib.sample_recording.downsampling import MinMaxSeries
 
 # 配置文件路径
@@ -2073,6 +2074,9 @@ class WebConfigServer(object):
         }
         self.current_position = None
         self._latest_real_gps = None
+        self._gps_evidence = {}
+        self._gps_mavros = {}
+        self._last_valid_gps_at = None
         self.live_track_points = []
         self.route_waypoints = []
         self.route_snapshot_id = None
@@ -2168,6 +2172,7 @@ class WebConfigServer(object):
             self.lab_sim_status_sub = rospy.Subscriber('/usv/lab_sim/status', String, self._lab_sim_status_cb)
             self.lab_sample_event_sub = rospy.Subscriber('/usv/lab_sim/sample_event', String, self._lab_sample_event_cb)
             self.system_health_sub = rospy.Subscriber('/usv/system_health', String, self._system_health_cb)
+            self.gps_diagnostics_sub = rospy.Subscriber('/usv/gps_diagnostics', String, self._gps_diagnostics_cb, queue_size=1)
             try:
                 from sensor_msgs.msg import NavSatFix
                 self.gps_sub = rospy.Subscriber('/mavros/global_position/global', NavSatFix, self._gps_cb)
@@ -3242,6 +3247,30 @@ class WebConfigServer(object):
         if self.socketio:
             self.socketio.emit("lab_status", self._lab_status_snapshot())
 
+    def _gps_diagnostics_cb(self, msg):
+        try:
+            evidence = json.loads(msg.data)
+            if isinstance(evidence, dict) and isinstance(evidence.get('records'), dict):
+                self._gps_evidence = evidence
+        except (TypeError, ValueError):
+            pass
+
+    def _gps_diagnostics_snapshot(self):
+        limit = rospy.get_param('/mavlink_trigger_node/sampling_max_position_age_s', 2.0) if not self.standalone else 2.0
+        result = diagnose(getattr(self, '_gps_evidence', {}), self._latest_real_gps,
+                          getattr(self, '_gps_mavros', {}), limit)
+        result['last_valid_gps_at'] = getattr(self, '_last_valid_gps_at', None)
+        return result
+
+    def _map_position_snapshot(self):
+        position = copy.deepcopy(self.current_position)
+        if position and position.get('position_source') == 'real':
+            position['gps_valid'] = self._gps_diagnostics_snapshot()['map_position_valid']
+            position['last_valid'] = not position['gps_valid']
+            stamp = finite(position.get('received_at'))
+            position['age_s'] = max(0, time.time() - stamp) if stamp is not None else None
+        return position
+
     def _gps_cb(self, msg):
         """GPS 回调：缓存 WGS84 船位，并生成高德展示用 GCJ-02 坐标。
 
@@ -3250,6 +3279,9 @@ class WebConfigServer(object):
         """
         # Separate hardware fix from the display position, even in lab_real mode.
         self._latest_real_gps = navsat_position(msg, rospy.Time.now().to_sec())
+        if not self._gps_diagnostics_snapshot()['map_position_valid']:
+            return
+        self._last_valid_gps_at = self._latest_real_gps['received_at']
         lab = self._current_lab_config()
         if lab.get("enabled") and lab.get("position_source", "lab_sim") == "lab_sim":
             return
@@ -3263,6 +3295,8 @@ class WebConfigServer(object):
         if not position:
             return
         position["received_at"] = time.time()
+        position['gps_valid'] = True
+        position['last_valid'] = False
         gps_fix_type = getattr(msg, "fix_type", None)
         status = getattr(msg, "status", None)
         if gps_fix_type is None and status is not None:
@@ -4002,6 +4036,7 @@ class WebConfigServer(object):
 
     def _web_mavros_state_cb(self, msg):
         """MAVROS State 回调 - 用于通信诊断"""
+        self._gps_mavros = {'connected': bool(msg.connected), 'received_monotonic': time.monotonic()}
         prev_connected = self._mavros_state.get("connected", False)
         self._mavros_state = {
             "connected": msg.connected,
@@ -4553,7 +4588,7 @@ class WebConfigServer(object):
             return jsonify({
                 "success": True,
                 "data": {
-                    "position": self.current_position,
+                    "position": self._map_position_snapshot(),
                     "track_points": self.live_track_points[-MAX_LIVE_TRACK_POINTS:],
                     "route_waypoints": self.route_waypoints,
                     "data_points": self._current_live_samples(),
@@ -4643,7 +4678,7 @@ class WebConfigServer(object):
                 "data": {
                     "config": self._current_lab_config(),
                     "status": self._lab_status_snapshot(),
-                    "position": self.current_position,
+                    "position": self._map_position_snapshot(),
                     "track_points": self.live_track_points[-MAX_LIVE_TRACK_POINTS:],
                 },
             })
@@ -4735,6 +4770,12 @@ class WebConfigServer(object):
             return jsonify({"success": False, "message": "保存失败"}), 500
 
         # 任务控制 API
+        @self.app.route('/api/gps/diagnostics', methods=['GET'])
+        def gps_diagnostics():
+            response = jsonify(self._gps_diagnostics_snapshot())
+            response.headers['Cache-Control'] = 'no-store'
+            return response
+
         @self.app.route('/api/gps', methods=['GET'])
         def gps_status():
             position = copy.deepcopy(self._latest_real_gps or {})

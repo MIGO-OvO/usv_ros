@@ -139,6 +139,25 @@ class PumpSafetyTests(unittest.TestCase):
             self.node._check_spectro_freshness()
         self.assertFalse(self.node.automation_engine.is_running())
 
+    def test_ads_ack_waits_for_data_and_silence_changes_runtime_state(self):
+        with patch.object(self.module.time, 'monotonic', return_value=10.0):
+            self.node._on_text_received('ADS_OK:START')
+        self.assertEqual(self.node.spectro_state, 'starting')
+        with patch.object(self.module.time, 'monotonic', return_value=20.0):
+            self.node._check_spectro_freshness()
+        self.assertEqual(self.node.spectro_state, 'stale')
+        self.assertFalse(self.node.latest_spectro['valid'])
+        self.node._on_spectro_received({'voltage': 1.2, 'valid': True})
+        self.assertEqual(self.node.spectro_state, 'acquiring')
+
+    def test_stopped_spectrometer_does_not_later_become_stale(self):
+        self.node._last_valid_spectro_at = 10.0
+        self.node._on_text_received('ADS_OK:STOP')
+        with patch.object(self.module.time, 'monotonic', return_value=20.0):
+            self.node._check_spectro_freshness()
+        self.assertEqual(self.node.spectro_state, 'stopped')
+        self.assertEqual(self.node._last_published_spectro_status, 'stopped')
+
     def test_reconnect_cancels_motion_before_arming_new_device_session(self):
         self.node.automation_engine._running.set()
         observed = []
