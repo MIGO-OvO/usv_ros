@@ -223,6 +223,36 @@ class SamplingContextContractTests(unittest.TestCase):
         self.assertEqual(self.server.data_manager.current_mission_file, existing)
         self.assertEqual(self.server.data_recording_source, 'survey')
 
+    def test_immediate_owned_failure_is_not_reported_as_success(self):
+        self.server.standalone = False
+
+        def control(*args, **kwargs):
+            self.server._automation_status_cb(msg(json.dumps({
+                'status': 'failed', 'running': False,
+                'sampling_context': {'attempt_id': 'fast-failure'},
+                'last_error': 'first step failed',
+            })))
+            return True, 'Automation started', {}
+
+        with patch.object(self.server, '_publish_steps', return_value={'attempt_id': 'fast-failure'}), \
+                patch.object(self.server, '_call_control_command', side_effect=control):
+            response = self.server.app.test_client().post('/api/mission/start').get_json()
+        self.assertFalse(response['success'])
+        self.assertIn('first step failed', response['message'])
+        self.assertIsNone(self.server._web_attempt_id)
+        self.assertIsNone(self.server.current_sample_window)
+
+    def test_old_failure_cannot_reject_new_start(self):
+        self.server.standalone = False
+        self.server.latest_automation_status = {
+            'status': 'failed', 'running': False, 'last_error': 'old failure',
+            'sampling_context': {'attempt_id': 'old'},
+        }
+        with patch.object(self.server, '_publish_steps', return_value={'attempt_id': 'new'}), \
+                patch.object(self.server, '_call_control_command', return_value=(True, 'started', {})):
+            response = self.server.app.test_client().post('/api/mission/start').get_json()
+        self.assertTrue(response['success'])
+
     def test_terminal_cleanup_cannot_interleave_with_new_window_start(self):
         self.server.standalone = False
         self.server._sampling_context = {'source': 'web', 'attempt_id': 'old-A'}
