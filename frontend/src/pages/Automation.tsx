@@ -10,6 +10,7 @@ import { Play, Square, Pause, Save, FolderOpen, Plus, Trash2, ArrowUp, ArrowDown
 import { useAppStore } from '@/store'
 import { InjectionPumpCard } from '@/components/injection-pump-card'
 import { WaypointSamplingCard } from '@/components/waypoint-sampling-card'
+import { GpsStatusCard } from '@/components/gps-status-card'
 import { toast } from '@/hooks/use-toast'
 import {
   getAutomationControlAvailability,
@@ -84,6 +85,7 @@ export default function Automation() {
   const controls = getAutomationControlAvailability(automationState)
   const [steps, setSteps] = useState<Step[]>([])
   const [loopCount, setLoopCount] = useState(1)
+  const [requireGps, setRequireGps] = useState(true)
   const [pumpSettings, setPumpSettings] = useState<PumpSettings>({ ...DEFAULT_PUMP_SETTINGS })
   const [presetName, setPresetName] = useState('')
 
@@ -153,6 +155,7 @@ export default function Automation() {
       }
 
       const body: Record<string, unknown> = {
+        require_gps: requireGps,
         sampling_sequence: { steps, loop_count: loopCount },
         pump_settings: pumpSettings,
       }
@@ -322,11 +325,23 @@ export default function Automation() {
 
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(18rem,22rem)_minmax(0,1fr)] xl:items-start">
         <div className="space-y-6">
+          <GpsStatusCard />
           <Card className="h-fit">
             <CardHeader>
               <CardTitle>全局配置</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
+              <div className="space-y-2">
+                <div className="flex items-center justify-between gap-3">
+                  <Label htmlFor="require-gps">启动时要求 GPS</Label>
+                  <Switch id="require-gps" checked={requireGps} onCheckedChange={setRequireGps}
+                    disabled={automationRunning || automationPaused} aria-describedby="require-gps-help" />
+                </div>
+                <p id="require-gps-help" className="text-xs text-muted-foreground">
+                  {requireGps ? '启动前校验有效定位；室内台架测试可关闭。' : '室内测试：允许无 GPS 执行真实泵控；无定位记录不进入地图。'}
+                  仅本页启动生效，刷新后恢复开启；不改变航点采样限制。
+                </p>
+              </div>
               <div className="space-y-2">
                 <Label>循环次数 (0 = 无限循环)</Label>
                 <NumericInput value={loopCount} onValueChange={(v) => setLoopCount(Math.max(0, v))} integer min={0} className="h-9" />

@@ -88,3 +88,18 @@ def sample_record(context, spectrometer=None, water_quality=None, timestamp_end=
         'spectrometer': copy.deepcopy(spectrometer or {}),
         'water_quality': copy.deepcopy(water_quality or {'concentration': None, 'unit': None}),
     }
+
+
+def bind_web_context(context, position, max_age_s=2.0, require_gps=True):
+    """Explicit per-request Web bench opt-out; other entry points remain strict."""
+    if type(require_gps) is not bool:
+        raise ValueError('require_gps must be a boolean')
+    try:
+        return bind_context(context, position, max_age_s)
+    except ValueError as exc:
+        if require_gps:
+            raise
+        context.update(record_id=uuid.uuid4().hex, timestamp_start=time.time(),
+                       gps_snapshot={'position_source': 'web_no_gps'},
+                       simulated=False, gps_required=False, gps_rejection_reason=str(exc))
+        return context
