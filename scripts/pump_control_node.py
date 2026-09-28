@@ -557,6 +557,8 @@ class PumpControlNode(object):
 
         # 分光状态
         self.latest_spectro = None
+        # No averaged frame has arrived yet; cold-start steps still need a snapshot.
+        self._latest_spectro_received_at = None
         self.spectro_state = "idle"
         self._last_published_spectro_status = None
         self._spectro_sequence = 0

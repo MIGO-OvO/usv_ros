@@ -6155,6 +6155,18 @@ class WebConfigServer(object):
             # 调用服务
             if action == 'start':
                 ok, message, _ = self._call_control_command('automation_start', steps_payload)
+                # The worker can fail before its start-service response reaches Web.
+                # Only an observed failure from this attempt may override that response.
+                with self._sample_lifecycle_lock:
+                    latest = self.latest_automation_status or {}
+                    latest_context = latest.get('sampling_context') or {}
+                    status = str(latest.get('status', '')).lower()
+                    if (ok and latest_context.get('attempt_id') == steps_payload['attempt_id']
+                            and any(token in status for token in ('fail', 'error', 'owner_lost'))):
+                        ok = False
+                        message = str(latest.get('last_error') or
+                                      (latest.get('failure') or {}).get('reason') or
+                                      'Automation failed during startup')
                 with self._web_state_lock:
                     cancelled = stop_generation != self._web_stop_generation
                     if ok and not cancelled:
