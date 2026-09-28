@@ -36,6 +36,8 @@ import sys
 import threading
 import time
 import uuid
+import copy
+from collections import deque
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.dirname(SCRIPT_DIR)
@@ -50,6 +52,7 @@ from std_srvs.srv import Trigger, TriggerResponse
 from mavros_msgs.msg import State, WaypointReached, Mavlink
 from mavros_msgs.srv import SetMode, SetModeRequest
 from scripts.lib.lab_sim.coordinates import Coordinate
+from scripts.lib.sample_recording.record import bind_context, freeze_position, navsat_position, sample_record
 from scripts.lib.lab_sim.model_config import (
     Analyte,
     LabConfigV2,
@@ -97,8 +100,8 @@ SURVEY_GATE_DEFAULTS = {
     "survey_min_speed_mps": 0.0,
     "survey_max_speed_mps": 0.0,
     "survey_require_valid_spectrometer": False,
-    "survey_require_gps": False,
-    "survey_max_position_age_s": 5.0,
+    "survey_require_gps": True,
+    "survey_max_position_age_s": 2.0,
 }
 
 
@@ -175,6 +178,7 @@ class MAVLinkTriggerNode(object):
         self.default_on_fail = str(rospy.get_param('~sampling_on_fail', 'HOLD')).strip().upper()
         self.auto_trigger_on_waypoint = bool(rospy.get_param('~auto_trigger_on_waypoint', False))
         self.spectrometer_service_timeout = float(rospy.get_param('~spectrometer_service_timeout', 3.0))
+        self.sampling_max_position_age_s = float(rospy.get_param('~sampling_max_position_age_s', 2.0))
         self._survey_gate_defaults = {
             "survey_interval_s": max(1.0, _float_or_default(
                 rospy.get_param('~survey_interval_s', SURVEY_GATE_DEFAULTS["survey_interval_s"]),
@@ -223,9 +227,11 @@ class MAVLinkTriggerNode(object):
         self.last_linear_speed = 0.0
         self.last_yaw_rate = 0.0
         self._latest_global_position = None
+        self._latest_lab_position = None
         self._last_survey_sample_position = None
         self.waypoint_states = {}
         self.state_lock = threading.Lock()
+        self._sample_record_lock = threading.Lock()
 
         # 走航采样状态
         self._survey_active = False
@@ -246,6 +252,7 @@ class MAVLinkTriggerNode(object):
         self.pump_command_pub = rospy.Publisher('/usv/pump_command', String, queue_size=10)
         self.spectrometer_command_pub = rospy.Publisher('/usv/spectrometer_command', String, queue_size=10)
         self.sample_event_pub = rospy.Publisher('/usv/lab_sim/sample_event', String, queue_size=10)
+        self.sample_record_pub = rospy.Publisher('/usv/sample_record', String, queue_size=20)
         self.spectrometer_voltage_pub = rospy.Publisher('/usv/spectrometer_voltage', String, queue_size=10)
         self.lab_command_pub = rospy.Publisher('/usv/lab_sim/command', String, queue_size=5)
         self.cmd_ack_pub = rospy.Publisher('/usv/mavlink_cmd_ack', Float32MultiArray, queue_size=10)
@@ -255,6 +262,7 @@ class MAVLinkTriggerNode(object):
         self.waypoint_sub = rospy.Subscriber('/mavros/mission/reached', WaypointReached, self._waypoint_cb)
         # C2: 实验模式下虚拟船到点事件 (独立话题, 仅 lab_mode 生效)
         self.lab_reached_sub = rospy.Subscriber('/usv/lab_sim/waypoint_reached', String, self._lab_waypoint_cb, queue_size=10)
+        self.lab_position_sub = rospy.Subscriber('/usv/lab_sim/status', String, self._lab_position_cb, queue_size=10)
         self.pump_status_sub = rospy.Subscriber('/usv/pump_status', String, self._pump_status_cb)
         self.automation_status_sub = rospy.Subscriber('/usv/automation_status', String, self._automation_status_cb)
         self.spectrometer_voltage_sub = rospy.Subscriber('/usv/spectrometer_voltage', String, self._spectrometer_voltage_cb)
@@ -304,18 +312,30 @@ class MAVLinkTriggerNode(object):
         )
 
     def _global_position_cb(self, msg):
-        lat = _float_or_none(getattr(msg, "latitude", None))
-        lon = _float_or_none(getattr(msg, "longitude", None))
-        if lat is None or lon is None:
-            return
-        position = {
-            "lat": lat,
-            "lon": lon,
-            "alt": _float_or_none(getattr(msg, "altitude", None)),
-            "received_at": time.time(),
-        }
+        # Store invalid fixes too: a lost fix must invalidate the previous good one.
+        position = navsat_position(msg, rospy.Time.now().to_sec())
         with self.state_lock:
             self._latest_global_position = position
+
+    def _bind_sample_position(self, context, position=None, simulated=False):
+        try:
+            if position is None:
+                position = self._survey_state_snapshot()['position']
+            bind_context(context, position, getattr(self, 'sampling_max_position_age_s', 2.0), simulated)
+            return True
+        except ValueError as exc:
+            self._publish_status('sampling_rejected:' + str(exc))
+            return False
+
+    def _lab_position_cb(self, msg):
+        try:
+            data = json.loads(msg.data)
+            position = {'lat': data.get('lat'), 'lon': data.get('lng'),
+                        'received_at': time.time(), 'position_source': 'lab_sim'}
+        except (ValueError, TypeError, AttributeError):
+            return
+        with self.state_lock:
+            self._latest_lab_position = position
 
     def _imu_cb(self, msg):
         """IMU 回调。"""
@@ -594,6 +614,18 @@ class MAVLinkTriggerNode(object):
             "quality_flags": list(event.quality_flags),
             "timestamp": time.time(),
         }
+        acquisition = self.current_sampling_context or {}
+        if acquisition.get('record_id'):
+            record = sample_record(acquisition, payload,
+                                   {'concentration': event_payload['mean'], 'unit': config.analytes[0].unit},
+                                   time.time())
+            event_payload['sample_record'] = record
+            payload['sample_record'] = record
+            acquisition['spectrometer'] = copy.deepcopy(record['spectrometer'])
+            acquisition['water_quality'] = copy.deepcopy(record['water_quality'])
+            # Same publisher as started/stopped: no cross-topic ordering assumption.
+            self._publish_status('sampling_measurement:' + json.dumps(record))
+            self._emit_sample_record(acquisition, 'succeeded', 'simulated')
         self.sample_event_pub.publish(String(json.dumps(event_payload)))
         self.spectrometer_voltage_pub.publish(String(json.dumps(payload)))
         return event_payload, payload
@@ -609,6 +641,11 @@ class MAVLinkTriggerNode(object):
             # 真实采样设备: 复用泵/光谱仪自动化流程
             self.is_sampling = True
             self.current_sampling_context = {'waypoint_seq': seq, 'source': 'lab_real'}
+            if not self._bind_sample_position(self.current_sampling_context):
+                self.is_sampling = False
+                self.current_sampling_context = None
+                self._set_mission_state(MissionState.FAILED, 'gps_rejected')
+                return
             config = self._load_config() or self._get_default_config()
             steps_data = self._build_manual_steps_payload(config)
             steps_data['waypoint_seq'] = seq
@@ -616,11 +653,16 @@ class MAVLinkTriggerNode(object):
             context = self.current_sampling_context
             if not self._start_prepared_automation():
                 self._cleanup_sampling_attempt(context, 'lab_real_start_failed')
+                self._emit_sample_record(context, 'failed', 'lab_real_start_failed')
                 self.is_sampling = False
                 self._set_mission_state(MissionState.FAILED, "%d:lab_real_start_failed" % seq)
                 self._publish_status("sampling_stopped")
             return
         # 模拟数据源: 生成有限液滴事件, 详情走专用话题, 兼容通路只发一次聚合值。
+        self.current_sampling_context = {'waypoint_seq': seq, 'source': 'lab_sim'}
+        if not self._bind_sample_position(self.current_sampling_context, {'lat': lat, 'lon': lng}, True):
+            return
+        self.is_sampling = True
         self._publish_status("sampling_started")
         sim_cfg = lab.get('sim', {}) if isinstance(lab.get('sim'), dict) else {}
         dwell_s = max(0.0, _float_or_default(sim_cfg.get('sample_dwell_s', 3.0), 3.0))
@@ -641,6 +683,8 @@ class MAVLinkTriggerNode(object):
         )
         self._set_mission_state(MissionState.SAMPLING_DONE, str(seq))
         self._publish_status("sampling_stopped")
+        self.current_sampling_context = None
+        self.is_sampling = False
         if hasattr(self, "lab_command_pub"):
             command = {"cmd": "mission_complete", "waypoint_seq": int(seq)}
             self.lab_command_pub.publish(String(json.dumps(command)))
@@ -694,6 +738,7 @@ class MAVLinkTriggerNode(object):
                 if cancellation_reason:
                     cancelled, reason = True, cancellation_reason
         if cancelled:
+            self._emit_sample_record(sampling_context, 'cancelled', reason)
             self._publish_sampling_result(sampling_context, 'cancelled', reason)
             self._publish_status("sampling_stopped")
             if was_survey_sample:
@@ -703,6 +748,7 @@ class MAVLinkTriggerNode(object):
                 self._request_fcu_hold()
             return
         if success:
+            self._emit_sample_record(sampling_context, 'succeeded', reason)
             self._set_waypoint_state(wp_seq, WaypointSamplingState.DONE)
             if is_manual_sample:
                 self.current_sampling_context = None
@@ -725,6 +771,7 @@ class MAVLinkTriggerNode(object):
             rospy.sleep(1.0)
             self._resume_auto_if_mission_exists()
         else:
+            self._emit_sample_record(sampling_context, 'failed', reason)
             self._set_waypoint_state(wp_seq, WaypointSamplingState.FAILED)
             self._set_mission_state(MissionState.FAILED, "{}:{}".format(wp_seq, reason))
             if was_survey_sample:
@@ -825,6 +872,17 @@ class MAVLinkTriggerNode(object):
             payload = {}
         with self.state_lock:
             self.latest_spectrometer_payload = payload if isinstance(payload, dict) else {}
+            context = self.current_sampling_context
+            if self.is_sampling and isinstance(context, dict) and context.get('record_id'):
+                measurement = self.latest_spectrometer_payload
+                status = measurement.get('status')
+                stress = isinstance(status, int) and bool(status & 0x10)
+                if not stress and bool(measurement.get('simulated', False)) == bool(context.get('simulated', False)):
+                    context['spectrometer'] = copy.deepcopy(measurement)
+                    context['water_quality'] = {
+                        'concentration': measurement.get('concentration') if measurement.get('valid') else None,
+                        'unit': measurement.get('concentration_unit'),
+                    }
 
     def _start_sampling_sequence(self, waypoint_seq=None, retry_count_override=None, on_fail_override=None):
         """启动采样序列。"""
@@ -879,8 +937,13 @@ class MAVLinkTriggerNode(object):
         steps_data = self._build_steps_payload(config, waypoint_seq)
         steps_data['retry_count'] = waypoint_cfg['retry_count']
         steps_data['on_fail'] = waypoint_cfg['on_fail']
+        if not self._bind_sample_position(context):
+            context.update(on_fail='HOLD', retry_count=0)
+            self._handle_failure_action('gps_rejected')
+            return False
         if not self._start_injection_session("waypoint", config):
             cleaned, superseded = self._cleanup_sampling_attempt(context, 'injection_start_failed')
+            self._emit_sample_record(context, 'failed', 'injection_start_failed')
             if superseded:
                 return False
             if not cleaned:
@@ -896,6 +959,7 @@ class MAVLinkTriggerNode(object):
         self.is_sampling = True
         if not self._start_prepared_automation():
             cleaned, superseded = self._cleanup_sampling_attempt(context, 'automation_start_failed')
+            self._emit_sample_record(context, 'failed', 'automation_start_failed')
             self.is_sampling = False
             if superseded:
                 return False
@@ -942,6 +1006,7 @@ class MAVLinkTriggerNode(object):
             # Explicit operator stop remains global, but is a single pump RPC.
             stop_ok = self._call_automation_service('stop')
         reason = sampling_context.get('cancel_reason', 'operator_stop') if stop_ok else 'control_stop_failed'
+        self._emit_sample_record(sampling_context, 'cancelled' if stop_ok else 'failed', reason)
         self._publish_sampling_result(sampling_context, 'cancelled' if stop_ok else 'failed', reason)
         if sampling_context.get("source") == "manual":
             self.current_sampling_context = None
@@ -1236,6 +1301,10 @@ class MAVLinkTriggerNode(object):
             if (not self.is_sampling or not isinstance(context, dict)
                     or context.get('cancel_reason')):
                 return False
+        if not self._bind_sample_position(context):
+            return False
+        if isinstance(self._prepared_automation_payload, dict):
+            self._prepared_automation_payload.update(context)
         if not self._call_automation_service('start'):
             return False
         with self.state_lock:
@@ -1390,8 +1459,37 @@ class MAVLinkTriggerNode(object):
         msg.data = json.dumps({
             'source': 'fcu', 'sample_id': int(context['sample_id']),
             'outcome': outcome, 'reason': str(reason),
+            'sample_record': (context.get('_terminal_record') or sample_record(
+                              context, context.get('spectrometer'), context.get('water_quality'), time.time())
+                              if context.get('record_id') else None),
         })
         self.sampling_result_pub.publish(msg)
+
+    def _emit_sample_record(self, context, outcome, reason):
+        lock = getattr(self, '_sample_record_lock', None)
+        if lock is None:
+            lock = self._sample_record_lock = threading.Lock()
+        with lock:
+            return self._emit_sample_record_locked(context, outcome, reason)
+
+    def _emit_sample_record_locked(self, context, outcome, reason):
+        if not context.get('record_id') or context.get('_record_emitted'):
+            return
+        emitted = getattr(self, '_emitted_sample_ids', None)
+        if emitted is None:
+            emitted = self._emitted_sample_ids = deque(maxlen=512)
+        if context['record_id'] in emitted:
+            return
+        record = sample_record(context, context.get('spectrometer'), context.get('water_quality'), time.time())
+        record.update(outcome=outcome, reason=str(reason))
+        context['_terminal_record'] = record
+        publisher = getattr(self, 'sample_record_pub', None)
+        if publisher is not None:
+            msg = String()
+            msg.data = json.dumps(record)
+            publisher.publish(msg)
+        context['_record_emitted'] = True
+        emitted.append(context['record_id'])
 
     def _send_command_ack(self, command, result, target_system, target_component):
         """发布 COMMAND_ACK 请求，由 usv_mavlink_router_bridge.py 统一封装发送。"""
@@ -1526,9 +1624,13 @@ class MAVLinkTriggerNode(object):
         steps_data = self._build_manual_steps_payload(config)
         context = {'waypoint_seq': int(self.current_waypoint), 'source': 'manual', 'attempt_id': uuid.uuid4().hex}
         self.current_sampling_context = context
+        if not self._bind_sample_position(context):
+            self.current_sampling_context = None
+            return False
         self.is_sampling = True
         if not self._start_injection_session("manual", config):
             self._cleanup_sampling_attempt(context, 'manual_injection_start_failed')
+            self._emit_sample_record(context, 'failed', 'manual_injection_start_failed')
             self.is_sampling = False
             self.current_sampling_context = None
             self._set_mission_state(MissionState.IDLE, "manual_start_rejected")
@@ -1541,6 +1643,7 @@ class MAVLinkTriggerNode(object):
         self._prepare_automation_steps(steps_data)
         if not self._start_prepared_automation():
             self._cleanup_sampling_attempt(context, 'automation_start_failed')
+            self._emit_sample_record(context, 'failed', 'automation_start_failed')
             self.is_sampling = False
             self.current_sampling_context = None
             self._set_mission_state(MissionState.IDLE, "manual_start_rejected")
@@ -1571,6 +1674,11 @@ class MAVLinkTriggerNode(object):
             'attempt_id': uuid.uuid4().hex,
         }
         self.current_sampling_context = context
+        if not self._bind_sample_position(context):
+            self.current_sampling_context = None
+            self._publish_sampling_result(context, 'failed', 'gps_rejected')
+            self._request_fcu_hold()
+            return False
         self.is_sampling = True
         if not self._start_injection_session("fcu", config):
             self._handle_completion(False, 'fcu_injection_start_failed', expected_context=context)
@@ -1663,11 +1771,23 @@ class MAVLinkTriggerNode(object):
         gate = self._survey_gate_config(config)
         snapshot = self._survey_state_snapshot()
         position = snapshot["position"]
+        lab = (config or {}).get('lab_mode') or {}
+        simulated = lab.get('enabled') and lab.get('data_source', 'simulated') == 'simulated'
+        if simulated:
+            position = dict(getattr(self, '_latest_lab_position', None) or position)
         last_position = snapshot["last_position"]
         speed = snapshot["speed"]
 
         if gate["survey_require_valid_spectrometer"] and not snapshot["spectrometer"].get("valid", False):
             return False, "spectrometer_invalid"
+
+        if not simulated:
+            if not position:
+                return False, 'no_gps'
+            try:
+                freeze_position(position, getattr(self, 'sampling_max_position_age_s', 2.0))
+            except ValueError as exc:
+                return False, str(exc)
 
         position_needed = gate["survey_require_gps"] or gate["survey_min_distance_m"] > 0.0
         if position_needed:
@@ -1683,6 +1803,9 @@ class MAVLinkTriggerNode(object):
             return False, "speed_too_high"
 
         if gate["survey_min_distance_m"] > 0.0 and last_position:
+            if any(_float_or_none(value) is None for value in
+                   (position.get('lat'), position.get('lon'), last_position.get('lat'), last_position.get('lon'))):
+                return False, 'gps_invalid_coordinates'
             distance_m = self._haversine_m(
                 last_position["lat"],
                 last_position["lon"],
@@ -1697,11 +1820,11 @@ class MAVLinkTriggerNode(object):
         state_lock = getattr(self, "state_lock", None)
         if state_lock is not None:
             with state_lock:
-                position = dict(getattr(self, "_latest_global_position", {}) or {})
+                position = dict((self.current_sampling_context or {}).get('gps_snapshot') or {})
                 if position:
                     self._last_survey_sample_position = position
             return
-        position = dict(getattr(self, "_latest_global_position", {}) or {})
+        position = dict((self.current_sampling_context or {}).get('gps_snapshot') or {})
         if position:
             self._last_survey_sample_position = position
 
@@ -1738,13 +1861,16 @@ class MAVLinkTriggerNode(object):
 
         lab = config.get('lab_mode', {}) if isinstance(config.get('lab_mode', {}), dict) else {}
         if lab.get('enabled', False) and str(lab.get('data_source', 'simulated')).strip().lower() == 'simulated':
-            position = self._survey_state_snapshot()["position"]
+            position = dict(getattr(self, '_latest_lab_position', None) or self._survey_state_snapshot()["position"])
             lat = position.get("lat")
             lng = position.get("lon", position.get("lng"))
             if lat is None or lng is None:
                 self._publish_status("survey_gate_skipped:no_gps")
                 return "skipped"
             if not self._set_survey_sampling_flags(True):
+                return 'skipped'
+            if not self._bind_sample_position(self.current_sampling_context, position, True):
+                self._set_survey_sampling_flags(False)
                 return 'skipped'
             self._publish_status("sampling_started")
             self._publish_lab_sampling_event(
@@ -1765,6 +1891,9 @@ class MAVLinkTriggerNode(object):
 
         if not self._set_survey_sampling_flags(True):
             return 'skipped'
+        if not self._bind_sample_position(self.current_sampling_context):
+            self._set_survey_sampling_flags(False)
+            return 'skipped'
         self._prepare_automation_steps(steps_data, source='survey')
         context = self.current_sampling_context
         if self._start_prepared_automation():
@@ -1772,6 +1901,7 @@ class MAVLinkTriggerNode(object):
             return "started"
 
         self._cleanup_sampling_attempt(context, 'survey_sample_start_failed')
+        self._emit_sample_record(context, 'failed', 'survey_sample_start_failed')
         self._set_survey_sampling_flags(False)
         self._survey_active = False
         self._set_mission_state(MissionState.FAILED, "survey_sample_start_failed")
@@ -1790,8 +1920,15 @@ class MAVLinkTriggerNode(object):
         config = self._load_config() or self._get_default_config()
         gate = self._survey_gate_config(config)
         self.current_sampling_context = {'source': 'survey', 'attempt_id': uuid.uuid4().hex}
+        lab = config.get('lab_mode') or {}
+        simulated = lab.get('enabled') and lab.get('data_source', 'simulated') == 'simulated'
+        # Preflight only: the continuous injection owner is not a sample record.
+        # Each survey acquisition below creates its own UUID and start snapshot.
+        if not simulated and not self._bind_sample_position({}):
+            self.current_sampling_context = None
+            return False
         self._survey_owner_attempt_id = self.current_sampling_context['attempt_id']
-        if not self._start_injection_session("survey", config):
+        if not simulated and not self._start_injection_session("survey", config):
             self._cleanup_sampling_attempt(self.current_sampling_context, 'survey_injection_start_failed')
             self._set_mission_state(MissionState.FAILED, "survey_injection_start_failed")
             return False

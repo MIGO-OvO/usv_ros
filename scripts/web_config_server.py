@@ -117,6 +117,7 @@ from scripts.lib.lab_sim.models import CoordinatePairRef, ModelParseError, Sampl
 from scripts.lib.lab_sim.route_planner import RoutePlannerError, plan_coverage_route
 from scripts.lib.sample_recording import MIN_RAW_RECORD_HZ, SampleRecordingStorage, normalize_raw_frame
 from scripts.lib.sample_recording.models import safe_id
+from scripts.lib.sample_recording.record import bind_context, navsat_position
 from scripts.lib.sample_recording.downsampling import MinMaxSeries
 
 # 配置文件路径
@@ -171,7 +172,7 @@ DEFAULT_MAPPING_PROFILE = {
     "survey_max_speed_mps": 0.0,
     "survey_require_valid_spectrometer": True,
     "survey_require_gps": True,
-    "survey_max_position_age_s": 5.0,
+    "survey_max_position_age_s": 2.0,
 }
 SURVEY_GATE_REASON_LABELS = {
     "no_gps": "GPS unavailable",
@@ -791,7 +792,7 @@ def _position_with_age(position=None, now=None):
         return None
     result = copy.deepcopy(position)
     received_at = _to_float_or_none(result.get("received_at"))
-    if received_at is not None:
+    if received_at is not None and not result.get('frozen_at_start'):
         current_time = time.time() if now is None else now
         age_s = max(0.0, current_time - received_at)
         result["position_age_s"] = age_s
@@ -1299,7 +1300,7 @@ class MissionDataManager(object):
             "metric_used": "sampling_event_mean",
             "position_source": "lab_sim",
             "lab_mode": True,
-            "sample_id": event_id,
+            "sample_id": (event_payload.get('sample_record') or {}).get('sample_id', event_id),
             "sample_event_id": event_id,
             "sample_event_mode": str(event_payload.get("mode", "")),
             "route_ref": dict(route_ref),
@@ -1329,6 +1330,8 @@ class MissionDataManager(object):
         else:
             event = SamplingEvent.from_dict(sampling_event)
         event_payload = event.to_dict()
+        if isinstance(sampling_event, dict) and isinstance(sampling_event.get('sample_record'), dict):
+            event_payload['sample_record'] = copy.deepcopy(sampling_event['sample_record'])
         self.current_mission_data.setdefault("sampling_events", []).append(event_payload)
         self.current_mission_data.setdefault("data_points", []).append(
             self._sampling_event_data_point(event_payload)
@@ -2069,6 +2072,7 @@ class WebConfigServer(object):
             "spectrometer_active": False,
         }
         self.current_position = None
+        self._latest_real_gps = None
         self.live_track_points = []
         self.route_waypoints = []
         self.route_snapshot_id = None
@@ -2315,7 +2319,17 @@ class WebConfigServer(object):
             return False
 
         automation = self.latest_automation_status if isinstance(self.latest_automation_status, dict) else {}
-        position = self.current_position if isinstance(self.current_position, dict) else None
+        window = self.current_sample_window or {}
+        # GPS at acquisition start, never the moving map marker / closing fix.
+        position = window.get('gps_start') if window else self.current_position
+        if window and position:
+            frozen = position
+            position = make_position_snapshot(frozen['lat'], frozen['lng'], frozen.get('alt'),
+                                              source='lab_sim' if window.get('simulated') else 'real',
+                                              lab_mode=bool(window.get('simulated')))
+            position.update({key: frozen[key] for key in
+                             ('received_at', 'gps_timestamp', 'position_age_s', 'fix_status', 'frozen_at_start')
+                             if key in frozen})
         started_at = time.perf_counter()
         try:
             try:
@@ -2323,10 +2337,10 @@ class WebConfigServer(object):
                     sample.get("voltage", 0.0),
                     sample.get("absorbance", 0.0),
                     position=position,
-                    waypoint_seq=self.current_waypoint_seq,
+                    waypoint_seq=window.get('waypoint_id', self.current_waypoint_seq),
                     step_index=automation.get("step_index", automation.get("current_step")),
                     loop_index=automation.get("loop_index", automation.get("current_loop")),
-                    sample_id=automation.get("sample_id"),
+                    sample_id=window.get('sample_id', automation.get("sample_id")),
                     spectrometer_raw=sample.get("raw_summary", {}),
                     pollution_metric=self._current_metric_config(),
                     lab_mode=bool(position.get("lab_mode", False)) if position else False,
@@ -2388,6 +2402,11 @@ class WebConfigServer(object):
         waypoint_seq = context.get('waypoint_seq') if mode == 'waypoint' else None
         mavlink_sample_id = context.get('sample_id') if source == 'fcu' else None
         return {
+            "record_id": context.get('record_id'),
+            "timestamp_start": context.get('timestamp_start', time.time()),
+            "gps_snapshot": copy.deepcopy(context.get('gps_snapshot')),
+            "simulated": bool(context.get('simulated', False)),
+            "waypoint_id": context.get('waypoint_seq'),
             "mode": mode,
             "source": source,
             "attempt_id": context.get('attempt_id'),
@@ -2440,6 +2459,11 @@ class WebConfigServer(object):
             self.current_sample_window = None
             return
         try:
+            window = self.current_sample_window
+            raw = self.latest_spectrometer_payload or {}
+            # Do not attach a previous acquisition's water-quality result.
+            if (raw.get('sample_record') or {}).get('sample_id') == window.get('sample_id'):
+                window['water_quality'] = copy.deepcopy(raw['sample_record']['water_quality'])
             self.sample_storage.close_window(mission_data, self.current_sample_window, self.current_position)
             self._save_current_mission_data()
         except (OSError, ValueError) as exc:
@@ -2599,6 +2623,17 @@ class WebConfigServer(object):
     def _trigger_status_cb_locked(self, msg):
         """采样生命周期回调，用于 Web 数据中心自动建档。"""
         raw_status = str(getattr(msg, "data", "") or "")
+        if raw_status.startswith('sampling_measurement:'):
+            try:
+                record = json.loads(raw_status.split(':', 1)[1])
+                window = self.current_sample_window
+                if window and record.get('sample_id') == window.get('sample_id'):
+                    window['water_quality'] = copy.deepcopy(record.get('water_quality', {}))
+                    window['spectrometer']['measurement'] = copy.deepcopy(record.get('spectrometer', {}))
+                    self._save_current_mission_data()
+            except (TypeError, ValueError):
+                pass
+            return
         if raw_status.startswith('sampling_context:'):
             try:
                 context = json.loads(raw_status.split(':', 1)[1])
@@ -2875,6 +2910,20 @@ class WebConfigServer(object):
             self._voltage_realtime_buffer.append(realtime_sample)
 
         if self.automation_running:
+            window = self.current_sample_window
+            if window and not bool(data.get('simulated', False)) and not window.get('simulated'):
+                status_bits = data.get('status')
+                stress = isinstance(status_bits, int) and bool(status_bits & 0x10)
+                if not stress:
+                    window['spectrometer']['measurement'] = copy.deepcopy(data)
+                    metric = resolve_pollution_metric(self.current_voltage, self.current_absorbance,
+                                                      self._current_metric_config())
+                    window['water_quality'] = {
+                        'concentration': metric['concentration'] if data.get('valid') else None,
+                        'unit': metric['concentration_unit'],
+                        'calibration_id': metric['calibration_id'],
+                        'method_name': metric['method_name'],
+                    }
             sample_event_aggregate = bool(data.get("sample_event_id"))
             raw_summary = self._spectrometer_raw_summary(data)
             with self._mission_sample_lock:
@@ -2982,6 +3031,8 @@ class WebConfigServer(object):
             return
         try:
             event_payload = SamplingEvent.from_dict(data).to_dict()
+            if isinstance(data.get('sample_record'), dict):
+                event_payload['sample_record'] = copy.deepcopy(data['sample_record'])
         except (ModelParseError, CoordinateError, ValueError, TypeError) as exc:
             rospy.logwarn("Invalid lab sample event payload: %s", str(exc))
             return
@@ -3197,6 +3248,8 @@ class WebConfigServer(object):
         实验模式 (position_source=lab_sim) 下忽略真实 GPS, 由 lab_sim 独占船位,
         避免真实 GPS 与虚拟船位同时写入导致地图船位跳变。
         """
+        # Separate hardware fix from the display position, even in lab_real mode.
+        self._latest_real_gps = navsat_position(msg, rospy.Time.now().to_sec())
         lab = self._current_lab_config()
         if lab.get("enabled") and lab.get("position_source", "lab_sim") == "lab_sim":
             return
@@ -6052,6 +6105,12 @@ class WebConfigServer(object):
                     if self.automation_running or self.automation_paused or self.current_sample_window is not None:
                         return jsonify(success=False, message='Sampling already active'), 409
                     previous_context = dict(self._sampling_context)
+                    acquisition = {'source': 'web'}
+                    try:
+                        bind_context(acquisition, self._latest_real_gps,
+                                     rospy.get_param('/mavlink_trigger_node/sampling_max_position_age_s', 2.0))
+                    except ValueError as exc:
+                        return jsonify(success=False, message=str(exc)), 409
                     sampling_sequence = request_data.get('sampling_sequence')
                     waypoint_sampling = request_data.get('waypoint_sampling')
                     config_patch = {}
@@ -6064,6 +6123,8 @@ class WebConfigServer(object):
                         self.config_manager.update(config_patch)
                     steps_payload = self._publish_steps(transaction_only=True)
                     self._sampling_context = {'source': 'web', 'attempt_id': steps_payload['attempt_id']}
+                    self._sampling_context.update(acquisition)
+                    steps_payload.update(self._sampling_context)
                     started_recording = not bool(self.data_manager.current_mission_file)
                     self._start_data_recording_if_needed(source="web")
                     if started_recording:
