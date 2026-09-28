@@ -2,6 +2,20 @@
 @tailwind components;
 @tailwind utilities;
 
+/* Monitor keeps diagnostic tools mounted while native details hide their UI. */
+.monitor-diagnostics details > div {
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+  background: transparent;
+  backdrop-filter: none;
+}
+.monitor-page summary:focus-visible {
+  outline: 2px solid hsl(var(--ring));
+  outline-offset: 2px;
+}
+.monitor-page { overflow-wrap: anywhere; }
+
 @layer base {
   :root {
     --background: 0 0% 100%;

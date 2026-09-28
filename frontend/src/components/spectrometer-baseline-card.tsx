@@ -14,7 +14,7 @@ function formatRemaining(milliseconds: number): string {
 
 function Metric({ label, value }: { readonly label: string; readonly value: string }) {
   return (
-    <div className="min-w-0 rounded-md border bg-muted/20 px-3 py-2">
+    <div className="min-w-0 px-2 py-1">
       <div className="truncate text-[11px] text-muted-foreground">{label}</div>
       <div className="mt-0.5 font-mono text-sm font-semibold tabular-nums">{value}</div>
     </div>
@@ -59,14 +59,14 @@ export function SpectrometerBaselineCard({
             ? '已有基线'
             : '未获取'
   const phaseClass = active || saving
-    ? 'text-emerald-500'
+    ? 'text-blue-700 dark:text-blue-400'
     : baselineSet
-      ? 'text-blue-500'
+      ? 'text-emerald-700 dark:text-emerald-400'
       : 'text-muted-foreground'
   const remainingLabel = summary?.phase === 'stabilizing' ? '距平均开始' : '距流程完成'
 
   return (
-    <Card className="min-w-0 overflow-hidden bg-card/50 backdrop-blur-sm">
+    <Card className="min-w-0 overflow-hidden shadow-none">
       <CardHeader className="grid min-w-0 gap-3 pb-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
         <div className="min-w-0">
           <CardTitle className="flex items-center gap-2 text-sm font-medium">
@@ -125,11 +125,11 @@ export function SpectrometerBaselineCard({
           aria-valuenow={Math.round(summary?.progressPercent ?? (baselineSet ? 100 : 0))}
         >
           <div
-            className="h-full rounded-full bg-emerald-500 transition-[width] duration-500"
+            className={cn('h-full rounded-full', active || saving ? 'bg-blue-600' : baselineSet ? 'bg-emerald-600' : 'bg-muted')}
             style={{ width: `${summary?.progressPercent ?? (baselineSet ? 100 : 0)}%` }}
           />
         </div>
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+        <div className="grid grid-cols-2 gap-2 border-t pt-2 sm:grid-cols-4">
           <Metric label="当前阶段" value={phaseLabel} />
           <Metric label={remainingLabel} value={active ? formatRemaining(summary?.remainingMs ?? 0) : '--:--'} />
           <Metric label="平均窗口有效样本" value={String(summary?.validSampleCount ?? 0)} />

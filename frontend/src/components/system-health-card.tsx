@@ -20,7 +20,8 @@ export interface VoltageDiagnostics {
   nonDetectorSamples: number
 }
 
-export function SystemHealthCard({ voltageDiagnostics }: {
+export function SystemHealthCard({ voltageDiagnostics, compact = false }: {
+  compact?: boolean
   voltageDiagnostics?: VoltageDiagnostics
 }) {
   const health = useAppStore((state) => state.systemHealth)
@@ -30,6 +31,17 @@ export function SystemHealthCard({ voltageDiagnostics }: {
   const nodes = health?.ros_nodes || []
   const aliveNodes = nodes.filter((node) => node.alive).length
   const spectrometer = health?.detector?.spectrometer
+
+  if (compact) return <section aria-label="系统状态" className="flex flex-wrap gap-x-5 gap-y-2 border-y py-3 text-xs tabular-nums">
+    <span>Jetson {fmt(health?.jetson?.temperature_c, '°C')}</span>
+    <span>CPU {fmt(health?.jetson?.cpu_percent, '%')}</span>
+    <span>内存 {fmt(health?.jetson?.memory_percent, '%')}</span>
+    <span>ESP32 {fmt(health?.detector?.temperature_c, '°C')}</span>
+    <span>Heap 可用 {fmt(health?.detector?.heap_percent_free, '%')}</span>
+    <span>ROS {nodes.length ? `${aliveNodes}/${nodes.length}` : '--'}</span>
+    <span className={(spectrometer?.crc_error ?? 0) > 0 ? 'text-amber-700 dark:text-amber-400' : ''}>ADS CRC {fmt(spectrometer?.crc_error, '', 0)}</span>
+    <span className={(spectrometer?.duplicate ?? 0) > 0 ? 'text-amber-700 dark:text-amber-400' : ''}>ADS 重复 {fmt(spectrometer?.duplicate, '', 0)}</span>
+  </section>
 
   return (
     <Card className="min-w-0 overflow-hidden bg-card/50 backdrop-blur-sm">
@@ -41,7 +53,7 @@ export function SystemHealthCard({ voltageDiagnostics }: {
           </span>
           <span className={cn(
             'inline-flex items-center gap-1 text-xs font-medium',
-            ok ? 'text-emerald-500' : warn ? 'text-orange-500' : 'text-red-500',
+            ok ? 'text-emerald-700 dark:text-emerald-400' : warn ? 'text-amber-700 dark:text-amber-400' : level === 'unknown' ? 'text-muted-foreground' : 'text-red-700 dark:text-red-400',
           )}>
             {ok ? <CheckCircle className="h-3.5 w-3.5" /> : <AlertTriangle className="h-3.5 w-3.5" />}
             {health?.health?.summary || '等待数据'}
