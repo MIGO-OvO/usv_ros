@@ -571,6 +571,14 @@ class PumpControlNode(object):
         self.spectro_baseline_voltage = float(self.spectro_config.get('baseline_voltage', 0.0))
         self.spectro_command_event = threading.Event()
         self.spectro_command_result = None
+        # Verified configuration transactions (I2CMAP/ADSCFG) serialize through
+        # _config_txn_lock; the reader thread publishes matching ACK lines into
+        # the pending _text_txn so waiting never blocks the serial callback.
+        self._config_txn_lock = threading.RLock()
+        self._text_txn_lock = threading.Lock()
+        self._text_txn = None
+        self._spectro_txn_phase = 'idle'
+        self._last_spectro_txn_error = None
         self._current_step_spectro_timestamp = None
         self._lower_device_settings_file = self._resolve_lower_device_settings_file()
         self._lower_device_settings = self._load_lower_device_settings()
@@ -886,6 +894,153 @@ class PumpControlNode(object):
     def _query_ads_status(self):
         return self.send_command('ADSSTATUS?')
 
+    @staticmethod
+    def _parse_kv_response(response):
+        """Parse a firmware ACK line; key=value pairs keep raw string values.
+
+        Tolerates leading tag segments without '=' (e.g. ADS_OK:CFG,CH=2,...).
+        """
+        try:
+            body = response.split(':', 1)[1]
+            result = {}
+            for token in body.split(','):
+                if '=' not in token:
+                    continue
+                key, value = token.split('=', 1)
+                result[key.strip()] = value.strip()
+            return result
+        except (AttributeError, IndexError, ValueError):
+            return None
+
+    @staticmethod
+    def _kv_int(mapping, key):
+        """Read an integer key from a parsed ACK line (handles 0x...)."""
+        try:
+            return int(str(mapping.get(key)).strip(), 0)
+        except (TypeError, ValueError):
+            return None
+
+    def _send_and_wait_text(self, command, success_prefixes, error_prefixes, timeout=2.0):
+        """Send one configuration command and wait for its ACK line.
+
+        Returns (ok, line). ok is True only when a line matching a success
+        prefix arrived before timeout and no error prefix matched. Only one
+        transaction may run at a time (guaranteed by _config_txn_lock); the
+        wait happens on the caller thread, never inside the reader callback.
+        """
+        success = tuple(success_prefixes or ())
+        errors = tuple(error_prefixes or ())
+        if not success:
+            return False, 'no success prefix configured'
+        txn = {'event': threading.Event(), 'line': None, 'success': success, 'error': errors}
+        with self._text_txn_lock:
+            self._text_txn = txn
+        try:
+            if not self.send_command(command):
+                return False, 'serial send failed'
+            if not txn['event'].wait(timeout):
+                return False, 'timeout'
+            line = txn['line'] or ''
+            if any(line.startswith(prefix) for prefix in errors):
+                return False, line
+            if any(line.startswith(prefix) for prefix in success):
+                return True, line
+            return False, line
+        finally:
+            with self._text_txn_lock:
+                if self._text_txn is txn:
+                    self._text_txn = None
+
+    def _apply_i2c_mapping(self):
+        """Apply the I2C map and verify the firmware echo before returning True."""
+        angles = self.i2c_mapping.get('angles', {})
+        cmd = "I2CMAP:X={x},Y={y},Z={z},A={a},SPEC={spec}".format(
+            x=angles.get('X', 0),
+            y=angles.get('Y', 3),
+            z=angles.get('Z', 4),
+            a=angles.get('A', 7),
+            spec=self.i2c_mapping.get('spectro_channel', 2)
+        )
+        self._spectro_txn_phase = 'i2c_map'
+        ok, response = self._send_and_wait_text(cmd, ('I2CMAP_OK:',), ('I2CMAP_ERR:',), timeout=2.0)
+        if not ok:
+            self._spectro_txn_phase = 'i2c_map_failed'
+            self._last_spectro_txn_error = 'I2CMAP: %s' % response
+            rospy.logwarn("I2C mapping apply failed: %s", response)
+            self._publish_spectro_status('i2c_map_failed')
+            return False
+        expected = {'X': int(angles.get('X', 0)), 'Y': int(angles.get('Y', 3)),
+                    'Z': int(angles.get('Z', 4)), 'A': int(angles.get('A', 7)),
+                    'SPEC': int(self.i2c_mapping.get('spectro_channel', 2))}
+        applied = self._parse_kv_response(response)
+        if applied is None or any(self._kv_int(applied, key) != value for key, value in expected.items()):
+            self._spectro_txn_phase = 'i2c_map_failed'
+            self._last_spectro_txn_error = 'I2CMAP mismatch: %s' % response
+            rospy.logwarn("I2C mapping mismatch: sent %s, applied %s", expected, applied)
+            self._publish_spectro_status('i2c_map_mismatch')
+            return False
+        rospy.loginfo("Applied I2C mapping (verified): %s", response)
+        return True
+
+    def _apply_spectro_config(self):
+        """Apply the ADS config and verify the firmware echo before returning True."""
+        cmd = self._build_ads_config_command()
+        self._spectro_txn_phase = 'ads_config'
+        ok, response = self._send_and_wait_text(cmd, ('ADS_OK:CFG,',), ('ADS_ERR:',), timeout=2.0)
+        if not ok:
+            self._spectro_txn_phase = 'ads_config_failed'
+            self._last_spectro_txn_error = 'ADSCFG: %s' % response
+            rospy.logwarn("Spectrometer config apply failed: %s", response)
+            self._publish_spectro_status('ads_config_failed')
+            return False
+        if not self._verify_ads_config_echo(response):
+            self._spectro_txn_phase = 'ads_config_failed'
+            self._last_spectro_txn_error = 'ADSCFG mismatch: %s' % response
+            self._publish_spectro_status('ads_config_mismatch')
+            return False
+        self.spectro_state = 'configured'
+        self._publish_spectro_status('configured')
+        self._publish_spectro_config_snapshot()
+        return True
+
+    def _verify_ads_config_echo(self, response):
+        """Validate the ADS_OK:CFG echo against the requested configuration.
+
+        DR is compared with tolerance because the firmware snaps the request to
+        its nearest supported data rate; every other field must match exactly.
+        """
+        applied = self._parse_kv_response(response)
+        if not applied:
+            return False
+        cfg = self.spectro_config
+        vref_raw = str(cfg.get('vref_mode', 'AVDD')).strip().upper()
+        vref_mode = 'INT' if vref_raw in ('INT', 'INTERNAL', 'INT_2V048') else 'AVDD'
+        adc_rate = max(MIN_RAW_RECORD_HZ, int(cfg.get('adc_rate', 90) or 90))
+        publish_rate = max(MIN_RAW_RECORD_HZ, int(cfg.get('publish_rate', 90) or 90))
+        expected_int = {
+            'CH': int(self.i2c_mapping.get('spectro_channel', 2)),
+            'ADDR': int(str(cfg.get('ads_address', '0x40')).strip(), 0),
+            'GAIN': int(cfg.get('gain', 1) or 1),
+            'PR': publish_rate,
+        }
+        for key, value in expected_int.items():
+            if self._kv_int(applied, key) != value:
+                rospy.logwarn("ADS config mismatch on %s: sent %s, applied %s",
+                              key, value, applied.get(key))
+                return False
+        if str(applied.get('REF', '')).strip().upper() != vref_mode:
+            rospy.logwarn("ADS config mismatch on REF: sent %s, applied %s",
+                          vref_mode, applied.get('REF'))
+            return False
+        if str(applied.get('MODE', '')).strip().upper() != ('CONT' if cfg.get('continuous_mode', True) else 'SINGLE'):
+            rospy.logwarn("ADS config mismatch on MODE: applied %s", applied.get('MODE'))
+            return False
+        actual_rate = self._kv_int(applied, 'DR')
+        if actual_rate is None or abs(actual_rate - adc_rate) > max(1, adc_rate * 0.15):
+            rospy.logwarn("ADS config mismatch on DR: sent %s, applied %s", adc_rate, actual_rate)
+            return False
+        return True
+
     def _start_angle_stream(self):
         ok = self.send_command('ANGLESTREAM_START')
         if ok:
@@ -896,29 +1051,6 @@ class PumpControlNode(object):
         ok = self.send_command('ANGLESTREAM_STOP')
         if ok:
             rospy.loginfo('Angle stream stopped')
-        return ok
-
-    def _apply_i2c_mapping(self):
-        angles = self.i2c_mapping.get('angles', {})
-        cmd = "I2CMAP:X={x},Y={y},Z={z},A={a},SPEC={spec}".format(
-            x=angles.get('X', 0),
-            y=angles.get('Y', 3),
-            z=angles.get('Z', 4),
-            a=angles.get('A', 7),
-            spec=self.i2c_mapping.get('spectro_channel', 2)
-        )
-        ok = self.send_command(cmd)
-        if ok:
-            rospy.loginfo("Applied I2C mapping: %s", cmd)
-        return ok
-
-    def _apply_spectro_config(self):
-        cmd = self._build_ads_config_command()
-        ok = self.send_command(cmd)
-        if ok:
-            self.spectro_state = 'configured'
-            self._publish_spectro_status('configured')
-            self._publish_spectro_config_snapshot()
         return ok
 
     def _build_ads_config_command(self):
@@ -952,21 +1084,75 @@ class PumpControlNode(object):
             return self.spectro_command_result
         return False, 'timeout'
 
-    def _spectro_start(self):
+    def prepare_and_start_spectrometer(self, overrides=None):
+        """Authoritative spectrometer startup transaction shared by Web and QGC.
+
+        Chain: refresh authoritative runtime config -> optional overrides ->
+        verified I2C map -> verified ADS config -> ADSSTART (wait ADS_OK:START)
+        -> wait for the first valid spectrometer frame. Serial writes alone
+        never imply success.
+        """
+        with self._config_txn_lock:
+            return self._prepare_and_start_spectrometer_locked(overrides)
+
+    def _prepare_and_start_spectrometer_locked(self, overrides=None):
+        self._last_spectro_txn_error = None
+        self._refresh_runtime_settings()
+        if isinstance(overrides, dict):
+            mapping = overrides.get('mapping')
+            if isinstance(mapping, dict):
+                if isinstance(mapping.get('angles'), dict):
+                    self.i2c_mapping['angles'] = mapping['angles']
+                if 'spectro_channel' in mapping:
+                    try:
+                        self.i2c_mapping['spectro_channel'] = int(mapping['spectro_channel'])
+                    except (TypeError, ValueError):
+                        return False, 'invalid spectro_channel in mapping'
+            spectro = overrides.get('spectro')
+            if isinstance(spectro, dict) and spectro:
+                updated = dict(spectro)
+                updated.pop('cmd', None)
+                self.spectro_config = self._normalize_lower_device_spectro_config(
+                    dict(self.spectro_config, **updated)
+                )
+                self.spectro_reference_voltage = float(self.spectro_config.get('reference_voltage', self.spectro_reference_voltage))
+                self.spectro_baseline_voltage = float(self.spectro_config.get('baseline_voltage', self.spectro_baseline_voltage))
         if not self._apply_i2c_mapping():
-            return False, 'Spectrometer I2C mapping apply failed'
+            return False, self._last_spectro_txn_error or 'I2C mapping apply failed'
         if not self._apply_spectro_config():
-            return False, 'Spectrometer config command send failed'
+            return False, self._last_spectro_txn_error or 'ADS config apply failed'
         self._clear_spectro_reference()
         time.sleep(0.1)
+        self._spectro_txn_phase = 'start'
         self._begin_spectro_command_wait()
-        ok = self.send_command('ADSSTART')
-        if not ok:
+        if not self.send_command('ADSSTART'):
+            self._last_spectro_txn_error = 'ADSSTART send failed'
             return False, 'Spectrometer start command send failed'
         success, message = self._wait_for_spectro_command_result(timeout=2.0)
-        if success:
-            self._last_valid_spectro_at = time.monotonic()
-        return success, message if message != 'timeout' else 'Spectrometer start timeout'
+        if not success:
+            self._last_spectro_txn_error = 'ADSSTART: %s' % message
+            return False, message if message != 'timeout' else 'Spectrometer start timeout'
+        self._spectro_txn_phase = 'wait_frame'
+        if not self._wait_first_valid_spectro_frame(timeout=2.0):
+            self._last_spectro_txn_error = 'no valid spectrometer frame after start'
+            return False, 'Spectrometer start timeout: no valid frame'
+        self._spectro_txn_phase = 'running'
+        return True, message
+
+    def _wait_first_valid_spectro_frame(self, timeout=2.0):
+        """Wait for a valid raw frame received after the start ACK."""
+        ack_seen_at = time.monotonic()
+        deadline = ack_seen_at + max(0.0, float(timeout))
+        while True:
+            if self._last_valid_spectro_at is not None and self._last_valid_spectro_at > ack_seen_at:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.02)
+
+    def _spectro_start(self):
+        """Legacy entry point; both Web and QGC funnel into the same transaction."""
+        return self.prepare_and_start_spectrometer()
 
     def _spectro_stop(self):
         self._invalidate_spectro('stopped')
@@ -1417,6 +1603,15 @@ class PumpControlNode(object):
             if self._automation_is_active():
                 self._auto_stop_callback(None)
             return
+        # Publish the ACK line to a pending verified configuration transaction.
+        # Existing handlers below keep their side effects (spectro_state,
+        # status telemetry), so the capture must not swallow the line.
+        with self._text_txn_lock:
+            txn = self._text_txn
+        if txn is not None and (any(text.startswith(prefix) for prefix in txn['success'])
+                                or any(text.startswith(prefix) for prefix in txn['error'])):
+            txn['line'] = text
+            txn['event'].set()
         # 自动化运行时提升日志级别，便于排查 PID_DONE 等固件消息
         if self.automation_engine.is_running():
             rospy.loginfo("MCU text: %s", text)
@@ -2042,7 +2237,7 @@ class PumpControlNode(object):
             return success, "Spectrometer configured" if success else "Spectrometer config failed", {"spectrometer": self.spectro_config}
 
         if action == "spectrometer_start":
-            success, message = self._spectro_start()
+            success, message = self.prepare_and_start_spectrometer(payload)
             return success, message, {}
 
         if action == "spectrometer_stop":
@@ -2521,6 +2716,8 @@ class PumpControlNode(object):
             "last_error": engine_status.get("last_error") or self.last_automation_failure.get("reason", ""),
             "failure": dict(self.last_automation_failure),
             "spectrometer_state": self.spectro_state,
+            "spectrometer_txn_phase": self._spectro_txn_phase,
+            "spectrometer_last_txn_error": self._last_spectro_txn_error,
         }
         msg = String()
         msg.data = json.dumps(payload, ensure_ascii=False)

@@ -313,7 +313,7 @@ class MAVLinkTriggerNode(object):
 
     def _global_position_cb(self, msg):
         # Store invalid fixes too: a lost fix must invalidate the previous good one.
-        position = navsat_position(msg, rospy.Time.now().to_sec())
+        position = navsat_position(msg)
         with self.state_lock:
             self._latest_global_position = position
 
@@ -331,7 +331,8 @@ class MAVLinkTriggerNode(object):
         try:
             data = json.loads(msg.data)
             position = {'lat': data.get('lat'), 'lon': data.get('lng'),
-                        'received_at': time.time(), 'position_source': 'lab_sim'}
+                        'received_at': time.time(), 'received_monotonic': time.monotonic(),
+                        'position_source': 'lab_sim'}
         except (ValueError, TypeError, AttributeError):
             return
         with self.state_lock:
@@ -1794,8 +1795,15 @@ class MAVLinkTriggerNode(object):
             if not position:
                 return False, "no_gps"
             max_age = gate["survey_max_position_age_s"]
-            if max_age > 0.0 and time.time() - float(position.get("received_at", 0.0) or 0.0) > max_age:
-                return False, "gps_stale"
+            # Local receive-time freshness (same clock domain as this node).
+            # max_age == 0 disables the check entirely, as before.
+            if max_age > 0.0:
+                received = _float_or_none(position.get("received_monotonic"))
+                if received is None:
+                    return False, 'gps_missing_receive_time'
+                local_age = time.monotonic() - received
+                if local_age < 0.0 or local_age > max_age:
+                    return False, "gps_stale"
 
         if gate["survey_min_speed_mps"] > 0.0 and speed < gate["survey_min_speed_mps"]:
             return False, "speed_too_low"

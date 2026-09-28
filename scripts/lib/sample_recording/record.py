@@ -17,7 +17,15 @@ def finite(value):
         return None
 
 
-def navsat_position(msg, ros_now=None):
+def navsat_position(msg):
+    """Snapshot a NavSatFix message.
+
+    Freshness authority is ``received_monotonic`` (Jetson local receive time).
+    ``gps_timestamp`` (FCU/MAVROS header.stamp) is retained for the record and
+    diagnostics only: the FCU and Jetson wall clocks are separate clock domains
+    and are not proven synchronized, so their offset must never be a hard
+    admission gate. ``header_clock_offset_s`` is display/diagnostic metadata.
+    """
     stamp = getattr(getattr(msg, 'header', None), 'stamp', None)
     timestamp = finite(stamp.to_sec()) if hasattr(stamp, 'to_sec') else None
     now = time.time()
@@ -27,12 +35,23 @@ def navsat_position(msg, ros_now=None):
         'alt': finite(getattr(msg, 'altitude', None)),
         'fix_status': getattr(getattr(msg, 'status', None), 'status', -1),
         'gps_timestamp': timestamp,
-        'source_age_at_receive_s': (ros_now - timestamp
-                                    if ros_now is not None and timestamp is not None else None),
+        'header_clock_offset_s': (now - timestamp if timestamp is not None else None),
         'received_at': now,
         'received_monotonic': time.monotonic(),
         'position_source': 'gps',
     }
+
+
+def position_local_age_s(position, now=None):
+    """Raw local receive age in seconds; None when receive time is missing.
+
+    May be negative when the receive stamp is in the future (clock anomaly);
+    callers decide how to classify that case.
+    """
+    received = finite((position or {}).get('received_monotonic'))
+    if received is None:
+        return None
+    return (time.monotonic() if now is None else now) - received
 
 
 def freeze_position(position, max_age_s=2.0, simulated=False):
@@ -45,17 +64,17 @@ def freeze_position(position, max_age_s=2.0, simulated=False):
     else:
         if finite(p.get('fix_status')) is None or p['fix_status'] < 0:
             raise ValueError('gps_no_fix')
-        stamp = finite(p.get('gps_timestamp'))
-        received = finite(p.get('received_monotonic'))
-        source_age = finite(p.get('source_age_at_receive_s'))
-        if stamp is None or stamp <= 0 or received is None or source_age is None:
-            raise ValueError('gps_missing_timestamp')
-        elapsed = time.monotonic() - received
-        age = source_age + elapsed
+        # Hard freshness gate uses only the Jetson-local monotonic receive
+        # time. header.stamp belongs to the FCU/MAVROS clock domain and stays
+        # diagnostic-only; a wall-clock offset must not reject a fresh fix.
+        elapsed = position_local_age_s(p)
+        if elapsed is None:
+            raise ValueError('gps_missing_receive_time')
         limit = finite(max_age_s)
         limit = limit if limit is not None and limit > 0 else 2.0
-        if source_age < 0 or elapsed < 0 or not 0 <= age <= limit:
+        if elapsed < 0 or elapsed > limit:
             raise ValueError('gps_stale')
+        age = elapsed
     p.update(lat=lat, lon=lon, lng=lon, position_age_s=age,
              position_source='lab_sim' if simulated else 'gps')
     return p

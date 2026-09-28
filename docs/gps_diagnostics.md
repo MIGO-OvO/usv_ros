@@ -44,7 +44,7 @@ MAVROS connected 独立显示；状态消息超过 3 秒显示未知/已过期�
 
 `global_position` 是直接 GLOBAL_POSITION_INT，`navsat` 是 MAVROS NavSatFix，避免混淆不同源和高度基准。缺失测量为 null；卫星 255、DOP 65535、精度 0 等未知哨兵不伪装成测量值。age 使用同一 Jetson 启动周期的单调时钟，Unix 接收时间仅用于显示。原始帧 age 是消息接收年龄，不是独立 GNSS 测量时间证明。
 
-`sampling_position` 原样执行 `freeze_position()`，保留 `gps_missing`、`gps_no_fix`、`gps_stale`、`gps_invalid_coordinates`、`gps_missing_timestamp` 语义。它不使用诊断坐标替代采样坐标。Web 现有显式台架 `require_gps=false` 豁免保留，默认开启 GPS 要求，不影响 FCU 航点准入；无定位台架记录不进入地图。
+`sampling_position` 原样执行 `freeze_position()`，保留 `gps_missing`、`gps_no_fix`、`gps_stale`、`gps_invalid_coordinates`、`gps_missing_receive_time` 语义。采样新鲜度的唯一硬门控是 Jetson 本地单调接收时钟（`received_monotonic`）：`header.stamp` 属于 FCU/MAVROS 时钟域，与 Jetson 墙钟未证明同步，因此只写入记录与诊断（`header_clock_offset_s`），偏差超过 2 秒仅产生告警，不再单独作为 `gps_stale` 依据。它不使用诊断坐标替代采样坐标。Web 现有显式台架 `require_gps=false` 豁免保留，默认开启 GPS 要求，不影响 FCU 航点准入；无定位台架记录不进入地图。
 
 地图准入更保守：严格 NavSatFix 校验 + 新鲜有效原始3D Fix + FCU heartbeat。无效消息不更新当前位置、不追加 live track；保留的点明确显示“最后有效 GPS 位置”和 age。Lab 模拟位置继续走独立既有路径。
 
@@ -53,7 +53,7 @@ MAVROS connected 独立显示；状态消息超过 3 秒显示未知/已过期�
 1. 无 GPS_RAW_INT 但有全局坐标：橙色缺失，不能显示 GPS 正常。
 2. fix_type=1、SAT=0：黄色未定位；3D + 合法坐标：绿色；2D、DGPS、RTK 分别标注。
 3. MAVROS 断开而 FCU 心跳持续：FCU 正常 / MAVROS 异常；FCU 心跳停止超过 3 秒：红色。
-4. NavSatFix status=-1、陈旧、无时间戳、越界：不移动地图，不追加轨迹，不放宽严格采样校验。
+4. NavSatFix status=-1、本地接收超时、接收时间缺失、越界：不移动地图，不追加轨迹，不放宽严格采样校验；header.stamp 偏差不拒绝新鲜定位，仅显示诊断告警。
 5. GPS_RAW_INT 停止超过默认 2 秒：过期；bridge 停止时 Web 仍按缓存原接收时间判旧。
 6. 恢复有效数据后地图继续更新；确认任务控制、USV_DONE 闭环及 Lab 模拟无回归。
 
