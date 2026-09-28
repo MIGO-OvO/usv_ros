@@ -62,3 +62,13 @@ MAVROS connected 独立显示；状态消息超过 3 秒显示未知/已过期�
 M9 FIX 灯、天线馈电/接头、遮挡、多路径、模块硬件故障仍需现场核对。软件可定位到链路/配置/原始数据/Fix/融合/采样层，但不能远程证明天线正常。固件版本不可用不阻塞页面。
 
 离线复现：`python -m unittest discover -s tests -p test_gps_diagnostics.py`；UI 合成数据：`python tests/gps_diagnostics_fixture_server.py`，仅监听 `127.0.0.1:5087`，不连接硬件。
+
+## 本次验证（Windows，2026-09-28）
+
+- GNSS 专项 17 项通过：A–F、错误来源心跳过滤、参数未知/陈旧、未知哨兵、版本解码、严格采样拒绝原因、地图门控和既有 bridge TCP 接入。
+- 回归：524 passed、1 skipped、90 subtests passed；4 deselected 分别为以下两项环境限制和两项既有失败。没有宣称全量零失败。
+- Windows Bash/WSL 调用挂起：`test_addr_skips_jetson_usb_and_docker_bridge_addresses`、`test_status_flags_internet_wifi_band_mismatch`。按用户要求跳过，留待 Jetson 验证。
+- 既有失败：`test_web_map_config_serves_offline_tile_proxy_without_amap_key` 仍预期 amap，当前主干实现是 google；`test_frontend_declares_runnable_map_smoke_script` 仍断言已不存在的 `MAP_TILE_NATIVE_MAX_ZOOM = 18`。首次回归已实际运行并确认失败，与本次 GPS 修改无关，未改动底图实现或削弱断言。
+- `npm run build` 通过；`npm run lint` 无错误、2 条既有 Hook 警告；前端 automation-controls / lab-coordinates / time-series 共 23 项通过。build 保留既有 bundle-size 和 Browserslist 提示。
+- Python compileall 通过；390px 手机与 1366px 桌面浏览器验证未见横向溢出，原始帧缺失时即使显示融合坐标仍明确橙色告警，详情可展开。
+- 真实 ROS、router 串口链路、MAVROS 断连恢复、M9 卫星捕获/天线及在航采样闭环尚未实机验证。
