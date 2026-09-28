@@ -8,7 +8,7 @@
 
 飞控需更新为采样超时默认 HOLD、支持 `USV_FAIL` 的匹配版本。22 个显示遥测名称及 31010..31019 命令号不变；分光超过 2 秒未更新时置无效。`USV_DONE/USV_FAIL` 尚无端到端 ACK 或跨飞控重启会话保证，不能以本地发送成功当作船态证明。
 
-远程 API 写操作默认关闭。设置进程环境 `USV_WEB_CONTROL_TOKEN`（至少 16 字符）后支持 Bearer 认证或 HTTP Basic（用户名 `operator`，密码为令牌）；浏览器先访问 `/api/control/auth`。不把令牌保存到源码或配置 JSON；非可信网络必须使用 HTTPS/VPN。配置令牌后本机写操作也须认证；跨源写请求默认拒绝。
+船载热点/LAN 的 API 写操作默认无需登录，现有前端可直接进行分光、泵控和自动采样；跨源/跨站写请求仍拒绝。仅设置进程环境 `USV_WEB_REQUIRE_AUTH=1` 才启用认证，并必须同时配置 `USV_WEB_CONTROL_TOKEN`（至少 16 字符，否则服务拒绝启动）；仅设置 token 不启用认证。认证模式下本机和远程写操作均需 Bearer 或 HTTP Basic（用户名 `operator`，密码为令牌），浏览器先访问 `/api/control/auth`。环境变更后重启 Web 服务。不把令牌保存到源码或配置 JSON。默认模式下任何可达客户端都可调用控制 API，同源检查不能替代身份认证；非可信网络应启用认证并通过 HTTPS/VPN 和网络访问隔离保护。
 
 安全测试：`python -B -m unittest discover -s tests -p 'test_system_safety_contract.py'`、`test_sampling_context_contract.py`、`test_web_control_access.py`；完整验收与整船版本检查见总仓库 `docs/current/70_verification.md`。
 
