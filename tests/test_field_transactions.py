@@ -129,6 +129,37 @@ class FieldTransactionTests(unittest.TestCase):
         self.assertFalse(worker.is_alive())
         self.assertFalse(ports[1].is_open)
 
+    def test_keepalive_continues_while_ack_awaits_delayed_firmware_reply(self):
+        """I2CMAP/ADSCFG ACK waits must not starve the hardware watchdog lease."""
+        ports = self.serial_environment()
+        self.node._apply_runtime_configuration = Mock()
+        self.assertTrue(self.node.connect())
+        self.assertTrue(ports[0].wait_keepalives(1))
+        baseline = len(ports[0].keepalives())
+
+        released = threading.Event()
+
+        def late_reply():
+            time.sleep(1.0)
+            self.node._on_text_received(MAP_ACK)
+            released.set()
+
+        acker = threading.Thread(target=late_reply, daemon=True)
+        acker.start()
+        try:
+            started = time.monotonic()
+            ok, _ = self.node._send_and_wait_text(
+                'I2CMAP:X=0,Y=3,Z=4,A=7,SPEC=2', ('I2CMAP_OK:',), ('I2CMAP_ERR:',), timeout=3.0)
+            elapsed = time.monotonic() - started
+        finally:
+            released.set()
+            acker.join(3)
+
+        self.assertTrue(ok)
+        self.assertGreaterEqual(elapsed, 0.9)
+        # Keepalives kept flowing during the ACK wait window.
+        self.assertTrue(ports[0].wait_keepalives(baseline + 2, 1.0))
+
     def test_watchdog_trip_never_rearms_or_restores_output(self):
         ports = self.serial_environment()
         self.node._apply_runtime_configuration = Mock()
