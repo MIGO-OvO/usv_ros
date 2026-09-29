@@ -6106,6 +6106,7 @@ class WebConfigServer(object):
                 "success": True,
                 "data": {
                     "latest": self.latest_system_health,
+                    "automation": self.latest_automation_status,
                     "history": self.system_health_history,
                     "realtime": self._realtime_stats_snapshot(),
                 }
@@ -6119,6 +6120,7 @@ class WebConfigServer(object):
                 "mavros_state": self._mavros_state,
                 "bridge_latest": self._bridge_diag,
                 "system_health_latest": self.latest_system_health,
+                "automation_latest": self.latest_automation_status,
                 "realtime": self._realtime_stats_snapshot(),
                 "bridge_history": self._diag_history,
                 "link_events": self._link_events,
