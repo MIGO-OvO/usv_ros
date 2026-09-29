@@ -248,6 +248,25 @@ class AutomationEngine(object):
             self._pending_pid_motors.discard(motor)
             self._pid_complete_event.set()
 
+    def notify_pid_failed(self, motor, reason_text):
+        """
+        通知 PID 失败/超时 (由外部调用)。
+
+        PID_DONE 表示成功；PID_TIMEOUT / PID_FAIL 是固件给出的失败信号，
+        必须终止当前自动化并记录原因，不允许静默当作完成继续流程。
+
+        Args:
+            motor: 失败的电机名称
+            reason_text: 'pid_timeout' 或 'pid_fail'
+        """
+        if not self._running.is_set():
+            return
+        self._pending_pid_motors.discard(motor)
+        self._pid_complete_event.set()
+        self._handle_error(
+            "PID 电机 {} 固件报告异常: {}".format(motor, reason_text)
+        )
+
     def get_status(self):
         """
         获取当前状态。

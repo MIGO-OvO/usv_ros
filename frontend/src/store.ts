@@ -192,6 +192,14 @@ interface StatusPayload {
   automation_total?: number
   current_loop?: number
   total_loops?: number
+  terminal_reason?: string | null
+  last_error?: string
+  controller_fault?: string | null
+  spectrometer_state?: string
+  spectrometer_last_txn_error?: string | null
+  spectrometer_age_s?: number | null
+  owner_age_s?: number | null
+  serial_connected?: boolean
 }
 
 const MAX_HISTORY_POINTS = 200_000
@@ -246,6 +254,12 @@ interface AppState {
   currentLoop: number
   totalLoops: number
   missionStatus: string
+  automationTerminalReason: string | null
+  automationLastError: string
+  automationControllerFault: string | null
+  automationSpectroState: string | null
+  automationSpectroAgeS: number | null
+  automationOwnerAgeS: number | null
   pumpAngles: PumpAngles
   rawAngles: PumpAngles
   angleTelemetry: AngleTelemetry
@@ -332,6 +346,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   currentLoop: 0,
   totalLoops: 0,
   missionStatus: 'IDLE',
+  automationTerminalReason: null,
+  automationLastError: '',
+  automationControllerFault: null,
+  automationSpectroState: null,
+  automationSpectroAgeS: null,
+  automationOwnerAgeS: null,
   pumpAngles: DEFAULT_ANGLES,
   rawAngles: DEFAULT_ANGLES,
   angleTelemetry: DEFAULT_ANGLE_TELEMETRY,
@@ -482,6 +502,12 @@ export const useAppStore = create<AppState>((set, get) => ({
         totalLoops: data.total_loops ?? 0,
         missionStatus: data.mission_status || 'IDLE',
         spectrometerStatus: data.spectrometer_status || 'idle',
+        automationTerminalReason: data.terminal_reason ?? null,
+        automationLastError: data.last_error || '',
+        automationControllerFault: data.controller_fault ?? null,
+        automationSpectroState: data.spectrometer_state ?? null,
+        automationSpectroAgeS: data.spectrometer_age_s ?? null,
+        automationOwnerAgeS: data.owner_age_s ?? null,
       })
     })
 

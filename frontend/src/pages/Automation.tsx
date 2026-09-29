@@ -79,11 +79,26 @@ const normalizeSteps = (rawSteps?: Partial<Step>[]): Step[] =>
   Array.isArray(rawSteps) ? rawSteps.map((step) => normalizeStep(step)) : []
 
 export default function Automation() {
-  const { automationRunning, automationPaused, automationStep, automationTotal, currentLoop, totalLoops } = useAppStore()
+  const {
+    automationRunning,
+    automationPaused,
+    automationStep,
+    automationTotal,
+    currentLoop,
+    totalLoops,
+    automationTerminalReason,
+    automationLastError,
+    automationControllerFault,
+    automationSpectroState,
+    automationSpectroAgeS,
+    automationOwnerAgeS,
+  } = useAppStore()
   const automationState = { running: automationRunning, paused: automationPaused }
   const controls = getAutomationControlAvailability(automationState)
   const [steps, setSteps] = useState<Step[]>([])
   const [loopCount, setLoopCount] = useState(1)
+  // 服务器持久化 policy：初始 true 仅是 HTML 首帧兜底，fetchConfig 会立即
+  // 用 GET /api/config 的 automation_policy.require_gps 覆盖。
   const [requireGps, setRequireGps] = useState(true)
   const [pumpSettings, setPumpSettings] = useState<PumpSettings>({ ...DEFAULT_PUMP_SETTINGS })
   const [presetName, setPresetName] = useState('')
@@ -99,6 +114,9 @@ export default function Automation() {
       if (data.sampling_sequence) {
         setSteps(normalizeSteps(data.sampling_sequence.steps))
         setLoopCount(data.sampling_sequence.loop_count ?? 1)
+      }
+      if (data.automation_policy) {
+        setRequireGps(data.automation_policy.require_gps ?? true)
       }
       if (data.pump_settings) {
         const policy = data.pump_settings.injection_pump_policy || {}
@@ -118,6 +136,20 @@ export default function Automation() {
       }
     } catch (error) {
       console.error(error)
+    }
+  }
+
+  const persistRequireGps = async (next: boolean) => {
+    setRequireGps(next)
+    try {
+      await fetch('/api/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ automation_policy: { require_gps: next } }),
+      })
+    } catch (error) {
+      console.error(error)
+      toast({ title: 'GPS 策略保存失败', description: '已切换本页状态，但服务器持久化失败', variant: 'destructive' })
     }
   }
 
@@ -286,6 +318,29 @@ export default function Automation() {
     setSteps(newSteps)
   }
 
+  const TERMINAL_REASON_TEXT: Record<string, string> = {
+    completed: '任务全部完成',
+    operator_stop: '操作员手动停止',
+    operator_pause: '操作员暂停',
+    pid_timeout: 'PID 等待超时',
+    pid_fail: 'PID 执行失败',
+    spectrometer_start_failed: '分光仪启动失败',
+    spectrometer_frame_timeout: '分光启动后未收到有效数据帧',
+    spectrometer_stale: '分光数据超时',
+    watchdog_tripped: 'ESP32 硬件看门狗触发',
+    owner_lost: '控制所有权心跳丢失',
+    serial_disconnected: '检测装置串口断开',
+    controller_fault: '控制器故障',
+    configuration_failed: '任务配置无效',
+    cleanup_failed: '停止清理失败（泵可能仍在运行，请检查）',
+    unknown_error: '未知错误',
+  }
+  const idle = !automationRunning && !automationPaused
+  const showTerminal = idle && Boolean(automationTerminalReason)
+  const terminalTitle =
+    automationTerminalReason === 'completed' ? '任务已完成' : '任务已停止'
+  const terminalVariantOk = automationTerminalReason === 'completed'
+
   return (
     <div className="p-4 md:p-8 space-y-6 max-w-7xl mx-auto pb-32">
       <header className="flex flex-col md:flex-row md:items-center justify-between gap-4">
@@ -322,6 +377,46 @@ export default function Automation() {
         </div>
       </header>
 
+      {showTerminal && (
+        <Card className={terminalVariantOk ? 'border-emerald-500/40' : 'border-amber-500/50'}>
+          <CardContent className="py-4 space-y-2">
+            <div className="flex items-center gap-2">
+              <span
+                className={
+                  terminalVariantOk
+                    ? 'text-sm font-semibold text-emerald-500'
+                    : 'text-sm font-semibold text-amber-500'
+                }
+              >
+                {terminalTitle}
+              </span>
+              <span className="text-sm">
+                原因：{TERMINAL_REASON_TEXT[automationTerminalReason || ''] || automationTerminalReason}
+              </span>
+            </div>
+            {automationLastError && (
+              <p className="text-xs text-muted-foreground break-all">错误详情：{automationLastError}</p>
+            )}
+            <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted-foreground">
+              {(automationStep > 0 || automationTotal > 0) && (
+                <span className="tabular-nums">步骤：{automationStep} / {automationTotal}</span>
+              )}
+              {totalLoops > 0 && (
+                <span className="tabular-nums">循环：{currentLoop} / {totalLoops === 0 ? '∞' : totalLoops}</span>
+              )}
+              {automationSpectroState && <span>分光状态：{automationSpectroState}</span>}
+              {typeof automationSpectroAgeS === 'number' && (
+                <span className="tabular-nums">最后有效分光数据：{automationSpectroAgeS.toFixed(1)} 秒前</span>
+              )}
+              {typeof automationOwnerAgeS === 'number' && (
+                <span className="tabular-nums">最后心跳：{automationOwnerAgeS.toFixed(1)} 秒前</span>
+              )}
+              {automationControllerFault && <span>控制器故障：{automationControllerFault}</span>}
+            </div>
+          </CardContent>
+        </Card>
+      )}
+
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(18rem,22rem)_minmax(0,1fr)] xl:items-start">
         <div className="space-y-6">
           <Card className="h-fit">
@@ -332,12 +427,12 @@ export default function Automation() {
               <div className="space-y-2">
                 <div className="flex items-center justify-between gap-3">
                   <Label htmlFor="require-gps">启动时要求 GPS</Label>
-                  <Switch id="require-gps" checked={requireGps} onCheckedChange={setRequireGps}
+                  <Switch id="require-gps" checked={requireGps} onCheckedChange={(v) => void persistRequireGps(v)}
                     disabled={automationRunning || automationPaused} aria-describedby="require-gps-help" />
                 </div>
                 <p id="require-gps-help" className="text-xs text-muted-foreground">
                   {requireGps ? '启动前校验有效定位；室内台架测试可关闭。' : '室内测试：允许无 GPS 执行真实泵控；无定位记录不进入地图。'}
-                  仅本页启动生效，刷新后恢复开启；不改变航点采样限制。
+                  该开关为服务器持久化配置，切换页面、刷新或重启后仍保持；不改变航点采样限制。
                 </p>
               </div>
               <div className="space-y-2">

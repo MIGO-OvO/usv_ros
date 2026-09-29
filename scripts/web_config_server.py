@@ -1584,6 +1584,12 @@ DEFAULT_CONFIG = {
     "sampling": {
         "sample_timeout_s": 0.0
     },
+    "automation_policy": {
+        # Web 自动化启动默认是否要求有效 GPS 定位。
+        # 服务器持久化：页面切换/刷新/服务重启后仍保持；单次启动可用
+        # /api/mission/start 的 require_gps 字段显式覆盖本默认值。
+        "require_gps": True
+    },
     "mapping_profile": copy.deepcopy(DEFAULT_MAPPING_PROFILE),
     "detection_settings": {
         "duration": 5.0,
@@ -1794,6 +1800,14 @@ class ConfigManager(object):
         return normalize_pollution_metric_config(data)
 
     @staticmethod
+    def _normalize_automation_policy(data):
+        """Normalize the persisted web automation policy (require_gps default)."""
+        normalized = dict(DEFAULT_CONFIG.get('automation_policy', {}))
+        raw = data if isinstance(data, dict) else {}
+        normalized['require_gps'] = bool(raw.get('require_gps', True))
+        return normalized
+
+    @staticmethod
     def _normalize_mapping_profile(data):
         return normalize_mapping_profile_config(data)
 
@@ -1854,6 +1868,9 @@ class ConfigManager(object):
             self.config['lab_mode'] = self._normalize_lab_mode(
                 self.config.get('lab_mode', {})
             )
+            self.config['automation_policy'] = self._normalize_automation_policy(
+                self.config.get('automation_policy', {})
+            )
             self._migrate_legacy_hardware_defaults()
             self.config['updated_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(self.config_file, 'w', encoding='utf-8') as f:
@@ -1907,6 +1924,9 @@ class ConfigManager(object):
         self.config['lab_mode'] = self._normalize_lab_mode(
             self.config.get('lab_mode', {})
         )
+        self.config['automation_policy'] = self._normalize_automation_policy(
+            self.config.get('automation_policy', {})
+        )
 
     @staticmethod
     def _same_persisted_lab_config(left, right):
@@ -1959,6 +1979,9 @@ class ConfigManager(object):
         self.config['lab_mode'] = self._normalize_lab_mode(
             self.config.get('lab_mode', {})
         )
+        self.config['automation_policy'] = self._normalize_automation_policy(
+            self.config.get('automation_policy', {})
+        )
         return self.save()
 
     def get(self):
@@ -1985,6 +2008,9 @@ class ConfigManager(object):
         )
         config['lab_mode'] = self._normalize_lab_mode(
             config.get('lab_mode', {})
+        )
+        config['automation_policy'] = self._normalize_automation_policy(
+            config.get('automation_policy', {})
         )
         return config
 
@@ -5059,6 +5085,7 @@ class WebConfigServer(object):
                 "pump_settings": config.get("pump_settings", {}),
                 "sampling_sequence": config.get("sampling_sequence", {}),
                 "waypoint_sampling": config.get("waypoint_sampling", {}),
+                "automation_policy": config.get("automation_policy", {}),
             }
             return Response(
                 json.dumps(export_data, ensure_ascii=False, indent=2),
@@ -5083,6 +5110,8 @@ class WebConfigServer(object):
                 patch['sampling_sequence'] = data['sampling_sequence']
             if 'waypoint_sampling' in data and isinstance(data['waypoint_sampling'], dict):
                 patch['waypoint_sampling'] = ConfigManager._normalize_waypoint_sampling(data['waypoint_sampling'])
+            if 'automation_policy' in data and isinstance(data['automation_policy'], dict):
+                patch['automation_policy'] = ConfigManager._normalize_automation_policy(data['automation_policy'])
 
             if not patch:
                 return jsonify({"success": False, "message": "未找到可导入的配置字段"}), 400
@@ -6187,10 +6216,14 @@ class WebConfigServer(object):
                         return jsonify(success=False, message='Sampling already active'), 409
                     previous_context = dict(self._sampling_context)
                     acquisition = {'source': 'web'}
+                    # 持久化配置提供默认 policy；请求 payload 里的 require_gps
+                    # 是本次任务的显式覆盖值，两份配置职责不同。
+                    automation_policy = self.config_manager.get().get('automation_policy', {})
+                    default_require_gps = bool(automation_policy.get('require_gps', True))
                     try:
                         bind_web_context(acquisition, self._latest_real_gps,
                                          rospy.get_param('/mavlink_trigger_node/sampling_max_position_age_s', 2.0),
-                                         require_gps=request_data.get('require_gps', True))
+                                         require_gps=request_data.get('require_gps', default_require_gps))
                     except ValueError as exc:
                         return jsonify(success=False, message=str(exc)), 409
                     sampling_sequence = request_data.get('sampling_sequence')
@@ -6309,18 +6342,31 @@ class WebConfigServer(object):
         self._add_log("配置已发送到控制节点")
         return steps_data
 
+    def _owner_heartbeat_loop(self):
+        """独立线程：持续为当前 web attempt 续约 sampling owner lease。
+
+        与 socket 推送/UI 广播分离，避免 emit 抖动或 GIL 争用导致假 owner_lost。
+        不依赖浏览器当前所在页面，也不依赖 HTTP 请求线程。
+        """
+        while not rospy.is_shutdown():
+            try:
+                if (not self.standalone and self._web_attempt_id
+                        and (self.automation_running or self.automation_paused)):
+                    owner = String()
+                    owner.data = json.dumps({'attempt_id': self._web_attempt_id})
+                    self.owner_pub.publish(owner)
+            except Exception as exc:  # pragma: no cover - defensive
+                rospy.logwarn("Owner heartbeat publish failed: %s", exc)
+            threading.Event().wait(0.5)
+
     def _data_push_loop(self):
         """后台线程：定时推送实时数据"""
         rate = 2 # Hz
         while not rospy.is_shutdown():
             self._expire_spectrometer_measurement()
-            if (not self.standalone and self._web_attempt_id
-                    and (self.automation_running or self.automation_paused)):
-                owner = String()
-                owner.data = json.dumps({'attempt_id': self._web_attempt_id})
-                self.owner_pub.publish(owner)
             if self.socketio:
                 automation = self.latest_automation_status if isinstance(self.latest_automation_status, dict) else {}
+                failure = automation.get("failure") if isinstance(automation.get("failure"), dict) else {}
                 self.socketio.emit('status', {
                     "pump_connected": self.pump_connected,
                     "automation_running": self.automation_running,
@@ -6331,6 +6377,16 @@ class WebConfigServer(object):
                     "automation_total": automation.get("automation_total", 0),
                     "current_loop": automation.get("current_loop", 0),
                     "total_loops": automation.get("total_loops", 0),
+                    # Terminal diagnostics: the Web UI shows why a task ended
+                    # without requiring SSH access to the Jetson.
+                    "terminal_reason": automation.get("terminal_reason"),
+                    "last_error": automation.get("last_error") or failure.get("reason") or "",
+                    "controller_fault": automation.get("controller_fault"),
+                    "spectrometer_state": automation.get("spectrometer_state"),
+                    "spectrometer_last_txn_error": automation.get("spectrometer_last_txn_error"),
+                    "spectrometer_age_s": automation.get("spectrometer_age_s"),
+                    "owner_age_s": automation.get("owner_age_s"),
+                    "serial_connected": automation.get("serial_connected"),
                 })
                 self.latest_angle_telemetry = self._build_angle_telemetry(self.latest_angle_telemetry)
                 self.socketio.emit('manual_status', self.manual_status)
@@ -6448,6 +6504,11 @@ class WebConfigServer(object):
         data_thread = threading.Thread(target=self._data_push_loop)
         data_thread.daemon = True
         data_thread.start()
+
+        # 独立的 owner lease 心跳线程：与 UI 推送解耦，保障自动化不被误停
+        owner_thread = threading.Thread(target=self._owner_heartbeat_loop, name='WebOwnerHeartbeat')
+        owner_thread.daemon = True
+        owner_thread.start()
 
         realtime_thread = threading.Thread(target=self._realtime_flush_loop)
         realtime_thread.daemon = True

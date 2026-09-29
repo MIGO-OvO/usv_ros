@@ -92,6 +92,26 @@ SPECTRO_STATUS_TEST = 0x10
 # 原始分光帧的最小上行频率。前端聚合输出可更低，但落盘链路不得低于此值。
 MIN_RAW_RECORD_HZ = 20
 
+# 统一 terminal reason 枚举：自动化任务结束的唯一权威原因来源。
+# completed 仅由引擎正常跑完触发；其余终止路径都必须给出对应 reason。
+TERMINAL_REASONS = {
+    'completed',
+    'operator_stop',
+    'operator_pause',
+    'pid_timeout',
+    'pid_fail',
+    'spectrometer_start_failed',
+    'spectrometer_frame_timeout',
+    'spectrometer_stale',
+    'watchdog_tripped',
+    'owner_lost',
+    'serial_disconnected',
+    'controller_fault',
+    'configuration_failed',
+    'cleanup_failed',
+    'unknown_error',
+}
+
 DEFAULT_I2C_MAPPING = {
     "angles": {"X": 0, "Y": 3, "Z": 4, "A": 7},
     "spectro_channel": 2,
@@ -509,6 +529,10 @@ class PumpControlNode(object):
         self._owner_last_seen = None
         self._configuration_ready = False
         self._last_automation_status_text = 'idle'
+        # Unified terminal reason: the authoritative cause of the last
+        # automation termination. Never guess from status text.
+        self._terminal_reason = None
+        self._terminal_reason_at = None
 
         # 指令生成器
         self.command_generator = CommandGenerator()
@@ -748,6 +772,8 @@ class PumpControlNode(object):
                 self._last_control_keepalive = time.monotonic()
             except (serial.SerialException, OSError) as exc:
                 self._controller_fault = self._controller_fault or 'disconnected'
+                if self._automation_is_active():
+                    self._set_terminal_reason('serial_disconnected')
                 rospy.logwarn('Watchdog keepalive failed: %s', exc)
                 return
             finally:
@@ -759,6 +785,8 @@ class PumpControlNode(object):
         self._controller_fault = 'disconnected'
         self._publish_status("error: " + str(error))
         self._invalidate_spectro('disconnected')
+        if self._automation_is_active():
+            self._set_terminal_reason('serial_disconnected')
         threading.Thread(target=self._reconnect_after_reader_error, daemon=True).start()
 
     def _reconnect_after_reader_error(self):
@@ -1719,6 +1747,7 @@ class PumpControlNode(object):
             self._controller_fault = 'watchdog_tripped'
             self._invalidate_spectro('watchdog_tripped')
             if self._automation_is_active():
+                self._set_terminal_reason('watchdog_tripped')
                 self._auto_stop_callback(None)
             return
         # Publish the ACK line to a pending verified configuration transaction.
@@ -1825,6 +1854,8 @@ class PumpControlNode(object):
             return
 
         # 检查 PID 完成/超时/失败消息（固件是 PID 完成的唯一权威来源）
+        # 语义契约：PID_DONE=success；PID_TIMEOUT/PID_FAIL=automation failure。
+        # 后两者绝不能当作 motor complete 继续流程。
         if text.startswith("PID_DONE:"):
             # 格式: PID_DONE:X,abs=360.0,err=0.05
             try:
@@ -1846,7 +1877,7 @@ class PumpControlNode(object):
                 motor = parts[0].strip()
                 if motor in MOTOR_NAMES:
                     rospy.logwarn("[PID] 固件报告超时: %s", info)
-                    self._notify_pid_complete(motor)
+                    self._on_pid_failure(motor, 'pid_timeout', info)
             except Exception as e:
                 rospy.logwarn("[PID] 解析 PID_TIMEOUT 失败: %s (%s)", text, e)
             return
@@ -1854,10 +1885,10 @@ class PumpControlNode(object):
         if text.startswith("PID_FAIL:"):
             try:
                 info = text.replace("PID_FAIL:", "")
-                motor = info.split("=")[0].strip() if "=" in info else info.strip()
+                motor = info.split(",")[0].split("=")[0].strip()
                 if motor in MOTOR_NAMES:
                     rospy.logerr("[PID] 固件报告失败: %s", info)
-                    self._notify_pid_complete(motor)
+                    self._on_pid_failure(motor, 'pid_fail', info)
             except Exception as e:
                 rospy.logwarn("[PID] 解析 PID_FAIL 失败: %s (%s)", text, e)
             return
@@ -1906,6 +1937,26 @@ class PumpControlNode(object):
         msg.data = motor
         self.pid_complete_pub.publish(msg)
         rospy.loginfo("PID complete: %s", motor)
+
+    def _on_pid_failure(self, motor, reason, info):
+        """固件报告 PID 超时/失败：终止自动化并记录统一 terminal reason。
+
+        该回调在串口 reader 线程触发；引擎的失败路径（_handle_error）不拿
+        _control_lock，不会与停止请求死锁。
+        """
+        self._set_terminal_reason(reason)
+        if self._automation_is_active():
+            self.automation_engine.notify_pid_failed(motor, reason)
+        else:
+            rospy.logwarn("[PID] %s (%s) reported while automation inactive", reason, info)
+
+    def _set_terminal_reason(self, reason):
+        """记录统一 terminal reason；重复调用保留首次（根因优先）。"""
+        if reason not in TERMINAL_REASONS:
+            reason = 'unknown_error'
+        if self._terminal_reason is None:
+            self._terminal_reason = reason
+            self._terminal_reason_at = time.time()
 
 
     def _on_spectro_received(self, data):
@@ -1958,12 +2009,19 @@ class PumpControlNode(object):
 
     def _check_spectro_freshness(self):
         # A START ACK can age out startup, but cannot make a measurement fresh.
+        # Startup (ACK received, no valid frame yet) and runtime acquisition
+        # silence are two distinct states with two distinct terminal reasons.
         freshness_at = (self._spectro_start_ack_at if self.spectro_state == 'starting'
                         else self._last_valid_spectro_at)
         if freshness_at is not None and time.monotonic() - freshness_at > self.measurement_timeout:
+            if self.spectro_state == 'starting':
+                reason = 'spectrometer_frame_timeout'
+            else:
+                reason = 'spectrometer_stale'
             self.spectro_state = 'stale'
             self._invalidate_spectro('stale')
             if self._automation_is_active() and self.spectro_config.get('enabled', True):
+                self._set_terminal_reason(reason)
                 self._auto_stop_callback(None)
 
     def _owner_heartbeat_cb(self, msg):
@@ -1982,6 +2040,8 @@ class PumpControlNode(object):
                     and self._owner_last_seen is not None
                     and time.monotonic() - self._owner_last_seen > 5.0):
                 self._controller_fault = 'owner_lost'
+                if self._automation_is_active():
+                    self._set_terminal_reason('owner_lost')
                 self._auto_stop_callback(None)
                 self._publish_automation_status('owner_lost')
 
@@ -2582,6 +2642,9 @@ class PumpControlNode(object):
                 "real_propulsion_enabled": bool(lab_options.get("real_propulsion_enabled", False)),
             }
             self.last_automation_failure = {}
+            # Fresh configuration for a new attempt: reset the terminal reason.
+            self._terminal_reason = None
+            self._terminal_reason_at = None
             if self.lab_mode_enabled and self.lab_options["bypass_pid_wait"]:
                 pid_mode = False
 
@@ -2642,12 +2705,18 @@ class PumpControlNode(object):
 
         if step_count == 0:
             rospy.logwarn("Automation start rejected: no steps loaded")
+            self._set_terminal_reason('configuration_failed')
             return TriggerResponse(success=False, message="No automation steps loaded")
 
         if (not self._configuration_ready or self._owner_last_seen is None
                 or time.monotonic() - self._owner_last_seen > 5.0):
             return TriggerResponse(success=False, message='Fresh configuration with attempt_id and owner heartbeat required')
         self._configuration_ready = False
+        # New attempt: forget any terminal reason from the previous run so the
+        # Web UI never shows a stale cause.
+        self._terminal_reason = None
+        self._terminal_reason_at = None
+        self.last_automation_failure = {}
 
         rospy.loginfo("Automation start requested: %d steps, loop_count=%s, pid_mode=%s, pid_precision=%.3f",
                       step_count,
@@ -2660,6 +2729,7 @@ class PumpControlNode(object):
             rospy.loginfo("Automation engine thread started successfully")
             self._publish_automation_status("running")
         else:
+            self._set_terminal_reason('configuration_failed')
             rospy.logerr("Automation engine failed to start despite pre-check passing")
         return TriggerResponse(success=success, message=message)
 
@@ -2670,15 +2740,52 @@ class PumpControlNode(object):
     def _auto_stop_locked(self, req):
         """停止自动化服务回调。"""
         self._configuration_ready = False
-        rospy.loginfo("Automation stop requested")
+        # A stop without a pre-registered fault reason is an operator stop.
+        self._set_terminal_reason('operator_stop')
+        rospy.loginfo("Automation stop requested (terminal_reason=%s)", self._terminal_reason)
         if self.automation_engine.is_running() or self.automation_engine.is_paused():
             self.automation_engine.stop()
         success = self.stop_all_pumps()
         self._stop_injection_for_automation_policy()
         message = "Automation stopped and pumps halted" if success else "Automation stopped but pump halt failed"
+        if not success:
+            self._set_terminal_reason('cleanup_failed')
+        self._log_automation_terminal()
         self._publish_automation_status("stopped")
         self._publish_status('automation: stopped')
         return TriggerResponse(success=success, message=message)
+
+    def _log_automation_terminal(self):
+        """结构化输出自动化终止诊断，现场无需 SSH 即可从 Web 获得同样信息。"""
+        try:
+            engine_status = self.automation_engine.get_status()
+        except Exception:
+            engine_status = {}
+        now = time.monotonic()
+        spectro_age = (now - self._last_valid_spectro_at
+                       if self._last_valid_spectro_at is not None else None)
+        owner_age = (now - self._owner_last_seen
+                     if self._owner_last_seen is not None else None)
+        rospy.logwarn(
+            "[AUTOMATION TERMINAL] reason=%s attempt_id=%s source=%s "
+            "step=%s/%s loop=%s/%s pending_motors=%s spectro_state=%s "
+            "spectro_txn_phase=%s spectro_age=%s owner_age=%s "
+            "controller_fault=%s serial_connected=%s",
+            self._terminal_reason,
+            self.sampling_context.get('attempt_id'),
+            self.sampling_context.get('source', 'unknown'),
+            engine_status.get('current_step', 0),
+            engine_status.get('total_steps', 0),
+            engine_status.get('current_loop', 0),
+            engine_status.get('total_loops', 0),
+            sorted(engine_status.get('pending_motors', []) or []),
+            self.spectro_state,
+            self._spectro_txn_phase,
+            ("%.2fs" % spectro_age) if spectro_age is not None else "n/a",
+            ("%.2fs" % owner_age) if owner_age is not None else "n/a",
+            self._controller_fault,
+            bool(self.serial_conn and self.serial_conn.is_open),
+        )
 
     def _auto_pause_callback(self, req):
         """暂停自动化服务回调。"""
@@ -2734,9 +2841,14 @@ class PumpControlNode(object):
     def _on_automation_status(self, status):
         """自动化状态更新回调。"""
         rospy.loginfo("[Automation] 状态更新: %s", status)
+        status_lower = str(status or "").lower()
+        if "finish" in status_lower or "done" in status_lower:
+            # Engine finished all steps on its own: this is a success, distinct
+            # from an operator/safety stop.
+            self._set_terminal_reason('completed')
+            self._log_automation_terminal()
         self._publish_status("automation: " + status)
         self._publish_automation_status(status)
-        status_lower = str(status or "").lower()
         if (
             "finish" in status_lower
             or "done" in status_lower
@@ -2756,6 +2868,19 @@ class PumpControlNode(object):
             "spectrometer_state": self.spectro_state,
             "lab_mode": bool(self.lab_mode_enabled),
         }
+        # Classify the engine error into the unified terminal reason taxonomy.
+        #固件主动报告的 PID 失败已在 _on_pid_failure 设置 reason；这里兜底
+        # 处理引擎内部等待超时与发送失败。
+        if 'PID 等待超时' in error:
+            self._set_terminal_reason('pid_timeout')
+        elif '固件报告异常: pid_fail' in error:
+            self._set_terminal_reason('pid_fail')
+        elif '固件报告异常: pid_timeout' in error:
+            self._set_terminal_reason('pid_timeout')
+        elif ('发送失败' in error) or ('发送异常' in error) or ('发送指令异常' in error):
+            self._set_terminal_reason('controller_fault')
+        else:
+            self._set_terminal_reason('unknown_error')
         if "PID 等待超时" in error and self._current_auto_step:
             step = self._current_auto_step
             step_name = step.get("name", "未命名步骤")
@@ -2841,8 +2966,14 @@ class PumpControlNode(object):
         reported_loop = max(0, int(engine_status.get("current_loop", 0) or 0))
         if total_loops:
             reported_loop = min(reported_loop, total_loops)
+        now = time.monotonic()
+        spectro_age_s = (round(now - self._last_valid_spectro_at, 2)
+                         if self._last_valid_spectro_at is not None else None)
+        owner_age_s = (round(now - self._owner_last_seen, 2)
+                       if self._owner_last_seen is not None else None)
         payload = {
             "status": status_text,
+            "terminal_reason": self._terminal_reason,
             "sampling_context": dict(self.sampling_context),
             "sample_id": self.sampling_context.get('sample_id'),
             "source": self.sampling_context.get('source', 'unknown'),
@@ -2863,6 +2994,9 @@ class PumpControlNode(object):
             "spectrometer_txn_phase": self._spectro_txn_phase,
             "spectrometer_last_txn_error": self._last_spectro_txn_error,
             "spectrometer_cleanup_error": self._spectro_cleanup_error,
+            "spectrometer_age_s": spectro_age_s,
+            "owner_age_s": owner_age_s,
+            "serial_connected": bool(self.serial_conn and self.serial_conn.is_open),
         }
         msg = String()
         msg.data = json.dumps(payload, ensure_ascii=False)
