@@ -153,7 +153,7 @@ export function GpsStatusCard({ gps, failed, detailed = false }: {
               <li key={`${entry.received_at}-${index}`}><time>{date(entry.received_at)}</time> · {entry.text}</li>)}</ul> : <p>暂无日志</p>}
           </section>
           <p className="text-muted-foreground">此面板只读。缺少原始帧可能是接收机、配置或消息流问题；无法仅凭软件判断天线或硬件损坏。</p>
-          <p className="text-muted-foreground">显示层：超过后端新鲜度阈值的坐标标记为降级；超过 {Math.max(10, gps?.freshness_threshold_s ?? 2)} 秒不再用作主坐标。采样准入始终以服务器严格校验为准。</p>
+          <p className="text-muted-foreground">MAVROS 位置显示与采样准入分开判断；超过后端采样阈值（{(gps?.freshness_threshold_s ?? 2).toFixed(1)}s）的数据会标记为降级，采样准入始终以服务器严格校验为准。</p>
         </div>
       </div>}
     </CardContent>
