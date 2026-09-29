@@ -56,15 +56,15 @@ const reasonText: Record<string, string> = {
 function layerStatus(gps: Diagnostics | null) {
   const raw = gps?.gps_raw
   const navsat = gps?.navsat
-  const limit = Math.max(10, gps?.freshness_threshold_s ?? 2)
+  const limit = gps?.freshness_threshold_s ?? 2
   const ageText = (value: Maybe | undefined) =>
     typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(1)}s` : '—'
   const receiver = !raw?.available ? '未收到 GPS_RAW_INT'
     : raw.stale ? '原始 GNSS 遥测陈旧'
       : `${raw.fix_label || 'Unknown'} · ${num(raw.satellites, 0)} SAT · HDOP ${num(raw.hdop)}`
   const mavros = !navsat?.available ? '未收到 NavSatFix'
-    : (navsat.age_s ?? Infinity) > limit ? `NavSatFix 陈旧 · ${ageText(navsat.age_s)}`
-      : `正常 · ${ageText(navsat.age_s)}`
+    : `已接收 · age ${ageText(navsat.age_s)} · ${(navsat.age_s ?? Infinity) > limit
+      ? `超过采样阈值 ${limit.toFixed(1)}s` : `采样时效内（阈值 ${limit.toFixed(1)}s）`}`
   const sampling = !gps ? '未知'
     : gps.sampling_position.valid ? `可用于采样 · ${ageText(navsat?.age_s)}`
       : `不可用 · ${reasonText[gps.sampling_position.reason ?? ''] ?? gps.sampling_position.reason}`
@@ -126,7 +126,7 @@ export function GpsStatusCard({ gps, failed, detailed = false }: {
         <span className="font-medium" role="listitem">GPS Receiver</span>
         <span role="listitem" className={layer.receiver.includes('陈旧') || layer.receiver.includes('未收到') ? colors.orange : undefined}>{layer.receiver}</span>
         <span className="font-medium" role="listitem">MAVROS Position</span>
-        <span role="listitem" className={layer.mavros.includes('陈旧') || layer.mavros.includes('未收到') ? colors.orange : undefined}>{layer.mavros}</span>
+        <span role="listitem" className={layer.mavros.includes('超过采样阈值') || layer.mavros.includes('未收到') ? colors.orange : undefined}>{layer.mavros}</span>
         <span className="font-medium" role="listitem">Sampling GPS</span>
         <span role="listitem" className={layer.sampling.includes('不可用') ? colors.error : colors.success}>{layer.sampling}</span>
       </div>

@@ -484,13 +484,22 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
                 "health": {"code": 1, "level": "warn", "summary": "warm"},
             }
             server._system_health_cb(string_cls(json.dumps(payload)))
+            transaction = {
+                'spectrometer_txn_phase': 'frame_timeout',
+                'spectrometer_last_txn_error': 'no valid spectrometer frame after start',
+                'spectrometer_cleanup_error': 'ADS_ERR:I2C',
+            }
+            server._automation_status_cb(string_cls(json.dumps(transaction)))
             response = client.get("/api/diagnostics/system")
+            exported = client.get('/api/diagnostics/export').get_json()
 
         self.assertEqual(response.status_code, 200)
         body = response.get_json()
         self.assertTrue(body["success"])
         self.assertEqual(body["data"]["latest"]["health"]["summary"], "warm")
         self.assertEqual(body["data"]["history"][-1]["detector"]["heap_free"], 120000)
+        self.assertEqual(body['data']['automation'], transaction)
+        self.assertEqual(exported['automation_latest'], transaction)
         self.assertIn(("system_health", payload), server.socketio.events)
 
     def test_web_periodic_snapshot_does_not_emit_synthetic_voltage_sample(self):
@@ -3307,7 +3316,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         node.send_command = lambda cmd: True
         node._apply_i2c_mapping = lambda: True
         node._apply_spectro_config = lambda: True
-        node._wait_for_spectro_command_result = lambda timeout=2.0: (True, "ADS_OK:START")
+        node._send_and_wait_text = lambda *args, **kwargs: (True, "ADS_OK:START")
         node._wait_first_valid_spectro_frame = lambda timeout=2.0: True
 
         auto_response = node._auto_start_callback(None)
@@ -3876,13 +3885,14 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         node.inject_pump_speed = 0
         sent = []
         node.send_command = lambda cmd: sent.append(cmd) or True
-        node._wait_for_spectro_command_result = lambda timeout=2.0: (True, "ADS_OK:START")
         node._wait_first_valid_spectro_frame = lambda timeout=2.0: True
 
         def fake_send_and_wait(cmd, success_prefixes, error_prefixes, timeout=2.0):
             sent.append(cmd)
             if cmd.startswith("I2CMAP:"):
                 return True, "I2CMAP_OK:X=0,Y=3,Z=4,A=7,SPEC=2"
+            if cmd == "ADSSTART":
+                return True, "ADS_OK:START"
             return True, "ADS_OK:CFG,CH=2,ADDR=0x40,AIN=AIN0,REF=AVDD,GAIN=1,DR=90,MODE=CONT,PR=90"
 
         node._send_and_wait_text = fake_send_and_wait
@@ -3946,15 +3956,16 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         node.send_command = lambda cmd: sent.append(cmd) or True
         node._send_and_wait_text = lambda cmd, ok, err, timeout=2.0: (
             (True, "I2CMAP_OK:X=0,Y=3,Z=4,A=7,SPEC=2") if cmd.startswith("I2CMAP:")
+            else (False, "timeout") if cmd == "ADSSTART"
+            else (True, "ADS_OK:STOP") if cmd == "ADSSTOP"
             else (True, "ADS_OK:CFG,CH=2,ADDR=0x40,AIN=AIN0,REF=AVDD,GAIN=1,DR=90,MODE=CONT,PR=90")
         )
-        node._wait_for_spectro_command_result = lambda timeout=2.0: (False, "timeout")
 
         success, message = node.prepare_and_start_spectrometer()
 
         self.assertFalse(success)
         self.assertEqual(message, "Spectrometer start timeout")
-        self.assertEqual(node._spectro_txn_phase, "start")
+        self.assertEqual(node._spectro_txn_phase, "start_failed")
 
     def test_pump_node_spectrometer_start_reports_missing_first_frame(self):
         module, _, _ = _load_script(
@@ -3966,9 +3977,10 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         node.send_command = lambda cmd: sent.append(cmd) or True
         node._send_and_wait_text = lambda cmd, ok, err, timeout=2.0: (
             (True, "I2CMAP_OK:X=0,Y=3,Z=4,A=7,SPEC=2") if cmd.startswith("I2CMAP:")
+            else (True, "ADS_OK:START") if cmd == "ADSSTART"
+            else (True, "ADS_OK:STOP") if cmd == "ADSSTOP"
             else (True, "ADS_OK:CFG,CH=2,ADDR=0x40,AIN=AIN0,REF=AVDD,GAIN=1,DR=90,MODE=CONT,PR=90")
         )
-        node._wait_for_spectro_command_result = lambda timeout=2.0: (True, "ADS_OK:START")
         node._wait_first_valid_spectro_frame = lambda timeout=2.0: False
 
         success, message = node.prepare_and_start_spectrometer()
