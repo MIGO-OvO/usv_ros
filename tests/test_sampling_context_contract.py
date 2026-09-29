@@ -295,6 +295,54 @@ class SamplingContextContractTests(unittest.TestCase):
         self.assertEqual(self.server.current_sample_window['attempt_id'], 'new-B')
         self.assertEqual(self.server._sampling_context['attempt_id'], 'new-B')
 
+    def test_cancelled_start_rolls_back_window_and_leaves_next_attempt_clean(self):
+        """Stop during a pending start: the attempt must fail, roll back its
+        window and never pollute the following attempt."""
+        self.server.standalone = False
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        def control(action, payload=None, source='web'):
+            calls.append(action)
+            if action == 'automation_start':
+                started.set()
+                release.wait(5)
+                # Hardware accepted the start; Web must still cancel it.
+                return True, 'accepted', {}
+            return True, 'ok', {}
+
+        result = {}
+        with patch.object(self.server, '_publish_steps', return_value={'attempt_id': 'cancelled-A'}), \
+                patch.object(self.server, '_call_control_command', side_effect=control):
+            start = threading.Thread(
+                target=lambda: result.update(
+                    response=self.server.app.test_client().post('/api/mission/start').get_json()))
+            try:
+                start.start()
+                self.assertTrue(started.wait(3))
+                self.assertIsNotNone(self.server.current_sample_window)
+                # Operator presses Stop while the start request is still in flight.
+                self.server._cancel_pending_web_start()
+            finally:
+                release.set()
+                start.join(5)
+
+        self.assertFalse(result['response']['success'])
+        self.assertIn('cancel', result['response']['message'].lower())
+        self.assertIsNone(self.server.current_sample_window)
+        self.assertIsNone(self.server._web_attempt_id)
+        self.assertNotIn('cancelled-A', (self.server._sampling_context or {}).get('attempt_id', ''))
+        self.assertEqual(calls.count('manual_stop_all'), 1)
+
+        # A fresh start after the cancelled one is not polluted by the old attempt.
+        with patch.object(self.server, '_publish_steps', return_value={'attempt_id': 'fresh-B'}), \
+                patch.object(self.server, '_call_control_command', return_value=(True, 'accepted', {})):
+            retry = self.server.app.test_client().post('/api/mission/start', json={'require_gps': False})
+        self.assertTrue(retry.get_json()['success'])
+        self.assertEqual(self.server._web_attempt_id, 'fresh-B')
+        self.assertEqual(self.server.current_sample_window['attempt_id'], 'fresh-B')
+
 
 if __name__ == '__main__':
     unittest.main()
