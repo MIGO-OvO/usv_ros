@@ -11,6 +11,7 @@ import { GpsStatusCard } from '@/components/gps-status-card'
 import { useGpsDiagnostics } from '@/hooks/use-gps-diagnostics'
 import { SpectroSpikeTestCard } from '@/components/spectro-spike-test-card'
 import { SpectrometerBaselineCard } from '@/components/spectrometer-baseline-card'
+import { SpectrometerDiagnosticsCard } from '@/components/spectrometer-diagnostics-card'
 import { VoltageCanvasChart } from '@/components/voltage-canvas-chart'
 import { TimeSeriesCanvasChart } from '@/components/time-series-canvas-chart'
 import { ScrollArea } from '@/components/ui/scroll-area'
@@ -732,6 +733,8 @@ export default function Monitor() {
         </div>
         <p className="border-t px-4 py-2 text-xs text-muted-foreground">完整历史数据请到“数据中心”下载 Jetson 本地任务包</p>
       </section>
+
+      <SpectrometerDiagnosticsCard />
 
       <SpectrometerBaselineCard
         summary={baselineSummary}

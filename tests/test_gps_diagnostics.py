@@ -137,13 +137,41 @@ class BridgeDiagnosticsTests(unittest.TestCase):
         for reason, pos in [('gps_no_fix', dict(gps_position(), fix_status=-1)),
                             ('gps_stale', gps_position(age=4)),
                             ('gps_invalid_coordinates', gps_position(lat=91)),
-                            ('gps_missing_timestamp', dict(gps_position(), gps_timestamp=None))]:
+                            ('gps_missing_receive_time', dict(gps_position(), received_monotonic=None))]:
             with self.subTest(reason=reason):
                 result = diagnose(evidence().snapshot(), pos)
                 self.assertFalse(result['sampling_position']['valid'])
                 self.assertEqual(result['sampling_position']['reason'], reason)
                 with self.assertRaisesRegex(ValueError, reason):
                     freeze_position(pos)
+
+    def test_clock_offset_is_diagnostic_and_never_gates_sampling(self):
+        # header.stamp far behind the Jetson wall clock: sampling stays valid.
+        pos = gps_position()
+        pos['gps_timestamp'] = time.time() - 5.0
+        pos['header_clock_offset_s'] = 5.0
+        result = diagnose(evidence().snapshot(), pos)
+        self.assertTrue(result['sampling_position']['valid'])
+        self.assertIsNone(result['sampling_position']['reason'])
+        self.assertAlmostEqual(result['navsat']['header_clock_offset_s'], 5.0)
+        self.assertTrue(any('偏差' in warning for warning in result['warnings']))
+        # Future header.stamp: allowed too, warning points the other direction.
+        pos['gps_timestamp'] = time.time() + 30.0
+        pos['header_clock_offset_s'] = -30.0
+        result = diagnose(evidence().snapshot(), pos)
+        self.assertTrue(result['sampling_position']['valid'])
+        self.assertTrue(any('偏差' in warning for warning in result['warnings']))
+        # Small offsets stay quiet.
+        result = diagnose(evidence().snapshot(), gps_position())
+        self.assertFalse(any('偏差' in warning for warning in result['warnings']))
+
+    def test_navsat_age_uses_local_receive_clock_only(self):
+        pos = gps_position()
+        pos['gps_timestamp'] = time.time() - 9.0
+        pos['header_clock_offset_s'] = 9.0
+        result = diagnose(evidence().snapshot(), pos)
+        self.assertLess(result['navsat']['age_s'], 1.0)
+        self.assertTrue(result['sampling_position']['valid'])
 
 
 @unittest.skipUnless(FLASK_AVAILABLE, 'Flask unavailable')
@@ -179,14 +207,22 @@ class DiagnosticsIntegrationTests(unittest.TestCase):
         self.assertEqual(position['wgs84']['lat'], 30)
         self.assertIsNotNone(position['age_s'])
 
-    def test_missing_raw_stale_invalid_and_missing_stamp_cannot_move_map(self):
+    def test_missing_raw_invalid_and_no_fix_cannot_move_map(self):
         self.server._gps_evidence = evidence(None).snapshot()
         self.gps()
         self.assertIsNone(self.server.current_position)
         self.server._gps_evidence = evidence().snapshot()
-        for fields in ({'age': 4}, {'lat': 91}, {'status': -1}):
+        for fields in ({'lat': 91}, {'status': -1}):
             self.gps(**fields)
         self.assertEqual(self.server.live_track_points, [])
+
+    def test_stale_header_stamp_with_fresh_local_receive_moves_map(self):
+        # Field scenario behind the clock-domain fix: header.stamp trails the
+        # Jetson wall clock, but the fix was received just now. The map must
+        # move; sampling admission stays strict on the local receive clock.
+        self.gps(age=4)
+        self.assertEqual(len(self.server.live_track_points), 1)
+        self.assertTrue(self.server._map_position_snapshot()['gps_valid'])
 
     def test_silent_gps_expiry_marks_last_position(self):
         self.gps()

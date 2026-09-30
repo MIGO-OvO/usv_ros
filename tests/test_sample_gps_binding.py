@@ -70,11 +70,11 @@ class SampleGPSBindingTests(unittest.TestCase):
         self.assertFalse(self.node._do_manual_sample())
         self.node._start_injection_session.assert_not_called()
 
-    def test_invalid_positions_and_source_age_are_rejected(self):
+    def test_invalid_positions_and_missing_receive_time_are_rejected(self):
         invalid = [dict(lat=float('nan')), dict(lon=181), dict(lat=-91),
-                   dict(fix_status=-1), dict(gps_timestamp=0),
-                   dict(source_age_at_receive_s=-0.1), dict(source_age_at_receive_s=3),
-                   dict(received_monotonic=time.monotonic() - 3)]
+                   dict(fix_status=-1), dict(received_monotonic=None),
+                   dict(received_monotonic=time.monotonic() - 3),
+                   dict(received_monotonic=time.monotonic() + 5)]
         for changes in invalid:
             with self.subTest(changes=changes):
                 p = gps_position()
@@ -152,13 +152,29 @@ class SampleGPSBindingTests(unittest.TestCase):
     def test_age_boundary_and_wall_clock_change(self):
         p = gps_position()
         p['received_monotonic'] = 100
-        p['source_age_at_receive_s'] = 0.5
-        with patch('scripts.lib.sample_recording.record.time.monotonic', return_value=101.5), \
-                patch('scripts.lib.sample_recording.record.time.time', return_value=0):
+        with patch('scripts.lib.sample_recording.record.time.monotonic', return_value=102.0), \
+                patch('scripts.lib.sample_recording.record.time.time', return_value=999999.0):
             self.assertEqual(freeze_position(p)['position_age_s'], 2.0)
-        with patch('scripts.lib.sample_recording.record.time.monotonic', return_value=101.501):
+        with patch('scripts.lib.sample_recording.record.time.monotonic', return_value=102.001):
             with self.assertRaises(ValueError):
                 freeze_position(p)
+
+    def test_fresh_local_receive_survives_bad_wall_clock_offset(self):
+        # FCU/MAVROS header.stamp 5s behind the Jetson wall clock must not
+        # reject a locally fresh fix (field observation: QGC OK, ROS stale).
+        p = gps_position()
+        p['gps_timestamp'] = time.time() - 5.0
+        p['header_clock_offset_s'] = 5.0
+        frozen = freeze_position(p)
+        self.assertGreaterEqual(frozen['position_age_s'], 0.0)
+        self.assertLess(frozen['position_age_s'], 2.0)
+        self.assertAlmostEqual(frozen['gps_timestamp'], p['gps_timestamp'])
+
+    def test_future_header_stamp_is_diagnostic_not_a_gate(self):
+        p = gps_position()
+        p['gps_timestamp'] = time.time() + 30.0
+        p['header_clock_offset_s'] = -30.0
+        self.assertTrue(freeze_position(p)['position_age_s'] >= 0.0)
 
     def test_lab_real_uses_hardware_fix_not_virtual_waypoint(self):
         self.node._run_lab_sampling(7, 20, 100, {'data_source': 'real'})

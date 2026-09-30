@@ -117,7 +117,7 @@ from scripts.lib.lab_sim.models import CoordinatePairRef, ModelParseError, Sampl
 from scripts.lib.lab_sim.route_planner import RoutePlannerError, plan_coverage_route
 from scripts.lib.sample_recording import MIN_RAW_RECORD_HZ, SampleRecordingStorage, normalize_raw_frame
 from scripts.lib.sample_recording.models import safe_id
-from scripts.lib.sample_recording.record import bind_web_context, freeze_position, navsat_position, finite
+from scripts.lib.sample_recording.record import bind_web_context, freeze_position, navsat_position, position_local_age_s, finite
 from scripts.lib.gps_diagnostics import diagnose
 from scripts.lib.sample_recording.downsampling import MinMaxSeries
 
@@ -178,6 +178,7 @@ DEFAULT_MAPPING_PROFILE = {
 SURVEY_GATE_REASON_LABELS = {
     "no_gps": "GPS unavailable",
     "gps_stale": "GPS stale",
+    "gps_missing_receive_time": "GPS receive time missing",
     "distance_too_short": "distance too short",
     "speed_too_low": "speed too low",
     "speed_too_high": "speed too high",
@@ -1583,6 +1584,12 @@ DEFAULT_CONFIG = {
     "sampling": {
         "sample_timeout_s": 0.0
     },
+    "automation_policy": {
+        # Web 自动化启动默认是否要求有效 GPS 定位。
+        # 服务器持久化：页面切换/刷新/服务重启后仍保持；单次启动可用
+        # /api/mission/start 的 require_gps 字段显式覆盖本默认值。
+        "require_gps": True
+    },
     "mapping_profile": copy.deepcopy(DEFAULT_MAPPING_PROFILE),
     "detection_settings": {
         "duration": 5.0,
@@ -1793,6 +1800,16 @@ class ConfigManager(object):
         return normalize_pollution_metric_config(data)
 
     @staticmethod
+    def _normalize_automation_policy(data):
+        """Normalize the persisted web automation policy (require_gps default)."""
+        normalized = dict(DEFAULT_CONFIG.get('automation_policy', {}))
+        raw = data if isinstance(data, dict) else {}
+        value = raw.get('require_gps', True)
+        # Invalid persisted values fail closed; API updates reject them below.
+        normalized['require_gps'] = value if type(value) is bool else True
+        return normalized
+
+    @staticmethod
     def _normalize_mapping_profile(data):
         return normalize_mapping_profile_config(data)
 
@@ -1853,6 +1870,9 @@ class ConfigManager(object):
             self.config['lab_mode'] = self._normalize_lab_mode(
                 self.config.get('lab_mode', {})
             )
+            self.config['automation_policy'] = self._normalize_automation_policy(
+                self.config.get('automation_policy', {})
+            )
             self._migrate_legacy_hardware_defaults()
             self.config['updated_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             with open(self.config_file, 'w', encoding='utf-8') as f:
@@ -1906,6 +1926,9 @@ class ConfigManager(object):
         self.config['lab_mode'] = self._normalize_lab_mode(
             self.config.get('lab_mode', {})
         )
+        self.config['automation_policy'] = self._normalize_automation_policy(
+            self.config.get('automation_policy', {})
+        )
 
     @staticmethod
     def _same_persisted_lab_config(left, right):
@@ -1931,8 +1954,21 @@ class ConfigManager(object):
 
     def update(self, data):
         """更新配置。"""
-        self._merge_config(data)
-        return self.save()
+        if 'automation_policy' in data:
+            policy = data['automation_policy']
+            if (not isinstance(policy, dict) or
+                    ('require_gps' in policy and type(policy['require_gps']) is not bool)):
+                raise ValueError('automation_policy.require_gps must be a JSON boolean')
+        previous = copy.deepcopy(self.config)
+        try:
+            self._merge_config(data)
+            if self.save():
+                return True
+        except Exception:
+            self.config = previous
+            raise
+        self.config = previous
+        return False
 
     def reset(self):
         """重置为默认配置。"""
@@ -1957,6 +1993,9 @@ class ConfigManager(object):
         )
         self.config['lab_mode'] = self._normalize_lab_mode(
             self.config.get('lab_mode', {})
+        )
+        self.config['automation_policy'] = self._normalize_automation_policy(
+            self.config.get('automation_policy', {})
         )
         return self.save()
 
@@ -1984,6 +2023,9 @@ class ConfigManager(object):
         )
         config['lab_mode'] = self._normalize_lab_mode(
             config.get('lab_mode', {})
+        )
+        config['automation_policy'] = self._normalize_automation_policy(
+            config.get('automation_policy', {})
         )
         return config
 
@@ -2616,6 +2658,9 @@ class WebConfigServer(object):
         if terminal_status:
             self.automation_running = False
             self.automation_paused = False
+            with self._web_state_lock:
+                if isinstance(context, dict) and context.get('attempt_id') == self._web_attempt_id:
+                    self._web_attempt_id = None
             if self._finish_owned_recording(data):
                 return
             if not expected and self.data_recording_source == "web":
@@ -3278,7 +3323,7 @@ class WebConfigServer(object):
         避免真实 GPS 与虚拟船位同时写入导致地图船位跳变。
         """
         # Separate hardware fix from the display position, even in lab_real mode.
-        self._latest_real_gps = navsat_position(msg, rospy.Time.now().to_sec())
+        self._latest_real_gps = navsat_position(msg)
         if not self._gps_diagnostics_snapshot()['map_position_valid']:
             return
         self._last_valid_gps_at = self._latest_real_gps['received_at']
@@ -4443,7 +4488,11 @@ class WebConfigServer(object):
             data = json_object()
             if data is None:
                 return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
-            if self.config_manager.update(data):
+            try:
+                saved = self.config_manager.update(data)
+            except ValueError as exc:
+                return jsonify(success=False, message=str(exc)), 400
+            if saved:
                 self._add_log("配置已保存", "success")
                 return jsonify({"success": True, "message": "配置已保存"})
             return jsonify({"success": False, "message": "保存失败"}), 500
@@ -4787,9 +4836,8 @@ class WebConfigServer(object):
                     valid, reason = True, None
                 except ValueError as exc:
                     reason = str(exc)
-            received = finite(position.get('received_monotonic'))
-            source_age = finite(position.get('source_age_at_receive_s'))
-            age = source_age + time.monotonic() - received if received is not None and source_age is not None else None
+            received = position.get('received_monotonic')
+            age = position_local_age_s(position) if received is not None else None
             return jsonify(valid=valid, reason=reason, latitude=finite(position.get('lat')),
                            longitude=finite(position.get('lon')), altitude=finite(position.get('alt')),
                            fix_status=position.get('fix_status'), position_age_s=age,
@@ -5059,6 +5107,7 @@ class WebConfigServer(object):
                 "pump_settings": config.get("pump_settings", {}),
                 "sampling_sequence": config.get("sampling_sequence", {}),
                 "waypoint_sampling": config.get("waypoint_sampling", {}),
+                "automation_policy": config.get("automation_policy", {}),
             }
             return Response(
                 json.dumps(export_data, ensure_ascii=False, indent=2),
@@ -5083,6 +5132,12 @@ class WebConfigServer(object):
                 patch['sampling_sequence'] = data['sampling_sequence']
             if 'waypoint_sampling' in data and isinstance(data['waypoint_sampling'], dict):
                 patch['waypoint_sampling'] = ConfigManager._normalize_waypoint_sampling(data['waypoint_sampling'])
+            if 'automation_policy' in data:
+                policy = data['automation_policy']
+                if (not isinstance(policy, dict) or
+                        ('require_gps' in policy and type(policy['require_gps']) is not bool)):
+                    return jsonify(success=False, message='require_gps must be a JSON boolean'), 400
+                patch['automation_policy'] = policy
 
             if not patch:
                 return jsonify({"success": False, "message": "未找到可导入的配置字段"}), 400
@@ -5327,21 +5382,40 @@ class WebConfigServer(object):
                 self.spectrometer_status = "acquiring"
                 return jsonify({"success": True, "message": "模拟模式已启动分光采集"})
 
+            # Single authoritative transaction: sync the saved hardware config
+            # into the ROS runtime params, then run the same verified
+            # prepare-and-start chain that QGC 31018 triggers.
             current = self.config_manager.get()
             hw = normalize_hardware({}, current.get('hardware', DEFAULT_CONFIG['hardware']))
-            results = self._publish_hardware_runtime_config(hw, force_start=True)
-            ok = bool(
-                results["i2c_mapping"]["success"]
-                and results["spectrometer"]
-                and results["spectrometer"]["success"]
-            )
-            message = results["spectrometer"]["message"] if results["spectrometer"] else "分光启动失败"
+            self._set_pump_runtime_params(hw)
+            payload = {
+                "mapping": {
+                    "angles": dict(hw.get("i2c_mapping", {})),
+                    "spectro_channel": int(hw.get("spectro_channel", 2)),
+                },
+                "spectro": {
+                    "ads_address": hw.get("ads_address", "0x40"),
+                    "mux": hw.get("mux", "AIN0"),
+                    "gain": int(hw.get("gain", 1)),
+                    "vref_mode": hw.get("vref_mode", "AVDD"),
+                    "adc_rate": max(MIN_RAW_RECORD_HZ, int(hw.get("adc_rate", 90))),
+                    "publish_rate": max(MIN_RAW_RECORD_HZ, int(hw.get("publish_rate", 90))),
+                    "spectro_output_hz": int(hw.get("spectro_output_hz", 10)),
+                    "continuous_mode": bool(hw.get("continuous_mode", True)),
+                    "reference_voltage": float(hw.get("reference_voltage", 0.0)),
+                    "baseline_voltage": float(hw.get("baseline_voltage", 0.0)),
+                },
+            }
+            ok, message, _ = self._call_control_command("spectrometer_start", payload)
             if ok:
                 self.spectrometer_status = "starting"
             return jsonify({
                 "success": ok,
                 "message": "分光配置已下发并启动" if ok else message,
-                "results": results,
+                "results": {
+                    "i2c_mapping": {"success": ok},
+                    "spectrometer": {"success": ok, "message": message},
+                },
             })
 
         @self.app.route('/api/spectrometer/stop', methods=['POST'])
@@ -6087,6 +6161,7 @@ class WebConfigServer(object):
                 "success": True,
                 "data": {
                     "latest": self.latest_system_health,
+                    "automation": self.latest_automation_status,
                     "history": self.system_health_history,
                     "realtime": self._realtime_stats_snapshot(),
                 }
@@ -6100,6 +6175,7 @@ class WebConfigServer(object):
                 "mavros_state": self._mavros_state,
                 "bridge_latest": self._bridge_diag,
                 "system_health_latest": self.latest_system_health,
+                "automation_latest": self.latest_automation_status,
                 "realtime": self._realtime_stats_snapshot(),
                 "bridge_history": self._diag_history,
                 "link_events": self._link_events,
@@ -6166,10 +6242,14 @@ class WebConfigServer(object):
                         return jsonify(success=False, message='Sampling already active'), 409
                     previous_context = dict(self._sampling_context)
                     acquisition = {'source': 'web'}
+                    # 持久化配置提供默认 policy；请求 payload 里的 require_gps
+                    # 是本次任务的显式覆盖值，两份配置职责不同。
+                    automation_policy = self.config_manager.get().get('automation_policy', {})
+                    default_require_gps = bool(automation_policy.get('require_gps', True))
                     try:
                         bind_web_context(acquisition, self._latest_real_gps,
                                          rospy.get_param('/mavlink_trigger_node/sampling_max_position_age_s', 2.0),
-                                         require_gps=request_data.get('require_gps', True))
+                                         require_gps=request_data.get('require_gps', default_require_gps))
                     except ValueError as exc:
                         return jsonify(success=False, message=str(exc)), 409
                     sampling_sequence = request_data.get('sampling_sequence')
@@ -6195,6 +6275,13 @@ class WebConfigServer(object):
 
             # 调用服务
             if action == 'start':
+                with self._web_state_lock:
+                    cancelled = stop_generation != self._web_stop_generation
+                    if not cancelled:
+                        self._web_attempt_id = steps_payload['attempt_id']
+                if cancelled:
+                    self._rollback_web_start(steps_payload, created_window, created_mission_file, previous_context)
+                    return jsonify(success=False, message='Start cancelled by stop request')
                 ok, message, _ = self._call_control_command('automation_start', steps_payload)
                 # The worker can fail before its start-service response reaches Web.
                 # Only an observed failure from this attempt may override that response.
@@ -6210,10 +6297,8 @@ class WebConfigServer(object):
                                       'Automation failed during startup')
                 with self._web_state_lock:
                     cancelled = stop_generation != self._web_stop_generation
-                    if ok and not cancelled:
-                        self._web_attempt_id = steps_payload['attempt_id']
                 if cancelled:
-                    self._call_control_command('manual_stop_all', {})
+                    self._call_control_command('automation_cleanup', {'attempt_id': steps_payload['attempt_id']})
                     ok, message = False, 'Start cancelled by stop request'
                 resp = type('StartResult', (), {'success': ok, 'message': message})()
             else:
@@ -6239,6 +6324,10 @@ class WebConfigServer(object):
             return jsonify({"success": False, "message": msg})
 
     def _rollback_web_start(self, payload, window, mission_file, previous_context):
+        attempt = payload.get('attempt_id') if isinstance(payload, dict) else None
+        with self._web_state_lock:
+            if attempt and self._web_attempt_id == attempt:
+                self._web_attempt_id = None
         with self._sample_lifecycle_lock:
             attempt = payload.get('attempt_id') if isinstance(payload, dict) else None
             owns_context = bool(attempt) and self._sampling_context.get('attempt_id') == attempt
@@ -6288,18 +6377,35 @@ class WebConfigServer(object):
         self._add_log("配置已发送到控制节点")
         return steps_data
 
+    def _owner_heartbeat_loop(self):
+        """独立线程：持续为当前 web attempt 续约 sampling owner lease。
+
+        与 socket 推送/UI 广播分离，避免 emit 抖动或 GIL 争用导致假 owner_lost。
+        不依赖浏览器当前所在页面，也不依赖 HTTP 请求线程。
+        """
+        while not rospy.is_shutdown():
+            try:
+                self._publish_web_owner_heartbeat()
+            except Exception as exc:  # pragma: no cover - defensive
+                rospy.logwarn("Owner heartbeat publish failed: %s", exc)
+            threading.Event().wait(0.5)
+
+    def _publish_web_owner_heartbeat(self):
+        # Includes a pending start; stop/rollback/terminal clear only their owner.
+        with self._web_state_lock:
+            if not self.standalone and self._web_attempt_id:
+                owner = String()
+                owner.data = json.dumps({'attempt_id': self._web_attempt_id})
+                self.owner_pub.publish(owner)
+
     def _data_push_loop(self):
         """后台线程：定时推送实时数据"""
         rate = 2 # Hz
         while not rospy.is_shutdown():
             self._expire_spectrometer_measurement()
-            if (not self.standalone and self._web_attempt_id
-                    and (self.automation_running or self.automation_paused)):
-                owner = String()
-                owner.data = json.dumps({'attempt_id': self._web_attempt_id})
-                self.owner_pub.publish(owner)
             if self.socketio:
                 automation = self.latest_automation_status if isinstance(self.latest_automation_status, dict) else {}
+                failure = automation.get("failure") if isinstance(automation.get("failure"), dict) else {}
                 self.socketio.emit('status', {
                     "pump_connected": self.pump_connected,
                     "automation_running": self.automation_running,
@@ -6310,6 +6416,20 @@ class WebConfigServer(object):
                     "automation_total": automation.get("automation_total", 0),
                     "current_loop": automation.get("current_loop", 0),
                     "total_loops": automation.get("total_loops", 0),
+                    # Terminal diagnostics: the Web UI shows why a task ended
+                    # without requiring SSH access to the Jetson.
+                    "terminal_reason": automation.get("terminal_reason"),
+                    "last_error": automation.get("last_error") or failure.get("reason") or "",
+                    "controller_fault": automation.get("controller_fault"),
+                    "spectrometer_state": automation.get("spectrometer_state"),
+                    "spectrometer_config_state": automation.get("spectrometer_config_state"),
+                    "spectrometer_txn_phase": automation.get("spectrometer_txn_phase"),
+                    "spectrometer_txn_attempt": automation.get("spectrometer_txn_attempt", 0),
+                    "spectrometer_retry_errors": automation.get("spectrometer_retry_errors", []),
+                    "spectrometer_last_txn_error": automation.get("spectrometer_last_txn_error"),
+                    "spectrometer_age_s": automation.get("spectrometer_age_s"),
+                    "owner_age_s": automation.get("owner_age_s"),
+                    "serial_connected": automation.get("serial_connected"),
                 })
                 self.latest_angle_telemetry = self._build_angle_telemetry(self.latest_angle_telemetry)
                 self.socketio.emit('manual_status', self.manual_status)
@@ -6427,6 +6547,11 @@ class WebConfigServer(object):
         data_thread = threading.Thread(target=self._data_push_loop)
         data_thread.daemon = True
         data_thread.start()
+
+        # 独立的 owner lease 心跳线程：与 UI 推送解耦，保障自动化不被误停
+        owner_thread = threading.Thread(target=self._owner_heartbeat_loop, name='WebOwnerHeartbeat')
+        owner_thread.daemon = True
+        owner_thread.start()
 
         realtime_thread = threading.Thread(target=self._realtime_flush_loop)
         realtime_thread.daemon = True

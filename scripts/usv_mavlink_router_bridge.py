@@ -83,6 +83,8 @@ class USVMavlinkRouterBridge(object):
         self._pkt_count = 0
         self._automation_step = 0.0
         self._automation_total = 0.0
+        self._current_loop = 0.0
+        self._total_loops = 0.0
         self._sample_count = 0.0
         self._pid_error = 0.0
         self._pid_mode = 0.0
@@ -256,6 +258,8 @@ class USVMavlinkRouterBridge(object):
 
         self._automation_step = float(data_dict.get("automation_step", 0.0) or 0.0)
         self._automation_total = float(data_dict.get("automation_total", 0.0) or 0.0)
+        self._current_loop = float(data_dict.get("current_loop", 0.0) or 0.0)
+        self._total_loops = float(data_dict.get("total_loops", 0.0) or 0.0)
         status_text = str(data_dict.get("status", "") or "").lower()
         reported_running = bool(data_dict.get("running", False))
         terminal_status = (
@@ -631,7 +635,7 @@ class USVMavlinkRouterBridge(object):
                 self._diag_tx_total += 1
                 self._diag_tx_heartbeat += 1
 
-    def _send_payload(self, voltage, absorbance, angles, status, automation_step, automation_total, sample_count, pid_error, pid_mode, baseline_set, reference_voltage, baseline_voltage, spectrometer_valid, health_fields=None):
+    def _send_payload(self, voltage, absorbance, angles, status, automation_step, automation_total, current_loop, total_loops, sample_count, pid_error, pid_mode, baseline_set, reference_voltage, baseline_voltage, spectrometer_valid, health_fields=None):
         t = int((time.time() - self._boot_time) * 1000) & 0xFFFFFFFF
         health = dict(DEFAULT_HEALTH_FIELDS)
         health.update(health_fields if health_fields is not None else getattr(self, "_health_fields", {}))
@@ -646,6 +650,8 @@ class USVMavlinkRouterBridge(object):
             (b"USV_PKT\x00\x00\x00", float(self._pkt_count)),
             (b"USV_STEP\x00\x00", automation_step),
             (b"USV_STOT\x00\x00", automation_total),
+            (b"USV_LOOP\x00\x00", current_loop),
+            (b"USV_LTOT\x00\x00", total_loops),
             (b"USV_SCNT\x00\x00", sample_count),
             (b"USV_PERR\x00\x00", pid_error),
             (b"USV_PMOD\x00\x00", pid_mode),
@@ -696,6 +702,8 @@ class USVMavlinkRouterBridge(object):
                 status = self._status_code
                 automation_step = self._automation_step
                 automation_total = self._automation_total
+                current_loop = self._current_loop
+                total_loops = self._total_loops
                 sample_count = self._sample_count
                 pid_error = self._pid_error
                 pid_mode = self._pid_mode
@@ -726,7 +734,7 @@ class USVMavlinkRouterBridge(object):
             for text, severity in pending_st:
                 self._send_statustext(text, severity)
 
-            self._send_payload(voltage, absorbance, angles, status, automation_step, automation_total, sample_count, pid_error, pid_mode, baseline_set, reference_voltage, baseline_voltage, spectrometer_valid, health_fields)
+            self._send_payload(voltage, absorbance, angles, status, automation_step, automation_total, current_loop, total_loops, sample_count, pid_error, pid_mode, baseline_set, reference_voltage, baseline_voltage, spectrometer_valid, health_fields)
 
             try:
                 self._publish_gps_evidence()

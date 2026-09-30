@@ -693,6 +693,8 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
         self.assertEqual(bridge._automation_step, 2.0)
         self.assertEqual(bridge._automation_total, 5.0)
+        self.assertEqual(bridge._current_loop, 1.0)
+        self.assertEqual(bridge._total_loops, 3.0)
         self.assertEqual(bridge._pid_mode, 1.0)
         self.assertEqual(bridge._status_code, module.USVMavlinkRouterBridge._MISSION_STATE_CODES["SAMPLING"])
 
@@ -794,6 +796,8 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
             status=14,
             automation_step=2,
             automation_total=5,
+            current_loop=1,
+            total_loops=3,
             sample_count=7,
             pid_error=0.01,
             pid_mode=1,
@@ -813,8 +817,13 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         self.assertIn("USV_JCPU", names)
         self.assertIn("USV_JMEM", names)
         self.assertIn("USV_EHEAP", names)
-        self.assertEqual(len(mav.named_values), 22)
-        self.assertEqual(bridge._diag_tx_named, 22)
+        self.assertIn("USV_LOOP", names)
+        self.assertIn("USV_LTOT", names)
+        sent_values = dict(mav.named_values)
+        self.assertEqual(sent_values["USV_LOOP"], 1.0)
+        self.assertEqual(sent_values["USV_LTOT"], 3.0)
+        self.assertEqual(len(mav.named_values), 24)
+        self.assertEqual(bridge._diag_tx_named, 24)
 
     def test_rover_nav_script_time_is_the_only_mission_sampling_trigger(self):
         workspace_root = _workspace_root()
@@ -851,6 +860,8 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
             status=14,
             automation_step=2,
             automation_total=5,
+            current_loop=1,
+            total_loops=3,
             sample_count=7,
             pid_error=0.01,
             pid_mode=1,
@@ -861,9 +872,9 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         )
 
         self.assertEqual(reconnects, [True])
-        self.assertEqual(len(recovered_mav.named_values), 22)
+        self.assertEqual(len(recovered_mav.named_values), 24)
         self.assertEqual(recovered_mav.named_values[0][0], "USV_VOLT")
-        self.assertEqual(bridge._diag_tx_named, 22)
+        self.assertEqual(bridge._diag_tx_named, 24)
 
     def test_router_bridge_caches_spectrometer_valid_from_voltage_payload(self):
         module = _load_script("usv_mavlink_router_bridge_valid_payload_test", "scripts/usv_mavlink_router_bridge.py")
@@ -909,6 +920,8 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
             status=1,
             automation_step=2.0,
             automation_total=3.0,
+            current_loop=2.0,
+            total_loops=5.0,
             sample_count=4.0,
             pid_error=0.5,
             pid_mode=1.0,
@@ -919,13 +932,13 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         )
 
         sent = dict(mav.named_values)
-        self.assertEqual(len(mav.named_values), 22)
+        self.assertEqual(len(mav.named_values), 24)
         self.assertAlmostEqual(sent["USV_JTMP"], 55.2)
         self.assertAlmostEqual(sent["USV_ETMP"], 43.2)
         self.assertAlmostEqual(sent["USV_JCPU"], 12.5)
         self.assertAlmostEqual(sent["USV_JMEM"], 34.0)
         self.assertAlmostEqual(sent["USV_EHEAP"], 37.5)
-        self.assertEqual(bridge._diag_tx_named, 22)
+        self.assertEqual(bridge._diag_tx_named, 24)
 
     def test_trigger_node_set_baseline_uses_latest_valid_voltage(self):
         module = _load_script("mavlink_trigger_node_baseline_valid_test", "scripts/mavlink_trigger_node.py")

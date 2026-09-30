@@ -213,6 +213,7 @@ const reasonLabels: Record<string, string> = {
 const surveyGateReasonLabels: Record<string, string> = {
   no_gps: '缺少 GPS',
   gps_stale: 'GPS 过期',
+  gps_missing_receive_time: '缺少 GPS 接收时间',
   distance_too_short: '距离不足',
   speed_too_low: '速度过低',
   speed_too_high: '速度过高',

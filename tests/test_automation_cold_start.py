@@ -12,6 +12,7 @@ class AutomationColdStartTests(unittest.TestCase):
             'pump_cold_start', 'scripts/pump_control_node.py')
         self.node = self.module.PumpControlNode()
         self.node.send_command = Mock(return_value=True)
+        self.node.automation_engine.send_command = self.node.send_command
         self.step = {'name': 'cold start', 'interval': 0,
                      'A': {'enable': 'E', 'direction': 'F', 'speed': '8', 'angle': '1440'}}
 

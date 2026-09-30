@@ -34,6 +34,7 @@ class SamplingTerminalContractTests(unittest.TestCase):
         module, _, _ = load_runtime('terminal_contract_pump', 'scripts/pump_control_node.py')
         with patch.object(module, 'InjectionPumpWorker', return_value=None):
             pump = module.PumpControlNode()
+        pump.send_command = lambda command: True
         pump.sampling_context = dict(context)
         pump.status_pub = fcu_results.ForwardPublisher(self.node._pump_status_cb)
         callback = getattr(self.node, '_automation_status_cb', None)

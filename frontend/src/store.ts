@@ -192,6 +192,18 @@ interface StatusPayload {
   automation_total?: number
   current_loop?: number
   total_loops?: number
+  terminal_reason?: string | null
+  last_error?: string
+  controller_fault?: string | null
+  spectrometer_state?: string
+  spectrometer_last_txn_error?: string | null
+  spectrometer_config_state?: string | null
+  spectrometer_txn_phase?: string | null
+  spectrometer_txn_attempt?: number
+  spectrometer_retry_errors?: { attempt: number; phase: string; error: string }[]
+  spectrometer_age_s?: number | null
+  owner_age_s?: number | null
+  serial_connected?: boolean
 }
 
 const MAX_HISTORY_POINTS = 200_000
@@ -239,6 +251,12 @@ interface AppState {
   socket: Socket | null
   connected: boolean
   pumpConnected: boolean
+  serialConnected: boolean | null
+  spectrometerConfigState: string | null
+  spectrometerTxnPhase: string | null
+  spectrometerLastTxnError: string | null
+  spectrometerTxnAttempt: number
+  spectrometerRetryErrors: { attempt: number; phase: string; error: string }[]
   automationRunning: boolean
   automationPaused: boolean
   automationStep: number
@@ -246,6 +264,12 @@ interface AppState {
   currentLoop: number
   totalLoops: number
   missionStatus: string
+  automationTerminalReason: string | null
+  automationLastError: string
+  automationControllerFault: string | null
+  automationSpectroState: string | null
+  automationSpectroAgeS: number | null
+  automationOwnerAgeS: number | null
   pumpAngles: PumpAngles
   rawAngles: PumpAngles
   angleTelemetry: AngleTelemetry
@@ -325,6 +349,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   socket: null,
   connected: false,
   pumpConnected: false,
+  serialConnected: null,
+  spectrometerConfigState: null,
+  spectrometerTxnPhase: null,
+  spectrometerLastTxnError: null,
+  spectrometerTxnAttempt: 0,
+  spectrometerRetryErrors: [],
   automationRunning: false,
   automationPaused: false,
   automationStep: 0,
@@ -332,6 +362,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   currentLoop: 0,
   totalLoops: 0,
   missionStatus: 'IDLE',
+  automationTerminalReason: null,
+  automationLastError: '',
+  automationControllerFault: null,
+  automationSpectroState: null,
+  automationSpectroAgeS: null,
+  automationOwnerAgeS: null,
   pumpAngles: DEFAULT_ANGLES,
   rawAngles: DEFAULT_ANGLES,
   angleTelemetry: DEFAULT_ANGLE_TELEMETRY,
@@ -467,13 +503,20 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     socket.on('disconnect', () => {
       angleSnapshotCommitter.cancel()
-      set({ connected: false, voltageBatchSupported: false })
+      set({ connected: false, voltageBatchSupported: false, serialConnected: null,
+        spectrometerConfigState: null, spectrometerTxnPhase: null, automationSpectroState: null })
       console.log('Socket disconnected')
     })
 
     socket.on('status', (data: StatusPayload) => {
       set({
         pumpConnected: data.pump_connected ?? false,
+        serialConnected: data.serial_connected ?? null,
+        spectrometerConfigState: data.spectrometer_config_state ?? null,
+        spectrometerTxnPhase: data.spectrometer_txn_phase ?? null,
+        spectrometerLastTxnError: data.spectrometer_last_txn_error ?? null,
+        spectrometerTxnAttempt: data.spectrometer_txn_attempt ?? 0,
+        spectrometerRetryErrors: data.spectrometer_retry_errors ?? [],
         automationRunning: data.automation_running ?? false,
         automationPaused: data.automation_paused ?? false,
         automationStep: data.automation_step ?? 0,
@@ -482,6 +525,12 @@ export const useAppStore = create<AppState>((set, get) => ({
         totalLoops: data.total_loops ?? 0,
         missionStatus: data.mission_status || 'IDLE',
         spectrometerStatus: data.spectrometer_status || 'idle',
+        automationTerminalReason: data.terminal_reason ?? null,
+        automationLastError: data.last_error || '',
+        automationControllerFault: data.controller_fault ?? null,
+        automationSpectroState: data.spectrometer_state ?? null,
+        automationSpectroAgeS: data.spectrometer_age_s ?? null,
+        automationOwnerAgeS: data.owner_age_s ?? null,
       })
     })
 
