@@ -14,6 +14,18 @@
 
 提交前审计新增回归：`test_sampling_terminal_contract.py`、`test_sampling_cleanup_ownership.py`，覆盖跨任务终态、早到响应、旧清理 RPC、显式停止和走航租约。Web 记录窗口按 attempt 串行化建立/清理，拒绝启动只回滚自身资源。
 
+### 分光冷启动与现场诊断
+
+`connect()` 的成功仅表示串口已打开、设备身份与会话握手通过；发布 `serial_connected`，不会以 `connected` 暗示 I2C/ADS 配置成功。Web 的 Automation 和监控页常驻显示串口、I2C/ADS 运行配置、采集状态、事务阶段、最近错误及重试记录。`ready` 只表示 I2CMAP 和 ADSCFG 回显已验证；只有 ADSSTART ACK 后收到有效真实帧才表示启动成功。
+
+- 新串口会话握手后等待 0.5 秒稳定期，独立 watchdog keepalive 持续运行。
+- 一次点击执行 `I2CMAP → ADSCFG → ADSSTART → 首个有效帧`。瞬时 I2C 错误或 ACK 超时最多尝试 3 次，退避 0.15 / 0.30 秒；每次重新发送并校验配置回显。参数错误、回显不匹配、控制器故障直接失败。
+- 重试前消费独立 `ADS_STATUS:` 响应，排空前次迟到 ACK；ADSSTART 失败先确认 ADSSTOP。清理失败不重试；响应同步失败要求重连，避免后续点击误用旧 ACK。固件文本命令按顺序处理是该屏障的协议依据。
+- ACK 预算仍为 2 秒。新会话首次采集首帧预算为 4 秒（从 START ACK 计时）；成功后暖启动首帧及运行 freshness 使用原 `measurement_timeout`（默认 2 秒）。无效、模拟、过期或截止后到达的帧不算成功。4 秒是有界冷启动容错预算，仍须在 Jetson/ESP32 上验证实际延迟分布。
+- 失败阶段分别见 `serial_failed`、`i2c_map_failed`、`ads_config_failed`、`start_failed`、`frame_timeout`；`spectrometer_last_txn_error` 保留主要原因，重试恢复后该字段清空，但本次重试记录仍可展开查看。自动化 `terminal_reason` 保持独立。
+
+回归：`python -B -m pytest tests/test_spectrometer_cold_start.py tests/test_field_transactions.py tests/test_terminal_reasons.py`；前端：`cd frontend && node --test scripts/test-spectrometer-diagnostics.mjs`。部署时更新前端构建产物并重启 `pump_control_node`、`web_config_server`；本次没有更改串口协议或固件。实机验收：冷上电一次启动、前两次瞬时 I2C 失败的同次点击恢复、配置失败显示、串口拔插、首帧延迟/缺失、运行断流及物理输出停止。
+
 [![ROS Noetic](https://img.shields.io/badge/ROS-Noetic-22314E?logo=ros&logoColor=white)](https://wiki.ros.org/noetic)
 [![Python](https://img.shields.io/badge/Python-3.8-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![MAVLink](https://img.shields.io/badge/MAVLink-v2-0B7285)](https://mavlink.io/)

@@ -3819,7 +3819,14 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         node = module.PumpControlNode()
         node.inject_pump_speed = 0
         sent = []
-        node.send_command = lambda cmd: sent.append(cmd) or True
+        def send(cmd):
+            sent.append(cmd)
+            if cmd.startswith('I2CMAP:'):
+                node._on_text_received('I2CMAP_OK:X=2,Y=3,Z=6,A=7,SPEC=2')
+            elif cmd.startswith('ADSCFG:'):
+                node._on_text_received('ADS_OK:CFG,' + cmd.split(':', 1)[1])
+            return True
+        node.send_command = send
 
         node._spectro_cmd_callback(string_cls(json.dumps({
             "cmd": "set_i2c_map",
@@ -3842,6 +3849,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         })))
 
         self.assertEqual(sent[0], "I2CMAP:X=2,Y=3,Z=6,A=7,SPEC=2")
+        self.assertEqual(node._spectro_config_state, 'ready')
         self.assertIn("ADSCFG:CH=2,ADDR=0x40,AIN=AIN0,REF=INT,GAIN=4,DR=90,MODE=CONT,PR=200", sent[1])
 
         node._spectro_cmd_callback(string_cls(json.dumps({
@@ -3943,7 +3951,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         success, message = node.prepare_and_start_spectrometer()
 
         self.assertFalse(success)
-        self.assertEqual(message, "ADSCFG: ADS_ERR:I2C")
+        self.assertEqual(message, "ADSCFG: ADS_ERR:I2C; retry synchronization: ADS_ERR:I2C")
         self.assertNotIn("ADSSTART", sent)
 
     def test_pump_node_spectrometer_start_timeout_does_not_report_success(self):

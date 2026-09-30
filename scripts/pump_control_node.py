@@ -92,6 +92,12 @@ SPECTRO_STATUS_TEST = 0x10
 # 原始分光帧的最小上行频率。前端聚合输出可更低，但落盘链路不得低于此值。
 MIN_RAW_RECORD_HZ = 20
 
+# Cold-session budgets; running freshness and hardware watchdog are unchanged.
+SPECTRO_SERIAL_SETTLE_S = 0.5
+SPECTRO_INIT_ATTEMPTS = 3
+SPECTRO_RETRY_BACKOFF_S = 0.15
+SPECTRO_COLD_FIRST_FRAME_S = 4.0
+
 # 统一 terminal reason 枚举：自动化任务结束的唯一权威原因来源。
 # completed 仅由引擎正常跑完触发；其余终止路径都必须给出对应 reason。
 TERMINAL_REASONS = {
@@ -608,6 +614,15 @@ class PumpControlNode(object):
         self._last_spectro_txn_error = None
         self._spectro_cleanup_error = None
         self._spectro_start_ack_at = None
+        self._spectro_config_state = 'unconfigured'
+        self._spectro_i2c_verified = False
+        self._spectro_reply_sync_required = False
+        self._spectro_reply_sync_failed = False
+        self._spectro_ready_after = None
+        self._spectro_cold_start_pending = False
+        self._spectro_first_frame_deadline = None
+        self._spectro_txn_attempt = 0
+        self._spectro_retry_errors = []
         self._current_step_spectro_timestamp = None
         self._lower_device_settings_file = self._resolve_lower_device_settings_file()
         self._lower_device_settings = self._load_lower_device_settings()
@@ -710,10 +725,24 @@ class PumpControlNode(object):
                 on_error=lambda error: self._on_serial_reader_error(error, reader_connection)
             )
 
-            self._apply_runtime_configuration()
+            # Transport identity and configuration readiness are independent.
+            # Keepalive is already running throughout settling/ACK waits.
+            self._spectro_ready_after = time.monotonic() + SPECTRO_SERIAL_SETTLE_S
+            self._spectro_cold_start_pending = True
+            self._spectro_config_state = 'unconfigured'
+            self._spectro_reply_sync_required = False
+            self._spectro_reply_sync_failed = False
+            self._spectro_cleanup_error = None
+            self.spectro_state = 'idle'
+            self._publish_status('serial_connected')
+            self._publish_automation_status(self._last_automation_status_text)
+            configured = self._apply_runtime_configuration()
 
-            rospy.loginfo("Connected to pump controller: %s", self.serial_port)
-            self._publish_status("connected")
+            rospy.loginfo("Serial connected: %s; spectrometer configuration: %s",
+                          self.serial_port, self._spectro_config_state)
+            if not configured:
+                rospy.logwarn('Runtime initialization failed: %s', self._last_spectro_txn_error)
+            self._publish_automation_status(self._last_automation_status_text)
             return True
 
         except Exception as e:
@@ -740,6 +769,16 @@ class PumpControlNode(object):
                 except Exception as e:
                     rospy.logwarn("Error closing serial: %s", str(e))
             self.serial_conn = None
+        self._spectro_config_state = 'disconnected'
+        self._spectro_i2c_verified = False
+        self._spectro_ready_after = None
+        self._spectro_first_frame_deadline = None
+        self._spectro_start_ack_at = None
+        self._last_valid_spectro_at = None
+        self.spectro_state = 'disconnected'
+        self._invalidate_spectro('disconnected')
+        self._publish_status('disconnected')
+        self._publish_automation_status(self._last_automation_status_text)
         rospy.loginfo("Disconnected from pump controller")
 
     def _start_keepalive_worker(self):
@@ -800,6 +839,7 @@ class PumpControlNode(object):
             if connection is not self.serial_conn:
                 return False
             self._controller_fault = self._controller_fault or 'disconnected'
+            self._spectro_config_state = 'disconnected'
             if self._automation_is_active():
                 self._set_terminal_reason('serial_disconnected')
             return True
@@ -844,7 +884,10 @@ class PumpControlNode(object):
             self.timeout = new_timeout
 
             if self.connect():
-                msg = "Reconnected to %s @ %d" % (self.serial_port, self.baudrate)
+                msg = "Serial reconnected to %s @ %d; spectrometer configuration: %s" % (
+                    self.serial_port, self.baudrate, self._spectro_config_state)
+                if self._last_spectro_txn_error:
+                    msg += '; ' + self._last_spectro_txn_error
                 rospy.loginfo(msg)
                 return TriggerResponse(success=True, message=msg)
             else:
@@ -999,15 +1042,12 @@ class PumpControlNode(object):
             if not ok:
                 return False
         else:
-            if not self._apply_i2c_mapping():
-                return False
-            if self.spectro_config.get('enabled', True) and not self._apply_spectro_config():
+            if not self._initialize_spectrometer(start=False)[0]:
                 return False
         if self.angle_stream.get('enabled', True) and self.angle_stream.get('auto_start', True):
             self._start_angle_stream()
         if not self.spectro_config.get('enabled', True):
             self._publish_spectro_status('disabled')
-        self._query_ads_status()
         return True
 
     def _query_i2c_mapping(self):
@@ -1016,7 +1056,8 @@ class PumpControlNode(object):
         return ok
 
     def _query_ads_status(self):
-        return self.send_command('ADSSTATUS?')
+        # Never leave a status reply queued: retry barriers use this distinct tag.
+        return self._send_and_wait_text('ADSSTATUS?', ('ADS_STATUS:',), ('ADS_ERR:',))[0]
 
     @staticmethod
     def _parse_kv_response(response):
@@ -1056,25 +1097,42 @@ class PumpControlNode(object):
             return self._send_and_wait_text_locked(command, success_prefixes, error_prefixes, timeout)
 
     def _send_and_wait_text_locked(self, command, success_prefixes, error_prefixes, timeout):
+        # Also covers standalone services and raw/topic configuration clients.
+        # No setter may bypass a previous timeout or failed reply barrier.
+        if command.startswith(('I2CMAP:', 'ADSCFG:')) or command in ('ADSSTART', 'I2CMAP?'):
+            synced, error = self._ensure_spectro_reply_sync()
+            if not synced:
+                return False, error
         if self._controller_fault and command not in ('ADSSTOP', 'I2CMAP?', 'ADSSTATUS?'):
             return False, self._controller_fault
         success = tuple(success_prefixes or ())
         errors = tuple(error_prefixes or ())
         if not success:
             return False, 'no success prefix configured'
-        txn = {'event': threading.Event(), 'line': None, 'success': success, 'error': errors}
+        txn = {'event': threading.Event(), 'line': None, 'received_at': None,
+               'success': success, 'error': errors}
         with self._text_txn_lock:
             self._text_txn = txn
         try:
+            deadline = time.monotonic() + timeout
             if not self.send_command(command):
                 return False, 'serial send failed'
-            deadline = time.monotonic() + timeout
             while not txn['event'].wait(min(0.05, max(0.0, deadline - time.monotonic()))):
                 if self._controller_fault:
                     return False, self._controller_fault
                 if time.monotonic() >= deadline:
+                    self._spectro_reply_sync_required = True
+                    if command == 'ADSSTATUS?':
+                        self._spectro_reply_sync_failed = True
                     return False, 'timeout'
             line = txn['line'] or ''
+            if txn['received_at'] is None or txn['received_at'] > deadline:
+                self._spectro_reply_sync_required = True
+                if command == 'ADSSTATUS?':
+                    self._spectro_reply_sync_failed = True
+                return False, 'timeout'
+            if self._controller_fault and command not in ('ADSSTOP', 'I2CMAP?', 'ADSSTATUS?'):
+                return False, self._controller_fault
             if any(line.startswith(prefix) for prefix in errors):
                 return False, line
             if any(line.startswith(prefix) for prefix in success):
@@ -1084,6 +1142,18 @@ class PumpControlNode(object):
             with self._text_txn_lock:
                 if self._text_txn is txn:
                     self._text_txn = None
+
+    def _ensure_spectro_reply_sync(self):
+        if self._spectro_reply_sync_failed:
+            return False, 'serial reply synchronization failed; reconnect required'
+        if not self._spectro_reply_sync_required:
+            return True, ''
+        synced, reply = self._send_and_wait_text('ADSSTATUS?', ('ADS_STATUS:',), ('ADS_ERR:',))
+        if not synced:
+            self._spectro_reply_sync_failed = True
+            return False, 'serial reply synchronization: ' + reply
+        self._spectro_reply_sync_required = False
+        return True, reply
 
     def _apply_i2c_mapping(self):
         """Apply the I2C map and verify the firmware echo before returning True."""
@@ -1096,10 +1166,17 @@ class PumpControlNode(object):
             spec=self.i2c_mapping.get('spectro_channel', 2)
         )
         self._spectro_txn_phase = 'i2c_map'
+        self._spectro_i2c_verified = False
+        self._spectro_config_state = 'mapping'
+        self._publish_automation_status(self._last_automation_status_text)
         ok, response = self._send_and_wait_text(cmd, ('I2CMAP_OK:',), ('I2CMAP_ERR:',), timeout=2.0)
         if not ok:
             self._spectro_txn_phase = 'i2c_map_failed'
             self._last_spectro_txn_error = 'I2CMAP: %s' % response
+            self._spectro_config_state = 'failed'
+            if response == 'serial send failed' or response.startswith('serial reply synchronization'):
+                self._spectro_txn_phase = 'serial_failed'
+                self._spectro_config_state = 'disconnected' if response == 'serial send failed' else 'failed'
             rospy.logwarn("I2C mapping apply failed: %s", response)
             self._publish_spectro_status('i2c_map_failed')
             return False
@@ -1110,11 +1187,14 @@ class PumpControlNode(object):
         if applied is None or any(self._kv_int(applied, key) != value for key, value in expected.items()):
             self._spectro_txn_phase = 'i2c_map_failed'
             self._last_spectro_txn_error = 'I2CMAP mismatch: %s' % response
+            self._spectro_config_state = 'failed'
             rospy.logwarn("I2C mapping mismatch: sent %s, applied %s", expected, applied)
             self._publish_spectro_status('i2c_map_mismatch')
             return False
         rospy.loginfo("Applied I2C mapping (verified): %s", response)
         self._spectro_txn_phase = 'i2c_mapped'
+        self._spectro_i2c_verified = True
+        self._spectro_config_state = 'mapped'
         self._last_spectro_txn_error = None
         return True
 
@@ -1122,19 +1202,26 @@ class PumpControlNode(object):
         """Apply the ADS config and verify the firmware echo before returning True."""
         cmd = self._build_ads_config_command()
         self._spectro_txn_phase = 'ads_config'
+        self._spectro_config_state = 'configuring'
+        self._publish_automation_status(self._last_automation_status_text)
         ok, response = self._send_and_wait_text(cmd, ('ADS_OK:CFG,',), ('ADS_ERR:',), timeout=2.0)
         if not ok:
             self._spectro_txn_phase = 'ads_config_failed'
             self._last_spectro_txn_error = 'ADSCFG: %s' % response
+            self._spectro_config_state = 'failed'
+            if response == 'serial send failed' or response.startswith('serial reply synchronization'):
+                self._spectro_txn_phase = 'serial_failed'
+                self._spectro_config_state = 'disconnected' if response == 'serial send failed' else 'failed'
             rospy.logwarn("Spectrometer config apply failed: %s", response)
             self._publish_spectro_status('ads_config_failed')
             return False
         if not self._verify_ads_config_echo(response):
             self._spectro_txn_phase = 'ads_config_failed'
             self._last_spectro_txn_error = 'ADSCFG mismatch: %s' % response
+            self._spectro_config_state = 'failed'
             self._publish_spectro_status('ads_config_mismatch')
             return False
-        self.spectro_state = 'configured'
+        self._spectro_config_state = 'ready' if self._spectro_i2c_verified else 'ads_configured'
         self._spectro_txn_phase = 'configured'
         self._last_spectro_txn_error = None
         self._publish_spectro_status('configured')
@@ -1237,6 +1324,8 @@ class PumpControlNode(object):
                     'start': 'start_failed', 'wait_frame': 'no_valid_frame',
                 }.get(phase, 'start_failed')
                 self._last_spectro_txn_error = str(exc)
+                if phase in ('i2c_map', 'ads_config'):
+                    self._spectro_config_state = 'failed'
                 if self._spectro_start_ack_at is not None:
                     self._cleanup_failed_spectro_start()
                 return False, self._last_spectro_txn_error
@@ -1257,6 +1346,7 @@ class PumpControlNode(object):
                         self.i2c_mapping['spectro_channel'] = int(mapping['spectro_channel'])
                     except (TypeError, ValueError):
                         self._spectro_txn_phase = 'i2c_map_failed'
+                        self._spectro_config_state = 'failed'
                         self._last_spectro_txn_error = 'invalid spectro_channel in mapping'
                         return False, self._last_spectro_txn_error
             spectro = overrides.get('spectro')
@@ -1269,12 +1359,72 @@ class PumpControlNode(object):
                 )
                 self.spectro_reference_voltage = float(self.spectro_config.get('reference_voltage', self.spectro_reference_voltage))
                 self.spectro_baseline_voltage = float(self.spectro_config.get('baseline_voltage', self.spectro_baseline_voltage))
-        if not self._apply_i2c_mapping():
-            return False, self._last_spectro_txn_error or 'I2C mapping apply failed'
-        if not self._apply_spectro_config():
-            return False, self._last_spectro_txn_error or 'ADS config apply failed'
+        return self._initialize_spectrometer(start=True)
+
+    def _initialize_spectrometer(self, start):
+        """Bounded recovery of transient initialization only; echoes stay mandatory.
+
+        Firmware processes text commands in order. ADSSTATUS has a distinct
+        reply tag and drains late setter ACKs before another attempt is sent.
+        A mismatch/configuration error is terminal, never silently retried.
+        """
+        self._spectro_retry_errors = []
+        self._spectro_txn_attempt = 0
+        synced, error = self._ensure_spectro_reply_sync()
+        if not synced:
+            self._last_spectro_txn_error = error
+            self._spectro_txn_phase = 'serial_failed'
+            self._spectro_config_state = 'failed'
+            return False, self._last_spectro_txn_error
+        if self._spectro_ready_after is not None and time.monotonic() < self._spectro_ready_after:
+            self._spectro_txn_phase = 'settling'
+            self._spectro_config_state = 'settling'
+            self._publish_automation_status(self._last_automation_status_text)
+            while time.monotonic() < self._spectro_ready_after and not self._controller_fault:
+                time.sleep(max(0.0, min(0.02, self._spectro_ready_after - time.monotonic())))
+        for attempt in range(1, SPECTRO_INIT_ATTEMPTS + 1):
+            self._spectro_txn_attempt = attempt
+            ok = self._apply_i2c_mapping()
+            if ok and (start or self.spectro_config.get('enabled', True)):
+                ok = self._apply_spectro_config()
+            elif ok:
+                self._spectro_config_state = 'disabled'
+            if ok and start:
+                ok, message = self._start_configured_spectrometer()
+            else:
+                message = self._last_spectro_txn_error or 'configuration verified'
+            if ok:
+                return True, message
+            error = self._last_spectro_txn_error or message
+            phase = self._spectro_txn_phase
+            retryable = (error in ('I2CMAP: timeout', 'ADSCFG: timeout', 'ADSSTART: timeout',
+                                  'I2CMAP: I2CMAP_ERR:I2C', 'ADSCFG: ADS_ERR:I2C',
+                                  'ADSSTART: ADS_ERR:I2C'))
+            if attempt == SPECTRO_INIT_ATTEMPTS or not retryable or self._controller_fault or self._spectro_cleanup_error:
+                return False, message
+            self._spectro_retry_errors.append({'attempt': attempt, 'phase': phase, 'error': error})
+            rospy.logwarn('Spectrometer initialization attempt %d/%d failed at %s: %s; retrying',
+                          attempt, SPECTRO_INIT_ATTEMPTS, phase, error)
+            self._spectro_txn_phase = 'retry_sync'
+            self._publish_automation_status(self._last_automation_status_text)
+            synced, reply = self._send_and_wait_text(
+                'ADSSTATUS?', ('ADS_STATUS:',), ('ADS_ERR:',), timeout=2.0)
+            if not synced:
+                self._spectro_reply_sync_failed = True
+                self._spectro_txn_phase = phase
+                self._last_spectro_txn_error = error + '; retry synchronization: ' + reply
+                return False, self._last_spectro_txn_error
+            self._spectro_reply_sync_required = False
+            time.sleep(SPECTRO_RETRY_BACKOFF_S * attempt)
+        return False, self._last_spectro_txn_error
+
+    def _start_configured_spectrometer(self):
         self._clear_spectro_reference()
+        self._spectro_start_ack_at = None
+        self._last_valid_spectro_at = None
+        self._spectro_first_frame_deadline = None
         self._spectro_txn_phase = 'start'
+        self._publish_automation_status(self._last_automation_status_text)
         success, message = self._send_and_wait_text('ADSSTART', ('ADS_OK:START',), ('ADS_ERR:',), timeout=2.0)
         if not success:
             self._spectro_txn_phase = 'start_failed'
@@ -1283,14 +1433,25 @@ class PumpControlNode(object):
             self._cleanup_failed_spectro_start()
             return False, message if message != 'timeout' else 'Spectrometer start timeout'
         self._spectro_txn_phase = 'wait_frame'
-        if not self._wait_first_valid_spectro_frame(timeout=2.0):
+        # Only the first acquisition in a freshly handshaken serial session
+        # gets startup grace. Running freshness and all ACK waits stay unchanged.
+        frame_timeout = self._first_spectro_frame_timeout()
+        self._spectro_first_frame_deadline = self._spectro_start_ack_at + frame_timeout if self._spectro_start_ack_at is not None else None
+        self._publish_automation_status(self._last_automation_status_text)
+        if not self._wait_first_valid_spectro_frame(timeout=frame_timeout):
             self._spectro_txn_phase = 'no_valid_frame' if self._controller_fault else 'frame_timeout'
             self._last_spectro_txn_error = self._controller_fault or 'no valid spectrometer frame after start'
             self._cleanup_failed_spectro_start()
             return False, 'Spectrometer start timeout: no valid frame'
+        self._spectro_first_frame_deadline = None
+        self._spectro_cold_start_pending = False
         self._spectro_txn_phase = 'running'
         self._last_spectro_txn_error = None
         return True, message
+
+    def _first_spectro_frame_timeout(self):
+        return (max(self.measurement_timeout, SPECTRO_COLD_FIRST_FRAME_S)
+                if self._spectro_cold_start_pending else self.measurement_timeout)
 
     def _cleanup_failed_spectro_start(self):
         # Bounded secondary cleanup; never replace the startup phase/error.
@@ -1303,6 +1464,7 @@ class PumpControlNode(object):
         finally:
             self.spectro_state = 'error' if self._spectro_cleanup_error else 'stopped'
             self._last_valid_spectro_at = None
+            self._spectro_first_frame_deadline = None
             self._invalidate_spectro(self.spectro_state)
         if self._spectro_cleanup_error:
             rospy.logwarn('Spectrometer startup cleanup failed: %s', self._spectro_cleanup_error)
@@ -1310,12 +1472,14 @@ class PumpControlNode(object):
     def _wait_first_valid_spectro_frame(self, timeout=2.0):
         """Wait for a valid raw frame received after the start ACK."""
         ack_seen_at = self._spectro_start_ack_at
-        deadline = time.monotonic() + max(0.0, float(timeout))
+        deadline = (ack_seen_at if ack_seen_at is not None else time.monotonic()) + max(0.0, float(timeout))
         while True:
             if self._controller_fault:
                 return False
             if (ack_seen_at is not None and self._last_valid_spectro_at is not None
-                    and self._last_valid_spectro_at >= ack_seen_at and self.spectro_state == 'acquiring'):
+                    and ack_seen_at <= self._last_valid_spectro_at <= deadline
+                    and time.monotonic() - self._last_valid_spectro_at <= self.measurement_timeout
+                    and self.spectro_state == 'acquiring'):
                 return True
             if time.monotonic() >= deadline:
                 return False
@@ -1767,6 +1931,17 @@ class PumpControlNode(object):
         if text == 'ADS_OK:START':
             # Startup deadline only, never measurement freshness.
             self._spectro_start_ack_at = time.monotonic()
+            frame_timeout = self._first_spectro_frame_timeout()
+            self._spectro_first_frame_deadline = self._spectro_start_ack_at + frame_timeout
+            self.spectro_state = 'starting'
+            self._publish_spectro_status('starting')
+        if text == 'ADS_OK:STOP':
+            # STOP must finish its state changes before its waiter can retry.
+            self.spectro_state = 'stopped'
+            self._last_valid_spectro_at = None
+            self._spectro_start_ack_at = None
+            self._spectro_first_frame_deadline = None
+            self._publish_spectro_status('stopped')
         if text == 'WATCHDOG_TRIPPED' or text.startswith('WATCHDOG_ERR:'):
             self._controller_fault = 'watchdog_tripped'
             self._invalidate_spectro('watchdog_tripped')
@@ -1783,6 +1958,7 @@ class PumpControlNode(object):
                     any(text.startswith(prefix) for prefix in txn['success'])
                     or any(text.startswith(prefix) for prefix in txn['error'])):
                 txn['line'] = text
+                txn['received_at'] = time.monotonic()
                 txn['event'].set()
         # 自动化运行时提升日志级别，便于排查 PID_DONE 等固件消息
         if self.automation_engine.is_running():
@@ -1850,15 +2026,9 @@ class PumpControlNode(object):
             return
 
         if text.startswith("ADS_OK:START"):
-            self.spectro_state = 'starting'
-            self._publish_spectro_status('starting')
             return
 
         if text.startswith("ADS_OK:STOP"):
-            self.spectro_state = 'stopped'
-            self._last_valid_spectro_at = None
-            self._spectro_start_ack_at = None
-            self._publish_spectro_status('stopped')
             return
 
         if text.startswith("ADS_STATUS:"):
@@ -1866,7 +2036,8 @@ class PumpControlNode(object):
             return
 
         if text.startswith("ADS_ERR:"):
-            self.spectro_state = 'error'
+            if self._spectro_txn_phase not in ('ads_config', 'retry_sync'):
+                self.spectro_state = 'error'
             self._publish_spectro_status(text)
             return
 
@@ -2060,6 +2231,10 @@ class PumpControlNode(object):
         awaiting_first = (self._spectro_start_ack_at is not None and
                           (self._last_valid_spectro_at is None or
                            self._last_valid_spectro_at < self._spectro_start_ack_at))
+        if (awaiting_first and self._spectro_txn_phase in ('start', 'wait_frame')
+                and self._spectro_first_frame_deadline is not None
+                and time.monotonic() <= self._spectro_first_frame_deadline):
+            return
         freshness_at = self._spectro_start_ack_at if awaiting_first else self._last_valid_spectro_at
         if freshness_at is not None and time.monotonic() - freshness_at > self.measurement_timeout:
             if awaiting_first:
@@ -2527,10 +2702,16 @@ class PumpControlNode(object):
         if cmd_upper == 'I2CMAP?':
             self._query_i2c_mapping()
             return
+        if cmd_upper == 'ADSSTATUS?':
+            self._query_ads_status()
+            return
         if cmd_upper.startswith('I2CMAP:'):
+            self._spectro_i2c_verified = False
+            self._spectro_config_state = 'unconfigured'
             self._send_and_wait_text(cmd_upper, ('I2CMAP_OK:',), ('I2CMAP_ERR:',))
             return
         if cmd_upper.startswith('ADSCFG:'):
+            self._spectro_config_state = 'unconfigured'
             self._send_and_wait_text(cmd_upper, ('ADS_OK:CFG,',), ('ADS_ERR:',))
             return
         if cmd_upper == 'ADSSTART':
@@ -3060,6 +3241,9 @@ class PumpControlNode(object):
             "failure": dict(self.last_automation_failure),
             "spectrometer_state": self.spectro_state,
             "spectrometer_txn_phase": self._spectro_txn_phase,
+            "spectrometer_config_state": self._spectro_config_state,
+            "spectrometer_txn_attempt": self._spectro_txn_attempt,
+            "spectrometer_retry_errors": list(self._spectro_retry_errors),
             "spectrometer_terminal_reason": {
                 'i2c_map_failed': 'i2c_map_failed',
                 'ads_config_failed': 'ads_config_failed',
@@ -3071,7 +3255,8 @@ class PumpControlNode(object):
             "spectrometer_cleanup_error": self._spectro_cleanup_error,
             "spectrometer_age_s": spectro_age_s,
             "owner_age_s": owner_age_s,
-            "serial_connected": bool(self.serial_conn and self.serial_conn.is_open),
+            "serial_connected": bool(self.serial_conn and self.serial_conn.is_open
+                                     and self._controller_fault not in ('disconnected', 'reconnecting')),
         }
         msg = String()
         msg.data = json.dumps(payload, ensure_ascii=False)

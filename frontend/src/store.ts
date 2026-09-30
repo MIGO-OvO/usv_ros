@@ -197,6 +197,10 @@ interface StatusPayload {
   controller_fault?: string | null
   spectrometer_state?: string
   spectrometer_last_txn_error?: string | null
+  spectrometer_config_state?: string | null
+  spectrometer_txn_phase?: string | null
+  spectrometer_txn_attempt?: number
+  spectrometer_retry_errors?: { attempt: number; phase: string; error: string }[]
   spectrometer_age_s?: number | null
   owner_age_s?: number | null
   serial_connected?: boolean
@@ -247,6 +251,12 @@ interface AppState {
   socket: Socket | null
   connected: boolean
   pumpConnected: boolean
+  serialConnected: boolean | null
+  spectrometerConfigState: string | null
+  spectrometerTxnPhase: string | null
+  spectrometerLastTxnError: string | null
+  spectrometerTxnAttempt: number
+  spectrometerRetryErrors: { attempt: number; phase: string; error: string }[]
   automationRunning: boolean
   automationPaused: boolean
   automationStep: number
@@ -339,6 +349,12 @@ export const useAppStore = create<AppState>((set, get) => ({
   socket: null,
   connected: false,
   pumpConnected: false,
+  serialConnected: null,
+  spectrometerConfigState: null,
+  spectrometerTxnPhase: null,
+  spectrometerLastTxnError: null,
+  spectrometerTxnAttempt: 0,
+  spectrometerRetryErrors: [],
   automationRunning: false,
   automationPaused: false,
   automationStep: 0,
@@ -487,13 +503,20 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     socket.on('disconnect', () => {
       angleSnapshotCommitter.cancel()
-      set({ connected: false, voltageBatchSupported: false })
+      set({ connected: false, voltageBatchSupported: false, serialConnected: null,
+        spectrometerConfigState: null, spectrometerTxnPhase: null, automationSpectroState: null })
       console.log('Socket disconnected')
     })
 
     socket.on('status', (data: StatusPayload) => {
       set({
         pumpConnected: data.pump_connected ?? false,
+        serialConnected: data.serial_connected ?? null,
+        spectrometerConfigState: data.spectrometer_config_state ?? null,
+        spectrometerTxnPhase: data.spectrometer_txn_phase ?? null,
+        spectrometerLastTxnError: data.spectrometer_last_txn_error ?? null,
+        spectrometerTxnAttempt: data.spectrometer_txn_attempt ?? 0,
+        spectrometerRetryErrors: data.spectrometer_retry_errors ?? [],
         automationRunning: data.automation_running ?? false,
         automationPaused: data.automation_paused ?? false,
         automationStep: data.automation_step ?? 0,

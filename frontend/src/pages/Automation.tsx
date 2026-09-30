@@ -10,6 +10,7 @@ import { NumericInput } from '@/components/ui/numeric-input'
 import { Play, Square, Pause, Save, FolderOpen, Plus, Trash2, ArrowUp, ArrowDown, Download, Upload, Loader2 } from 'lucide-react'
 import { useAppStore } from '@/store'
 import { InjectionPumpCard } from '@/components/injection-pump-card'
+import { SpectrometerDiagnosticsCard } from '@/components/spectrometer-diagnostics-card'
 import { WaypointSamplingCard } from '@/components/waypoint-sampling-card'
 import { toast } from '@/hooks/use-toast'
 import {
@@ -380,6 +381,8 @@ export default function Automation() {
           </Button>
         </div>
       </header>
+
+      <SpectrometerDiagnosticsCard />
 
       {showTerminal && (
         <Card className={terminalVariantOk ? 'border-emerald-500/40' : 'border-amber-500/50'}>
