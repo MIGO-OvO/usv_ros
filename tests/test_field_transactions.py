@@ -114,6 +114,38 @@ class FieldTransactionTests(unittest.TestCase):
             caller.join(2)
         self.assertEqual(result, [True])
 
+    def test_keepalive_failure_stops_engine_outside_serial_lock(self):
+        port = FakeSerial()
+        port.open()
+        self.node.serial_conn = port
+        stopped = threading.Event()
+        self.node._reconnect_after_reader_error = Mock()
+        def stop(connection):
+            self.assertIs(connection, port)
+            self.assertTrue(self.node.serial_lock.acquire(timeout=0.2))
+            self.node.serial_lock.release()
+            self.node._auto_stop_callback(None)
+            stopped.set()
+        self.node._reconnect_after_reader_error.side_effect = stop
+        port.write = Mock(side_effect=OSError('unplugged'))
+        engine = self.node.automation_engine
+        engine.set_steps([{'interval': 100000}])
+        engine.on_step_command = lambda step: True
+        engine.on_step_wait = lambda step: True
+        self.assertTrue(engine.start())
+        self.node._start_keepalive_worker()
+        self.assertTrue(stopped.wait(3))
+        self.assertFalse(engine.is_running())
+        self.assertEqual(self.node._terminal_reason, 'serial_disconnected')
+
+    def test_old_serial_error_cannot_stop_new_connection(self):
+        old, new = FakeSerial(), FakeSerial()
+        self.node.serial_conn = new
+        self.node._on_serial_reader_error('late error', old)
+        self.assertIsNone(self.node._controller_fault)
+        self.node._reconnect_after_reader_error(old)
+        self.assertIs(self.node.serial_conn, new)
+
     def test_reconnect_stops_old_worker_and_disconnect_stops_new_worker(self):
         ports = self.serial_environment()
         self.node._apply_runtime_configuration = Mock()
@@ -269,6 +301,10 @@ class FieldTransactionTests(unittest.TestCase):
                 sent = self.ack_sender(**overrides)
                 self.assertFalse(self.node.prepare_and_start_spectrometer()[0])
                 self.assertEqual(self.node._spectro_txn_phase, phase)
+                status = json.loads(self.pubs['/usv/automation_status'].messages[-1].data)
+                self.assertEqual(status['spectrometer_terminal_reason'],
+                                 'spectrometer_start_failed' if phase == 'start_failed' else phase)
+                self.assertIsNone(self.node._terminal_reason)
                 if phase != 'start_failed':
                     self.assertNotIn('ADSSTART', sent)
 
@@ -400,6 +436,8 @@ class FieldTransactionTests(unittest.TestCase):
                 self.node.lab_mode_enabled = True
                 self.node.pid_mode = False
                 self.node.send_command = Mock(return_value=True)
+                self.node.automation_engine.send_command = self.node.send_command
+                self.node._reset_terminal()
                 self.node.automation_engine.set_steps([{'name': 'one', 'interval': 0}])
                 self.node.automation_engine.loop_count = count
                 with patch.object(self.node, '_wait_seconds_with_pause', return_value=True):

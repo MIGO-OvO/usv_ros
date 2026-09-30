@@ -41,8 +41,8 @@ class TerminalReasonTests(unittest.TestCase):
         stop_flag = threading.Event()
         worker = threading.Thread(target=stop_flag.wait, args=(30,), daemon=True)
         worker.start()
-        self.addCleanup(stop_flag.set)
         self.addCleanup(lambda: worker.join(timeout=2))
+        self.addCleanup(stop_flag.set)
         self.node.automation_engine._running.set()
         self.node.automation_engine._thread = worker
         self.node.sampling_context = {
@@ -58,6 +58,149 @@ class TerminalReasonTests(unittest.TestCase):
         if publisher is None:
             return []
         return [json.loads(msg.data) for msg in publisher.messages]
+
+    def test_idle_pid_failure_does_not_poison_terminal_reason(self):
+        for text in ('PID_FAIL:X', 'PID_TIMEOUT:A,err=5'):
+            self.node._on_text_received(text)
+            self.assertIsNone(self.node._terminal_reason)
+
+    def test_unowned_pid_failure_does_not_poison_active_attempt(self):
+        self.activate_automation()
+        self.node.automation_engine._pending_pid_motors = {'X'}
+        self.node._on_text_received('PID_FAIL:A')
+        self.assertIsNone(self.node._terminal_reason)
+
+    def test_late_idle_pid_message_preserves_previous_and_next_attempt(self):
+        self.node._set_terminal_reason('completed')
+        self.node._log_automation_terminal()
+        self.node._on_text_received('PID_TIMEOUT:X')
+        self.assertEqual(self.node._terminal_reason, 'completed')
+        self.node._reset_terminal()
+        self.node._on_text_received('PID_FAIL:X')
+        self.assertIsNone(self.node._terminal_reason)
+
+    def test_next_attempt_reset_waits_for_accepted_pid_failure_delivery(self):
+        self.activate_automation()
+        self.node.automation_engine._pending_pid_motors = {'X'}
+        accepted, release, reset = threading.Event(), threading.Event(), threading.Event()
+        def deliver(motor, reason):
+            accepted.set()
+            release.wait(2)
+        def reset_attempt():
+            self.node._reset_terminal()
+            reset.set()
+        self.node.automation_engine.notify_pid_failed = Mock(side_effect=deliver)
+        reader = threading.Thread(target=lambda: self.node._on_text_received('PID_FAIL:X'))
+        new_attempt = threading.Thread(target=reset_attempt)
+        reader.start()
+        try:
+            self.assertTrue(accepted.wait(1))
+            new_attempt.start()
+            self.assertFalse(reset.wait(0.1))
+        finally:
+            release.set()
+            reader.join(2)
+            if new_attempt.ident is not None:
+                new_attempt.join(2)
+        self.assertTrue(reset.is_set())
+        self.assertIsNone(self.node._terminal_reason)
+
+    def test_cleanup_failure_is_separate_from_first_cause(self):
+        self.activate_automation()
+        self.node._set_terminal_reason('watchdog_tripped')
+        self.node.stop_all_pumps = Mock(return_value=False)
+        self.node._auto_stop_callback(None)
+        self.assertEqual(self.node._terminal_reason, 'watchdog_tripped')
+        self.assertTrue(self.automation_status_payloads()[-1]['cleanup_failed'])
+
+    def test_operator_stop_keeps_cleanup_failure_visible(self):
+        self.activate_automation()
+        self.node.stop_all_pumps = Mock(return_value=False)
+        self.node._auto_stop_callback(None)
+        self.assertEqual(self.node._terminal_reason, 'operator_stop')
+        self.assertTrue(self.node._cleanup_failed)
+
+    def test_first_cause_wins_concurrently(self):
+        gate = threading.Barrier(9)
+        def set_reason(reason):
+            gate.wait()
+            self.node._set_terminal_reason(reason)
+        workers = [threading.Thread(target=set_reason, args=(reason,))
+                   for reason in ['owner_lost', 'pid_fail'] * 4]
+        for worker in workers:
+            worker.start()
+        gate.wait()
+        for worker in workers:
+            worker.join(1)
+        first = (self.node._terminal_reason, self.node._terminal_reason_at)
+        self.node._set_terminal_reason('operator_stop')
+        self.assertEqual(first, (self.node._terminal_reason, self.node._terminal_reason_at))
+
+    def test_terminal_finalizes_only_once(self):
+        self.activate_automation()
+        self.node._on_automation_status('finished')
+        self.node._on_automation_status('finished')
+        self.node.stop_all_pumps.assert_called_once()
+        self.node._auto_stop_callback(None)
+        terminal = [s for s in self.terminal_logs if '[AUTOMATION TERMINAL]' in s]
+        self.assertEqual(len(terminal), 1)
+
+    def test_stop_callback_does_not_publish_worker_terminal_before_cleanup(self):
+        self.activate_automation()
+        self.node.automation_engine.stop = Mock(
+            side_effect=lambda: self.node._on_automation_status('stopped'))
+        self.node.stop_all_pumps = Mock(return_value=False)
+        self.node._auto_stop_callback(None)
+        payloads = self.automation_status_payloads()
+        self.assertEqual(len(payloads), 1)
+        self.assertTrue(payloads[0]['cleanup_failed'])
+
+    def test_engine_stop_write_failure_survives_successful_followup_cleanup(self):
+        self.activate_automation()
+        self.node.automation_engine.send_command = Mock(side_effect=[False, True])
+        self.node._auto_stop_callback(None)
+        self.assertTrue(self.node._cleanup_failed)
+
+    def test_terminal_log_finalizes_once_concurrently(self):
+        self.node._set_terminal_reason('pid_fail')
+        gate = threading.Barrier(5)
+        def finalize():
+            gate.wait()
+            self.node._log_automation_terminal()
+        workers = [threading.Thread(target=finalize) for _ in range(4)]
+        for worker in workers:
+            worker.start()
+        gate.wait()
+        for worker in workers:
+            worker.join(1)
+            self.assertFalse(worker.is_alive())
+        self.assertEqual(len([s for s in self.terminal_logs if '[AUTOMATION TERMINAL]' in s]), 1)
+
+    def test_engine_start_rejection_finalizes_failure(self):
+        self.node.automation_engine.set_steps([{'name': 'one', 'interval': 0}])
+        self.node._configuration_ready = True
+        self.node._owner_last_seen = time.monotonic()
+        self.node.automation_engine.start = Mock(return_value=False)
+        self.node.stop_all_pumps = Mock(return_value=True)
+        self.assertFalse(self.node._auto_start_callback(None).success)
+        self.assertEqual(self.automation_status_payloads()[-1]['terminal_reason'], 'configuration_failed')
+        self.assertEqual(len([s for s in self.terminal_logs if '[AUTOMATION TERMINAL]' in s]), 1)
+
+    def test_failed_path_finalizes(self):
+        self.activate_automation()
+        self.node._on_automation_error('PID 等待超时')
+        self.node._on_automation_status('failed')
+        self.assertEqual(len([s for s in self.terminal_logs if '[AUTOMATION TERMINAL]' in s]), 1)
+
+    def test_cleanup_exception_cannot_report_finished(self):
+        self.activate_automation()
+        self.node.stop_all_pumps = Mock(side_effect=OSError('write failed'))
+        self.node._on_automation_status('finished')
+        payload = self.automation_status_payloads()[-1]
+        self.assertEqual(payload['status'], 'failed')
+        self.assertEqual(payload['terminal_reason'], 'cleanup_failed')
+        self.assertTrue(payload['cleanup_failed'])
+        self.node._stop_injection_for_automation_policy.assert_called_once()
 
     # ------------------------------------------------------------------
     # PID semantics
@@ -115,6 +258,14 @@ class TerminalReasonTests(unittest.TestCase):
         self.node.spectro_state = 'starting'
         self.node._spectro_start_ack_at = time.monotonic() - 10.0
         self.node._last_valid_spectro_at = None
+        self.node._check_spectro_freshness()
+        self.assertEqual(self.node._terminal_reason, 'spectrometer_frame_timeout')
+
+    def test_invalid_startup_frame_does_not_hide_frame_deadline(self):
+        self.activate_automation()
+        self.node._spectro_start_ack_at = time.monotonic() - 10
+        self.node._last_valid_spectro_at = None
+        self.node._on_spectro_received({'valid': False, 'i2c_error': True})
         self.node._check_spectro_freshness()
         self.assertEqual(self.node._terminal_reason, 'spectrometer_frame_timeout')
 

@@ -97,10 +97,8 @@ MIN_RAW_RECORD_HZ = 20
 TERMINAL_REASONS = {
     'completed',
     'operator_stop',
-    'operator_pause',
     'pid_timeout',
     'pid_fail',
-    'spectrometer_start_failed',
     'spectrometer_frame_timeout',
     'spectrometer_stale',
     'watchdog_tripped',
@@ -533,6 +531,10 @@ class PumpControlNode(object):
         # automation termination. Never guess from status text.
         self._terminal_reason = None
         self._terminal_reason_at = None
+        self._terminal_lock = threading.RLock()
+        self._terminal_finalized = False
+        self._cleanup_failed = False
+        self._stop_in_progress = False
 
         # 指令生成器
         self.command_generator = CommandGenerator()
@@ -697,6 +699,7 @@ class PumpControlNode(object):
 
             # 启动读取器
             self.serial_reader = PumpSerialReader(self.serial_conn)
+            reader_connection = self.serial_conn
             self.serial_reader.start(
                 on_angle=self._on_angle_received,
                 on_pid=self._on_pid_data_received,
@@ -704,7 +707,7 @@ class PumpControlNode(object):
                 on_spectro=self._on_spectro_received,
                 on_health=self._on_health_received,
                 on_text=self._on_text_received,
-                on_error=self._on_serial_reader_error
+                on_error=lambda error: self._on_serial_reader_error(error, reader_connection)
             )
 
             self._apply_runtime_configuration()
@@ -763,40 +766,60 @@ class PumpControlNode(object):
         while not stop.wait(0.5) and not rospy.is_shutdown():
             if not self.serial_lock.acquire(timeout=0.1):
                 continue
+            failed = False
             try:
-                if stop.is_set() or connection is not self.serial_conn or not connection.is_open:
+                if stop.is_set() or connection is not self.serial_conn:
                     return
+                if not connection.is_open:
+                    raise serial.SerialException('serial port closed')
                 if self._controller_fault:
                     continue
                 connection.write(b'WATCHDOG:KEEPALIVE\r\n')
                 self._last_control_keepalive = time.monotonic()
             except (serial.SerialException, OSError) as exc:
-                self._controller_fault = self._controller_fault or 'disconnected'
-                if self._automation_is_active():
-                    self._set_terminal_reason('serial_disconnected')
+                failed = True
                 rospy.logwarn('Watchdog keepalive failed: %s', exc)
-                return
             finally:
                 self.serial_lock.release()
+            if failed:
+                self._on_serial_reader_error('keepalive write failed', connection)
+                return
 
-    def _on_serial_reader_error(self, error):
+    def _on_serial_reader_error(self, error, connection=None):
         """读取线程异常后异步重连，避免在读取线程内 join 自身。"""
-        rospy.logwarn("Serial reader stopped: %s", str(error))
-        self._controller_fault = 'disconnected'
-        self._publish_status("error: " + str(error))
-        self._invalidate_spectro('disconnected')
-        if self._automation_is_active():
-            self._set_terminal_reason('serial_disconnected')
-        threading.Thread(target=self._reconnect_after_reader_error, daemon=True).start()
+        connection = self.serial_conn if connection is None else connection
+        if not self._latch_serial_fault(connection):
+            return
+        rospy.logwarn("Serial worker stopped: %s", str(error))
+        threading.Thread(target=self._reconnect_after_reader_error,
+                         args=(connection,), daemon=True).start()
 
-    def _reconnect_after_reader_error(self):
-        self._auto_stop_callback(None)
+    def _latch_serial_fault(self, connection):
+        """Reader, keepalive and explicit reconnect share fault attribution."""
+        with self.serial_lock:
+            if connection is not self.serial_conn:
+                return False
+            self._controller_fault = self._controller_fault or 'disconnected'
+            if self._automation_is_active():
+                self._set_terminal_reason('serial_disconnected')
+            return True
+
+    def _reconnect_after_reader_error(self, connection=None):
+        with self._control_lock:
+            if connection is not self.serial_conn:
+                return
+            self._publish_status('error: serial disconnected')
+            self._invalidate_spectro('disconnected')
+            self._auto_stop_locked(None)
         rospy.sleep(1.0)
-        self.disconnect()
-        if not rospy.is_shutdown() and self.connect():
-            rospy.loginfo("Recovered pump serial connection")
-        else:
-            self._publish_status("disconnected")
+        with self._control_lock:
+            if connection is not self.serial_conn:
+                return
+            self.disconnect()
+            if not rospy.is_shutdown() and self.connect():
+                rospy.loginfo("Recovered pump serial connection")
+            else:
+                self._publish_status("disconnected")
 
     def _reconnect_callback(self, req):
         """运行时重连串口服务回调。从 ROS 参数读取最新配置并重连。"""
@@ -805,6 +828,7 @@ class PumpControlNode(object):
 
     def _reconnect_locked(self, req):
         try:
+            self._latch_serial_fault(self.serial_conn)
             self._controller_fault = 'reconnecting'
             self._auto_stop_callback(None)
             new_port = rospy.get_param('~serial_port', self.serial_port)
@@ -1833,6 +1857,7 @@ class PumpControlNode(object):
         if text.startswith("ADS_OK:STOP"):
             self.spectro_state = 'stopped'
             self._last_valid_spectro_at = None
+            self._spectro_start_ack_at = None
             self._publish_spectro_status('stopped')
             return
 
@@ -1944,19 +1969,40 @@ class PumpControlNode(object):
         该回调在串口 reader 线程触发；引擎的失败路径（_handle_error）不拿
         _control_lock，不会与停止请求死锁。
         """
-        self._set_terminal_reason(reason)
-        if self._automation_is_active():
-            self.automation_engine.notify_pid_failed(motor, reason)
-        else:
-            rospy.logwarn("[PID] %s (%s) reported while automation inactive", reason, info)
+        # Serialize acceptance and failure delivery with the next attempt's
+        # reset. Otherwise an accepted old reply could resume after reset and
+        # fail the new engine. This callback never takes _control_lock.
+        with self._terminal_lock:
+            if (self.automation_engine.is_running()
+                    and motor in self.automation_engine._pending_pid_motors):
+                self._set_terminal_reason(reason)
+                self.automation_engine.notify_pid_failed(motor, reason)
+            else:
+                rospy.logwarn("[PID] %s (%s) reported while automation inactive", reason, info)
 
     def _set_terminal_reason(self, reason):
         """记录统一 terminal reason；重复调用保留首次（根因优先）。"""
         if reason not in TERMINAL_REASONS:
             reason = 'unknown_error'
-        if self._terminal_reason is None:
-            self._terminal_reason = reason
-            self._terminal_reason_at = time.time()
+        with self._terminal_lock:
+            if not self._terminal_finalized and self._terminal_reason is None:
+                self._terminal_reason = reason
+                self._terminal_reason_at = time.time()
+
+    def _reset_terminal(self):
+        with self._terminal_lock:
+            self._terminal_reason = None
+            self._terminal_reason_at = None
+            self._terminal_finalized = False
+            self._cleanup_failed = False
+
+    def _record_cleanup_result(self, success):
+        if success:
+            return
+        with self._terminal_lock:
+            self._cleanup_failed = True
+            self._controller_fault = self._controller_fault or 'cleanup_failed'
+            self._set_terminal_reason('cleanup_failed')
 
 
     def _on_spectro_received(self, data):
@@ -2011,10 +2057,12 @@ class PumpControlNode(object):
         # A START ACK can age out startup, but cannot make a measurement fresh.
         # Startup (ACK received, no valid frame yet) and runtime acquisition
         # silence are two distinct states with two distinct terminal reasons.
-        freshness_at = (self._spectro_start_ack_at if self.spectro_state == 'starting'
-                        else self._last_valid_spectro_at)
+        awaiting_first = (self._spectro_start_ack_at is not None and
+                          (self._last_valid_spectro_at is None or
+                           self._last_valid_spectro_at < self._spectro_start_ack_at))
+        freshness_at = self._spectro_start_ack_at if awaiting_first else self._last_valid_spectro_at
         if freshness_at is not None and time.monotonic() - freshness_at > self.measurement_timeout:
-            if self.spectro_state == 'starting':
+            if awaiting_first:
                 reason = 'spectrometer_frame_timeout'
             else:
                 reason = 'spectrometer_stale'
@@ -2643,8 +2691,7 @@ class PumpControlNode(object):
             }
             self.last_automation_failure = {}
             # Fresh configuration for a new attempt: reset the terminal reason.
-            self._terminal_reason = None
-            self._terminal_reason_at = None
+            self._reset_terminal()
             if self.lab_mode_enabled and self.lab_options["bypass_pid_wait"]:
                 pid_mode = False
 
@@ -2714,8 +2761,7 @@ class PumpControlNode(object):
         self._configuration_ready = False
         # New attempt: forget any terminal reason from the previous run so the
         # Web UI never shows a stale cause.
-        self._terminal_reason = None
-        self._terminal_reason_at = None
+        self._reset_terminal()
         self.last_automation_failure = {}
 
         rospy.loginfo("Automation start requested: %d steps, loop_count=%s, pid_mode=%s, pid_precision=%.3f",
@@ -2731,6 +2777,7 @@ class PumpControlNode(object):
         else:
             self._set_terminal_reason('configuration_failed')
             rospy.logerr("Automation engine failed to start despite pre-check passing")
+            self._on_automation_status('failed')
         return TriggerResponse(success=success, message=message)
 
     def _auto_stop_callback(self, req):
@@ -2743,20 +2790,40 @@ class PumpControlNode(object):
         # A stop without a pre-registered fault reason is an operator stop.
         self._set_terminal_reason('operator_stop')
         rospy.loginfo("Automation stop requested (terminal_reason=%s)", self._terminal_reason)
-        if self.automation_engine.is_running() or self.automation_engine.is_paused():
-            self.automation_engine.stop()
-        success = self.stop_all_pumps()
-        self._stop_injection_for_automation_policy()
+        self._stop_in_progress = True
+        try:
+            if self.automation_engine.is_running() or self.automation_engine.is_paused():
+                try:
+                    self.automation_engine.stop()
+                except Exception as exc:
+                    self._record_cleanup_result(False)
+                    rospy.logerr('Automation stop exception: %s', exc)
+            success = self._cleanup_automation_outputs()
+        finally:
+            self._stop_in_progress = False
         message = "Automation stopped and pumps halted" if success else "Automation stopped but pump halt failed"
-        if not success:
-            self._set_terminal_reason('cleanup_failed')
         self._log_automation_terminal()
         self._publish_automation_status("stopped")
         self._publish_status('automation: stopped')
         return TriggerResponse(success=success, message=message)
 
+    def _cleanup_automation_outputs(self):
+        success = not (self._cleanup_failed or self.automation_engine._cleanup_failed)
+        for cleanup in (self.stop_all_pumps, self._stop_injection_for_automation_policy):
+            try:
+                success = bool(cleanup()) and success
+            except Exception as exc:
+                success = False
+                rospy.logerr('Automation cleanup exception: %s', exc)
+        self._record_cleanup_result(success)
+        return success
+
     def _log_automation_terminal(self):
         """结构化输出自动化终止诊断，现场无需 SSH 即可从 Web 获得同样信息。"""
+        with self._terminal_lock:
+            if self._terminal_finalized:
+                return
+            self._terminal_finalized = True
         try:
             engine_status = self.automation_engine.get_status()
         except Exception:
@@ -2770,7 +2837,7 @@ class PumpControlNode(object):
             "[AUTOMATION TERMINAL] reason=%s attempt_id=%s source=%s "
             "step=%s/%s loop=%s/%s pending_motors=%s spectro_state=%s "
             "spectro_txn_phase=%s spectro_age=%s owner_age=%s "
-            "controller_fault=%s serial_connected=%s",
+            "controller_fault=%s serial_connected=%s cleanup_failed=%s",
             self._terminal_reason,
             self.sampling_context.get('attempt_id'),
             self.sampling_context.get('source', 'unknown'),
@@ -2785,6 +2852,7 @@ class PumpControlNode(object):
             ("%.2fs" % owner_age) if owner_age is not None else "n/a",
             self._controller_fault,
             bool(self.serial_conn and self.serial_conn.is_open),
+            self._cleanup_failed,
         )
 
     def _auto_pause_callback(self, req):
@@ -2842,21 +2910,20 @@ class PumpControlNode(object):
         """自动化状态更新回调。"""
         rospy.loginfo("[Automation] 状态更新: %s", status)
         status_lower = str(status or "").lower()
-        if "finish" in status_lower or "done" in status_lower:
-            # Engine finished all steps on its own: this is a success, distinct
-            # from an operator/safety stop.
-            self._set_terminal_reason('completed')
+        if status_lower in ('finished', 'failed', 'stopped'):
+            # The synchronous stop path owns cleanup and publication. Do not
+            # expose a worker terminal before physical cleanup has completed.
+            with self._terminal_lock:
+                if self._stop_in_progress or self._terminal_finalized:
+                    return
+            self._cleanup_automation_outputs()
+            if self._cleanup_failed and status_lower == 'finished':
+                status = status_lower = 'failed'
+            self._set_terminal_reason({'finished': 'completed', 'failed': 'unknown_error',
+                                       'stopped': 'operator_stop'}[status_lower])
             self._log_automation_terminal()
         self._publish_status("automation: " + status)
         self._publish_automation_status(status)
-        if (
-            "finish" in status_lower
-            or "done" in status_lower
-            or "stop" in status_lower
-            or "error" in status_lower
-            or "fail" in status_lower
-        ):
-            self._stop_injection_for_automation_policy()
 
     def _on_automation_error(self, error):
         """自动化错误回调。"""
@@ -2974,6 +3041,7 @@ class PumpControlNode(object):
         payload = {
             "status": status_text,
             "terminal_reason": self._terminal_reason,
+            "cleanup_failed": self._cleanup_failed,
             "sampling_context": dict(self.sampling_context),
             "sample_id": self.sampling_context.get('sample_id'),
             "source": self.sampling_context.get('source', 'unknown'),
@@ -2992,6 +3060,13 @@ class PumpControlNode(object):
             "failure": dict(self.last_automation_failure),
             "spectrometer_state": self.spectro_state,
             "spectrometer_txn_phase": self._spectro_txn_phase,
+            "spectrometer_terminal_reason": {
+                'i2c_map_failed': 'i2c_map_failed',
+                'ads_config_failed': 'ads_config_failed',
+                'start_failed': 'spectrometer_start_failed',
+                'no_valid_frame': 'spectrometer_frame_timeout',
+                'frame_timeout': 'spectrometer_frame_timeout',
+            }.get(self._spectro_txn_phase),
             "spectrometer_last_txn_error": self._last_spectro_txn_error,
             "spectrometer_cleanup_error": self._spectro_cleanup_error,
             "spectrometer_age_s": spectro_age_s,

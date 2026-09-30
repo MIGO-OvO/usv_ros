@@ -1804,7 +1804,9 @@ class ConfigManager(object):
         """Normalize the persisted web automation policy (require_gps default)."""
         normalized = dict(DEFAULT_CONFIG.get('automation_policy', {}))
         raw = data if isinstance(data, dict) else {}
-        normalized['require_gps'] = bool(raw.get('require_gps', True))
+        value = raw.get('require_gps', True)
+        # Invalid persisted values fail closed; API updates reject them below.
+        normalized['require_gps'] = value if type(value) is bool else True
         return normalized
 
     @staticmethod
@@ -1952,8 +1954,21 @@ class ConfigManager(object):
 
     def update(self, data):
         """更新配置。"""
-        self._merge_config(data)
-        return self.save()
+        if 'automation_policy' in data:
+            policy = data['automation_policy']
+            if (not isinstance(policy, dict) or
+                    ('require_gps' in policy and type(policy['require_gps']) is not bool)):
+                raise ValueError('automation_policy.require_gps must be a JSON boolean')
+        previous = copy.deepcopy(self.config)
+        try:
+            self._merge_config(data)
+            if self.save():
+                return True
+        except Exception:
+            self.config = previous
+            raise
+        self.config = previous
+        return False
 
     def reset(self):
         """重置为默认配置。"""
@@ -2643,6 +2658,9 @@ class WebConfigServer(object):
         if terminal_status:
             self.automation_running = False
             self.automation_paused = False
+            with self._web_state_lock:
+                if isinstance(context, dict) and context.get('attempt_id') == self._web_attempt_id:
+                    self._web_attempt_id = None
             if self._finish_owned_recording(data):
                 return
             if not expected and self.data_recording_source == "web":
@@ -4470,7 +4488,11 @@ class WebConfigServer(object):
             data = json_object()
             if data is None:
                 return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
-            if self.config_manager.update(data):
+            try:
+                saved = self.config_manager.update(data)
+            except ValueError as exc:
+                return jsonify(success=False, message=str(exc)), 400
+            if saved:
                 self._add_log("配置已保存", "success")
                 return jsonify({"success": True, "message": "配置已保存"})
             return jsonify({"success": False, "message": "保存失败"}), 500
@@ -5110,8 +5132,12 @@ class WebConfigServer(object):
                 patch['sampling_sequence'] = data['sampling_sequence']
             if 'waypoint_sampling' in data and isinstance(data['waypoint_sampling'], dict):
                 patch['waypoint_sampling'] = ConfigManager._normalize_waypoint_sampling(data['waypoint_sampling'])
-            if 'automation_policy' in data and isinstance(data['automation_policy'], dict):
-                patch['automation_policy'] = ConfigManager._normalize_automation_policy(data['automation_policy'])
+            if 'automation_policy' in data:
+                policy = data['automation_policy']
+                if (not isinstance(policy, dict) or
+                        ('require_gps' in policy and type(policy['require_gps']) is not bool)):
+                    return jsonify(success=False, message='require_gps must be a JSON boolean'), 400
+                patch['automation_policy'] = policy
 
             if not patch:
                 return jsonify({"success": False, "message": "未找到可导入的配置字段"}), 400
@@ -6249,6 +6275,13 @@ class WebConfigServer(object):
 
             # 调用服务
             if action == 'start':
+                with self._web_state_lock:
+                    cancelled = stop_generation != self._web_stop_generation
+                    if not cancelled:
+                        self._web_attempt_id = steps_payload['attempt_id']
+                if cancelled:
+                    self._rollback_web_start(steps_payload, created_window, created_mission_file, previous_context)
+                    return jsonify(success=False, message='Start cancelled by stop request')
                 ok, message, _ = self._call_control_command('automation_start', steps_payload)
                 # The worker can fail before its start-service response reaches Web.
                 # Only an observed failure from this attempt may override that response.
@@ -6264,10 +6297,8 @@ class WebConfigServer(object):
                                       'Automation failed during startup')
                 with self._web_state_lock:
                     cancelled = stop_generation != self._web_stop_generation
-                    if ok and not cancelled:
-                        self._web_attempt_id = steps_payload['attempt_id']
                 if cancelled:
-                    self._call_control_command('manual_stop_all', {})
+                    self._call_control_command('automation_cleanup', {'attempt_id': steps_payload['attempt_id']})
                     ok, message = False, 'Start cancelled by stop request'
                 resp = type('StartResult', (), {'success': ok, 'message': message})()
             else:
@@ -6293,6 +6324,10 @@ class WebConfigServer(object):
             return jsonify({"success": False, "message": msg})
 
     def _rollback_web_start(self, payload, window, mission_file, previous_context):
+        attempt = payload.get('attempt_id') if isinstance(payload, dict) else None
+        with self._web_state_lock:
+            if attempt and self._web_attempt_id == attempt:
+                self._web_attempt_id = None
         with self._sample_lifecycle_lock:
             attempt = payload.get('attempt_id') if isinstance(payload, dict) else None
             owns_context = bool(attempt) and self._sampling_context.get('attempt_id') == attempt
@@ -6350,14 +6385,18 @@ class WebConfigServer(object):
         """
         while not rospy.is_shutdown():
             try:
-                if (not self.standalone and self._web_attempt_id
-                        and (self.automation_running or self.automation_paused)):
-                    owner = String()
-                    owner.data = json.dumps({'attempt_id': self._web_attempt_id})
-                    self.owner_pub.publish(owner)
+                self._publish_web_owner_heartbeat()
             except Exception as exc:  # pragma: no cover - defensive
                 rospy.logwarn("Owner heartbeat publish failed: %s", exc)
             threading.Event().wait(0.5)
+
+    def _publish_web_owner_heartbeat(self):
+        # Includes a pending start; stop/rollback/terminal clear only their owner.
+        with self._web_state_lock:
+            if not self.standalone and self._web_attempt_id:
+                owner = String()
+                owner.data = json.dumps({'attempt_id': self._web_attempt_id})
+                self.owner_pub.publish(owner)
 
     def _data_push_loop(self):
         """后台线程：定时推送实时数据"""

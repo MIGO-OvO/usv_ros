@@ -76,6 +76,7 @@ class AutomationEngine(object):
 
         # 错误状态
         self._failed = False
+        self._cleanup_failed = False
         self._last_error = None
 
         # 回调函数
@@ -156,6 +157,7 @@ class AutomationEngine(object):
         self._pid_complete_event.clear()
         self._failed = False
         self._last_error = None
+        self._cleanup_failed = False
 
         # 重置指令生成器
         self.command_generator.reset_for_auto_mode()
@@ -173,14 +175,15 @@ class AutomationEngine(object):
             self._running.clear()
             self._paused.clear()
 
-            # 发送停止指令
-            try:
-                # 先停止 PID
-                self.send_command(self.command_generator.generate_pid_stop_command())
-                # 再停止所有电机
-                self.send_command(self.command_generator.generate_stop_command())
-            except Exception:
-                pass
+            # Both halt writes must be attempted; a later successful retry
+            # must not erase an earlier cleanup failure.
+            for command in (self.command_generator.generate_pid_stop_command(),
+                            self.command_generator.generate_stop_command()):
+                try:
+                    if not self.send_command(command):
+                        self._cleanup_failed = True
+                except Exception:
+                    self._cleanup_failed = True
 
         # 等待线程结束
         if self._thread and self._thread.is_alive():
@@ -259,7 +262,7 @@ class AutomationEngine(object):
             motor: 失败的电机名称
             reason_text: 'pid_timeout' 或 'pid_fail'
         """
-        if not self._running.is_set():
+        if not self._running.is_set() or motor not in self._pending_pid_motors:
             return
         self._pending_pid_motors.discard(motor)
         self._pid_complete_event.set()
@@ -547,12 +550,13 @@ class AutomationEngine(object):
 
     def _cleanup(self):
         """清理资源。"""
-        try:
-            # 发送停止指令
-            self.send_command(self.command_generator.generate_pid_stop_command())
-            self.send_command(self.command_generator.generate_stop_command())
-        except Exception:
-            pass
+        for command in (self.command_generator.generate_pid_stop_command(),
+                        self.command_generator.generate_stop_command()):
+            try:
+                if not self.send_command(command):
+                    self._cleanup_failed = True
+            except Exception:
+                self._cleanup_failed = True
 
         with self._lock:
             stopped = not self._running.is_set()

@@ -8,6 +8,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 from test_hardware_runtime_sync import _load_script
 
@@ -58,11 +59,18 @@ class AutomationPolicyPersistenceTests(unittest.TestCase):
 
     def test_invalid_policy_values_fall_back_to_safe_default(self):
         manager = self.make_manager()
-        manager.update({'automation_policy': {'require_gps': 'not-a-bool'}})
-        # bool('not-a-bool') is True: non-empty junk cannot silently disable GPS.
+        for value in ('not-a-bool', '', 0, 1, None, [], {}):
+            with self.assertRaises(ValueError):
+                manager.update({'automation_policy': {'require_gps': value}})
         self.assertTrue(manager.get()['automation_policy']['require_gps'])
         manager.update({'automation_policy': {'require_gps': False}})
         self.assertFalse(manager.get()['automation_policy']['require_gps'])
+
+    def test_disk_failure_rolls_back_in_memory_policy(self):
+        manager = self.make_manager()
+        manager.save = Mock(return_value=False)
+        self.assertFalse(manager.update({'automation_policy': {'require_gps': False}}))
+        self.assertTrue(manager.get()['automation_policy']['require_gps'])
 
     def test_api_config_roundtrip(self):
         class TempConfigManager(self.module.ConfigManager):
@@ -72,6 +80,9 @@ class AutomationPolicyPersistenceTests(unittest.TestCase):
         self.module.ConfigManager = TempConfigManager
         server = self.module.WebConfigServer(standalone=False)
         client = server.app.test_client()
+        for value in ('false', '', 0, None):
+            response = client.post('/api/config', json={'automation_policy': {'require_gps': value}})
+            self.assertEqual(response.status_code, 400)
 
         get_resp = client.get('/api/config')
         self.assertEqual(get_resp.status_code, 200)

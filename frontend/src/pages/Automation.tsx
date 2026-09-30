@@ -1,5 +1,6 @@
-/* eslint-disable @typescript-eslint/no-explicit-any, react-hooks/immutability */
-import { useEffect, useState } from 'react'
+/* eslint-disable @typescript-eslint/no-explicit-any */
+import { useEffect, useRef, useState } from 'react'
+import { persistGpsPolicy } from '@/lib/gps-policy'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -100,6 +101,8 @@ export default function Automation() {
   // 服务器持久化 policy：初始 true 仅是 HTML 首帧兜底，fetchConfig 会立即
   // 用 GET /api/config 的 automation_policy.require_gps 覆盖。
   const [requireGps, setRequireGps] = useState(true)
+  const [savingGps, setSavingGps] = useState(false)
+  const gpsSavePending = useRef(false)
   const [pumpSettings, setPumpSettings] = useState<PumpSettings>({ ...DEFAULT_PUMP_SETTINGS })
   const [presetName, setPresetName] = useState('')
 
@@ -140,16 +143,17 @@ export default function Automation() {
   }
 
   const persistRequireGps = async (next: boolean) => {
-    setRequireGps(next)
+    if (gpsSavePending.current) return
+    gpsSavePending.current = true
+    setSavingGps(true)
     try {
-      await fetch('/api/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ automation_policy: { require_gps: next } }),
-      })
+      await persistGpsPolicy(next, requireGps, setRequireGps)
     } catch (error) {
       console.error(error)
-      toast({ title: 'GPS 策略保存失败', description: '已切换本页状态，但服务器持久化失败', variant: 'destructive' })
+      toast({ title: 'GPS 策略保存失败', description: '已恢复保存前的设置，请重试', variant: 'destructive' })
+    } finally {
+      gpsSavePending.current = false
+      setSavingGps(false)
     }
   }
 
@@ -362,7 +366,7 @@ export default function Automation() {
               )}
             </div>
           )}
-          <Button variant="outline" onClick={() => handleAction('start')} disabled={!controls.start}>
+          <Button variant="outline" onClick={() => handleAction('start')} disabled={!controls.start || savingGps}>
             <Play className="w-4 h-4 mr-2 text-emerald-500" /> 启动
           </Button>
           <Button variant="outline" onClick={() => handleAction('pause')} disabled={!controls.pause}>
@@ -428,7 +432,7 @@ export default function Automation() {
                 <div className="flex items-center justify-between gap-3">
                   <Label htmlFor="require-gps">启动时要求 GPS</Label>
                   <Switch id="require-gps" checked={requireGps} onCheckedChange={(v) => void persistRequireGps(v)}
-                    disabled={automationRunning || automationPaused} aria-describedby="require-gps-help" />
+                    disabled={automationRunning || automationPaused || savingGps} aria-describedby="require-gps-help" />
                 </div>
                 <p id="require-gps-help" className="text-xs text-muted-foreground">
                   {requireGps ? '启动前校验有效定位；室内台架测试可关闭。' : '室内测试：允许无 GPS 执行真实泵控；无定位记录不进入地图。'}

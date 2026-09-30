@@ -4,6 +4,7 @@ import tempfile
 import threading
 import unittest
 from unittest.mock import patch
+from unittest.mock import Mock
 
 from scripts.web_config_server import FLASK_AVAILABLE, WebConfigServer, String
 from gps_fixtures import gps_position
@@ -180,7 +181,8 @@ class SamplingContextContractTests(unittest.TestCase):
                     result = self.server.app.test_client().post('/api/mission/start').get_json()
                 self.assertFalse(result['success'])
                 self.assertIsNone(self.server._web_attempt_id)
-                self.assertEqual(calls.count('manual_stop_all'), 2)
+                self.assertEqual(calls.count('manual_stop_all'), 1)
+                self.assertEqual(calls.count('automation_cleanup'), 1)
 
     def test_old_or_unscoped_terminal_cannot_close_new_owned_window(self):
         self.server._sampling_context = {'source': 'web', 'attempt_id': 'new-B'}
@@ -322,6 +324,10 @@ class SamplingContextContractTests(unittest.TestCase):
                 start.start()
                 self.assertTrue(started.wait(3))
                 self.assertIsNotNone(self.server.current_sample_window)
+                self.server.owner_pub = Mock()
+                self.server._publish_web_owner_heartbeat()
+                beat = self.server.owner_pub.publish.call_args[0][0]
+                self.assertEqual(json.loads(beat.data)['attempt_id'], 'cancelled-A')
                 # Operator presses Stop while the start request is still in flight.
                 self.server._cancel_pending_web_start()
             finally:
@@ -333,7 +339,8 @@ class SamplingContextContractTests(unittest.TestCase):
         self.assertIsNone(self.server.current_sample_window)
         self.assertIsNone(self.server._web_attempt_id)
         self.assertNotIn('cancelled-A', (self.server._sampling_context or {}).get('attempt_id', ''))
-        self.assertEqual(calls.count('manual_stop_all'), 1)
+        self.assertEqual(calls.count('automation_cleanup'), 1)
+        self.assertNotIn('manual_stop_all', calls)
 
         # A fresh start after the cancelled one is not polluted by the old attempt.
         with patch.object(self.server, '_publish_steps', return_value={'attempt_id': 'fresh-B'}), \
@@ -342,6 +349,20 @@ class SamplingContextContractTests(unittest.TestCase):
         self.assertTrue(retry.get_json()['success'])
         self.assertEqual(self.server._web_attempt_id, 'fresh-B')
         self.assertEqual(self.server.current_sample_window['attempt_id'], 'fresh-B')
+
+    def test_old_rollback_does_not_clear_new_heartbeat_owner(self):
+        self.server.standalone = False
+        self.server._web_attempt_id = 'new-B'
+        self.server._sampling_context = {'attempt_id': 'new-B'}
+        self.server._rollback_web_start({'attempt_id': 'old-A'}, None, None, {})
+        self.server.owner_pub = Mock()
+        self.server._publish_web_owner_heartbeat()
+        self.assertEqual(json.loads(self.server.owner_pub.publish.call_args[0][0].data),
+                         {'attempt_id': 'new-B'})
+        self.server._cancel_pending_web_start()
+        self.server.owner_pub.reset_mock()
+        self.server._publish_web_owner_heartbeat()
+        self.server.owner_pub.publish.assert_not_called()
 
 
 if __name__ == '__main__':
