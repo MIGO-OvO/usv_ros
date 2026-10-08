@@ -484,13 +484,22 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
                 "health": {"code": 1, "level": "warn", "summary": "warm"},
             }
             server._system_health_cb(string_cls(json.dumps(payload)))
+            transaction = {
+                'spectrometer_txn_phase': 'frame_timeout',
+                'spectrometer_last_txn_error': 'no valid spectrometer frame after start',
+                'spectrometer_cleanup_error': 'ADS_ERR:I2C',
+            }
+            server._automation_status_cb(string_cls(json.dumps(transaction)))
             response = client.get("/api/diagnostics/system")
+            exported = client.get('/api/diagnostics/export').get_json()
 
         self.assertEqual(response.status_code, 200)
         body = response.get_json()
         self.assertTrue(body["success"])
         self.assertEqual(body["data"]["latest"]["health"]["summary"], "warm")
         self.assertEqual(body["data"]["history"][-1]["detector"]["heap_free"], 120000)
+        self.assertEqual(body['data']['automation'], transaction)
+        self.assertEqual(exported['automation_latest'], transaction)
         self.assertIn(("system_health", payload), server.socketio.events)
 
     def test_web_periodic_snapshot_does_not_emit_synthetic_voltage_sample(self):
@@ -545,13 +554,11 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             start_resp = client.post("/api/spectrometer/start")
 
         self.assertEqual(start_resp.status_code, 200)
-        self.assertEqual([call["action"] for call in control_calls[-3:]], [
-            "spectrometer_i2c_map",
-            "spectrometer_configure",
-            "spectrometer_start",
-        ])
-        first_payload = json.loads(control_calls[-3]["payload_json"])
-        self.assertEqual(first_payload["mapping"]["spectro_channel"], 2)
+        self.assertTrue(start_resp.get_json()["success"])
+        self.assertEqual([call["action"] for call in control_calls], ["spectrometer_start"])
+        payload = json.loads(control_calls[0]["payload_json"])
+        self.assertEqual(payload["mapping"]["spectro_channel"], 2)
+        self.assertIn("spectro", payload)
         self.assertEqual(publishers["/usv/spectrometer_command"].messages, [])
 
     def test_web_spectrometer_stop_route_publishes_stop_command(self):
@@ -3307,7 +3314,10 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         node.manual_mode_enabled = True
         node.automation_engine.steps = [{"name": "step"}]
         node.send_command = lambda cmd: True
-        node._wait_for_spectro_command_result = lambda timeout=2.0: (True, "ADS_OK:START")
+        node._apply_i2c_mapping = lambda: True
+        node._apply_spectro_config = lambda: True
+        node._send_and_wait_text = lambda *args, **kwargs: (True, "ADS_OK:START")
+        node._wait_first_valid_spectro_frame = lambda timeout=2.0: True
 
         auto_response = node._auto_start_callback(None)
         spectro_response = node._spectro_start_callback(None)
@@ -3809,7 +3819,14 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         node = module.PumpControlNode()
         node.inject_pump_speed = 0
         sent = []
-        node.send_command = lambda cmd: sent.append(cmd) or True
+        def send(cmd):
+            sent.append(cmd)
+            if cmd.startswith('I2CMAP:'):
+                node._on_text_received('I2CMAP_OK:X=2,Y=3,Z=6,A=7,SPEC=2')
+            elif cmd.startswith('ADSCFG:'):
+                node._on_text_received('ADS_OK:CFG,' + cmd.split(':', 1)[1])
+            return True
+        node.send_command = send
 
         node._spectro_cmd_callback(string_cls(json.dumps({
             "cmd": "set_i2c_map",
@@ -3832,6 +3849,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         })))
 
         self.assertEqual(sent[0], "I2CMAP:X=2,Y=3,Z=6,A=7,SPEC=2")
+        self.assertEqual(node._spectro_config_state, 'ready')
         self.assertIn("ADSCFG:CH=2,ADDR=0x40,AIN=AIN0,REF=INT,GAIN=4,DR=90,MODE=CONT,PR=200", sent[1])
 
         node._spectro_cmd_callback(string_cls(json.dumps({
@@ -3875,7 +3893,17 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         node.inject_pump_speed = 0
         sent = []
         node.send_command = lambda cmd: sent.append(cmd) or True
-        node._wait_for_spectro_command_result = lambda timeout=2.0: (True, "ADS_OK:START")
+        node._wait_first_valid_spectro_frame = lambda timeout=2.0: True
+
+        def fake_send_and_wait(cmd, success_prefixes, error_prefixes, timeout=2.0):
+            sent.append(cmd)
+            if cmd.startswith("I2CMAP:"):
+                return True, "I2CMAP_OK:X=0,Y=3,Z=4,A=7,SPEC=2"
+            if cmd == "ADSSTART":
+                return True, "ADS_OK:START"
+            return True, "ADS_OK:CFG,CH=2,ADDR=0x40,AIN=AIN0,REF=AVDD,GAIN=1,DR=90,MODE=CONT,PR=90"
+
+        node._send_and_wait_text = fake_send_and_wait
 
         success, message = node._spectro_start()
 
@@ -3885,6 +3913,89 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertIn("ADSCFG:CH=2,ADDR=0x40,AIN=AIN0,REF=AVDD,GAIN=1,DR=90,MODE=CONT,PR=90", sent[1])
         self.assertEqual(sent[2], "ADSSTART")
         self.assertEqual(node.spectro_reference_voltage, 0.0)
+        self.assertEqual(node._spectro_txn_phase, "running")
+
+    def test_pump_node_spectrometer_start_fails_on_i2c_mapping_mismatch(self):
+        module, _, _ = _load_script(
+            "pump_control_node_spectro_start_i2c_mismatch_test",
+            "scripts/pump_control_node.py",
+        )
+        node = module.PumpControlNode()
+        sent = []
+        node.send_command = lambda cmd: sent.append(cmd) or True
+        node._send_and_wait_text = lambda cmd, ok, err, timeout=2.0: (
+            (True, "I2CMAP_OK:X=0,Y=3,Z=4,A=7,SPEC=5") if cmd.startswith("I2CMAP:") else (True, "ADS_OK:CFG")
+        )
+
+        success, message = node.prepare_and_start_spectrometer()
+
+        self.assertFalse(success)
+        self.assertIn("mismatch", message)
+        # A failed mapping must never reach ADSSTART.
+        self.assertNotIn("ADSSTART", sent)
+        self.assertEqual(node._last_spectro_txn_error, "I2CMAP mismatch: I2CMAP_OK:X=0,Y=3,Z=4,A=7,SPEC=5")
+
+    def test_pump_node_spectrometer_start_fails_on_ads_err(self):
+        module, _, _ = _load_script(
+            "pump_control_node_spectro_start_ads_err_test",
+            "scripts/pump_control_node.py",
+        )
+        node = module.PumpControlNode()
+        sent = []
+        node.send_command = lambda cmd: sent.append(cmd) or True
+        node._send_and_wait_text = lambda cmd, ok, err, timeout=2.0: (
+            (True, "I2CMAP_OK:X=0,Y=3,Z=4,A=7,SPEC=2") if cmd.startswith("I2CMAP:")
+            else (False, "ADS_ERR:I2C")
+        )
+
+        success, message = node.prepare_and_start_spectrometer()
+
+        self.assertFalse(success)
+        self.assertEqual(message, "ADSCFG: ADS_ERR:I2C; retry synchronization: ADS_ERR:I2C")
+        self.assertNotIn("ADSSTART", sent)
+
+    def test_pump_node_spectrometer_start_timeout_does_not_report_success(self):
+        module, _, _ = _load_script(
+            "pump_control_node_spectro_start_timeout_test",
+            "scripts/pump_control_node.py",
+        )
+        node = module.PumpControlNode()
+        sent = []
+        node.send_command = lambda cmd: sent.append(cmd) or True
+        node._send_and_wait_text = lambda cmd, ok, err, timeout=2.0: (
+            (True, "I2CMAP_OK:X=0,Y=3,Z=4,A=7,SPEC=2") if cmd.startswith("I2CMAP:")
+            else (False, "timeout") if cmd == "ADSSTART"
+            else (True, "ADS_OK:STOP") if cmd == "ADSSTOP"
+            else (True, "ADS_OK:CFG,CH=2,ADDR=0x40,AIN=AIN0,REF=AVDD,GAIN=1,DR=90,MODE=CONT,PR=90")
+        )
+
+        success, message = node.prepare_and_start_spectrometer()
+
+        self.assertFalse(success)
+        self.assertEqual(message, "Spectrometer start timeout")
+        self.assertEqual(node._spectro_txn_phase, "start_failed")
+
+    def test_pump_node_spectrometer_start_reports_missing_first_frame(self):
+        module, _, _ = _load_script(
+            "pump_control_node_spectro_start_no_frame_test",
+            "scripts/pump_control_node.py",
+        )
+        node = module.PumpControlNode()
+        sent = []
+        node.send_command = lambda cmd: sent.append(cmd) or True
+        node._send_and_wait_text = lambda cmd, ok, err, timeout=2.0: (
+            (True, "I2CMAP_OK:X=0,Y=3,Z=4,A=7,SPEC=2") if cmd.startswith("I2CMAP:")
+            else (True, "ADS_OK:START") if cmd == "ADSSTART"
+            else (True, "ADS_OK:STOP") if cmd == "ADSSTOP"
+            else (True, "ADS_OK:CFG,CH=2,ADDR=0x40,AIN=AIN0,REF=AVDD,GAIN=1,DR=90,MODE=CONT,PR=90")
+        )
+        node._wait_first_valid_spectro_frame = lambda timeout=2.0: False
+
+        success, message = node.prepare_and_start_spectrometer()
+
+        self.assertFalse(success)
+        self.assertIn("no valid frame", message)
+        self.assertEqual(node._last_spectro_txn_error, "no valid spectrometer frame after start")
 
     def test_pump_node_spectrometer_baseline_command_sets_reference_voltage(self):
         module, _, string_cls = _load_script(

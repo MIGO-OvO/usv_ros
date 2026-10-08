@@ -76,6 +76,7 @@ class AutomationEngine(object):
 
         # 错误状态
         self._failed = False
+        self._cleanup_failed = False
         self._last_error = None
 
         # 回调函数
@@ -156,6 +157,7 @@ class AutomationEngine(object):
         self._pid_complete_event.clear()
         self._failed = False
         self._last_error = None
+        self._cleanup_failed = False
 
         # 重置指令生成器
         self.command_generator.reset_for_auto_mode()
@@ -173,14 +175,15 @@ class AutomationEngine(object):
             self._running.clear()
             self._paused.clear()
 
-            # 发送停止指令
-            try:
-                # 先停止 PID
-                self.send_command(self.command_generator.generate_pid_stop_command())
-                # 再停止所有电机
-                self.send_command(self.command_generator.generate_stop_command())
-            except Exception:
-                pass
+            # Both halt writes must be attempted; a later successful retry
+            # must not erase an earlier cleanup failure.
+            for command in (self.command_generator.generate_pid_stop_command(),
+                            self.command_generator.generate_stop_command()):
+                try:
+                    if not self.send_command(command):
+                        self._cleanup_failed = True
+                except Exception:
+                    self._cleanup_failed = True
 
         # 等待线程结束
         if self._thread and self._thread.is_alive():
@@ -247,6 +250,25 @@ class AutomationEngine(object):
         if motor in self._pending_pid_motors:
             self._pending_pid_motors.discard(motor)
             self._pid_complete_event.set()
+
+    def notify_pid_failed(self, motor, reason_text):
+        """
+        通知 PID 失败/超时 (由外部调用)。
+
+        PID_DONE 表示成功；PID_TIMEOUT / PID_FAIL 是固件给出的失败信号，
+        必须终止当前自动化并记录原因，不允许静默当作完成继续流程。
+
+        Args:
+            motor: 失败的电机名称
+            reason_text: 'pid_timeout' 或 'pid_fail'
+        """
+        if not self._running.is_set() or motor not in self._pending_pid_motors:
+            return
+        self._pending_pid_motors.discard(motor)
+        self._pid_complete_event.set()
+        self._handle_error(
+            "PID 电机 {} 固件报告异常: {}".format(motor, reason_text)
+        )
 
     def get_status(self):
         """
@@ -528,12 +550,13 @@ class AutomationEngine(object):
 
     def _cleanup(self):
         """清理资源。"""
-        try:
-            # 发送停止指令
-            self.send_command(self.command_generator.generate_pid_stop_command())
-            self.send_command(self.command_generator.generate_stop_command())
-        except Exception:
-            pass
+        for command in (self.command_generator.generate_pid_stop_command(),
+                        self.command_generator.generate_stop_command()):
+            try:
+                if not self.send_command(command):
+                    self._cleanup_failed = True
+            except Exception:
+                self._cleanup_failed = True
 
         with self._lock:
             stopped = not self._running.is_set()

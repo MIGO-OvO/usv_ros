@@ -10,6 +10,7 @@
     "test:automation-controls": "node --test scripts/test-automation-controls.ts",
     "test:lab-coordinates": "node --test scripts/test-lab-coordinate-contract.mjs",
     "test:time-series": "node --test scripts/test-time-series.ts",
+    "test:gps-layers": "node --test scripts/test-gps-layer-contract.mjs",
     "smoke:map": "node scripts/smoke-map.mjs",
     "smoke:map:browser": "node scripts/smoke-map-browser.mjs",
     "preview": "vite preview"

@@ -44,11 +44,39 @@ function Coordinates({ title, position }: { title: string; position?: Position }
 }
 
 
+const reasonText: Record<string, string> = {
+  gps_missing: '无数据',
+  gps_no_fix: '无 Fix',
+  gps_stale: '数据过期',
+  gps_invalid_coordinates: '坐标非法',
+  gps_missing_receive_time: '缺少接收时间',
+}
+
+/** Three independent layers: raw GNSS telemetry, MAVROS fix, sampling admission. */
+function layerStatus(gps: Diagnostics | null) {
+  const raw = gps?.gps_raw
+  const navsat = gps?.navsat
+  const limit = gps?.freshness_threshold_s ?? 2
+  const ageText = (value: Maybe | undefined) =>
+    typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(1)}s` : '—'
+  const receiver = !raw?.available ? '未收到 GPS_RAW_INT'
+    : raw.stale ? '原始 GNSS 遥测陈旧'
+      : `${raw.fix_label || 'Unknown'} · ${num(raw.satellites, 0)} SAT · HDOP ${num(raw.hdop)}`
+  const mavros = !navsat?.available ? '未收到 NavSatFix'
+    : `已接收 · age ${ageText(navsat.age_s)} · ${(navsat.age_s ?? Infinity) > limit
+      ? `超过采样阈值 ${limit.toFixed(1)}s` : `采样时效内（阈值 ${limit.toFixed(1)}s）`}`
+  const sampling = !gps ? '未知'
+    : gps.sampling_position.valid ? `可用于采样 · ${ageText(navsat?.age_s)}`
+      : `不可用 · ${reasonText[gps.sampling_position.reason ?? ''] ?? gps.sampling_position.reason}`
+  return { receiver, mavros, sampling }
+}
+
 export function GpsStatusCard({ gps, failed, detailed = false }: {
   gps: Diagnostics | null; failed: boolean; detailed?: boolean
 }) {
   const raw = gps?.gps_raw
   const summary = summarizeGps(gps)
+  const layer = layerStatus(gps)
   const details: [string, string | number][] = [
     ['FCU sysid / compid（预期 1/1）', `${gps?.fcu.system_id ?? '—'} / ${gps?.fcu.component_id ?? '—'}`],
     ['Heartbeat age', `${num(gps?.fcu.heartbeat_age_s)} s`],
@@ -92,7 +120,15 @@ export function GpsStatusCard({ gps, failed, detailed = false }: {
         <span>FCU：{link(gps?.fcu.heartbeat_valid)}</span>
         <span>MAVROS：{link(gps?.fcu.mavros_connected)}</span>
         <span className="break-all">GLOBAL_POSITION_INT：{!gps?.global_position.available ? '未收到' : gps.global_position.stale ? '数据较旧' : '正常'}</span>
-        <span>GPS RAW：{!raw?.available ? '未收到 GPS_RAW_INT' : raw.stale ? '已过期' : '正在接收'}</span>
+        <span>GPS RAW：{!raw?.available ? '未收到 GPS_RAW_INT' : raw.stale ? '原始 GNSS 遥测陈旧' : '正在接收'}</span>
+      </div>
+      <div className="grid gap-x-6 gap-y-1 border-y py-2 text-xs sm:grid-cols-[auto_minmax(0,1fr)]" role="list">
+        <span className="font-medium" role="listitem">GPS Receiver</span>
+        <span role="listitem" className={layer.receiver.includes('陈旧') || layer.receiver.includes('未收到') ? colors.orange : undefined}>{layer.receiver}</span>
+        <span className="font-medium" role="listitem">MAVROS Position</span>
+        <span role="listitem" className={layer.mavros.includes('超过采样阈值') || layer.mavros.includes('未收到') ? colors.orange : undefined}>{layer.mavros}</span>
+        <span className="font-medium" role="listitem">Sampling GPS</span>
+        <span role="listitem" className={layer.sampling.includes('不可用') ? colors.error : colors.success}>{layer.sampling}</span>
       </div>
       {detailed && gps?.warnings.map((warning) => <p key={warning} className="text-orange-700 dark:text-orange-400">{warning}</p>)}
       {detailed && <>
@@ -117,7 +153,7 @@ export function GpsStatusCard({ gps, failed, detailed = false }: {
               <li key={`${entry.received_at}-${index}`}><time>{date(entry.received_at)}</time> · {entry.text}</li>)}</ul> : <p>暂无日志</p>}
           </section>
           <p className="text-muted-foreground">此面板只读。缺少原始帧可能是接收机、配置或消息流问题；无法仅凭软件判断天线或硬件损坏。</p>
-          <p className="text-muted-foreground">显示层：超过后端新鲜度阈值的坐标标记为降级；超过 {Math.max(10, gps?.freshness_threshold_s ?? 2)} 秒不再用作主坐标。采样准入始终以服务器严格校验为准。</p>
+          <p className="text-muted-foreground">MAVROS 位置显示与采样准入分开判断；超过后端采样阈值（{(gps?.freshness_threshold_s ?? 2).toFixed(1)}s）的数据会标记为降级，采样准入始终以服务器严格校验为准。</p>
         </div>
       </div>}
     </CardContent>
