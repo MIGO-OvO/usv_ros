@@ -65,6 +65,8 @@ if lib_dir not in sys.path:
 from command_generator import CommandGenerator, MOTOR_NAMES, COMMAND_TERMINATOR
 from automation_engine import AutomationEngine
 from injection_pump_worker import InjectionPumpWorker
+from automation_preflight import (AutomationPreflight, PreflightError, PreflightCancelled,
+                                 normalize_preflight, involved_axes, load_zero_offsets)
 
 # 串口协议常量
 HEADER1 = 0x55
@@ -542,6 +544,13 @@ class PumpControlNode(object):
         self._terminal_finalized = False
         self._cleanup_failed = False
         self._stop_in_progress = False
+        self.preflight_config = normalize_preflight({})
+        self.calibration_file = os.path.expanduser(rospy.get_param(
+            '~calibration_file', '~/usv_ws/config/calibration.json'))
+        self._preflight = None
+        self._preflight_thread = None
+        self._preflight_connection = None
+        self._automation_injection_prepared = False
 
         # 指令生成器
         self.command_generator = CommandGenerator()
@@ -1639,6 +1648,10 @@ class PumpControlNode(object):
         policy = self._injection_policy_for_automation()
         if not policy:
             return True
+        # Preparation is performed once before the first step. Re-arm after
+        # a physical pause, but never repeat the lead time on every step.
+        if self._automation_injection_prepared and self.inject_pump_enabled:
+            return True
         speed = int(policy.get("speed", 0) or 0)
         if speed <= 0:
             self._update_injection_pump_state(enabled=False, error="Injection pump policy speed is 0")
@@ -1912,6 +1925,9 @@ class PumpControlNode(object):
             self.current_angles.update(angles)
             self.latest_angle_received_at = time.time()
 
+        if self._preflight:
+            self._preflight.notify_angles(angles)
+
         # 更新指令生成器
         self.command_generator.set_current_angles(angles)
 
@@ -1944,6 +1960,8 @@ class PumpControlNode(object):
 
     def _on_text_received(self, text):
         """文本响应回调。"""
+        if self._preflight and not text.startswith('PUMP_'):
+            self._preflight.notify_text(text)
         if text == 'ADS_OK:START':
             # Startup deadline only, never measurement freshness.
             self._spectro_start_ack_at = time.monotonic()
@@ -2035,6 +2053,8 @@ class PumpControlNode(object):
             return
 
         if self._parse_injection_pump_text(text):
+            if self._preflight:
+                self._preflight.notify_text(text)
             return
 
         if text.startswith("I2CMAP_OK:"):
@@ -2404,7 +2424,11 @@ class PumpControlNode(object):
 
     def _automation_is_active(self):
         worker = getattr(self.automation_engine, '_thread', None)
+        preparation = self._preflight_thread
         return bool(
+            (preparation is not None and preparation.is_alive())
+            or (self._preflight is not None and self._preflight.snapshot()['active'])
+            or
             self.automation_engine.is_running()
             or getattr(self.automation_engine, "is_paused", lambda: False)()
             # running is cleared before the worker's terminal callbacks finish.
@@ -2868,6 +2892,7 @@ class PumpControlNode(object):
             loop_count = data.get("loop_count", 1)
             pid_mode = bool(data.get("pid_mode", self.pid_mode))
             pid_precision = float(data.get("pid_precision", self.pid_precision))
+            preflight_config = normalize_preflight(data.get('preflight', {}))
             if (not isinstance(steps, list) or not all(isinstance(step, dict) for step in steps)
                     or type(loop_count) is not int or loop_count < 0
                     or not math.isfinite(pid_precision) or pid_precision <= 0):
@@ -2902,6 +2927,12 @@ class PumpControlNode(object):
             self.injection_pump_policy = self._normalize_injection_pump_policy(
                 data.get("injection_pump_policy", {})
             )
+            self.preflight_config = preflight_config
+            self._preflight = None
+            self._automation_injection_prepared = False
+            self.automation_engine._last_error = None
+            self.automation_engine._failed = False
+            self.automation_engine._cleanup_failed = False
 
             step_names = [step.get("name", "未命名步骤") for step in steps[:5] if isinstance(step, dict)]
             rospy.loginfo("Automation steps loaded: %d steps, %s loops, pid_mode=%s, pid_precision=%.3f, preview=%s",
@@ -2966,16 +2997,93 @@ class PumpControlNode(object):
                       "∞" if self.automation_engine.loop_count == 0 else str(self.automation_engine.loop_count),
                       self.pid_mode,
                       self.pid_precision)
-        success = self.automation_engine.start()
-        message = "Automation started" if success else "Automation start failed"
-        if success:
-            rospy.loginfo("Automation engine thread started successfully")
-            self._publish_automation_status("running")
-        else:
-            self._set_terminal_reason('configuration_failed')
-            rospy.logerr("Automation engine failed to start despite pre-check passing")
+        self._preflight_connection = self.serial_conn
+        self._preflight = AutomationPreflight(
+            self._send_preflight_command, self._check_preflight_active,
+            self._preflight_angles, self._publish_preflight_status)
+        self._preflight_thread = threading.Thread(
+            target=self._run_preflight, name='AutomationPreflight', daemon=True)
+        self._publish_preflight_status()
+        try:
+            self._preflight_thread.start()
+        except Exception as exc:
+            self._fail_preflight(self._preflight, exc)
+            return TriggerResponse(success=False, message="Preflight worker start failed")
+        return TriggerResponse(success=True, message="Preflight accepted; waiting for preparation completion")
+
+    def _publish_preflight_status(self):
+        self._publish_automation_status('preflight')
+
+    def _check_preflight_active(self):
+        if self._preflight.cancelled.is_set():
+            raise PreflightCancelled()
+        if rospy.is_shutdown():
+            raise PreflightError('controller_fault', 'ROS shutdown during Preflight')
+        if self._controller_fault:
+            raise PreflightError(self._terminal_reason or 'controller_fault',
+                                 'Preflight controller fault: ' + self._controller_fault)
+        if (self.serial_conn is not self._preflight_connection or
+                not self.serial_conn or not self.serial_conn.is_open):
+            raise PreflightError('serial_disconnected', 'Preflight serial session changed or disconnected')
+        if self._owner_last_seen is None or time.monotonic() - self._owner_last_seen > 5.0:
+            self._controller_fault = 'owner_lost'
+            raise PreflightError('owner_lost', 'Preflight owner heartbeat lost')
+
+    def _send_preflight_command(self, command, before_send=None):
+        # Waits happen outside this lock so STOP and owner renewals remain live.
+        with self._control_lock:
+            self._check_preflight_active()
+            if before_send:
+                before_send()
+            return self.send_command(command)
+
+    def _preflight_angles(self, motors):
+        with self.angles_lock:
+            angles = dict(self.current_angles)
+            received = self.latest_angle_received_at
+        if motors and (not received or not 0 <= time.time() - received <= 1.0):
+            raise PreflightError('controller_fault', 'Preflight requires fresh pump angle feedback')
+        for axis in motors:
+            value = angles.get(axis)
+            age = (self.detector_angle_channel_age_ms or {}).get(axis)
+            if (value is None or not math.isfinite(value) or not 0 <= value <= 360 or
+                    (age is not None and age > 500)):
+                raise PreflightError('controller_fault', 'Preflight invalid/stale angle for ' + axis)
+        return angles
+
+    def _run_preflight(self):
+        preparation = self._preflight
+        try:
+            motors = involved_axes(self.automation_engine.steps)
+            zeros = load_zero_offsets(self.calibration_file, motors)
+            injection = self._injection_policy_for_automation()
+            if injection and injection['speed'] <= 0:
+                raise ValueError('Injection pump pre-start speed must be positive')
+            preparation.run(motors, zeros, self.preflight_config, min(0.1, self.pid_precision),
+                            (injection['speed'], injection['lead_time_s']) if injection else None)
+            with self._control_lock:
+                self._check_preflight_active()
+                self._automation_injection_prepared = bool(injection)
+                with preparation.lock:
+                    preparation.state['active'] = False
+                if not self.automation_engine.start():
+                    raise PreflightError('configuration_failed', 'Automation engine start failed')
+                # The engine worker owns status publication after handoff.
+        except PreflightCancelled:
+            return  # The synchronous STOP path owns cleanup and terminal status.
+        except Exception as exc:
+            self._fail_preflight(preparation, exc)
+
+    def _fail_preflight(self, preparation, exc):
+        with self._control_lock:
+            if preparation.cancelled.is_set() or self._terminal_finalized:
+                return
+            reason = exc.reason if isinstance(exc, PreflightError) else 'configuration_failed'
+            self._set_terminal_reason(reason)
+            self.last_automation_failure = {'reason': str(exc), 'preflight_phase': preparation.snapshot()['phase']}
+            with preparation.lock:
+                preparation.state.update(phase='failed', active=False, error=str(exc))
             self._on_automation_status('failed')
-        return TriggerResponse(success=success, message=message)
 
     def _auto_stop_callback(self, req):
         with self._control_lock:
@@ -2984,6 +3092,8 @@ class PumpControlNode(object):
     def _auto_stop_locked(self, req):
         """停止自动化服务回调。"""
         self._configuration_ready = False
+        if self._preflight and self._preflight.snapshot()['active']:
+            self._preflight.cancel()
         # A stop without a pre-registered fault reason is an operator stop.
         self._set_terminal_reason('operator_stop')
         rospy.loginfo("Automation stop requested (terminal_reason=%s)", self._terminal_reason)
@@ -3056,6 +3166,8 @@ class PumpControlNode(object):
 
     def _auto_pause_callback(self, req):
         """暂停自动化服务回调。"""
+        if self._preflight and self._preflight.snapshot()['active']:
+            return TriggerResponse(success=False, message="Preflight cannot pause; stop and restart preparation")
         if not self.automation_engine.is_running():
             return TriggerResponse(success=False, message="Automation is not running")
         if self.automation_engine.is_paused():
@@ -3187,6 +3299,8 @@ class PumpControlNode(object):
             engine_status = {}
 
         running = bool(engine_status.get("running", False))
+        preflight = self._preflight.snapshot() if self._preflight else {'active': False, 'phase': 'idle'}
+        running = running or preflight['active']
         paused = bool(engine_status.get("paused", False))
         try:
             current_step = int(engine_status.get("current_step", 0) or 0)
@@ -3210,7 +3324,9 @@ class PumpControlNode(object):
         if terminal_status:
             running = False
             paused = False
-        if total_steps > 0 and (running or paused):
+        if preflight['active']:
+            automation_step = 0
+        elif total_steps > 0 and (running or paused):
             automation_step = min(current_step + 1, total_steps)
         elif total_steps > 0 and ("finish" in status_lower or "done" in status_lower):
             automation_step = total_steps
@@ -3239,6 +3355,7 @@ class PumpControlNode(object):
                        if self._owner_last_seen is not None else None)
         payload = {
             "status": status_text,
+            "preflight": preflight,
             "terminal_reason": self._terminal_reason,
             "cleanup_failed": self._cleanup_failed,
             "sampling_context": dict(self.sampling_context),
@@ -3312,6 +3429,8 @@ class PumpControlNode(object):
         while not rospy.is_shutdown():
             self._check_spectro_freshness()
             self._check_sampling_owner()
+            if self._preflight and self._preflight.snapshot()['active']:
+                self._publish_preflight_status()
             # 周期性状态日志
             angles = self.get_current_angles()
             rospy.logdebug_throttle(5, "Angles: %s", angles)

@@ -30,7 +30,7 @@ class SampleGPSBindingTests(unittest.TestCase):
             self.assertEqual(context['gps_snapshot']['lat'], 30.0)
             self.node._latest_global_position = gps_position(31.0, 121.0)
             return True
-        self.node._start_injection_session.side_effect = move
+        self.node._call_automation_service.side_effect = move
         self.assertTrue(self.node._do_manual_sample())
         context = self.node.current_sampling_context
         self.node._spectrometer_voltage_cb(self.message({'voltage': 1.23, 'valid': True}))

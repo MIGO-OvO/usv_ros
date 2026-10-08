@@ -119,6 +119,7 @@ from scripts.lib.sample_recording import MIN_RAW_RECORD_HZ, SampleRecordingStora
 from scripts.lib.sample_recording.models import safe_id
 from scripts.lib.sample_recording.record import bind_web_context, freeze_position, navsat_position, position_local_age_s, finite
 from scripts.lib.gps_diagnostics import diagnose
+from scripts.lib.automation_preflight import DEFAULT_PREFLIGHT, normalize_preflight, calibrated_offsets
 from scripts.lib.sample_recording.downsampling import MinMaxSeries
 
 # 配置文件路径
@@ -1013,6 +1014,7 @@ class CalibrationManager(object):
     def __init__(self, file_path=CALIBRATION_FILE):
         self.file_path = file_path
         self.offsets = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
+        self.configured_axes = set()
         self.load()
 
     def load(self):
@@ -1020,30 +1022,57 @@ class CalibrationManager(object):
             try:
                 with open(self.file_path, 'r') as f:
                     data = json.load(f)
-                    self.offsets.update(data.get('offsets', {}))
+                    offsets = calibrated_offsets(data)
+                    self.offsets.update(offsets)
+                    self.configured_axes = set(offsets)
             except Exception as e:
                 print(f"Error loading calibration: {e}")
 
     def save(self):
+        temporary = None
         try:
-            with open(self.file_path, 'w') as f:
-                json.dump({'offsets': self.offsets}, f, indent=2)
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                    dir=os.path.dirname(self.file_path), delete=False) as handle:
+                temporary = handle.name
+                json.dump({'offsets': self.offsets,
+                           'configured_axes': sorted(self.configured_axes)}, handle, indent=2)
+            os.replace(temporary, self.file_path)
+            return True
         except Exception as e:
             print(f"Error saving calibration: {e}")
+            return False
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
+
+    def update_offsets(self, offsets):
+        validated = calibrated_offsets({'offsets': offsets})
+        previous, configured = dict(self.offsets), set(self.configured_axes)
+        self.offsets.update(validated)
+        self.configured_axes.update(validated)
+        if self.save():
+            return True
+        self.offsets, self.configured_axes = previous, configured
+        return False
 
     def set_zero(self, axis, raw_angle):
         """设置当前角度为零点 (Offset = Raw)"""
         if axis in self.offsets:
-            self.offsets[axis] = raw_angle
-            self.save()
+            return self.update_offsets({axis: raw_angle})
 
     def reset(self, axis=None):
+        previous, configured = dict(self.offsets), set(self.configured_axes)
         if axis:
             if axis in self.offsets:
                 self.offsets[axis] = 0.0
+                self.configured_axes.discard(axis)
         else:
             self.offsets = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
-        self.save()
+            self.configured_axes.clear()
+        if self.save():
+            return True
+        self.offsets, self.configured_axes = previous, configured
+        return False
 
     def get_corrected_angle(self, axis, raw_angle):
         """获取校准后的角度"""
@@ -1537,6 +1566,7 @@ DEFAULT_CONFIG = {
         "pid_mode": True,
         "pid_precision": 0.1,
         "default_speed": 60,
+        "preflight": dict(DEFAULT_PREFLIGHT),
         "injection_pump_policy": {
             "mode": "manual",
             "lead_time_s": 0.0,
@@ -1793,6 +1823,7 @@ class ConfigManager(object):
             base.get('injection_pump_policy', {}),
             default_speed=base.get('default_speed', 60),
         )
+        base['preflight'] = normalize_preflight(base.get('preflight', {}))
         return base
 
     @staticmethod
@@ -1842,7 +1873,7 @@ class ConfigManager(object):
                 if not self._same_persisted_lab_config(loaded, self.config):
                     self.save()
                 return True
-        except (OSError, json.JSONDecodeError, ModelParseError, CoordinateError) as e:
+        except (OSError, ValueError, ModelParseError, CoordinateError) as e:
             rospy.logwarn("Failed to load config: %s", str(e))
         return False
 
@@ -5305,6 +5336,7 @@ class WebConfigServer(object):
                 "automation_total": automation.get("automation_total", 0),
                 "current_loop": automation.get("current_loop", 0),
                 "total_loops": automation.get("total_loops", 0),
+                "preflight": automation.get('preflight'),
             })
             emit('angles', self.current_angles)
             emit('angle_telemetry', self.latest_angle_telemetry)
@@ -5783,10 +5815,26 @@ class WebConfigServer(object):
         # ================= 零点校准 API =================
         @self.app.route('/api/calibration/offsets', methods=['GET'])
         def get_offsets():
-            return jsonify({"success": True, "data": self.calibration_manager.offsets})
+            return jsonify({"success": True, "data": self.calibration_manager.offsets,
+                            "configured_axes": sorted(self.calibration_manager.configured_axes)})
+
+        @self.app.route('/api/calibration/offsets', methods=['POST'])
+        def save_offsets():
+            if self.automation_running or self.automation_paused:
+                return jsonify(success=False, message='任务运行期间不能修改相对零点'), 409
+            data = json_object()
+            if data is None or not isinstance(data.get('offsets'), dict):
+                return jsonify(success=False, message='offsets 应为 X/Y/Z/A 角度对象'), 400
+            try:
+                ok = self.calibration_manager.update_offsets(data['offsets'])
+            except (TypeError, ValueError) as exc:
+                return jsonify(success=False, message=str(exc)), 400
+            return jsonify(success=ok, message='相对零点已保存' if ok else '相对零点保存失败'), 200 if ok else 500
 
         @self.app.route('/api/calibration/zero', methods=['POST'])
         def set_zero():
+            if self.automation_running or self.automation_paused:
+                return jsonify(success=False, message='任务运行期间不能修改相对零点'), 409
             data = json_object()
             if data is None:
                 return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
@@ -5794,24 +5842,27 @@ class WebConfigServer(object):
 
             if not axis:
                 if hasattr(self, 'raw_angles'):
-                    for ax in ['X', 'Y', 'Z', 'A']:
-                        if ax in self.raw_angles:
-                            self.calibration_manager.set_zero(ax, self.raw_angles[ax])
+                    if not self.calibration_manager.update_offsets(self.raw_angles):
+                        return jsonify(success=False, message='零点保存失败'), 500
                 return jsonify({"success": True, "message": "所有轴零点已设置"})
 
             if hasattr(self, 'raw_angles') and axis in self.raw_angles:
-                self.calibration_manager.set_zero(axis, self.raw_angles[axis])
+                if not self.calibration_manager.set_zero(axis, self.raw_angles[axis]):
+                    return jsonify(success=False, message='零点保存失败'), 500
                 return jsonify({"success": True, "message": f"{axis} 轴零点已设置"})
 
             return jsonify({"success": False, "message": "无法获取当前原始角度"}), 400
 
         @self.app.route('/api/calibration/reset', methods=['POST'])
         def reset_zero():
+            if self.automation_running or self.automation_paused:
+                return jsonify(success=False, message='任务运行期间不能修改相对零点'), 409
             data = json_object()
             if data is None:
                 return jsonify({"success": False, "message": "请求体应为 JSON 对象"}), 400
             axis = clean_string(data.get('axis'), '', 1).upper() or None
-            self.calibration_manager.reset(axis)
+            if not self.calibration_manager.reset(axis):
+                return jsonify(success=False, message='零点保存失败'), 500
             return jsonify({"success": True, "message": "零点已重置"})
 
         # ================= 进样泵控制 API =================
@@ -6260,8 +6311,11 @@ class WebConfigServer(object):
                         config_patch['sampling_sequence'] = normalized_sequence
                     if isinstance(waypoint_sampling, dict):
                         config_patch['waypoint_sampling'] = ConfigManager._normalize_waypoint_sampling(waypoint_sampling)
+                    if isinstance(request_data.get('pump_settings'), dict):
+                        config_patch['pump_settings'] = ConfigManager._normalize_pump_settings(request_data['pump_settings'])
                     if config_patch:
-                        self.config_manager.update(config_patch)
+                        if not self.config_manager.update(config_patch):
+                            return jsonify(success=False, message='任务配置保存失败'), 500
                     steps_payload = self._publish_steps(transaction_only=True)
                     self._sampling_context = {'source': 'web', 'attempt_id': steps_payload['attempt_id']}
                     self._sampling_context.update(acquisition)
@@ -6358,6 +6412,7 @@ class WebConfigServer(object):
             "loop_count": config.get('sampling_sequence', {}).get('loop_count', 1),
             "pid_mode": pid_mode,
             "pid_precision": config.get('pump_settings', {}).get('pid_precision', 0.1),
+            "preflight": normalize_preflight(config.get('pump_settings', {}).get('preflight', {})),
             "injection_pump_policy": ConfigManager._normalize_injection_pump_policy(
                 config.get('pump_settings', {}).get('injection_pump_policy', {}),
                 default_speed=config.get('pump_settings', {}).get('default_speed', 60),
@@ -6410,6 +6465,7 @@ class WebConfigServer(object):
                     "pump_connected": self.pump_connected,
                     "automation_running": self.automation_running,
                     "automation_paused": self.automation_paused,
+                    "preflight": automation.get('preflight'),
                     "mission_status": self.mission_status,
                     "spectrometer_status": self.spectrometer_status,
                     "automation_step": automation.get("automation_step", 0),

@@ -1,6 +1,7 @@
 import { create } from 'zustand'
 import { io, Socket } from 'socket.io-client'
 import { RingBuffer } from '@/lib/time-series/ring-buffer'
+import type { PreflightStatus } from '@/lib/automation-preflight'
 
 interface PumpAngles {
   X: number
@@ -183,6 +184,7 @@ interface ControlEvent {
 }
 
 interface StatusPayload {
+  preflight?: PreflightStatus | null
   pump_connected?: boolean
   automation_running?: boolean
   automation_paused?: boolean
@@ -259,6 +261,7 @@ interface AppState {
   spectrometerTxnAttempt: number
   spectrometerRetryErrors: { attempt: number; phase: string; error: string }[]
   automationRunning: boolean
+  automationPreflight: PreflightStatus | null
   automationPaused: boolean
   automationStep: number
   automationTotal: number
@@ -358,6 +361,7 @@ export const useAppStore = create<AppState>((set, get) => ({
   spectrometerTxnAttempt: 0,
   spectrometerRetryErrors: [],
   automationRunning: false,
+  automationPreflight: null,
   automationPaused: false,
   automationStep: 0,
   automationTotal: 0,
@@ -522,6 +526,7 @@ export const useAppStore = create<AppState>((set, get) => ({
         spectrometerTxnAttempt: data.spectrometer_txn_attempt ?? 0,
         spectrometerRetryErrors: data.spectrometer_retry_errors ?? [],
         automationRunning: data.automation_running ?? false,
+        automationPreflight: data.preflight ?? null,
         automationPaused: data.automation_paused ?? false,
         automationStep: data.automation_step ?? 0,
         automationTotal: data.automation_total ?? 0,

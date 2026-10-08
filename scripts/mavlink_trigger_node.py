@@ -422,6 +422,8 @@ class MAVLinkTriggerNode(object):
             'loop_count': waypoint_cfg['loop_count'],
             'pid_mode': (config or {}).get('pump_settings', {}).get('pid_mode', True),
             'pid_precision': (config or {}).get('pump_settings', {}).get('pid_precision', 0.1),
+            'preflight': (config or {}).get('pump_settings', {}).get('preflight', {}),
+            'injection_pump_policy': self._sampling_injection_policy(config),
             'waypoint_seq': int(waypoint_seq),
             'retry_count': waypoint_cfg['retry_count'],
             'on_fail': waypoint_cfg['on_fail'],
@@ -446,6 +448,8 @@ class MAVLinkTriggerNode(object):
             'loop_count': max(0, loop_count),
             'pid_mode': pid_mode,
             'pid_precision': config.get('pump_settings', {}).get('pid_precision', 0.1),
+            'preflight': config.get('pump_settings', {}).get('preflight', {}),
+            'injection_pump_policy': self._sampling_injection_policy(config),
             'lab_mode': lab_enabled,
             'position_source': str(lab_cfg.get('position_source', 'lab_sim' if lab_enabled else 'real') or 'real'),
             'lab_options': {
@@ -942,17 +946,6 @@ class MAVLinkTriggerNode(object):
             context.update(on_fail='HOLD', retry_count=0)
             self._handle_failure_action('gps_rejected')
             return False
-        if not self._start_injection_session("waypoint", config):
-            cleaned, superseded = self._cleanup_sampling_attempt(context, 'injection_start_failed')
-            self._emit_sample_record(context, 'failed', 'injection_start_failed')
-            if superseded:
-                return False
-            if not cleaned:
-                context.update(on_fail='HOLD', retry_count=0)
-            self._set_waypoint_state(waypoint_seq, WaypointSamplingState.FAILED)
-            self._set_mission_state(MissionState.FAILED, "{}:injection_start_failed".format(waypoint_seq))
-            self._handle_failure_action('injection_start_failed')
-            return False
         self._prepare_automation_steps(steps_data)
 
         self._set_waypoint_state(waypoint_seq, WaypointSamplingState.SAMPLING)
@@ -1403,6 +1396,12 @@ class MAVLinkTriggerNode(object):
             speed = 60
         return max(0, min(100, speed))
 
+    def _sampling_injection_policy(self, config):
+        """Preserve trigger pre-start settings, execute them after pump preparation."""
+        configured = (config or {}).get('pump_settings', {}).get('injection_pump_policy', {})
+        return {'mode': 'automation', 'speed': self._default_injection_speed(config),
+                'lead_time_s': configured.get('lead_time_s', 0.0), 'stop_on_finish': True}
+
     def _start_injection_session(self, source, config=None):
         payload = {
             "source": source,
@@ -1629,16 +1628,6 @@ class MAVLinkTriggerNode(object):
             self.current_sampling_context = None
             return False
         self.is_sampling = True
-        if not self._start_injection_session("manual", config):
-            self._cleanup_sampling_attempt(context, 'manual_injection_start_failed')
-            self._emit_sample_record(context, 'failed', 'manual_injection_start_failed')
-            self.is_sampling = False
-            self.current_sampling_context = None
-            self._set_mission_state(MissionState.IDLE, "manual_start_rejected")
-            if getattr(self, 'status_pub', None) is not None:
-                self._publish_status("manual_start_rejected")
-            return False
-
         self._set_mission_state(MissionState.SAMPLING, str(self.current_waypoint))
         self.is_sampling = True
         self._prepare_automation_steps(steps_data)
@@ -1681,9 +1670,6 @@ class MAVLinkTriggerNode(object):
             self._request_fcu_hold()
             return False
         self.is_sampling = True
-        if not self._start_injection_session("fcu", config):
-            self._handle_completion(False, 'fcu_injection_start_failed', expected_context=context)
-            return False
         if self.current_sampling_context is not context:
             self._cleanup_sampling_attempt(context, 'start_cancelled')
             return False

@@ -501,6 +501,29 @@ sudo USV_BOOT_START_NOW=true USV_STRICT_SELF_CHECK=false ./src/usv_ros/scripts/i
 3. 调用 `/usv/pump_reconnect`。
 4. `pump_control_node.py` 重新打开串口并执行检测装置身份握手。
 
+### Automation 启动前准备（Preflight）
+
+每次任务先完成以下准备，再进入现有 `AutomationEngine`；序列内部循环不重复准备：
+
+1. 自动统计本次 steps 中 `enable: "E"` 的 X/Y/Z/A（包括连续转动步骤）。
+2. 各相关轴以最短路径回到**预先保存的相对零点**，随后全部正转 360° 补偿液体位移。使用相对 `R` 指令，分别等待匹配的 `PID_START`、`CMD_OK` 和各轴 `PID_DONE`；不会发送归绝对 0° 的 `CAL` 或改写零点。
+3. 油相泵按配置额外正转分隔圈数。使用指定 rpm 的有限 `J` 指令；其 `CMD_OK` 仅代表接收成功，需连续真实角度反馈解环累计证明圈数，再确认轴停止指令。
+4. 按原进样泵任务策略预启动，确认 `PUMP_OK:SET=…,ON` 并等待 lead time；完成后才启动正式序列。manual/survey 策略不在此阶段启动进样泵。
+
+Web 自动化页的“启动前准备”可编辑相对零点、油相轴、分隔圈数和转速；桌面并列显示零点与分隔参数，窄屏纵向排列。运行期间配置锁定，Preflight 只能停止，不能暂停/恢复。阶段和待完成轴通过 `automation_status.preflight` 显示；准备期间 `running=true`、`automation_step=0`。启动 RPC 成功表示接受准备事务，终态仍由关联 attempt 的状态决定。
+
+配置保存在 `sampling_config.json` 的 `pump_settings.preflight`：
+
+```json
+{"oil_axis": "A", "separation_turns": 2, "separation_rpm": 5}
+```
+
+默认圈数为 0（跳过分隔，油相轴可为空）；启用分隔时圈数为 0.01–10、转速为 0.1–20 rpm，轴可独立于 steps 中的相关泵选择。零点复用 `calibration.json` 的 `offsets`，可通过 `GET/POST /api/calibration/offsets` 读取/保存原始角度，范围为 `[0, 360)`。新增 `configured_axes` 区分未设零与显式保存的 0°；旧文件中已有的 offsets 视为已配置。未保存过相关轴零点时任务失败，不回退到绝对 0°。泵节点可用私有参数 `~calibration_file` 指定同一零点文件。
+
+任一步骤 ACK/PID 超时、角度无效/断流、owner 丢失、watchdog 或串口故障均走现有停泵和终态清理；清理失败继续锁存故障。PID 算法、正式步骤等待、安全租约、GPS 准入与串口恢复协议保持原有行为。部署时成套更新并重启 pump、trigger、Web，含 `static/dist`。
+
+回归：`python -B -m pytest tests/test_automation_preflight.py tests/test_preflight_web_contract.py tests/test_system_safety_contract.py tests/test_terminal_reasons.py tests/test_sampling_cleanup_ownership.py`；前端：`cd frontend && npm run test:automation-controls && npm run build`。实机仍需在 Jetson/ESP32 台架确认：非 0° 相对零点、补偿方向及液体位移、跨 0° 的多圈分隔、进样启动顺序，以及每阶段停止/拔串口后的物理输出停止。
+
 ### launch 参数
 
 `launch/usv_bringup.launch` 当前暴露的参数如下：
@@ -600,7 +623,7 @@ REST API 和 Socket.IO 实时事件。
 | `GET /api/mission-config/export`、`POST /api/mission-config/import` | 任务配置导入导出 |
 | `POST /api/motor/command`、`POST /api/motor/stop` | 手动电机命令 |
 | `GET/POST /api/pid/config`、`POST /api/pid/test` | PID 参数与测试 |
-| `GET /api/calibration/offsets`、`POST /api/calibration/zero|reset|start` | 角度校准 |
+| `GET/POST /api/calibration/offsets`、`POST /api/calibration/zero|reset|start` | 相对零点与角度校准 |
 | `GET /api/data/voltage`、`POST /api/data/voltage/clear` | 当前内存电压历史 |
 | `POST /api/spectrometer/start`、`POST /api/spectrometer/stop`、`POST /api/spectrometer/baseline` | 分光采集启停；baseline 无请求体时沿用当前有效电压，也可通过 `reference_voltage` 写入稳定窗口的平均参考电压 |
 | `GET /api/data/missions` | 历史任务文件列表 |

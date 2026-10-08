@@ -11,6 +11,9 @@ import { Play, Square, Pause, Save, FolderOpen, Plus, Trash2, ArrowUp, ArrowDown
 import { useAppStore } from '@/store'
 import { InjectionPumpCard } from '@/components/injection-pump-card'
 import { SpectrometerDiagnosticsCard } from '@/components/spectrometer-diagnostics-card'
+import { AutomationPreflightCard } from '@/components/automation-preflight-card'
+import { DEFAULT_PREFLIGHT, PUMP_AXES, PREFLIGHT_PHASES, getInvolvedAxes, getPreflightLabel,
+  type PumpAxis, type PreflightConfig } from '@/lib/automation-preflight'
 import { WaypointSamplingCard } from '@/components/waypoint-sampling-card'
 import { toast } from '@/hooks/use-toast'
 import {
@@ -47,6 +50,7 @@ interface PumpSettings {
   pid_precision?: number
   default_speed: number
   injection_pump_policy: InjectionPumpPolicy
+  preflight: PreflightConfig
 }
 
 const DEFAULT_PUMP: PumpConfig = { enable: 'D', direction: 'F', speed: '5', angle: '0' }
@@ -60,6 +64,7 @@ const DEFAULT_STEP: Step = {
 }
 const DEFAULT_PUMP_SETTINGS: PumpSettings = {
   default_speed: 60,
+  preflight: { ...DEFAULT_PREFLIGHT },
   injection_pump_policy: {
     mode: 'manual',
     speed: 60,
@@ -83,6 +88,7 @@ const normalizeSteps = (rawSteps?: Partial<Step>[]): Step[] =>
 export default function Automation() {
   const {
     automationRunning,
+    automationPreflight,
     automationPaused,
     automationStep,
     automationTotal,
@@ -95,7 +101,8 @@ export default function Automation() {
     automationSpectroAgeS,
     automationOwnerAgeS,
   } = useAppStore()
-  const automationState = { running: automationRunning, paused: automationPaused }
+  const preparing = Boolean(automationPreflight?.active)
+  const automationState = { running: automationRunning, paused: automationPaused, preflight: preparing }
   const controls = getAutomationControlAvailability(automationState)
   const [steps, setSteps] = useState<Step[]>([])
   const [loopCount, setLoopCount] = useState(1)
@@ -106,6 +113,10 @@ export default function Automation() {
   const gpsSavePending = useRef(false)
   const [pumpSettings, setPumpSettings] = useState<PumpSettings>({ ...DEFAULT_PUMP_SETTINGS })
   const [presetName, setPresetName] = useState('')
+  const [relativeZeros, setRelativeZeros] = useState<Partial<Record<PumpAxis, string>>>({})
+  const [dirtyZeros, setDirtyZeros] = useState<Partial<Record<PumpAxis, string>>>({})
+  const [pendingAction, setPendingAction] = useState(false)
+  const involvedMotors = getInvolvedAxes(steps)
 
   useEffect(() => {
     void fetchConfig()
@@ -113,8 +124,15 @@ export default function Automation() {
 
   const fetchConfig = async () => {
     try {
-      const res = await fetch('/api/config')
+      const [res, zerosResponse] = await Promise.all([fetch('/api/config'), fetch('/api/calibration/offsets')])
       const data = await res.json()
+      const zeroData = await zerosResponse.json()
+      if (zerosResponse.ok && zeroData.success) {
+        const configured = zeroData.configured_axes ?? Object.keys(zeroData.data ?? {})
+        setRelativeZeros(Object.fromEntries(PUMP_AXES.filter((axis) => configured.includes(axis))
+          .map((axis) => [axis, String(zeroData.data[axis])])))
+        setDirtyZeros({})
+      }
       if (data.sampling_sequence) {
         setSteps(normalizeSteps(data.sampling_sequence.steps))
         setLoopCount(data.sampling_sequence.loop_count ?? 1)
@@ -129,6 +147,7 @@ export default function Automation() {
           ...DEFAULT_PUMP_SETTINGS,
           ...data.pump_settings,
           default_speed: defaultSpeed,
+          preflight: { ...DEFAULT_PREFLIGHT, ...data.pump_settings.preflight },
           injection_pump_policy: {
             ...DEFAULT_PUMP_SETTINGS.injection_pump_policy,
             ...policy,
@@ -158,9 +177,37 @@ export default function Automation() {
     }
   }
 
+  const saveRelativeZeros = async () => {
+    if (!Object.keys(dirtyZeros).length) return
+    const offsets: Partial<Record<PumpAxis, number>> = {}
+    for (const axis of PUMP_AXES) {
+      const raw = dirtyZeros[axis]
+      if (raw === undefined) continue
+      const value = Number(raw)
+      if (raw.trim() === '' || !Number.isFinite(value) || value < 0 || value >= 360) {
+        throw new Error(`${axis} 轴相对零点应为 0–360°（不含 360°）`)
+      }
+      offsets[axis] = value
+    }
+    const response = await fetch('/api/calibration/offsets', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ offsets }),
+    })
+    const result = await response.json()
+    if (!response.ok || !result.success) throw new Error(result.message || '相对零点保存失败')
+    setDirtyZeros({})
+  }
+
+  const validatePreparation = () => {
+    if (pumpSettings.preflight.separation_turns > 0 && !pumpSettings.preflight.oil_axis) {
+      throw new Error('请先选择油相泵轴')
+    }
+  }
+
   const saveConfig = async () => {
     try {
-      await fetch('/api/config', {
+      validatePreparation()
+      await saveRelativeZeros()
+      const response = await fetch('/api/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -171,8 +218,11 @@ export default function Automation() {
           pump_settings: pumpSettings,
         }),
       })
+      const result = await response.json()
+      if (!response.ok || !result.success) throw new Error(result.message || '配置保存失败')
+      toast({ title: '启动配置已保存', variant: 'success' })
     } catch (error) {
-      console.error(error)
+      toast({ title: '配置保存失败', description: String(error), variant: 'destructive' })
     }
   }
 
@@ -181,6 +231,13 @@ export default function Automation() {
     const options: RequestInit = { method: 'POST' }
 
     if (action === 'start') {
+      try {
+        validatePreparation()
+        await saveRelativeZeros()
+      } catch (error) {
+        toast({ title: '启动配置未就绪', description: String(error), variant: 'destructive' })
+        return
+      }
       let wpSampling: Record<string, unknown> | null = null
       try {
         const wpRes = await fetch('/api/waypoint-sampling')
@@ -202,6 +259,7 @@ export default function Automation() {
     }
 
     try {
+      setPendingAction(true)
       const response = await fetch(`/api/mission/${action}`, options)
       const result = await response.json()
       if (!response.ok || !result.success) {
@@ -209,7 +267,7 @@ export default function Automation() {
         return
       }
       const successTitles: Record<AutomationAction, string> = {
-        start: '任务已启动',
+        start: '已开始启动前准备',
         pause: '任务已暂停',
         resume: '任务已恢复',
         stop: '任务已停止',
@@ -218,6 +276,8 @@ export default function Automation() {
     } catch (error) {
       console.error(error)
       toast({ title: '请求失败', description: `任务${action}请求异常`, variant: 'destructive' })
+    } finally {
+      setPendingAction(false)
     }
   }
 
@@ -340,7 +400,7 @@ export default function Automation() {
     cleanup_failed: '停止清理失败（泵可能仍在运行，请检查）',
     unknown_error: '未知错误',
   }
-  const idle = !automationRunning && !automationPaused
+  const idle = !automationRunning && !automationPaused && !preparing
   const showTerminal = idle && Boolean(automationTerminalReason)
   const terminalTitle =
     automationTerminalReason === 'completed' ? '任务已完成' : '任务已停止'
@@ -354,20 +414,20 @@ export default function Automation() {
           <p className="text-muted-foreground">配置并执行采样序列任务。</p>
         </div>
         <div className="flex w-full flex-wrap items-center gap-2 md:w-auto">
-          {(automationRunning || automationPaused) && automationTotal > 0 && (
+          {(automationRunning || automationPaused || preparing) && automationTotal > 0 && (
             <div className="flex items-center gap-2 rounded-lg border border-emerald-500/30 bg-emerald-500/10 px-3 py-2">
               <Loader2 className="w-4 h-4 animate-spin text-emerald-500" />
               <span className="text-sm font-semibold tabular-nums whitespace-nowrap">
-                {automationPaused ? '已暂停' : '运行中'}：步骤 {automationStep} / {automationTotal}
+                {preparing ? getPreflightLabel(automationPreflight) : `${automationPaused ? '已暂停' : '运行中'}：步骤 ${automationStep} / ${automationTotal}`}
               </span>
-              {(totalLoops === 0 || totalLoops > 1) && (
+              {!preparing && (totalLoops === 0 || totalLoops > 1) && (
                 <span className="text-xs text-muted-foreground tabular-nums whitespace-nowrap">
                   第 {currentLoop} / {totalLoops === 0 ? '∞' : totalLoops} 圈
                 </span>
               )}
             </div>
           )}
-          <Button variant="outline" onClick={() => handleAction('start')} disabled={!controls.start || savingGps}>
+          <Button variant="outline" onClick={() => handleAction('start')} disabled={!controls.start || savingGps || pendingAction}>
             <Play className="w-4 h-4 mr-2 text-emerald-500" /> 启动
           </Button>
           <Button variant="outline" onClick={() => handleAction('pause')} disabled={!controls.pause}>
@@ -376,11 +436,40 @@ export default function Automation() {
           <Button variant="outline" onClick={() => handleAction('resume')} disabled={!controls.resume}>
             <Play className="w-4 h-4 mr-2 text-blue-500" /> 恢复
           </Button>
-          <Button variant="destructive" onClick={() => handleAction('stop')} disabled={!controls.stop}>
+          <Button variant="destructive" onClick={() => handleAction('stop')} disabled={!controls.stop && !pendingAction}>
             <Square className="w-4 h-4 mr-2" /> 停止
           </Button>
         </div>
       </header>
+
+      {automationPreflight && automationPreflight.phase !== 'idle' && (
+        <section aria-label="启动前准备进度" aria-live="polite" className="space-y-3 rounded-lg border p-4">
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <h2 className="text-sm font-semibold">Preflight · {getPreflightLabel(automationPreflight)}</h2>
+            <p className="text-xs text-muted-foreground">
+              相关泵：{automationPreflight.motors?.join(' / ') || '无'}
+              {automationPreflight.pending_motors?.length ? ` · 等待 ${automationPreflight.pending_motors.join(' / ')}` : ''}
+            </p>
+          </div>
+          <ol className="grid grid-cols-1 gap-2 sm:grid-cols-3 xl:grid-cols-6">
+            {PREFLIGHT_PHASES.map(([phase, label], index) => (
+              <li key={phase} aria-current={automationPreflight.phase === phase ? 'step' : undefined}
+                className={automationPreflight.phase === phase ? 'text-sm font-semibold text-foreground' : 'text-sm text-muted-foreground'}>
+                <span className="mr-2 tabular-nums">{index + 1}.</span>{label}
+              </li>
+            ))}
+          </ol>
+          {automationPreflight.error && <p className="text-sm text-destructive break-words">{automationPreflight.error}</p>}
+        </section>
+      )}
+
+      <AutomationPreflightCard motors={involvedMotors} zeros={relativeZeros} config={pumpSettings.preflight}
+        disabled={!idle || pendingAction}
+        onZero={(axis, value) => {
+          setRelativeZeros((current) => ({ ...current, [axis]: value }))
+          setDirtyZeros((current) => ({ ...current, [axis]: value }))
+        }}
+        onConfig={(patch) => setPumpSettings((current) => ({ ...current, preflight: { ...current.preflight, ...patch } }))} />
 
       <SpectrometerDiagnosticsCard />
 
@@ -520,7 +609,7 @@ export default function Automation() {
                   </Button>
                 </div>
               </div>
-              <Button className="w-full" onClick={saveConfig}>应用配置</Button>
+              <Button className="w-full" onClick={saveConfig} disabled={!idle || pendingAction}>保存启动配置</Button>
               <div className="flex gap-2 pt-2">
                 <Button variant="outline" size="sm" className="flex-1" onClick={handleExport}>
                   <Download className="w-4 h-4 mr-1" />导出
