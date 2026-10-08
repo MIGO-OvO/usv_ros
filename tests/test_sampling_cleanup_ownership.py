@@ -25,6 +25,8 @@ class SamplingCleanupOwnershipTests(unittest.TestCase):
             self.sent.append(command)
             if command.strip() == 'PIDQUERY':
                 self.pump._on_text_received('PIDPARAM:0.14,0.015,0.06,1,8')
+            elif command.strip() == 'STOPALL':
+                self.pump._on_text_received('STOPALL_OK')
             return True
         self.pump.send_command = send
         self.engine = self.pump.automation_engine
@@ -94,6 +96,10 @@ class SamplingCleanupOwnershipTests(unittest.TestCase):
         self.node.is_sampling = False
         self.node.current_sampling_context = None
         self.node._call_automation_service = lambda action: self.pump._auto_stop_callback(None).success
+        def transaction(action, payload=None):
+            ok, _, result = self.pump._execute_control_action(action, payload or {})
+            return ok, result
+        self.node._call_control_transaction = transaction
         self.assertTrue(self.node.handle_mavlink_command(31011))
         self.assertFalse(self.engine.is_running())
         self.assertFalse(self.pump.inject_pump_enabled)

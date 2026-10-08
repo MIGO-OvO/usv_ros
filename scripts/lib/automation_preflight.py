@@ -88,6 +88,9 @@ class PreflightCancelled(Exception):
 
 
 class AutomationPreflight:
+    # MT6701: 14-bit / 360deg (~0.022deg per count). Allow several counts
+    # for quantization/noise, independent of the formal step PID setting.
+    PID_PRECISION_DEG = 0.1
     ACK_TIMEOUT = 2.0
     PID_TIMEOUT = 60.0
     ANGLE_TIMEOUT = 1.0

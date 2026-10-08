@@ -331,7 +331,7 @@ class SurveyAndQGCChainTests(unittest.TestCase):
         owner = self.node.sampling_context['attempt_id']
         self.assertTrue(self.trigger._stop_survey())
         self.join()
-        self.assertEqual(self.requests[-1], ('automation_cleanup', {'attempt_id': owner, 'reason': 'survey_stop'}))
+        self.assertEqual(self.requests[-1], ('automation_cleanup', {'attempt_id': owner, 'reason': 'survey_stop', 'confirm_stop': True}))
         self.assertFalse(self.trigger._survey_active)
         self.assertFalse(self.node.inject_pump_enabled)
         self.assertNotIn('PUMP:SET:38', self.commands)
@@ -363,7 +363,7 @@ class SurveyAndQGCChainTests(unittest.TestCase):
         self.trigger._emit_sample_record = Mock()
         self.assertFalse(self.trigger._stop_survey())
         self.join()
-        self.assertEqual(self.requests[-1], ('automation_cleanup', {'attempt_id': owner, 'reason': 'survey_stop'}))
+        self.assertEqual(self.requests[-1], ('automation_cleanup', {'attempt_id': owner, 'reason': 'survey_stop', 'confirm_stop': True}))
         self.assertFalse(self.trigger._survey_active)
         self.assertFalse(self.trigger.is_sampling)
         self.assertEqual(self.trigger.current_mission_state, self.trigger_module.MissionState.FAILED)

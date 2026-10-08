@@ -54,6 +54,8 @@ class PreflightWorkerTests(unittest.TestCase):
         phase = preparation.snapshot()['phase'] if preparation else 'idle'
         if command.strip() == 'PIDQUERY':
             self.node._on_text_received('PIDPARAM:0.14,0.015,0.06,1,8')
+        elif command.strip() == 'STOPALL':
+            self.node._on_text_received('STOPALL_OK')
         elif command.strip() == 'PUMP:OFF':
             self.node._on_text_received('PUMP_OK:OFF')
         elif command.startswith('PUMP:SET:'):

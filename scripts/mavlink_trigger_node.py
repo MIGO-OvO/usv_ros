@@ -231,6 +231,9 @@ class MAVLinkTriggerNode(object):
         self._last_survey_sample_position = None
         self.waypoint_states = {}
         self.state_lock = threading.Lock()
+        # Serialize launch RPCs and STOP through their final state publication.
+        # Keep state_lock free so telemetry/owner callbacks can still run.
+        self._sampling_control_lock = threading.RLock()
         self._sample_record_lock = threading.Lock()
 
         # 走航采样状态
@@ -239,6 +242,7 @@ class MAVLinkTriggerNode(object):
         self._survey_interval = 5.0
         self._survey_thread = None
         self._survey_owner_attempt_id = None
+        self._survey_generation = None
 
         # 服务客户端
         self.set_mode_client = None
@@ -967,11 +971,15 @@ class MAVLinkTriggerNode(object):
         return True
 
     def _stop_sampling_sequence(self, expected_context=None, request_hold=True):
+        with self._sampling_control_lock:
+            return self._stop_sampling_sequence_locked(expected_context, request_hold)
+
+    def _stop_sampling_sequence_locked(self, expected_context=None, request_hold=True):
         """停止采样序列。"""
         rospy.loginfo("Stopping sampling sequence...")
         with self.state_lock:
             if expected_context is not None and self.current_sampling_context is not expected_context:
-                return
+                return True
             already_finishing = getattr(self, '_sampling_finishing', False)
             self._sampling_finishing = True
             sampling_context = dict(getattr(self, "current_sampling_context", {}) or {})
@@ -979,11 +987,14 @@ class MAVLinkTriggerNode(object):
             if was_survey:
                 self._survey_active = False
                 self._survey_sample_active = False
+                self._survey_generation = None
+                self._survey_owner_attempt_id = None
             # Claim cancellation before a stop-service callback can report Finished.
             self.is_sampling = False
             self.current_sampling_context = None
+            self._prepared_automation_payload = None
         try:
-            self._stop_sampling_context(sampling_context, was_survey, request_hold, expected_context is not None)
+            return self._stop_sampling_context(sampling_context, was_survey, request_hold, expected_context is not None)
         finally:
             with self.state_lock:
                 self._sampling_finishing = already_finishing
@@ -995,7 +1006,7 @@ class MAVLinkTriggerNode(object):
             if superseded:
                 self._publish_sampling_result(sampling_context, 'cancelled', 'cleanup_superseded')
                 self._publish_status('sampling_stopped')
-                return
+                return True
         else:
             # Explicit operator stop remains global, but is a single pump RPC.
             stop_ok = self._call_automation_service('stop')
@@ -1004,16 +1015,19 @@ class MAVLinkTriggerNode(object):
         self._publish_sampling_result(sampling_context, 'cancelled' if stop_ok else 'failed', reason)
         if sampling_context.get("source") == "manual":
             self.current_sampling_context = None
-            self._set_mission_state(MissionState.IDLE, "manual_stopped")
+            self._set_mission_state(MissionState.IDLE if stop_ok else MissionState.FAILED,
+                                    "manual_stopped" if stop_ok else reason)
             self._publish_status("sampling_stopped")
-            return
-        self._set_mission_state(MissionState.IDLE if was_survey else MissionState.HOLD_NO_MISSION,
+            return stop_ok
+        self._set_mission_state((MissionState.IDLE if was_survey else MissionState.HOLD_NO_MISSION)
+                                if stop_ok else MissionState.FAILED,
                                 str(self.current_waypoint))
         self._publish_status("sampling_stopped")
         if was_survey:
             self._publish_status('survey_stopped')
         if source == 'fcu' and (request_hold or not stop_ok):
             self._request_fcu_hold()
+        return stop_ok
 
     def _fcu_cancellation_reason(self):
         with self.state_lock:
@@ -1294,6 +1308,10 @@ class MAVLinkTriggerNode(object):
         rospy.loginfo("Sampling done at waypoint %d, FCU manages mode transition", self.current_waypoint)
 
     def _start_prepared_automation(self):
+        with self._sampling_control_lock:
+            return self._start_prepared_automation_locked()
+
+    def _start_prepared_automation_locked(self):
         with self.state_lock:
             context = self.current_sampling_context
             if (not self.is_sampling or not isinstance(context, dict)
@@ -1322,6 +1340,8 @@ class MAVLinkTriggerNode(object):
 
     def _call_automation_service(self, action):
         """调用自动化服务。"""
+        if action == 'stop':
+            return self._call_control_command('manual_stop_all', {'confirm_stop': True})
         if action == 'start':
             payload = getattr(self, '_prepared_automation_payload', None)
             self._prepared_automation_payload = None
@@ -1331,7 +1351,6 @@ class MAVLinkTriggerNode(object):
             return self._call_control_command('automation_start', payload)
         service_map = {
             'start': '/usv/automation_start',
-            'stop': '/usv/automation_stop',
             'pause': '/usv/automation_pause',
             'resume': '/usv/automation_resume'
         }
@@ -1382,7 +1401,7 @@ class MAVLinkTriggerNode(object):
             self._sampling_finishing = True
         try:
             success, result = self._call_control_transaction('automation_cleanup', {
-                'attempt_id': attempt, 'reason': str(reason),
+                'attempt_id': attempt, 'reason': str(reason), 'confirm_stop': True,
             })
         finally:
             with self.state_lock:
@@ -1526,8 +1545,7 @@ class MAVLinkTriggerNode(object):
                 # QGC 手动按钮或 Web 触发
                 return self._do_manual_sample()
         elif cmd_id == CMD_STOP_SAMPLING:
-            self._stop_sampling_sequence()
-            return True
+            return self._stop_sampling_sequence()
         elif cmd_id == CMD_PAUSE_SAMPLING:
             return self._pause_sampling()
         elif cmd_id == CMD_RESUME_SAMPLING:
@@ -1850,7 +1868,13 @@ class MAVLinkTriggerNode(object):
         } if active else None
         return True
 
-    def _start_survey_sample_once(self, config):
+    def _start_survey_sample_once(self, config, generation=None):
+        with self._sampling_control_lock:
+            if generation is not None and generation != self._survey_generation:
+                return 'skipped'
+            return self._start_survey_sample_once_locked(config)
+
+    def _start_survey_sample_once_locked(self, config):
         if not self._survey_active or getattr(self, '_sampling_finishing', False):
             return 'skipped'
         gate_ok, gate_reason = self._survey_gate_status(config)
@@ -1909,6 +1933,10 @@ class MAVLinkTriggerNode(object):
         return "failed"
 
     def _start_survey(self, interval=0):
+        with self._sampling_control_lock:
+            return self._start_survey_locked(interval)
+
+    def _start_survey_locked(self, interval=0):
         """启动走航采样：边走边测，不切 HOLD。"""
         if self._survey_active:
             rospy.logwarn("Survey already active")
@@ -1919,7 +1947,9 @@ class MAVLinkTriggerNode(object):
 
         config = self._load_config() or self._get_default_config()
         gate = self._survey_gate_config(config)
-        self.current_sampling_context = {'source': 'survey', 'attempt_id': uuid.uuid4().hex}
+        # A scheduler is not a pump owner. Acquire attempt/lease only when an
+        # acquisition is actually dispatched, so pre-first STOP is local.
+        self.current_sampling_context = None
         lab = config.get('lab_mode') or {}
         simulated = lab.get('enabled') and lab.get('data_source', 'simulated') == 'simulated'
         # Admission only: each acquisition owns preparation and injection.
@@ -1927,17 +1957,22 @@ class MAVLinkTriggerNode(object):
         if not simulated and not self._bind_sample_position({}):
             self.current_sampling_context = None
             return False
-        self._survey_owner_attempt_id = self.current_sampling_context['attempt_id']
+        self._survey_owner_attempt_id = None
+        self._survey_generation = uuid.uuid4().hex
         self._survey_interval = max(1.0, float(interval) if interval > 0 else gate["survey_interval_s"])
         self._survey_active = True
-        self._survey_thread = threading.Thread(target=self._survey_loop, daemon=True)
-        self._survey_thread.start()
+        self._survey_thread = threading.Thread(target=self._survey_loop, args=(self._survey_generation,), daemon=True)
         rospy.loginfo("Survey started, interval=%.1fs", self._survey_interval)
         self._set_mission_state(MissionState.SURVEYING, "{:.1f}".format(self._survey_interval))
         self._publish_status("survey_started")
+        self._survey_thread.start()
         return True
 
     def _stop_survey(self):
+        with self._sampling_control_lock:
+            return self._stop_survey_locked()
+
+    def _stop_survey_locked(self):
         """停止走航采样。"""
         with self.state_lock:
             if not self._survey_active:
@@ -1945,10 +1980,13 @@ class MAVLinkTriggerNode(object):
                 return True
             self._survey_active = False
             self._survey_sample_active = False
+            self._survey_generation = None
+            self._survey_owner_attempt_id = None
             was_sampling = self.is_sampling
             context = dict(self.current_sampling_context or {})
             self.is_sampling = False
             self.current_sampling_context = None
+            self._prepared_automation_payload = None
         # Pump cleanup owns both step motors and injection, scoped to the last
         # acquisition. A late Survey stop must never switch off a newer owner.
         owned = bool(context.get('attempt_id'))
@@ -1963,24 +2001,29 @@ class MAVLinkTriggerNode(object):
         self._publish_status("survey_stopped")
         return cleaned or superseded
 
-    def _survey_loop(self):
+    def _survey_loop(self, generation=None):
         """走航采样循环线程：按间隔反复触发单次采样。"""
         rospy.loginfo("Survey loop thread started, interval=%.1fs", self._survey_interval)
-        while self._survey_active and not rospy.is_shutdown():
+        generation = generation or getattr(self, '_survey_generation', None)
+        def active():
+            return self._survey_active and generation == getattr(self, '_survey_generation', None)
+        while active() and not rospy.is_shutdown():
             if not self.is_sampling:
                 config = self._load_config() or self._get_default_config()
-                result = self._start_survey_sample_once(config)
+                result = self._start_survey_sample_once(config, generation=generation)
                 if result == "failed":
                     break
                 if result == "started":
-                    while self.is_sampling and self._survey_active and not rospy.is_shutdown():
+                    while self.is_sampling and active() and not rospy.is_shutdown():
                         rospy.sleep(0.2)
             # 采样完成后等待间隔
             wait_end = time.time() + self._survey_interval
-            while self._survey_active and not rospy.is_shutdown() and time.time() < wait_end:
+            while active() and not rospy.is_shutdown() and time.time() < wait_end:
                 rospy.sleep(0.2)
 
-        self._survey_active = False
+        with self._sampling_control_lock:
+            if generation == getattr(self, '_survey_generation', None):
+                self._survey_active = False
         rospy.loginfo("Survey loop thread exited")
 
     def _trigger_srv_cb(self, req):

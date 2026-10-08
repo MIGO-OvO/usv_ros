@@ -233,6 +233,8 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         node._latest_global_position = gps_position()
         if not hasattr(node, 'state_lock'):
             node.state_lock = threading.Lock()
+        if not hasattr(node, '_sampling_control_lock'):
+            node._sampling_control_lock = threading.RLock()
 
         def start(source, config=None):
             calls.append(("on", source))
@@ -1094,6 +1096,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         node.state_lock = threading.Lock()
         node.is_sampling = False
         node._survey_active = True
+        node._sampling_control_lock = threading.RLock()
         node._survey_sample_active = False
         node._survey_interval = 5.0
         node.current_waypoint = 3

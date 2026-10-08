@@ -1138,7 +1138,8 @@ class PumpControlNode(object):
             synced, error = self._ensure_spectro_reply_sync()
             if not synced:
                 return False, error
-        if self._controller_fault and command not in ('ADSSTOP', 'I2CMAP?', 'ADSSTATUS?'):
+        stop_confirmation = command in ('STOPALL', 'PIDQUERY')
+        if self._controller_fault and not stop_confirmation and command not in ('ADSSTOP', 'I2CMAP?', 'ADSSTATUS?'):
             return False, self._controller_fault
         success = tuple(success_prefixes or ())
         errors = tuple(error_prefixes or ())
@@ -1153,20 +1154,22 @@ class PumpControlNode(object):
             if not self.send_command(command):
                 return False, 'serial send failed'
             while not txn['event'].wait(min(0.05, max(0.0, deadline - time.monotonic()))):
-                if self._controller_fault:
+                if self._controller_fault and not stop_confirmation:
                     return False, self._controller_fault
                 if time.monotonic() >= deadline:
-                    self._spectro_reply_sync_required = True
+                    if not stop_confirmation:
+                        self._spectro_reply_sync_required = True
                     if command == 'ADSSTATUS?':
                         self._spectro_reply_sync_failed = True
                     return False, 'timeout'
             line = txn['line'] or ''
             if txn['received_at'] is None or txn['received_at'] > deadline:
-                self._spectro_reply_sync_required = True
+                if not stop_confirmation:
+                    self._spectro_reply_sync_required = True
                 if command == 'ADSSTATUS?':
                     self._spectro_reply_sync_failed = True
                 return False, 'timeout'
-            if self._controller_fault and command not in ('ADSSTOP', 'I2CMAP?', 'ADSSTATUS?'):
+            if self._controller_fault and not stop_confirmation and command not in ('ADSSTOP', 'I2CMAP?', 'ADSSTATUS?'):
                 return False, self._controller_fault
             if any(line.startswith(prefix) for prefix in errors):
                 return False, line
@@ -2596,7 +2599,7 @@ class PumpControlNode(object):
                 return False, 'Cleanup requires attempt_id', {'cleanup': 'failed'}
             if attempt != self.sampling_context.get('attempt_id'):
                 return False, 'Cleanup owner was superseded', {'cleanup': 'superseded', 'attempt_id': attempt}
-            response = self._auto_stop_locked(None)
+            response = self._auto_stop_locked(None, confirm_stop=payload.get('confirm_stop') is True)
             if not response.success:
                 self._controller_fault = self._controller_fault or 'cleanup_failed'
             cleaned = bool(response.success and not self._controller_fault)
@@ -2643,7 +2646,7 @@ class PumpControlNode(object):
             }
 
         if action == "manual_stop_all":
-            success = self._auto_stop_callback(None).success
+            success = self._auto_stop_locked(None, confirm_stop=payload.get('confirm_stop') is True).success
             return success, "All pumps stopped" if success else "Stop all pumps failed", {}
 
         if action == "injection_on":
@@ -3089,7 +3092,7 @@ class PumpControlNode(object):
             injection = self._injection_policy_for_automation()
             if injection and injection['speed'] <= 0:
                 raise ValueError('Injection pump pre-start speed must be positive')
-            preparation.run(motors, zeros, self.preflight_config, min(0.1, self.pid_precision),
+            preparation.run(motors, zeros, self.preflight_config, preparation.PID_PRECISION_DEG,
                             (injection['speed'], injection['lead_time_s']) if injection else None)
             with self._control_lock:
                 self._check_preflight_active()
@@ -3119,7 +3122,7 @@ class PumpControlNode(object):
         with self._control_lock:
             return self._auto_stop_locked(req)
 
-    def _auto_stop_locked(self, req):
+    def _auto_stop_locked(self, req, confirm_stop=False):
         """停止自动化服务回调。"""
         self._configuration_ready = False
         if self._preflight and self._preflight.snapshot()['active']:
@@ -3136,13 +3139,35 @@ class PumpControlNode(object):
                     self._record_cleanup_result(False)
                     rospy.logerr('Automation stop exception: %s', exc)
             success = self._cleanup_automation_outputs()
+            if confirm_stop:
+                # Cleanup writes alone cannot prove firmware applied STOP.
+                # PIDQUERY drains previous STOPALL replies before the final
+                # STOPALL_OK. STOPALL disables all motors and injection.
+                try:
+                    confirmed = self._confirm_all_outputs_stopped()
+                except Exception as exc:
+                    confirmed = False
+                    rospy.logerr('Stop confirmation exception: %s', exc)
+                success = bool(success and confirmed and not self._controller_fault)
+                self._record_cleanup_result(success)
         finally:
             self._stop_in_progress = False
         message = "Automation stopped and pumps halted" if success else "Automation stopped but pump halt failed"
         self._log_automation_terminal()
-        self._publish_automation_status("stopped")
-        self._publish_status('automation: stopped')
+        status = 'cleanup_failed' if confirm_stop and not success else 'stopped'
+        self._publish_automation_status(status)
+        self._publish_status('automation: ' + status)
         return TriggerResponse(success=success, message=message)
+
+    def _confirm_all_outputs_stopped(self):
+        connection = self.serial_conn
+        if not connection or not connection.is_open:
+            return False
+        synced, _ = self._send_and_wait_text('PIDQUERY', ('PIDPARAM:',), ('CMD_ERR:',))
+        if not synced:
+            return False
+        confirmed, line = self._send_and_wait_text('STOPALL', ('STOPALL_OK',), ('CMD_ERR:',))
+        return bool(confirmed and line == 'STOPALL_OK' and self.serial_conn is connection and connection.is_open)
 
     def _cleanup_automation_outputs(self):
         success = not (self._cleanup_failed or self.automation_engine._cleanup_failed)
