@@ -1046,7 +1046,7 @@ class CalibrationManager(object):
                 os.unlink(temporary)
 
     def update_offsets(self, offsets):
-        validated = calibrated_offsets({'offsets': offsets})
+        validated = calibrated_offsets({'offsets': offsets, 'configured_axes': list(offsets)})
         previous, configured = dict(self.offsets), set(self.configured_axes)
         self.offsets.update(validated)
         self.configured_axes.update(validated)
@@ -1985,6 +1985,13 @@ class ConfigManager(object):
 
     def update(self, data):
         """更新配置。"""
+        if 'pump_settings' in data:
+            settings = data['pump_settings']
+            if not isinstance(settings, dict):
+                raise ValueError('pump_settings must be an object')
+            for key in ('preflight', 'injection_pump_policy'):
+                if key in settings and not isinstance(settings[key], dict):
+                    raise ValueError('pump_settings.%s must be an object' % key)
         if 'automation_policy' in data:
             policy = data['automation_policy']
             if (not isinstance(policy, dict) or
@@ -2573,32 +2580,6 @@ class WebConfigServer(object):
                 self._realtime_stats["record_errors"] += 1
             rospy.logwarn("Unable to append spectrometer raw frame: %s", str(exc))
 
-    def _current_injection_pump_policy(self):
-        config = self.config_manager.get()
-        pump_settings = config.get('pump_settings', {}) if isinstance(config.get('pump_settings'), dict) else {}
-        return ConfigManager._normalize_injection_pump_policy(
-            pump_settings.get('injection_pump_policy', {}),
-            default_speed=pump_settings.get('default_speed', 60),
-        )
-
-    def _apply_survey_injection_pump_policy(self, running):
-        policy = self._current_injection_pump_policy()
-        if policy.get('mode') != 'survey':
-            return
-        if running:
-            speed = int(policy.get('speed', 0) or 0)
-            if speed <= 0:
-                self._add_log("走航进样泵联动跳过：转速为 0", "warning")
-                return
-            ok, message, result = self._call_control_command("injection_on", {"speed": speed}, source="survey")
-        elif policy.get('stop_on_finish', True):
-            ok, message, result = self._call_control_command("injection_off", {}, source="survey")
-        else:
-            return
-        if result:
-            self.injection_pump_status.update(result)
-        self._add_log("走航进样泵联动: %s" % message, "success" if ok else "error")
-
     def _status_cb(self, msg):
         with self._sample_lifecycle_lock:
             self._status_cb_locked(msg)
@@ -2741,7 +2722,6 @@ class WebConfigServer(object):
             self.latest_survey_sample_done_at = received_at
         if 'survey_started' in status:
             self._start_data_recording_if_needed(source="survey")
-            self._apply_survey_injection_pump_policy(running=True)
         if 'sampling_started' in status:
             self.automation_running = True
             source = "lab" if self._lab_mission_recording_active() else "trigger"
@@ -2766,8 +2746,6 @@ class WebConfigServer(object):
             )
             if not keep_recording:
                 self._stop_data_recording_if_active()
-            if 'survey_stopped' in status:
-                self._apply_survey_injection_pump_policy(running=False)
         if self.socketio:
             self.socketio.emit("survey_status", self._survey_status_snapshot())
 
@@ -6311,8 +6289,12 @@ class WebConfigServer(object):
                         config_patch['sampling_sequence'] = normalized_sequence
                     if isinstance(waypoint_sampling, dict):
                         config_patch['waypoint_sampling'] = ConfigManager._normalize_waypoint_sampling(waypoint_sampling)
-                    if isinstance(request_data.get('pump_settings'), dict):
-                        config_patch['pump_settings'] = ConfigManager._normalize_pump_settings(request_data['pump_settings'])
+                    if 'pump_settings' in request_data:
+                        if not isinstance(request_data['pump_settings'], dict):
+                            return jsonify(success=False, message='pump_settings 应为对象'), 400
+                        # Merge the partial request before normalizing; injecting
+                        # defaults here overwrites unchanged persisted settings.
+                        config_patch['pump_settings'] = request_data['pump_settings']
                     if config_patch:
                         if not self.config_manager.update(config_patch):
                             return jsonify(success=False, message='任务配置保存失败'), 500

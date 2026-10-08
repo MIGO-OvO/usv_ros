@@ -28,8 +28,9 @@ class PreflightWorkerTests(unittest.TestCase):
         Path(self.node.calibration_file).write_text(json.dumps({'offsets': self.zeros}), encoding='utf-8')
         self.node.serial_conn = SimpleNamespace(is_open=True)
         self.node.spectro_config['enabled'] = False
-        self.node.current_angles.update(X=150.0, Y=5.0, Z=345.0, A=18.0)
-        self.node.latest_angle_received_at = time.time()
+        self.node._on_angle_received({'X': 150.0, 'Y': 5.0, 'Z': 345.0, 'A': 18.0})
+        self.node._on_health_received({'timestamp_ms': 1000})
+        self.node._on_text_received('ANGLE_AGE_CH_MS:1,1,1,1')
         self.commands = []
         self.phases = []
         self.block_phase = None
@@ -53,6 +54,8 @@ class PreflightWorkerTests(unittest.TestCase):
         phase = preparation.snapshot()['phase'] if preparation else 'idle'
         if command.strip() == 'PIDQUERY':
             self.node._on_text_received('PIDPARAM:0.14,0.015,0.06,1,8')
+        elif command.strip() == 'PUMP:OFF':
+            self.node._on_text_received('PUMP_OK:OFF')
         elif command.startswith('PUMP:SET:'):
             speed = int(command.strip().split(':')[-1])
             if self.missing_ack != 'injection':
@@ -62,7 +65,7 @@ class PreflightWorkerTests(unittest.TestCase):
             for axis, direction, delta, precision in re.findall(r'([XYZA])E([FB])R([\d.]+)P([\d.]+)', command):
                 delta = float(delta)
                 self.node._on_text_received('PID_START:%s,delta=%.1f,dir=%s,prec=%s' % (axis, delta, direction, precision))
-                if self.block_phase == phase:
+                if self.block_phase == phase and phase != 'separating':
                     continue
                 if self.failure_phase == phase:
                     self.node._on_text_received('PID_FAIL:%s=SENSOR_ERR' % axis)
@@ -114,7 +117,7 @@ class PreflightWorkerTests(unittest.TestCase):
         saved = Path(self.node.calibration_file).read_bytes()
         self.assertTrue(self.start()[0])
         self.join()
-        self.assertEqual(self.phases, ['homing', 'compensating'])
+        self.assertEqual(self.phases, ['homing', 'compensating', 'separating'])
         self.assertIn('XEBR27.000P0.1ZEBR135.000P0.1', self.commands)
         self.assertIn('XEFR360.000P0.1ZEFR360.000P0.1', self.commands)
         self.assertLess(self.commands.index('AEFV20J720.000'), self.commands.index('PUMP:SET:60'))
@@ -335,7 +338,8 @@ class PreflightContractTests(unittest.TestCase):
                 normalize_preflight(config)
 
     def test_saved_zero_zero_degrees_is_explicit_and_not_a_missing_default(self):
-        self.assertEqual(calibrated_offsets({'offsets': {'X': 0}}), {'X': 0.0})
+        self.assertEqual(calibrated_offsets({'offsets': {'X': 0}, 'configured_axes': ['X']}), {'X': 0.0})
+        self.assertEqual(calibrated_offsets({'offsets': {'X': 0}}), {})
         self.assertEqual(calibrated_offsets({'offsets': {'X': 0}, 'configured_axes': []}), {})
 
     def test_done_before_matching_start_never_satisfies_preparation(self):
@@ -350,7 +354,8 @@ class PreflightContractTests(unittest.TestCase):
 
     def test_separation_rejects_angle_jumps_and_stale_stream(self):
         runner = AutomationPreflight(lambda command: True, lambda: None, lambda axes: {}, lambda: None)
-        runner.travel = {'axis': 'X', 'angle': 10, 'at': time.monotonic(), 'degrees': 0, 'rpm': 5}
+        runner.travel = {'axis': 'X', 'angle': 10, 'at': time.monotonic(), 'degrees': 0, 'rpm': 5,
+                         'progress_at': time.monotonic(), 'progress_degrees': 0}
         runner.notify_angles({'X': 100})
         self.assertIsInstance(runner.error, PreflightError)
         runner.error = None

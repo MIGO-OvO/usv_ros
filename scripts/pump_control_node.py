@@ -577,6 +577,10 @@ class PumpControlNode(object):
         self.current_angles = {m: 0.0 for m in MOTOR_NAMES}
         self.angles_lock = threading.Lock()
         self.latest_angle_received_at = 0.0
+        self._angle_axis_received_at = {}
+        self._angle_age_received_at = None
+        self._angle_health_source_ms = None
+        self._angle_health_received_at = None
         self.detector_angle_age_ms = None
         self.detector_angle_channel_age_ms = None
         self.latest_angle_telemetry = {}
@@ -785,6 +789,12 @@ class PumpControlNode(object):
         self._spectro_ready_after = None
         self._spectro_first_frame_deadline = None
         self._spectro_start_ack_at = None
+        with self.angles_lock:
+            self._angle_axis_received_at.clear()
+            self._angle_age_received_at = None
+            self._angle_health_source_ms = None
+            self._angle_health_received_at = None
+            self.detector_angle_channel_age_ms = None
         self._last_valid_spectro_at = None
         self.spectro_state = 'disconnected'
         self._invalidate_spectro('disconnected')
@@ -1924,6 +1934,7 @@ class PumpControlNode(object):
         with self.angles_lock:
             self.current_angles.update(angles)
             self.latest_angle_received_at = time.time()
+            self._angle_axis_received_at.update({axis: time.monotonic() for axis in angles})
 
         if self._preflight:
             self._preflight.notify_angles(angles)
@@ -2018,7 +2029,9 @@ class PumpControlNode(object):
                 values = [int(float(value.strip())) for value in text.split(":", 1)[1].split(",")]
                 if len(values) != len(MOTOR_NAMES):
                     raise ValueError("expected four channel ages")
-                self.detector_angle_channel_age_ms = dict(zip(MOTOR_NAMES, values))
+                with self.angles_lock:
+                    self.detector_angle_channel_age_ms = dict(zip(MOTOR_NAMES, values))
+                    self._angle_age_received_at = time.monotonic()
                 payload = dict(self.latest_detector_health or {})
                 payload["received_at"] = time.time()
                 payload["angle_channel_age_ms"] = dict(self.detector_angle_channel_age_ms)
@@ -2376,6 +2389,13 @@ class PumpControlNode(object):
 
     def _on_health_received(self, data):
         """检测装置健康数据回调。"""
+        source_ms = data.get('timestamp_ms')
+        if type(source_ms) is int and 0 <= source_ms <= 0xffffffff:
+            with self.angles_lock:
+                previous = self._angle_health_source_ms
+                if previous is None or 0 < (source_ms - previous) % (1 << 32) < (1 << 31):
+                    self._angle_health_source_ms = source_ms
+                    self._angle_health_received_at = time.monotonic()
         # Binary health and the following ADS_HEALTH text line are emitted in
         # one firmware health cycle. Preserve the ADS counters when the next
         # binary packet refreshes temperature/heap fields.
@@ -3037,17 +3057,27 @@ class PumpControlNode(object):
                 before_send()
             return self.send_command(command)
 
-    def _preflight_angles(self, motors):
+    def _preflight_angles(self, motors, require_health=False):
         with self.angles_lock:
             angles = dict(self.current_angles)
             received = self.latest_angle_received_at
+            axis_received = dict(self._angle_axis_received_at)
+            ages = dict(self.detector_angle_channel_age_ms or {})
+            age_received = self._angle_age_received_at
+            health_received = self._angle_health_received_at
+        now = time.monotonic()
         if motors and (not received or not 0 <= time.time() - received <= 1.0):
             raise PreflightError('controller_fault', 'Preflight requires fresh pump angle feedback')
+        if require_health and (health_received is None or not 0 <= now - health_received <= 2.5):
+            raise PreflightError('controller_fault', 'Preflight requires advancing detector health timestamps')
         for axis in motors:
             value = angles.get(axis)
-            age = (self.detector_angle_channel_age_ms or {}).get(axis)
-            if (value is None or not math.isfinite(value) or not 0 <= value <= 360 or
-                    (age is not None and age > 500)):
+            at = axis_received.get(axis)
+            age = ages.get(axis)
+            if (at is None or not 0 <= now - at <= 1.0 or
+                    value is None or not math.isfinite(value) or not 0 <= value <= 360 or
+                    (age is not None and (age < 0 or age > 500 or age_received is None or
+                     age + max(0, now - age_received) * 1000 > 1500))):
                 raise PreflightError('controller_fault', 'Preflight invalid/stale angle for ' + axis)
         return angles
 

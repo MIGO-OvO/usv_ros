@@ -41,17 +41,25 @@ def involved_axes(steps):
 
 
 def calibrated_offsets(data):
-    """Legacy files explicitly containing offsets retain their saved zero points."""
+    """Legacy zero values are ambiguous: the old writer persisted defaults too."""
     offsets = data.get('offsets', {})
-    configured = data.get('configured_axes', list(offsets))
+    if not isinstance(offsets, dict):
+        raise ValueError('Saved relative zero offsets must be an object')
+    configured = data.get('configured_axes')
+    if configured is not None and (not isinstance(configured, list) or
+                                  any(axis not in AXES for axis in configured)):
+        raise ValueError('configured_axes must be a list of X/Y/Z/A')
     result = {}
-    for axis in configured:
-        if axis not in AXES or axis not in offsets or isinstance(offsets[axis], bool):
+    for axis, raw in offsets.items():
+        if axis not in AXES or isinstance(raw, bool):
             raise ValueError('Invalid saved relative zero for %s' % axis)
-        value = float(offsets[axis])
+        value = float(raw)
         if not math.isfinite(value) or not 0 <= value < 360:
             raise ValueError('Relative zero for %s must be in [0, 360)' % axis)
-        result[axis] = value
+        if (configured is not None and axis in configured) or (configured is None and value != 0):
+            result[axis] = value
+    if configured is not None and any(axis not in offsets for axis in configured):
+        raise ValueError('Configured relative zero is missing its offset')
     return result
 
 
@@ -83,6 +91,8 @@ class AutomationPreflight:
     ACK_TIMEOUT = 2.0
     PID_TIMEOUT = 60.0
     ANGLE_TIMEOUT = 1.0
+    PROGRESS_TIMEOUT = 2.0
+    SEPARATION_TOLERANCE_DEG = 0.5
 
     def __init__(self, send, check_active, angles, publish):
         self.send = send
@@ -124,6 +134,15 @@ class AutomationPreflight:
         with self.lock:
             if self.error:
                 raise self.error
+            if self.travel:
+                # 0xCC has no validity bit or source timestamp. Firmware can
+                # repeatedly emit last_valid even with an invalid sensor.
+                self.angles([self.travel['axis']], require_health=True)
+                now = time.monotonic()
+                if now - self.travel['at'] > self.ANGLE_TIMEOUT:
+                    raise PreflightError('controller_fault', 'Oil pump angle feedback timeout')
+                if now - self.travel['progress_at'] > self.PROGRESS_TIMEOUT:
+                    raise PreflightError('controller_fault', 'Oil pump has no verified forward progress')
 
     def _wait(self, ready, timeout, reason, message):
         deadline = time.monotonic() + timeout
@@ -203,6 +222,11 @@ class AutomationPreflight:
                     raise ValueError('Oil pump angle feedback jumped')
                 self.travel['degrees'] += delta
                 self.travel.update(angle=angle, at=now)
+                # Net forward progress must exceed noise/quantization. Repeated
+                # frames or oscillation around one angle cannot renew this clock.
+                threshold = max(0.1, self.travel['rpm'] * 6 * self.PROGRESS_TIMEOUT * 0.1)
+                if self.travel['degrees'] >= self.travel['progress_degrees'] + threshold:
+                    self.travel.update(progress_degrees=self.travel['degrees'], progress_at=now)
                 self.state['travel_degrees'] = round(self.travel['degrees'], 2)
             except (KeyError, TypeError, ValueError) as exc:
                 self.error = PreflightError('controller_fault', str(exc))
@@ -229,6 +253,10 @@ class AutomationPreflight:
     def run(self, motors, zeros, policy, precision, injection):
         # Ordered firmware text processing drains previous command replies.
         self.command('PIDQUERY', 'PIDPARAM:')
+        if injection:
+            # Managed acquisition owns injection from this point. Confirm OFF
+            # before preparation even if a previous/manual output was left on.
+            self.command('PUMP:OFF', 'PUMP_OK:OFF')
         self.stage('homing', motors=motors, oil_axis=policy['oil_axis'])
         raw = self.angles(motors)
         moves = {}
@@ -244,22 +272,28 @@ class AutomationPreflight:
             goal = policy['separation_turns'] * 360.0
             rpm = policy['separation_rpm']
             self.stage('separating', target_degrees=goal, travel_degrees=0.0)
+            # Prove sensor validity with firmware PID completion before open
+            # loop, including oil axes absent from steps. AGE_CH=0 alone is
+            # ambiguous when g_angleValid is false in the current firmware.
+            self.pid_moves({axis: (0.0, 'F')}, precision)
             # Drain preceding angle/reply packets before taking the baseline.
             self.command('PIDQUERY', 'PIDPARAM:')
             def arm_travel():
                 # The sender calls this under the control lock immediately
                 # before writing. Waiting for that lock cannot count old travel.
-                raw = self.angles([axis])
+                raw = self.angles([axis], require_health=True)
                 with self.lock:
-                    self.travel = {'axis': axis, 'angle': raw[axis], 'at': time.monotonic(),
-                                   'degrees': 0.0, 'rpm': rpm}
+                    now = time.monotonic()
+                    self.travel = {'axis': axis, 'angle': raw[axis], 'at': now,
+                                   'degrees': 0.0, 'rpm': rpm,
+                                   'progress_at': now, 'progress_degrees': 0.0}
             try:
                 self.command('%sEFV%gJ%.3f' % (axis, rpm, goal), before_send=arm_travel)
                 def completed():
-                    self.angles([axis])  # Validate freshness even when the target has been reached.
-                    if time.monotonic() - self.travel['at'] > self.ANGLE_TIMEOUT:
-                        raise PreflightError('controller_fault', 'Oil pump angle feedback timeout')
-                    return self.travel['degrees'] >= goal - precision
+                    # Independent of the formal PID tolerance; account for
+                    # finite-J step truncation and encoder noise, bounded to 5%.
+                    tolerance = min(self.SEPARATION_TOLERANCE_DEG, goal * 0.05)
+                    return self.travel['degrees'] >= goal - tolerance
                 self._wait(completed, goal / (rpm * 6.0) * 1.5 + 2.0,
                            'controller_fault', 'Oil pump did not complete separation travel')
                 self.command('%sDFV0J0' % axis)

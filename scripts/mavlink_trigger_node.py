@@ -1269,15 +1269,19 @@ class MAVLinkTriggerNode(object):
 
     def _pause_sampling(self):
         """暂停采样。"""
-        self._call_automation_service('pause')
+        if not self._call_automation_service('pause'):
+            return False
         self._set_mission_state(MissionState.PAUSED, str(self.current_waypoint))
         self._publish_status("sampling_paused")
+        return True
 
     def _resume_sampling(self):
         """恢复采样。"""
-        self._call_automation_service('resume')
+        if not self._call_automation_service('resume'):
+            return False
         self._set_mission_state(MissionState.SAMPLING, str(self.current_waypoint))
         self._publish_status("sampling_resumed")
+        return True
 
     def _resume_auto_if_mission_exists(self):
         """采样完成后的模式处理。
@@ -1396,10 +1400,13 @@ class MAVLinkTriggerNode(object):
             speed = 60
         return max(0, min(100, speed))
 
-    def _sampling_injection_policy(self, config):
+    def _sampling_injection_policy(self, config, source=None):
         """Preserve trigger pre-start settings, execute them after pump preparation."""
         configured = (config or {}).get('pump_settings', {}).get('injection_pump_policy', {})
-        return {'mode': 'automation', 'speed': self._default_injection_speed(config),
+        speed = self._default_injection_speed(config)
+        if source == 'survey' and configured.get('mode') in ('survey', 'automation'):
+            speed = configured.get('speed', speed)
+        return {'mode': 'automation', 'speed': speed,
                 'lead_time_s': configured.get('lead_time_s', 0.0), 'stop_on_finish': True}
 
     def _start_injection_session(self, source, config=None):
@@ -1522,11 +1529,9 @@ class MAVLinkTriggerNode(object):
             self._stop_sampling_sequence()
             return True
         elif cmd_id == CMD_PAUSE_SAMPLING:
-            self._pause_sampling()
-            return True
+            return self._pause_sampling()
         elif cmd_id == CMD_RESUME_SAMPLING:
-            self._resume_sampling()
-            return True
+            return self._resume_sampling()
         elif cmd_id == CMD_CALIBRATE:
             if self.is_sampling:
                 rospy.logwarn("Cannot calibrate while sampling is active")
@@ -1882,6 +1887,7 @@ class MAVLinkTriggerNode(object):
 
         steps_data = self._build_steps_payload(config, self.current_waypoint)
         steps_data['loop_count'] = 1
+        steps_data['injection_pump_policy'] = self._sampling_injection_policy(config, source='survey')
 
         if not self._set_survey_sampling_flags(True):
             return 'skipped'
@@ -1916,16 +1922,12 @@ class MAVLinkTriggerNode(object):
         self.current_sampling_context = {'source': 'survey', 'attempt_id': uuid.uuid4().hex}
         lab = config.get('lab_mode') or {}
         simulated = lab.get('enabled') and lab.get('data_source', 'simulated') == 'simulated'
-        # Preflight only: the continuous injection owner is not a sample record.
+        # Admission only: each acquisition owns preparation and injection.
         # Each survey acquisition below creates its own UUID and start snapshot.
         if not simulated and not self._bind_sample_position({}):
             self.current_sampling_context = None
             return False
         self._survey_owner_attempt_id = self.current_sampling_context['attempt_id']
-        if not simulated and not self._start_injection_session("survey", config):
-            self._cleanup_sampling_attempt(self.current_sampling_context, 'survey_injection_start_failed')
-            self._set_mission_state(MissionState.FAILED, "survey_injection_start_failed")
-            return False
         self._survey_interval = max(1.0, float(interval) if interval > 0 else gate["survey_interval_s"])
         self._survey_active = True
         self._survey_thread = threading.Thread(target=self._survey_loop, daemon=True)
@@ -1937,15 +1939,29 @@ class MAVLinkTriggerNode(object):
 
     def _stop_survey(self):
         """停止走航采样。"""
-        if not self._survey_active:
-            rospy.logwarn("Survey not active")
-            return True
-        self._survey_active = False
-        self._stop_injection_session("survey", "survey_stop")
+        with self.state_lock:
+            if not self._survey_active:
+                rospy.logwarn("Survey not active")
+                return True
+            self._survey_active = False
+            self._survey_sample_active = False
+            was_sampling = self.is_sampling
+            context = dict(self.current_sampling_context or {})
+            self.is_sampling = False
+            self.current_sampling_context = None
+        # Pump cleanup owns both step motors and injection, scoped to the last
+        # acquisition. A late Survey stop must never switch off a newer owner.
+        owned = bool(context.get('attempt_id'))
+        cleaned, superseded = self._cleanup_sampling_attempt(context, 'survey_stop') if owned else (True, False)
+        if was_sampling:
+            reason = 'cleanup_superseded' if superseded else ('operator_stop' if cleaned else 'control_stop_failed')
+            self._emit_sample_record(context, 'cancelled' if cleaned or superseded else 'failed', reason)
+            self._publish_status('sampling_stopped')
         rospy.loginfo("Survey stopped")
-        self._set_mission_state(MissionState.IDLE)
+        if not superseded:
+            self._set_mission_state(MissionState.IDLE if cleaned else MissionState.FAILED)
         self._publish_status("survey_stopped")
-        return True
+        return cleaned or superseded
 
     def _survey_loop(self):
         """走航采样循环线程：按间隔反复触发单次采样。"""

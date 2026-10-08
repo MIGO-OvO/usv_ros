@@ -4,7 +4,7 @@
 
 本版本需匹配带 `CAP=WATCHDOG1` 的 DetFirmware，旧固件会拒绝连接；ROS 每 500 ms 续约设备心跳，设备超过 3 秒失联停机且不因迟到心跳恢复。所有停止入口取消自动化；重连先取消旧事务。Web/trigger 通过 `ControlCommand.automation_start` 原子装载并启动本次步骤，`sampling_context` 和 `attempt_id` 用于归档及 5 秒 owner 续约。
 
-终态通过结构化 `automation_status` 的 attempt/source/sample_id 关联，快任务提前终态缓存到启动确认后消费。内部清理通过 `ControlCommand.automation_cleanup` 在同一控制锁内校验 attempt 并停止全部输出，结果为 `stopped/failed/superseded`；旧 owner 清理不能干扰新任务。失败或已锁存的会话故障不算清理成功，人工 31011/STOPALL 仍为全局停止。走航间隔保持进样 owner 续约，停止会取消整个调度，MANUAL/RTL 接管不被迟到失败覆盖。
+终态通过结构化 `automation_status` 的 attempt/source/sample_id 关联，快任务提前终态缓存到启动确认后消费。内部清理通过 `ControlCommand.automation_cleanup` 在同一控制锁内校验 attempt 并停止全部输出，结果为 `stopped/failed/superseded`；旧 owner 清理不能干扰新任务。失败或已锁存的会话故障不算清理成功，人工 31011/STOPALL 仍为全局停止。走航间隔保持采样 owner 续约、进样关闭，停止会取消整个调度，MANUAL/RTL 接管不被迟到失败覆盖。
 
 飞控需更新为采样超时默认 HOLD、支持 `USV_FAIL` 的匹配版本。22 个显示遥测名称及 31010..31019 命令号不变；分光超过 2 秒未更新时置无效。`USV_DONE/USV_FAIL` 尚无端到端 ACK 或跨飞控重启会话保证，不能以本地发送成功当作船态证明。
 
@@ -507,10 +507,12 @@ sudo USV_BOOT_START_NOW=true USV_STRICT_SELF_CHECK=false ./src/usv_ros/scripts/i
 
 1. 自动统计本次 steps 中 `enable: "E"` 的 X/Y/Z/A（包括连续转动步骤）。
 2. 各相关轴以最短路径回到**预先保存的相对零点**，随后全部正转 360° 补偿液体位移。使用相对 `R` 指令，分别等待匹配的 `PID_START`、`CMD_OK` 和各轴 `PID_DONE`；不会发送归绝对 0° 的 `CAL` 或改写零点。
-3. 油相泵按配置额外正转分隔圈数。使用指定 rpm 的有限 `J` 指令；其 `CMD_OK` 仅代表接收成功，需连续真实角度反馈解环累计证明圈数，再确认轴停止指令。
-4. 按原进样泵任务策略预启动，确认 `PUMP_OK:SET=…,ON` 并等待 lead time；完成后才启动正式序列。manual/survey 策略不在此阶段启动进样泵。
+3. 油相泵按配置额外正转分隔圈数。先以零位移 `R0` 的匹配 PID 完成确认传感器有效（也适用于不在 steps 中的油相轴），再使用指定 rpm 的有限 `J` 指令；其 `CMD_OK` 仅代表接收成功，需连续角度反馈解环累计证明圈数，再确认轴停止指令。分隔容差独立于正式 PID 精度，为 `min(0.5°, 目标角度 × 5%)`。
+4. 按进样泵任务策略预启动，确认 `PUMP_OK:SET=…,ON` 并等待 lead time；完成后才启动正式序列。受管进样在归位前先确认 OFF。Web 直接启动仍按其 automation 策略；trigger 发起的 Survey 每次采样将进样策略纳入同一准备事务，使用已配置联动速度和 lead time。Survey 启动/停止广播不会控制硬件，每次采样结束停机，间隔期间进样关闭；Survey 停止按 attempt 清理整个采样事务，不影响新 owner。
 
-Web 自动化页的“启动前准备”可编辑相对零点、油相轴、分隔圈数和转速；桌面并列显示零点与分隔参数，窄屏纵向排列。运行期间配置锁定，Preflight 只能停止，不能暂停/恢复。阶段和待完成轴通过 `automation_status.preflight` 显示；准备期间 `running=true`、`automation_step=0`。启动 RPC 成功表示接受准备事务，终态仍由关联 attempt 的状态决定。
+当前 DetFirmware 的 `0xCC` 角度帧没有有效位或源时间戳；传感器失效时会重复 last_valid，`ANGLE_AGE_CH_MS=0` 也不能单独证明有效。Preflight 使用逐轴 monotonic 接收时刻（1 秒断流预算）、有限/范围校验、通道 age 和独立健康包时间戳（2.5 秒预算，重复/倒退不续约，支持 uint32 回绕）。油相运动需在 2 秒内产生超过量化/噪声的净正向进展；相同帧或在固定位置附近抖动不能续约进展计时。以上检测失败均停止输出；这些有界软件门禁仍须台架验证机械停机延迟。
+
+Web 自动化页的“启动前准备”可编辑相对零点、油相轴、分隔圈数和转速；桌面并列显示零点与分隔参数，窄屏纵向排列。运行期间配置锁定，Preflight 只能停止，不能暂停/恢复。QGC 的 31012/31013 ACK 和 mission 状态仅在泵服务成功后更新；准备阶段的拒绝返回失败 ACK，不显示假暂停/恢复。阶段和待完成轴通过 `automation_status.preflight` 显示；准备期间 `running=true`、`automation_step=0`。启动 RPC 成功表示接受准备事务，终态仍由关联 attempt 的状态决定。
 
 配置保存在 `sampling_config.json` 的 `pump_settings.preflight`：
 
@@ -518,11 +520,11 @@ Web 自动化页的“启动前准备”可编辑相对零点、油相轴、分�
 {"oil_axis": "A", "separation_turns": 2, "separation_rpm": 5}
 ```
 
-默认圈数为 0（跳过分隔，油相轴可为空）；启用分隔时圈数为 0.01–10、转速为 0.1–20 rpm，轴可独立于 steps 中的相关泵选择。零点复用 `calibration.json` 的 `offsets`，可通过 `GET/POST /api/calibration/offsets` 读取/保存原始角度，范围为 `[0, 360)`。新增 `configured_axes` 区分未设零与显式保存的 0°；旧文件中已有的 offsets 视为已配置。未保存过相关轴零点时任务失败，不回退到绝对 0°。泵节点可用私有参数 `~calibration_file` 指定同一零点文件。
+默认圈数为 0（跳过分隔，油相轴可为空）；启用分隔时圈数为 0.01–10、转速为 0.1–20 rpm，轴可独立于 steps 中的相关泵选择。零点复用 `calibration.json` 的 `offsets`，可通过 `GET/POST /api/calibration/offsets` 读取/保存原始角度，范围为 `[0, 360)`。新增 `configured_axes` 区分未设零与显式保存的 0°；无此标记的旧文件只兼容非 0° 的已保存 offset，默认 0° 无法证明曾标定，须在 Web 明确保存确认。读旧文件不会重新设零或改写文件。未保存过相关轴零点时任务失败，不回退到绝对 0°。泵节点可用私有参数 `~calibration_file` 指定同一零点文件。启动和保存请求的部分 `pump_settings` 先递归合并，再校验完整配置，未提供的 PID、进样及分隔参数保持原值；无效请求回滚且不分派启动。
 
 任一步骤 ACK/PID 超时、角度无效/断流、owner 丢失、watchdog 或串口故障均走现有停泵和终态清理；清理失败继续锁存故障。PID 算法、正式步骤等待、安全租约、GPS 准入与串口恢复协议保持原有行为。部署时成套更新并重启 pump、trigger、Web，含 `static/dist`。
 
-回归：`python -B -m pytest tests/test_automation_preflight.py tests/test_preflight_web_contract.py tests/test_system_safety_contract.py tests/test_terminal_reasons.py tests/test_sampling_cleanup_ownership.py`；前端：`cd frontend && npm run test:automation-controls && npm run build`。实机仍需在 Jetson/ESP32 台架确认：非 0° 相对零点、补偿方向及液体位移、跨 0° 的多圈分隔、进样启动顺序，以及每阶段停止/拔串口后的物理输出停止。
+回归：`python -B -m pytest tests/test_preflight_review_regressions.py tests/test_automation_preflight.py tests/test_preflight_web_contract.py tests/test_system_safety_contract.py tests/test_terminal_reasons.py tests/test_sampling_cleanup_ownership.py`；前端：`cd frontend && npm run test:automation-controls && npm run build`。实机仍需在 Jetson/ESP32 台架确认：非 0° 相对零点、补偿方向及液体位移、跨 0° 的多圈分隔、拔除角度传感器/冻结反馈后的有界停机、最小 rpm 和小圈数容差、两轮 Survey 进样顺序，以及每阶段停止/拔串口后的物理输出停止。
 
 ### launch 参数
 
