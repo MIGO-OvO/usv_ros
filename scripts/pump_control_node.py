@@ -522,6 +522,7 @@ class PumpControlNode(object):
         # 串口连接
         self.serial_conn = None
         self.serial_reader = None
+        self._serial_fault_connection = None
         self._last_control_keepalive = 0.0
         self.serial_lock = threading.Lock()
         self._control_lock = threading.RLock()
@@ -707,6 +708,7 @@ class PumpControlNode(object):
                 raise serial.SerialException('detector firmware lacks WATCHDOG1; update the matched firmware')
             with self.serial_lock:
                 self.serial_conn.write(b'WATCHDOG:ARM\r\n')
+                self._serial_fault_connection = None
             self._controller_fault = None
             self._last_control_keepalive = time.monotonic()
             self._start_keepalive_worker()
@@ -825,19 +827,27 @@ class PumpControlNode(object):
                 return
 
     def _on_serial_reader_error(self, error, connection=None):
-        """读取线程异常后异步重连，避免在读取线程内 join 自身。"""
+        """串口读写异常后异步重连，避免在读取线程内 join 自身。"""
         connection = self.serial_conn if connection is None else connection
         if not self._latch_serial_fault(connection):
             return
         rospy.logwarn("Serial worker stopped: %s", str(error))
+        try:
+            self._publish_status('error: serial disconnected')
+            self._publish_automation_status(self._last_automation_status_text)
+        except Exception as exc:
+            rospy.logwarn('Serial fault status publication failed: %s', exc)
         threading.Thread(target=self._reconnect_after_reader_error,
                          args=(connection,), daemon=True).start()
 
     def _latch_serial_fault(self, connection):
-        """Reader, keepalive and explicit reconnect share fault attribution."""
+        """Reader, writes, keepalive and reconnect share fault attribution."""
         with self.serial_lock:
             if connection is not self.serial_conn:
                 return False
+            if connection is not None and connection is self._serial_fault_connection:
+                return False  # failed cleanup writes must not spawn more recovery
+            self._serial_fault_connection = connection
             self._controller_fault = self._controller_fault or 'disconnected'
             self._spectro_config_state = 'disconnected'
             if self._automation_is_active():
@@ -1009,6 +1019,7 @@ class PumpControlNode(object):
             rospy.logwarn("Serial not connected")
             return False
 
+        connection = None
         try:
             if self._is_injection_pump_command(command):
                 command = command.upper()
@@ -1016,15 +1027,20 @@ class PumpControlNode(object):
             with self.serial_lock:
                 if not self.serial_conn or not self.serial_conn.is_open:
                     return False
+                connection = self.serial_conn
                 if not command.endswith(COMMAND_TERMINATOR):
                     command += COMMAND_TERMINATOR
-                self.serial_conn.write(command.encode('utf-8'))
-                self.serial_conn.flush()
+                connection.write(command.encode('utf-8'))
+                connection.flush()
             rospy.logdebug("Sent: %s", command.strip())
             return True
 
         except (serial.SerialException, OSError) as e:
             rospy.logerr("Send failed: %s", str(e))
+            # The with-block has released serial_lock. Capture the failed
+            # connection so a late error cannot fault a replacement session.
+            if connection is not None:
+                self._on_serial_reader_error('serial write failed: %s' % e, connection)
             return False
 
     def _apply_runtime_configuration(self):
@@ -3032,7 +3048,9 @@ class PumpControlNode(object):
             ("%.2fs" % spectro_age) if spectro_age is not None else "n/a",
             ("%.2fs" % owner_age) if owner_age is not None else "n/a",
             self._controller_fault,
-            bool(self.serial_conn and self.serial_conn.is_open),
+            bool(self.serial_conn and self.serial_conn.is_open
+                 and self.serial_conn is not self._serial_fault_connection
+                 and self._controller_fault not in ('disconnected', 'reconnecting')),
             self._cleanup_failed,
         )
 
@@ -3256,6 +3274,7 @@ class PumpControlNode(object):
             "spectrometer_age_s": spectro_age_s,
             "owner_age_s": owner_age_s,
             "serial_connected": bool(self.serial_conn and self.serial_conn.is_open
+                                     and self.serial_conn is not self._serial_fault_connection
                                      and self._controller_fault not in ('disconnected', 'reconnecting')),
         }
         msg = String()

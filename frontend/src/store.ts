@@ -250,6 +250,7 @@ function createThrottledCommit<T>(intervalMs: number, commit: (data: T) => void)
 interface AppState {
   socket: Socket | null
   connected: boolean
+  statusSnapshotReceived: boolean
   pumpConnected: boolean
   serialConnected: boolean | null
   spectrometerConfigState: string | null
@@ -348,6 +349,7 @@ const DEFAULT_ANGLE_TELEMETRY: AngleTelemetry = {
 export const useAppStore = create<AppState>((set, get) => ({
   socket: null,
   connected: false,
+  statusSnapshotReceived: false,
   pumpConnected: false,
   serialConnected: null,
   spectrometerConfigState: null,
@@ -433,6 +435,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       lastVoltageSequence = null
       set({
         connected: true,
+        statusSnapshotReceived: false,
         voltageBatchSupported: false,
         voltageSequenceGaps: 0,
         voltageUiDropped: 0,
@@ -503,13 +506,14 @@ export const useAppStore = create<AppState>((set, get) => ({
 
     socket.on('disconnect', () => {
       angleSnapshotCommitter.cancel()
-      set({ connected: false, voltageBatchSupported: false, serialConnected: null,
+      set({ connected: false, statusSnapshotReceived: false, voltageBatchSupported: false, serialConnected: null,
         spectrometerConfigState: null, spectrometerTxnPhase: null, automationSpectroState: null })
       console.log('Socket disconnected')
     })
 
     socket.on('status', (data: StatusPayload) => {
       set({
+        statusSnapshotReceived: true,
         pumpConnected: data.pump_connected ?? false,
         serialConnected: data.serial_connected ?? null,
         spectrometerConfigState: data.spectrometer_config_state ?? null,
@@ -664,7 +668,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     const { socket } = get()
     if (socket) {
       socket.disconnect()
-      set({ socket: null, connected: false })
+      set({ socket: null, connected: false, statusSnapshotReceived: false })
     }
   },
 

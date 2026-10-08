@@ -77,3 +77,26 @@ test('missing fields and websocket disconnect cannot claim a ready serial sessio
   assert.match(render(), /未知（Web 离线）/)
   assert.doesNotMatch(render(), /配置已验证/)
 })
+
+test('offline errors and retry history are explicitly last-known until a fresh snapshot', () => {
+  const { handlers, store, render } = fixture()
+  handlers.status({ serial_connected: true, spectrometer_config_state: 'failed',
+    spectrometer_txn_phase: 'ads_config_failed', spectrometer_last_txn_error: 'ADSCFG: timeout',
+    controller_fault: 'cleanup_failed', spectrometer_txn_attempt: 2,
+    spectrometer_retry_errors: [{ attempt: 1, phase: 'ads_config_failed', error: 'ADSCFG: timeout' }] })
+  handlers.disconnect()
+  assert.equal(store.getState().spectrometerLastTxnError, 'ADSCFG: timeout')
+  assert.match(render(), /最后已知事务错误：ADSCFG: timeout/)
+  assert.match(render(), /最后已知事务重试记录/)
+  assert.match(render(), /最后已知控制器故障/)
+  assert.doesNotMatch(render(), /本次事务重试记录/)
+  handlers.connect()
+  // A reconnected Web socket alone does not refresh hardware diagnostics.
+  assert.match(render(), /最后已知事务错误：ADSCFG: timeout/)
+  assert.match(render(), /最后已知事务重试记录/)
+  handlers.status({ serial_connected: true, spectrometer_config_state: 'ready',
+    spectrometer_state: 'acquiring', spectrometer_txn_phase: 'running',
+    spectrometer_last_txn_error: null, spectrometer_retry_errors: [] })
+  assert.doesNotMatch(render(), /最后已知|ADSCFG: timeout|cleanup_failed/)
+  assert.match(render(), /最近事务错误：无/)
+})

@@ -146,6 +146,114 @@ class FieldTransactionTests(unittest.TestCase):
         self.node._reconnect_after_reader_error(old)
         self.assertIs(self.node.serial_conn, new)
 
+    def test_real_write_and_flush_errors_latch_transport_fault_before_return(self):
+        for operation in ('write', 'flush'):
+            for existing_fault in (None, 'watchdog_tripped'):
+                with self.subTest(operation=operation, existing_fault=existing_fault):
+                    port = FakeSerial()
+                    port.open()
+                    self.node.serial_conn = port
+                    self.node._controller_fault = existing_fault
+                    error = (self.module.serial.SerialException('device write failed')
+                             if operation == 'write' else OSError('device flush failed'))
+                    setattr(port, operation, Mock(side_effect=error))
+                    dispatched = threading.Event()
+                    def recover(connection):
+                        self.assertIs(connection, port)
+                        self.assertTrue(self.node.serial_lock.acquire(timeout=0.2))
+                        self.node.serial_lock.release()
+                        dispatched.set()
+                    with patch.object(self.node, '_reconnect_after_reader_error', side_effect=recover):
+                        before_status = len(self.pubs['/usv/automation_status'].messages)
+                        self.assertFalse(self.node.send_command('ADSSTATUS?'))
+                        self.assertTrue(dispatched.wait(1))
+                    # pyserial can leave is_open=True after a failed write.
+                    self.assertTrue(port.is_open)
+                    self.assertGreater(len(self.pubs['/usv/automation_status'].messages), before_status)
+                    status = json.loads(self.pubs['/usv/automation_status'].messages[-1].data)
+                    self.assertFalse(status['serial_connected'])
+                    self.assertEqual(status['spectrometer_config_state'], 'disconnected')
+                    self.assertEqual(status['controller_fault'], existing_fault or 'disconnected')
+
+    def test_cleanup_write_failure_does_not_dispatch_recursive_recovery(self):
+        port = FakeSerial()
+        port.open()
+        self.node.serial_conn = port
+        port.write = Mock(side_effect=OSError('unplugged'))
+        recovered = threading.Event()
+        def recover(connection):
+            self.assertIs(connection, port)
+            # This is what the existing recovery's STOPALL cleanup must survive.
+            self.assertFalse(self.node.send_command('STOPALL'))
+            recovered.set()
+        with patch.object(self.node, '_reconnect_after_reader_error', side_effect=recover) as recovery:
+            self.assertFalse(self.node.send_command('ADSSTATUS?'))
+            self.assertTrue(recovered.wait(1))
+            self.node._on_serial_reader_error('same failed connection', port)
+            self.assertEqual(recovery.call_count, 1)
+
+    def test_write_fault_recovery_survives_status_publication_failure(self):
+        for publish in ('_publish_status', '_publish_automation_status'):
+            with self.subTest(publish=publish):
+                port = FakeSerial()
+                port.open()
+                self.node.serial_conn = port
+                port.write = Mock(side_effect=OSError('device lost'))
+                recovered = threading.Event()
+                with patch.object(self.node, publish, side_effect=RuntimeError('publisher closed')):
+                    with patch.object(self.node, '_reconnect_after_reader_error',
+                                      side_effect=lambda connection: recovered.set()):
+                        self.assertFalse(self.node.send_command('ADSSTATUS?'))
+                        self.assertTrue(recovered.wait(1))
+                self.node._publish_automation_status('idle')
+                status = json.loads(self.pubs['/usv/automation_status'].messages[-1].data)
+                self.assertFalse(status['serial_connected'])
+
+    def test_write_fault_terminal_log_uses_latched_transport_state(self):
+        port = FakeSerial()
+        port.open()
+        self.node.serial_conn = port
+        port.write = Mock(side_effect=OSError('device lost'))
+        with patch.object(self.node, '_reconnect_after_reader_error'):
+            self.assertFalse(self.node.send_command('ADSSTATUS?'))
+        with patch.object(self.module.rospy, 'logwarn') as log:
+            self.node._log_automation_terminal()
+        self.assertIn('serial_connected=%s', log.call_args.args[0])
+        self.assertFalse(log.call_args.args[-2])
+
+    def test_old_write_error_cannot_fault_a_replacement_connection(self):
+        old, new = FakeSerial(), FakeSerial()
+        old.open()
+        new.open()
+        self.node.serial_conn = old
+        old.write = Mock(side_effect=OSError('old connection failed'))
+        fault = self.node._on_serial_reader_error
+        def late_error(error, connection):
+            self.node.serial_conn = new  # replacement before fault delivery
+            return fault(error, connection)
+        with patch.object(self.node, '_on_serial_reader_error', side_effect=late_error) as delivered:
+            with patch.object(self.node, '_reconnect_after_reader_error') as recovery:
+                self.assertFalse(self.node.send_command('ADSSTATUS?'))
+                self.assertIs(delivered.call_args.args[1], old)
+                recovery.assert_not_called()
+        self.node._publish_automation_status('idle')
+        self.assertTrue(json.loads(self.pubs['/usv/automation_status'].messages[-1].data)['serial_connected'])
+        self.assertIsNone(self.node._controller_fault)
+
+    def test_configuration_write_exception_reports_serial_failure_with_disconnected_status(self):
+        port = FakeSerial()
+        port.open()
+        self.node.serial_conn = port
+        port.write = Mock(side_effect=OSError('device lost'))
+        dispatched = threading.Event()
+        with patch.object(self.node, '_reconnect_after_reader_error', side_effect=lambda connection: dispatched.set()):
+            self.assertFalse(self.node.prepare_and_start_spectrometer()[0])
+            self.assertTrue(dispatched.wait(1))
+        status = json.loads(self.pubs['/usv/automation_status'].messages[-1].data)
+        self.assertFalse(status['serial_connected'])
+        self.assertEqual(status['spectrometer_txn_phase'], 'serial_failed')
+        self.assertIn('serial send failed', status['spectrometer_last_txn_error'])
+
     def test_reconnect_stops_old_worker_and_disconnect_stops_new_worker(self):
         ports = self.serial_environment()
         self.node._apply_runtime_configuration = Mock()
