@@ -3198,7 +3198,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             "stop_on_finish": True,
         })
 
-    def test_web_survey_trigger_status_applies_injection_pump_policy(self):
+    def test_web_survey_trigger_status_observes_lifecycle_without_driving_pumps(self):
         module, _, string_cls = _load_script(
             "web_config_server_survey_injection_policy_test",
             "scripts/web_config_server.py",
@@ -3230,12 +3230,15 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
                     },
                 },
             })
+            recording_calls = []
+            server._start_data_recording_if_needed = lambda source: recording_calls.append(("start", source))
+            server._stop_data_recording_if_active = lambda: recording_calls.append(("stop",))
 
             server._trigger_status_cb(string_cls("survey_started"))
             server._trigger_status_cb(string_cls("survey_stopped"))
 
-        self.assertEqual([call["action"] for call in control_calls], ["injection_on", "injection_off"])
-        self.assertEqual(json.loads(control_calls[0]["payload_json"])["speed"], 55)
+        self.assertEqual(control_calls, [])
+        self.assertEqual(recording_calls, [("start", "survey"), ("stop",)])
 
     def test_web_config_uses_legacy_step_pump_when_global_default_missing(self):
         module, _, _ = _load_script(

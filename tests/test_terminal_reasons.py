@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 from unittest.mock import Mock
+from types import SimpleNamespace
 
 from test_hardware_runtime_sync import _load_script
 
@@ -182,7 +183,11 @@ class TerminalReasonTests(unittest.TestCase):
         self.node._owner_last_seen = time.monotonic()
         self.node.automation_engine.start = Mock(return_value=False)
         self.node.stop_all_pumps = Mock(return_value=True)
-        self.assertFalse(self.node._auto_start_callback(None).success)
+        self.node.serial_conn = SimpleNamespace(is_open=True)
+        self.node.send_command = lambda command: self.node._on_text_received('PIDPARAM:0.14,0.015,0.06,1,8') or True
+        self.assertTrue(self.node._auto_start_callback(None).success)
+        self.node._preflight_thread.join(2)
+        self.assertFalse(self.node._preflight_thread.is_alive())
         self.assertEqual(self.automation_status_payloads()[-1]['terminal_reason'], 'configuration_failed')
         self.assertEqual(len([s for s in self.terminal_logs if '[AUTOMATION TERMINAL]' in s]), 1)
 

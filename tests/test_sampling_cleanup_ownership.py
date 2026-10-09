@@ -2,6 +2,7 @@
 import json
 import threading
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import test_fcu_sampling_result as fcu_results
@@ -18,7 +19,16 @@ class SamplingCleanupOwnershipTests(unittest.TestCase):
         with patch.object(self.module, 'InjectionPumpWorker', return_value=None):
             self.pump = self.module.PumpControlNode()
         self.sent = []
-        self.pump.send_command = lambda command: self.sent.append(command) or True
+        self.module.rospy.is_shutdown = lambda: False
+        self.pump.serial_conn = SimpleNamespace(is_open=True)
+        def send(command):
+            self.sent.append(command)
+            if command.strip() == 'PIDQUERY':
+                self.pump._on_text_received('PIDPARAM:0.14,0.015,0.06,1,8')
+            elif command.strip() == 'STOPALL':
+                self.pump._on_text_received('STOPALL_OK')
+            return True
+        self.pump.send_command = send
         self.engine = self.pump.automation_engine
         self.engine.send_command = self.pump.send_command
         self.engine.on_step_command = lambda step: True
@@ -86,6 +96,10 @@ class SamplingCleanupOwnershipTests(unittest.TestCase):
         self.node.is_sampling = False
         self.node.current_sampling_context = None
         self.node._call_automation_service = lambda action: self.pump._auto_stop_callback(None).success
+        def transaction(action, payload=None):
+            ok, _, result = self.pump._execute_control_action(action, payload or {})
+            return ok, result
+        self.node._call_control_transaction = transaction
         self.assertTrue(self.node.handle_mavlink_command(31011))
         self.assertFalse(self.engine.is_running())
         self.assertFalse(self.pump.inject_pump_enabled)
@@ -100,7 +114,7 @@ class SamplingCleanupOwnershipTests(unittest.TestCase):
         self.node._handle_completion(False, 'A_step_failed')
         self.assertEqual(accepted, [False])
 
-    def test_prestart_injection_claim_is_cleaned_when_start_is_rejected(self):
+    def test_rejected_start_claim_is_cleaned_without_early_injection(self):
         node = self.case.trigger_module.MAVLinkTriggerNode()
         node._latest_global_position = gps_position()
         node.set_mode = lambda mode: True
@@ -117,10 +131,10 @@ class SamplingCleanupOwnershipTests(unittest.TestCase):
         self.assertFalse(self.pump.inject_pump_enabled)
         self.assertFalse(self.pump._automation_is_active())
         self.assertTrue(self.pump.sampling_context.get('attempt_id'))
-        injection_owner = next(payload['attempt_id'] for action, payload in requests if action == 'injection_on')
-        self.assertNotEqual(injection_owner, 'A')
-        self.assertEqual(self.pump.sampling_context['attempt_id'], injection_owner)
-        self.assertEqual([action for action, _ in requests], ['injection_on', 'automation_start', 'automation_cleanup'])
+        owner = next(payload['attempt_id'] for action, payload in requests if action == 'automation_start')
+        self.assertNotEqual(owner, 'A')
+        self.assertEqual(self.pump.sampling_context['attempt_id'], owner)
+        self.assertEqual([action for action, _ in requests], ['automation_start', 'automation_cleanup'])
 
     def test_matching_cleanup_failure_latches_fault_and_rejects_new_owner(self):
         self.pump.send_command = lambda command: False

@@ -81,14 +81,15 @@ class FCUSamplingResultTests(unittest.TestCase):
         self.assertIn('sampling_stopped', [m.data for m in self.node.status_pub.messages])
 
     def test_start_failures_are_correlated_before_dispatch(self):
-        for failure in ('injection', 'automation'):
+        for failure in ('preflight', 'automation'):
             with self.subTest(failure=failure):
                 self.setUp()
-                if failure == 'injection':
-                    self.node._start_injection_session = lambda *args: False
+                if failure == 'preflight':
+                    self.trigger()
+                    self.node._handle_completion(False, 'controller_fault')
                 else:
                     self.node._call_automation_service = lambda action: False
-                self.trigger()
+                    self.trigger()
                 self.assert_no_done()
                 self.assertEqual(self.results()[0]['sample_id'], 42)
                 self.assertEqual(self.results()[0]['outcome'], 'failed')
@@ -205,13 +206,14 @@ class FCUSamplingResultTests(unittest.TestCase):
         self.assert_no_done()
         self.assertEqual(self.results()[0]['outcome'], 'cancelled')
 
-    def test_cancellation_during_injection_start_does_not_start_automation(self):
+    def test_cancellation_during_preparation_does_not_start_automation(self):
         calls = []
         self.node._call_automation_service = lambda action: calls.append(action) or True
-        def start_injection(*args):
+        original_prepare = self.node._prepare_automation_steps
+        def prepare(*args):
+            original_prepare(*args)
             self.node._stop_sampling_sequence()
-            return True
-        self.node._start_injection_session = start_injection
+        self.node._prepare_automation_steps = prepare
         self.trigger()
         self.assertEqual(calls, ['stop'])
         self.assert_no_done()

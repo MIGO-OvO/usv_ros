@@ -106,9 +106,21 @@ class PumpSafetyTests(unittest.TestCase):
         def start():
             observations.append((self.node.automation_engine.steps, dict(self.node.sampling_context)))
             return True
+        # This case owns the atomic payload handoff; feedback-driven preparation
+        # has its own real-worker regressions in test_automation_preflight.py.
+        self.module.rospy.is_shutdown = lambda: False
+        self.node.serial_conn = types.SimpleNamespace(is_open=True)
+        def send(command):
+            self.sent.append(command)
+            if command.strip() == 'PIDQUERY':
+                self.node._on_text_received('PIDPARAM:0.14,0.015,0.06,1,8')
+            return True
+        self.node.send_command = send
         with patch.object(self.node.automation_engine, 'start', side_effect=start):
             ok, _, _ = self.node._execute_control_action('automation_start', payload)
+            self.node._preflight_thread.join(2)
         self.assertTrue(ok)
+        self.assertFalse(self.node._preflight_thread.is_alive())
         self.assertEqual(observations[0][0], payload['steps'])
         self.assertEqual(observations[0][1]['sample_id'], 42)
 

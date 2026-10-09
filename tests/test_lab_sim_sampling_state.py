@@ -1,6 +1,7 @@
 import importlib.util
 import json
 import sys
+import threading
 import types
 import unittest
 from pathlib import Path
@@ -224,6 +225,7 @@ class LabSimSamplingStateTests(unittest.TestCase):
     def test_simulated_survey_window_publishes_bounded_event_without_automation(self):
         module = _load_script("mavlink_trigger_node_survey_event_test", "scripts/mavlink_trigger_node.py")
         node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node._sampling_control_lock = threading.RLock()
         node.current_waypoint = 0
         node.is_sampling = False
         node._survey_active = True

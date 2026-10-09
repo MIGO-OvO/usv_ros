@@ -4,7 +4,7 @@
 
 本版本需匹配带 `CAP=WATCHDOG1` 的 DetFirmware，旧固件会拒绝连接；ROS 每 500 ms 续约设备心跳，设备超过 3 秒失联停机且不因迟到心跳恢复。所有停止入口取消自动化；重连先取消旧事务。Web/trigger 通过 `ControlCommand.automation_start` 原子装载并启动本次步骤，`sampling_context` 和 `attempt_id` 用于归档及 5 秒 owner 续约。
 
-终态通过结构化 `automation_status` 的 attempt/source/sample_id 关联，快任务提前终态缓存到启动确认后消费。内部清理通过 `ControlCommand.automation_cleanup` 在同一控制锁内校验 attempt 并停止全部输出，结果为 `stopped/failed/superseded`；旧 owner 清理不能干扰新任务。失败或已锁存的会话故障不算清理成功，人工 31011/STOPALL 仍为全局停止。走航间隔保持进样 owner 续约，停止会取消整个调度，MANUAL/RTL 接管不被迟到失败覆盖。
+终态通过结构化 `automation_status` 的 attempt/source/sample_id 关联，快任务提前终态缓存到启动确认后消费。内部清理通过 `ControlCommand.automation_cleanup` 在同一控制锁内校验 attempt 并停止全部输出，结果为 `stopped/failed/superseded`；旧 owner 清理不能干扰新任务。失败或已锁存的会话故障不算清理成功，人工 31011/STOPALL 仍为全局停止。走航间隔保持采样 owner 续约、进样关闭，停止会取消整个调度，MANUAL/RTL 接管不被迟到失败覆盖。
 
 飞控需更新为采样超时默认 HOLD、支持 `USV_FAIL` 的匹配版本。22 个显示遥测名称及 31010..31019 命令号不变；分光超过 2 秒未更新时置无效。`USV_DONE/USV_FAIL` 尚无端到端 ACK 或跨飞控重启会话保证，不能以本地发送成功当作船态证明。
 
@@ -501,6 +501,35 @@ sudo USV_BOOT_START_NOW=true USV_STRICT_SELF_CHECK=false ./src/usv_ros/scripts/i
 3. 调用 `/usv/pump_reconnect`。
 4. `pump_control_node.py` 重新打开串口并执行检测装置身份握手。
 
+### Automation 启动前准备（Preflight）
+
+每次任务先完成以下准备，再进入现有 `AutomationEngine`；序列内部循环不重复准备：
+
+1. 自动统计本次 steps 中 `enable: "E"` 的 X/Y/Z/A（包括连续转动步骤）。
+2. 各相关轴以最短路径回到**预先保存的相对零点**，随后全部正转 360° 补偿液体位移。使用相对 `R` 指令，分别等待匹配的 `PID_START`、`CMD_OK` 和各轴 `PID_DONE`；不会发送归绝对 0° 的 `CAL` 或改写零点。归位、360° 补偿及油相 R0 的独立定位容差固定为 0.1°，覆盖 MT6701 的 14-bit 量化步长 `360/16384 ≈ 0.022°` 及少量噪声；正式步骤仍使用用户指定的 PID 精度。
+3. 油相泵按配置额外正转分隔圈数。先以零位移 `R0` 的匹配 PID 完成确认传感器有效（也适用于不在 steps 中的油相轴），再使用指定 rpm 的有限 `J` 指令；其 `CMD_OK` 仅代表接收成功，需连续角度反馈解环累计证明圈数，再确认轴停止指令。分隔容差独立于正式 PID 精度，为 `min(0.5°, 目标角度 × 5%)`。
+4. 按进样泵任务策略预启动，确认 `PUMP_OK:SET=…,ON` 并等待 lead time；完成后才启动正式序列。受管进样在归位前先确认 OFF。Web 直接启动仍按其 automation 策略；trigger 发起的 Survey 每次采样将进样策略纳入同一准备事务，使用已配置联动速度和 lead time。Survey 启动/停止广播不会控制硬件，每次采样结束停机，间隔期间进样关闭；Survey 停止按 attempt 清理整个采样事务，不影响新 owner。
+
+当前 DetFirmware 的 `0xCC` 角度帧没有有效位或源时间戳；传感器失效时会重复 last_valid，`ANGLE_AGE_CH_MS=0` 也不能单独证明有效。Preflight 使用逐轴 monotonic 接收时刻（1 秒断流预算）、有限/范围校验、通道 age 和独立健康包时间戳（2.5 秒预算，重复/倒退不续约，支持 uint32 回绕）。油相运动需在 2 秒内产生超过量化/噪声的净正向进展；相同帧或在固定位置附近抖动不能续约进展计时。以上检测失败均停止输出；这些有界软件门禁仍须台架验证机械停机延迟。
+
+Web 自动化页的“启动前准备”可编辑相对零点、油相轴、分隔圈数和转速；桌面并列显示零点与分隔参数，窄屏纵向排列。运行期间配置锁定，Preflight 只能停止，不能暂停/恢复。QGC 的 31012/31013 ACK 和 mission 状态仅在泵服务成功后更新；准备阶段的拒绝返回失败 ACK，不显示假暂停/恢复。阶段和待完成轴通过 `automation_status.preflight` 显示；准备期间 `running=true`、`automation_step=0`。启动 RPC 成功表示接受准备事务，终态仍由关联 attempt 的状态决定。
+
+QGC 31011 的全局停止和 trigger 内部按 attempt 的清理通过已有 `ControlCommand` 请求携带可选 `confirm_stop: true`：先执行原停止输出，再用 `PIDQUERY → PIDPARAM` 排空旧响应，随后等待最终 `STOPALL → STOPALL_OK` 确认固件已关闭电机、PID/校准/测试和进样。串口写入成功不能单独生成成功 ACK；清理/确认超时、异常或已锁存故障返回失败、mission 为 FAILED，保留原故障原因。原命令号、ACK 结构、串口指令及不带该标记的旧 ROS 调用兼容；部署须更新 pump 与 trigger。固件确认表示执行了停机逻辑，机械惯性/电气输出仍需台架测量。
+
+Survey 启动 RPC 与 31011/31016 停止及收尾共用独立事务锁，STOP 成功前等待已发出的启动 RPC 返回并完成清理；等待期间 `state_lock` 保持可用，遥测与 owner 回调照常运行。每轮 Survey 调度持有独立 generation，旧调度不能向重启后的 Survey 分派采样或清除其状态。首轮前未取得泵 owner 时停止只收尾本地调度；不会用未拥有的 attempt 停止其他任务。已取得 owner 时仍按 acquisition 的 attempt 清理，并保留 superseded 隔离。
+
+配置保存在 `sampling_config.json` 的 `pump_settings.preflight`：
+
+```json
+{"oil_axis": "A", "separation_turns": 2, "separation_rpm": 5}
+```
+
+默认圈数为 0（跳过分隔，油相轴可为空）；启用分隔时圈数为 0.01–10、转速为 0.1–20 rpm，轴可独立于 steps 中的相关泵选择。零点复用 `calibration.json` 的 `offsets`，可通过 `GET/POST /api/calibration/offsets` 读取/保存原始角度，范围为 `[0, 360)`。新增 `configured_axes` 区分未设零与显式保存的 0°；无此标记的旧文件只兼容非 0° 的已保存 offset，默认 0° 无法证明曾标定，须在 Web 明确保存确认。读旧文件不会重新设零或改写文件。未保存过相关轴零点时任务失败，不回退到绝对 0°。泵节点可用私有参数 `~calibration_file` 指定同一零点文件。启动和保存请求的部分 `pump_settings` 先递归合并，再校验完整配置，未提供的 PID、进样及分隔参数保持原值；无效请求回滚且不分派启动。
+
+任一步骤 ACK/PID 超时、角度无效/断流、owner 丢失、watchdog 或串口故障均走现有停泵和终态清理；清理失败继续锁存故障。PID 算法、正式步骤等待、安全租约、GPS 准入与串口恢复协议保持原有行为。部署时成套更新并重启 pump、trigger、Web，含 `static/dist`。
+
+回归：`python -B -m pytest tests/test_preflight_stop_races.py tests/test_preflight_review_regressions.py tests/test_automation_preflight.py tests/test_preflight_web_contract.py tests/test_system_safety_contract.py tests/test_terminal_reasons.py tests/test_sampling_cleanup_ownership.py`；前端：`cd frontend && npm run test:automation-controls && npm run build`。实机仍需在 Jetson/ESP32 台架确认：非 0° 相对零点、补偿方向及液体位移、跨 0° 的多圈分隔、拔除角度传感器/冻结反馈后的有界停机、最小 rpm 和小圈数容差、两轮 Survey 进样顺序、0.1° 定位稳定性、启动/停止并发与立即重启，以及每阶段停止/拔串口后的物理输出停止、STOPALL 确认延迟和 QGC 失败 ACK/FAILED 状态。
+
 ### launch 参数
 
 `launch/usv_bringup.launch` 当前暴露的参数如下：
@@ -600,7 +629,7 @@ REST API 和 Socket.IO 实时事件。
 | `GET /api/mission-config/export`、`POST /api/mission-config/import` | 任务配置导入导出 |
 | `POST /api/motor/command`、`POST /api/motor/stop` | 手动电机命令 |
 | `GET/POST /api/pid/config`、`POST /api/pid/test` | PID 参数与测试 |
-| `GET /api/calibration/offsets`、`POST /api/calibration/zero|reset|start` | 角度校准 |
+| `GET/POST /api/calibration/offsets`、`POST /api/calibration/zero|reset|start` | 相对零点与角度校准 |
 | `GET /api/data/voltage`、`POST /api/data/voltage/clear` | 当前内存电压历史 |
 | `POST /api/spectrometer/start`、`POST /api/spectrometer/stop`、`POST /api/spectrometer/baseline` | 分光采集启停；baseline 无请求体时沿用当前有效电压，也可通过 `reference_voltage` 写入稳定窗口的平均参考电压 |
 | `GET /api/data/missions` | 历史任务文件列表 |
