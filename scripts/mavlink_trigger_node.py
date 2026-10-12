@@ -52,7 +52,9 @@ from std_srvs.srv import Trigger, TriggerResponse
 from mavros_msgs.msg import State, WaypointReached, Mavlink
 from mavros_msgs.srv import SetMode, SetModeRequest
 from scripts.lib.lab_sim.coordinates import Coordinate
-from scripts.lib.sample_recording.record import bind_context, freeze_position, navsat_position, sample_record
+from scripts.lib.sample_recording.record import (
+    bind_automation_context, bind_context, freeze_position, navsat_position, sample_record,
+)
 from scripts.lib.lab_sim.model_config import (
     Analyte,
     LabConfigV2,
@@ -90,7 +92,7 @@ MAVLINK_MSG_ID_COMMAND_LONG = 76
 # MAV_RESULT enum
 MAV_RESULT_ACCEPTED = 0
 MAV_RESULT_TEMPORARILY_REJECTED = 1
-MAV_RESULT_FAILED = 5
+MAV_RESULT_FAILED = 4
 
 CONFIG_FILE = os.path.expanduser("~/usv_ws/config/sampling_config.json")
 
@@ -325,7 +327,12 @@ class MAVLinkTriggerNode(object):
         try:
             if position is None:
                 position = self._survey_state_snapshot()['position']
-            bind_context(context, position, getattr(self, 'sampling_max_position_age_s', 2.0), simulated)
+            max_age_s = getattr(self, 'sampling_max_position_age_s', 2.0)
+            if context.get('source') == 'manual' and not simulated:
+                bind_automation_context(context, position, max_age_s,
+                                        require_gps=context.get('gps_required', True))
+            else:
+                bind_context(context, position, max_age_s, simulated)
             return True
         except ValueError as exc:
             self._publish_status('sampling_rejected:' + str(exc))
@@ -1645,7 +1652,11 @@ class MAVLinkTriggerNode(object):
 
         config = self._load_config() or self._get_default_config()
         steps_data = self._build_manual_steps_payload(config)
-        context = {'waypoint_seq': int(self.current_waypoint), 'source': 'manual', 'attempt_id': uuid.uuid4().hex}
+        policy = config.get('automation_policy', {})
+        # Match the Web's saved setting; only an explicit JSON false opts out.
+        require_gps = not (isinstance(policy, dict) and policy.get('require_gps') is False)
+        context = {'waypoint_seq': int(self.current_waypoint), 'source': 'manual',
+                   'attempt_id': uuid.uuid4().hex, 'gps_required': require_gps}
         self.current_sampling_context = context
         if not self._bind_sample_position(context):
             self.current_sampling_context = None

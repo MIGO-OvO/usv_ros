@@ -109,8 +109,8 @@ def sample_record(context, spectrometer=None, water_quality=None, timestamp_end=
     }
 
 
-def bind_web_context(context, position, max_age_s=2.0, require_gps=True):
-    """Explicit per-request Web bench opt-out; other entry points remain strict."""
+def bind_automation_context(context, position, max_age_s=2.0, require_gps=True):
+    """Manual/Web automation may explicitly start with an unlocated record."""
     if type(require_gps) is not bool:
         raise ValueError('require_gps must be a boolean')
     try:
@@ -118,7 +118,13 @@ def bind_web_context(context, position, max_age_s=2.0, require_gps=True):
     except ValueError as exc:
         if require_gps:
             raise
+        position_source = 'manual_no_gps' if context.get('source') == 'manual' else 'web_no_gps'
         context.update(record_id=uuid.uuid4().hex, timestamp_start=time.time(),
-                       gps_snapshot={'position_source': 'web_no_gps'},
+                       gps_snapshot={'position_source': position_source},
                        simulated=False, gps_required=False, gps_rejection_reason=str(exc))
         return context
+
+
+def bind_web_context(context, position, max_age_s=2.0, require_gps=True):
+    """Bind Web automation using its request or persisted GPS requirement."""
+    return bind_automation_context(context, position, max_age_s, require_gps)
