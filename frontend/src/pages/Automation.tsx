@@ -528,7 +528,7 @@ export default function Automation() {
                 </div>
                 <p id="require-gps-help" className="text-xs text-muted-foreground">
                   {requireGps ? '启动前校验有效定位；室内台架测试可关闭。' : '室内测试：允许无 GPS 执行真实泵控；无定位记录不进入地图。'}
-                  该开关为服务器持久化配置，切换页面、刷新或重启后仍保持；不改变航点采样限制。
+                  Web 自动化与 QGC 手动点采样共用此设置，刷新或重启后仍保持。航线与走航采样需要有效定位。
                 </p>
               </div>
               <div className="space-y-2">

@@ -526,7 +526,7 @@ Survey 启动 RPC 与 31011/31016 停止及收尾共用独立事务锁，STOP �
 
 默认圈数为 0（跳过分隔，油相轴可为空）；启用分隔时圈数为 0.01–10、转速为 0.1–20 rpm，轴可独立于 steps 中的相关泵选择。零点复用 `calibration.json` 的 `offsets`，可通过 `GET/POST /api/calibration/offsets` 读取/保存原始角度，范围为 `[0, 360)`。新增 `configured_axes` 区分未设零与显式保存的 0°；无此标记的旧文件只兼容非 0° 的已保存 offset，默认 0° 无法证明曾标定，须在 Web 明确保存确认。读旧文件不会重新设零或改写文件。未保存过相关轴零点时任务失败，不回退到绝对 0°。泵节点可用私有参数 `~calibration_file` 指定同一零点文件。启动和保存请求的部分 `pump_settings` 先递归合并，再校验完整配置，未提供的 PID、进样及分隔参数保持原值；无效请求回滚且不分派启动。
 
-任一步骤 ACK/PID 超时、角度无效/断流、owner 丢失、watchdog 或串口故障均走现有停泵和终态清理；清理失败继续锁存故障。PID 算法、正式步骤等待、安全租约、GPS 准入与串口恢复协议保持原有行为。部署时成套更新并重启 pump、trigger、Web，含 `static/dist`。
+任一步骤 ACK/PID 超时、角度无效/断流、owner 丢失、watchdog 或串口故障均走现有停泵和终态清理；清理失败继续锁存故障。PID 算法、正式步骤等待、安全租约与串口恢复协议保持原有行为；GPS 准入详见下文手动点采样策略。部署时成套更新并重启 pump、trigger、Web，含 `static/dist`。
 
 回归：`python -B -m pytest tests/test_preflight_stop_races.py tests/test_preflight_review_regressions.py tests/test_automation_preflight.py tests/test_preflight_web_contract.py tests/test_system_safety_contract.py tests/test_terminal_reasons.py tests/test_sampling_cleanup_ownership.py`；前端：`cd frontend && npm run test:automation-controls && npm run build`。实机仍需在 Jetson/ESP32 台架确认：非 0° 相对零点、补偿方向及液体位移、跨 0° 的多圈分隔、拔除角度传感器/冻结反馈后的有界停机、最小 rpm 和小圈数容差、两轮 Survey 进样顺序、0.1° 定位稳定性、启动/停止并发与立即重启，以及每阶段停止/拔串口后的物理输出停止、STOPALL 确认延迟和 QGC 失败 ACK/FAILED 状态。
 
@@ -723,6 +723,21 @@ curl -X POST http://127.0.0.1:5000/api/hardware/apply \
 | `31017` | 设置分光 baseline，`param1=0` 使用最新有效电压 |
 | `31018` | 启动分光检测器信号采集 |
 | `31019` | 停止分光检测器信号采集 |
+
+QGC 手动点采样（`31010`，`param2=0`）与 Web 自动化共用保存到
+`~/usv_ws/config/sampling_config.json` 的 `automation_policy.require_gps`。默认要求 GPS；
+在 Web 自动化页关闭“启动时要求 GPS”后，下一次 QGC 手动点采样允许无 GPS 启动，无需重启节点。
+只有布尔值 `false` 关闭要求，缺失或非法配置仍要求 GPS。
+
+关闭要求后仍优先冻结有效硬件定位；无定位、失锁或过期时创建空坐标的真实采样记录，
+`position_source=manual_no_gps`、`simulated=false`，不使用模拟船位、不从结束位置补写起点，
+无定位记录不进入地图。FCU 航线、走航和实验真实采样继续要求有效 GPS。
+
+手动命令回执遵循飞控的 `MAV_RESULT` 定义：接受 `0`、忙碌暂拒 `1`、执行失败 `4`；
+`5` 表示执行中，不能用于失败，否则 QGC 会继续等待最终回执直至超时。
+离线回归：`python3 -B -m unittest discover -s tests -p 'test_manual_sampling_gps_policy.py'`。
+现场在无 fix 时关闭 GPS 要求并点击 QGC 点采样，应看到 `sampling_started` 和
+`/usv/mavlink_cmd_ack` 的 `[31010,0,...]`；重新开启要求后同样操作应返回 GPS 拒绝及 `[31010,4,...]`。
 
 航线定点采样使用飞控原生 `MAV_CMD_NAV_SCRIPT_TIME`：
 
