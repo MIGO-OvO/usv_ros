@@ -53,7 +53,7 @@ from mavros_msgs.msg import State, WaypointReached, Mavlink
 from mavros_msgs.srv import SetMode, SetModeRequest
 from scripts.lib.lab_sim.coordinates import Coordinate
 from scripts.lib.sample_recording.record import (
-    bind_automation_context, bind_context, freeze_position, navsat_position, sample_record,
+    bind_context, freeze_position, navsat_position, sample_record,
 )
 from scripts.lib.lab_sim.model_config import (
     Analyte,
@@ -102,7 +102,6 @@ SURVEY_GATE_DEFAULTS = {
     "survey_min_speed_mps": 0.0,
     "survey_max_speed_mps": 0.0,
     "survey_require_valid_spectrometer": False,
-    "survey_require_gps": True,
     "survey_max_position_age_s": 2.0,
 }
 
@@ -204,10 +203,6 @@ class MAVLinkTriggerNode(object):
                     SURVEY_GATE_DEFAULTS["survey_require_valid_spectrometer"],
                 ),
                 SURVEY_GATE_DEFAULTS["survey_require_valid_spectrometer"],
-            ),
-            "survey_require_gps": _bool_or_default(
-                rospy.get_param('~survey_require_gps', SURVEY_GATE_DEFAULTS["survey_require_gps"]),
-                SURVEY_GATE_DEFAULTS["survey_require_gps"],
             ),
             "survey_max_position_age_s": max(0.0, _float_or_default(
                 rospy.get_param('~survey_max_position_age_s', SURVEY_GATE_DEFAULTS["survey_max_position_age_s"]),
@@ -328,11 +323,7 @@ class MAVLinkTriggerNode(object):
             if position is None:
                 position = self._survey_state_snapshot()['position']
             max_age_s = getattr(self, 'sampling_max_position_age_s', 2.0)
-            if context.get('source') == 'manual' and not simulated:
-                bind_automation_context(context, position, max_age_s,
-                                        require_gps=context.get('gps_required', True))
-            else:
-                bind_context(context, position, max_age_s, simulated)
+            bind_context(context, position, max_age_s, simulated)
             return True
         except ValueError as exc:
             self._publish_status('sampling_rejected:' + str(exc))
@@ -465,7 +456,6 @@ class MAVLinkTriggerNode(object):
             'position_source': str(lab_cfg.get('position_source', 'lab_sim' if lab_enabled else 'real') or 'real'),
             'lab_options': {
                 'bypass_pid_wait': lab_bypass_pid,
-                'allow_no_gps': bool(lab_cfg.get('allow_no_gps', True)),
                 'real_propulsion_enabled': bool(lab_cfg.get('real_propulsion_enabled', False)),
             },
         }
@@ -657,11 +647,7 @@ class MAVLinkTriggerNode(object):
             # 真实采样设备: 复用泵/光谱仪自动化流程
             self.is_sampling = True
             self.current_sampling_context = {'waypoint_seq': seq, 'source': 'lab_real'}
-            if not self._bind_sample_position(self.current_sampling_context):
-                self.is_sampling = False
-                self.current_sampling_context = None
-                self._set_mission_state(MissionState.FAILED, 'gps_rejected')
-                return
+            self._bind_sample_position(self.current_sampling_context)
             config = self._load_config() or self._get_default_config()
             steps_data = self._build_manual_steps_payload(config)
             steps_data['waypoint_seq'] = seq
@@ -953,10 +939,7 @@ class MAVLinkTriggerNode(object):
         steps_data = self._build_steps_payload(config, waypoint_seq)
         steps_data['retry_count'] = waypoint_cfg['retry_count']
         steps_data['on_fail'] = waypoint_cfg['on_fail']
-        if not self._bind_sample_position(context):
-            context.update(on_fail='HOLD', retry_count=0)
-            self._handle_failure_action('gps_rejected')
-            return False
+        self._bind_sample_position(context)
         self._prepare_automation_steps(steps_data)
 
         self._set_waypoint_state(waypoint_seq, WaypointSamplingState.SAMPLING)
@@ -1324,8 +1307,7 @@ class MAVLinkTriggerNode(object):
             if (not self.is_sampling or not isinstance(context, dict)
                     or context.get('cancel_reason')):
                 return False
-        if not self._bind_sample_position(context):
-            return False
+        self._bind_sample_position(context)
         if isinstance(self._prepared_automation_payload, dict):
             self._prepared_automation_payload.update(context)
         if not self._call_automation_service('start'):
@@ -1652,15 +1634,10 @@ class MAVLinkTriggerNode(object):
 
         config = self._load_config() or self._get_default_config()
         steps_data = self._build_manual_steps_payload(config)
-        policy = config.get('automation_policy', {})
-        # Match the Web's saved setting; only an explicit JSON false opts out.
-        require_gps = not (isinstance(policy, dict) and policy.get('require_gps') is False)
         context = {'waypoint_seq': int(self.current_waypoint), 'source': 'manual',
-                   'attempt_id': uuid.uuid4().hex, 'gps_required': require_gps}
+                   'attempt_id': uuid.uuid4().hex}
         self.current_sampling_context = context
-        if not self._bind_sample_position(context):
-            self.current_sampling_context = None
-            return False
+        self._bind_sample_position(context)
         self.is_sampling = True
         self._set_mission_state(MissionState.SAMPLING, str(self.current_waypoint))
         self.is_sampling = True
@@ -1698,11 +1675,7 @@ class MAVLinkTriggerNode(object):
             'attempt_id': uuid.uuid4().hex,
         }
         self.current_sampling_context = context
-        if not self._bind_sample_position(context):
-            self.current_sampling_context = None
-            self._publish_sampling_result(context, 'failed', 'gps_rejected')
-            self._request_fcu_hold()
-            return False
+        self._bind_sample_position(context)
         self.is_sampling = True
         if self.current_sampling_context is not context:
             self._cleanup_sampling_attempt(context, 'start_cancelled')
@@ -1746,10 +1719,6 @@ class MAVLinkTriggerNode(object):
             "survey_require_valid_spectrometer": _bool_or_default(
                 raw.get("survey_require_valid_spectrometer", defaults["survey_require_valid_spectrometer"]),
                 defaults["survey_require_valid_spectrometer"],
-            ),
-            "survey_require_gps": _bool_or_default(
-                raw.get("survey_require_gps", defaults["survey_require_gps"]),
-                defaults["survey_require_gps"],
             ),
             "survey_max_position_age_s": max(0.0, _float_or_default(
                 raw.get("survey_max_position_age_s", defaults["survey_max_position_age_s"]),
@@ -1802,38 +1771,24 @@ class MAVLinkTriggerNode(object):
         if gate["survey_require_valid_spectrometer"] and not snapshot["spectrometer"].get("valid", False):
             return False, "spectrometer_invalid"
 
-        if not simulated:
-            if not position:
-                return False, 'no_gps'
-            try:
-                freeze_position(position, getattr(self, 'sampling_max_position_age_s', 2.0))
-            except ValueError as exc:
-                return False, str(exc)
-
-        position_needed = gate["survey_require_gps"] or gate["survey_min_distance_m"] > 0.0
-        if position_needed:
-            if not position:
-                return False, "no_gps"
-            max_age = gate["survey_max_position_age_s"]
-            # Local receive-time freshness (same clock domain as this node).
-            # max_age == 0 disables the check entirely, as before.
-            if max_age > 0.0:
-                received = _float_or_none(position.get("received_monotonic"))
-                if received is None:
-                    return False, 'gps_missing_receive_time'
-                local_age = time.monotonic() - received
-                if local_age < 0.0 or local_age > max_age:
-                    return False, "gps_stale"
+        # Distance is optional when no usable position is available. The
+        # interval scheduler still runs; invalid coordinates never become an anchor.
+        max_age = _float_or_default(getattr(self, 'sampling_max_position_age_s', 2.0), 2.0)
+        max_age = max_age if max_age > 0 else 2.0
+        if gate["survey_max_position_age_s"] > 0:
+            max_age = min(max_age, gate["survey_max_position_age_s"])
+        try:
+            position = freeze_position(position, max_age, simulated)
+        except ValueError:
+            position = {}
 
         if gate["survey_min_speed_mps"] > 0.0 and speed < gate["survey_min_speed_mps"]:
             return False, "speed_too_low"
         if gate["survey_max_speed_mps"] > 0.0 and speed > gate["survey_max_speed_mps"]:
             return False, "speed_too_high"
 
-        if gate["survey_min_distance_m"] > 0.0 and last_position:
-            if any(_float_or_none(value) is None for value in
-                   (position.get('lat'), position.get('lon'), last_position.get('lat'), last_position.get('lon'))):
-                return False, 'gps_invalid_coordinates'
+        if (gate["survey_min_distance_m"] > 0.0 and position and last_position
+                and all(_float_or_none(last_position.get(key)) is not None for key in ('lat', 'lon'))):
             distance_m = self._haversine_m(
                 last_position["lat"],
                 last_position["lon"],
@@ -1849,12 +1804,10 @@ class MAVLinkTriggerNode(object):
         if state_lock is not None:
             with state_lock:
                 position = dict((self.current_sampling_context or {}).get('gps_snapshot') or {})
-                if position:
-                    self._last_survey_sample_position = position
+                self._last_survey_sample_position = position if 'lat' in position and 'lon' in position else None
             return
         position = dict((self.current_sampling_context or {}).get('gps_snapshot') or {})
-        if position:
-            self._last_survey_sample_position = position
+        self._last_survey_sample_position = position if 'lat' in position and 'lon' in position else None
 
     def _set_survey_sampling_flags(self, active):
         state_lock = getattr(self, "state_lock", None)
@@ -1926,9 +1879,7 @@ class MAVLinkTriggerNode(object):
 
         if not self._set_survey_sampling_flags(True):
             return 'skipped'
-        if not self._bind_sample_position(self.current_sampling_context):
-            self._set_survey_sampling_flags(False)
-            return 'skipped'
+        self._bind_sample_position(self.current_sampling_context)
         self._prepare_automation_steps(steps_data, source='survey')
         context = self.current_sampling_context
         if self._start_prepared_automation():
@@ -1961,13 +1912,7 @@ class MAVLinkTriggerNode(object):
         # A scheduler is not a pump owner. Acquire attempt/lease only when an
         # acquisition is actually dispatched, so pre-first STOP is local.
         self.current_sampling_context = None
-        lab = config.get('lab_mode') or {}
-        simulated = lab.get('enabled') and lab.get('data_source', 'simulated') == 'simulated'
-        # Admission only: each acquisition owns preparation and injection.
         # Each survey acquisition below creates its own UUID and start snapshot.
-        if not simulated and not self._bind_sample_position({}):
-            self.current_sampling_context = None
-            return False
         self._survey_owner_attempt_id = None
         self._survey_generation = uuid.uuid4().hex
         self._survey_interval = max(1.0, float(interval) if interval > 0 else gate["survey_interval_s"])

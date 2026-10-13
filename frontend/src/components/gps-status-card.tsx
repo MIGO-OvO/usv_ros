@@ -52,7 +52,7 @@ const reasonText: Record<string, string> = {
   gps_missing_receive_time: '缺少接收时间',
 }
 
-/** Three independent layers: raw GNSS telemetry, MAVROS fix, sampling admission. */
+/** Raw GNSS telemetry, MAVROS fix and optional record coordinates are independent. */
 function layerStatus(gps: Diagnostics | null) {
   const raw = gps?.gps_raw
   const navsat = gps?.navsat
@@ -64,10 +64,10 @@ function layerStatus(gps: Diagnostics | null) {
       : `${raw.fix_label || 'Unknown'} · ${num(raw.satellites, 0)} SAT · HDOP ${num(raw.hdop)}`
   const mavros = !navsat?.available ? '未收到 NavSatFix'
     : `已接收 · age ${ageText(navsat.age_s)} · ${(navsat.age_s ?? Infinity) > limit
-      ? `超过采样阈值 ${limit.toFixed(1)}s` : `采样时效内（阈值 ${limit.toFixed(1)}s）`}`
+      ? `超过位置有效期 ${limit.toFixed(1)}s` : `位置有效期内（阈值 ${limit.toFixed(1)}s）`}`
   const sampling = !gps ? '未知'
-    : gps.sampling_position.valid ? `可用于采样 · ${ageText(navsat?.age_s)}`
-      : `不可用 · ${reasonText[gps.sampling_position.reason ?? ''] ?? gps.sampling_position.reason}`
+    : gps.sampling_position.valid ? `记录有效坐标 · ${ageText(navsat?.age_s)}`
+      : `记录空坐标 · ${reasonText[gps.sampling_position.reason ?? ''] ?? gps.sampling_position.reason}`
   return { receiver, mavros, sampling }
 }
 
@@ -126,9 +126,9 @@ export function GpsStatusCard({ gps, failed, detailed = false }: {
         <span className="font-medium" role="listitem">GPS Receiver</span>
         <span role="listitem" className={layer.receiver.includes('陈旧') || layer.receiver.includes('未收到') ? colors.orange : undefined}>{layer.receiver}</span>
         <span className="font-medium" role="listitem">MAVROS Position</span>
-        <span role="listitem" className={layer.mavros.includes('超过采样阈值') || layer.mavros.includes('未收到') ? colors.orange : undefined}>{layer.mavros}</span>
-        <span className="font-medium" role="listitem">Sampling GPS</span>
-        <span role="listitem" className={layer.sampling.includes('不可用') ? colors.error : colors.success}>{layer.sampling}</span>
+        <span role="listitem" className={layer.mavros.includes('超过位置有效期') || layer.mavros.includes('未收到') ? colors.orange : undefined}>{layer.mavros}</span>
+        <span className="font-medium" role="listitem">采样记录位置</span>
+        <span role="listitem" className={gps?.sampling_position.valid ? colors.success : colors.neutral}>{layer.sampling}</span>
       </div>
       {detailed && gps?.warnings.map((warning) => <p key={warning} className="text-orange-700 dark:text-orange-400">{warning}</p>)}
       {detailed && <>
@@ -139,8 +139,8 @@ export function GpsStatusCard({ gps, failed, detailed = false }: {
       <p className="text-muted-foreground">融合/全局位置不代表原始 GNSS 已获得 Fix。高度基准可能不同，不用于直接比较。</p>
       <p>{gps?.overall.message}</p>
       </>}
-      <p className="text-xs font-medium">采样准入：{!gps ? '未知' : gps.sampling_position.valid ? '有效（严格 NavSatFix 校验）' : `未通过 · ${gps.sampling_position.reason}`}</p>
-      <p className="text-xs text-muted-foreground">采样坐标源：MAVROS /global_position/global（后端严格 NavSatFix 校验，不以显示坐标替代）</p>
+      <p className="text-xs font-medium">GPS 仅用于记录位置；无有效定位仍允许采样。</p>
+      <p className="text-xs text-muted-foreground">记录坐标源：MAVROS /global_position/global；无有效定位时保留空坐标。</p>
       {!detailed && <a className="inline-block py-2 text-blue-700 underline dark:text-blue-400" href="#gps-diagnostics" onClick={() => { const panel = document.getElementById('gps-diagnostics'); if (panel instanceof HTMLDetailsElement) panel.open = true }}>详细诊断</a>}
       {detailed && <div className="border-t pt-3">
         <div className="mt-3 space-y-4 break-words">
@@ -153,7 +153,7 @@ export function GpsStatusCard({ gps, failed, detailed = false }: {
               <li key={`${entry.received_at}-${index}`}><time>{date(entry.received_at)}</time> · {entry.text}</li>)}</ul> : <p>暂无日志</p>}
           </section>
           <p className="text-muted-foreground">此面板只读。缺少原始帧可能是接收机、配置或消息流问题；无法仅凭软件判断天线或硬件损坏。</p>
-          <p className="text-muted-foreground">MAVROS 位置显示与采样准入分开判断；超过后端采样阈值（{(gps?.freshness_threshold_s ?? 2).toFixed(1)}s）的数据会标记为降级，采样准入始终以服务器严格校验为准。</p>
+          <p className="text-muted-foreground">MAVROS 位置显示与记录坐标有效性分开判断；超过后端位置有效期（{(gps?.freshness_threshold_s ?? 2).toFixed(1)}s）时记录空坐标，采样仍可启动。</p>
         </div>
       </div>}
     </CardContent>

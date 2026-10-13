@@ -454,10 +454,6 @@ export default function Lab() {
                 <span>跳过 PID 角度等待</span>
                 <Switch checked={config.bypass_pid_wait} onCheckedChange={(bypass_pid_wait) => updateConfig({ bypass_pid_wait })} />
               </label>
-              <label className="flex items-center justify-between gap-3 rounded-md border p-3">
-                <span>允许无 GPS</span>
-                <Switch checked={config.allow_no_gps} onCheckedChange={(allow_no_gps) => updateConfig({ allow_no_gps })} />
-              </label>
             </CardContent>
           </Card>
 

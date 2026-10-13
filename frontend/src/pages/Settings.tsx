@@ -60,7 +60,6 @@ interface MappingProfileConfig {
   survey_min_speed_mps: number
   survey_max_speed_mps: number
   survey_require_valid_spectrometer: boolean
-  survey_require_gps: boolean
   survey_max_position_age_s: number
 }
 
@@ -109,7 +108,6 @@ const DEFAULT_MAPPING_PROFILE: MappingProfileConfig = {
   survey_min_speed_mps: 0.0,
   survey_max_speed_mps: 0.0,
   survey_require_valid_spectrometer: true,
-  survey_require_gps: true,
   survey_max_position_age_s: 5.0,
 }
 
@@ -490,7 +488,7 @@ export default function Settings() {
                         <Input type="number" min="0" step="0.1" value={mappingProfile.survey_min_distance_m} onChange={e => setMappingNumber('survey_min_distance_m', e.target.value)} />
                     </div>
                     <div className="space-y-2">
-                        <Label>位置最大年龄 (s)</Label>
+                        <Label>距离计算的位置最大年龄 (s)</Label>
                         <Input type="number" min="0" step="0.1" value={mappingProfile.survey_max_position_age_s} onChange={e => setMappingNumber('survey_max_position_age_s', e.target.value)} />
                     </div>
                     <div className="space-y-2">
@@ -503,13 +501,6 @@ export default function Settings() {
                     </div>
                     <label className="flex items-center justify-between gap-3 rounded-md border bg-background/60 p-3 text-sm sm:border-0 sm:bg-transparent sm:p-0">
                         <span>
-                          <span className="font-medium block">需要 GPS</span>
-                          <span className="text-xs text-muted-foreground">缺少或过期位置时跳过本次走航采样。</span>
-                        </span>
-                        <Switch checked={mappingProfile.survey_require_gps} onCheckedChange={v => setMappingProfile(p => ({ ...p, survey_require_gps: v }))} />
-                    </label>
-                    <label className="flex items-center justify-between gap-3 rounded-md border bg-background/60 p-3 text-sm sm:border-0 sm:bg-transparent sm:p-0">
-                        <span>
                           <span className="font-medium block">需要有效分光</span>
                           <span className="text-xs text-muted-foreground">分光状态无效时只记录跳过原因。</span>
                         </span>
@@ -517,7 +508,7 @@ export default function Settings() {
                     </label>
                 </div>
                 <div className="rounded-md bg-muted/50 p-3 text-xs text-muted-foreground">
-                  门控发生在采样启动前；跳过只发布原因，不结束走航任务。
+                  有有效定位时检查最小距离；无定位时按时间间隔采样。速度和分光门控仍在启动前检查。
                 </div>
                 <div className="flex flex-col gap-2 sm:flex-row">
                     <Button className="flex-1" onClick={saveMappingProfile}><Save className="w-4 h-4 mr-2" /> 保存门控</Button>

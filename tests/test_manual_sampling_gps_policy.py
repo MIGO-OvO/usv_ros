@@ -1,4 +1,4 @@
-"""QGC manual sampling uses the saved GPS policy and terminal MAVLink ACKs."""
+"""Legacy GPS policies cannot block sampling; terminal MAVLink ACKs still apply."""
 import json
 import tempfile
 import types
@@ -58,18 +58,19 @@ class ManualSamplingGPSPolicyTests(unittest.TestCase):
         self.assertEqual(payload['gps_snapshot']['lat'], 30)
         self.assertFalse(payload['simulated'])
 
-    def test_default_and_invalid_policy_reject_no_fix_with_failed_ack(self):
+    def test_default_and_legacy_policy_values_accept_no_fix(self):
         for policy in (None, {}, {'require_gps': True}, {'require_gps': 'false'},
                        {'require_gps': 0}, {'require_gps': None}, False):
             with self.subTest(policy=policy):
                 node = self.make_node(policy, dict(gps_position(), fix_status=-1))
                 # Assert the protocol value, not the implementation's constant.
-                self.assertEqual(self.send_start(node), [31010.0, 4.0, 255.0, 190.0])
-                node._call_control_transaction.assert_not_called()
-                self.assertFalse(node.is_sampling)
-                self.assertIn('sampling_rejected:gps_no_fix', [m.data for m in node.status_pub.messages])
+                self.assertEqual(self.send_start(node), [31010.0, 0.0, 255.0, 190.0])
+                node._call_control_transaction.assert_called_once()
+                self.assertTrue(node.is_sampling)
+                self.assertEqual(node.current_sampling_context['gps_snapshot'],
+                                 {'position_source': 'manual_no_gps'})
 
-    def test_saved_policy_is_reloaded_for_each_manual_start(self):
+    def test_saved_required_policy_cannot_restore_the_gps_limit(self):
         node = self.make_node(position=dict(gps_position(), fix_status=-1))
         del node._load_config
         with tempfile.TemporaryDirectory() as directory:
@@ -79,8 +80,8 @@ class ManualSamplingGPSPolicyTests(unittest.TestCase):
                 self.assertEqual(self.send_start(node)[1], 0.0)
                 node._handle_completion(True, 'finished')
                 config_file.write_text(json.dumps({'automation_policy': {'require_gps': True}}), encoding='utf-8')
-                self.assertEqual(self.send_start(node)[1], 4.0)
-                node._call_control_transaction.assert_called_once()
+                self.assertEqual(self.send_start(node)[1], 0.0)
+                self.assertEqual(node._call_control_transaction.call_count, 2)
 
     def test_unlocated_record_is_not_filled_from_later_gps_or_map_position(self):
         node = self.make_node({'require_gps': False})
@@ -99,19 +100,18 @@ class ManualSamplingGPSPolicyTests(unittest.TestCase):
         self.assertIsNone(window['gps_start'])
         self.assertEqual(record['sample_id'], window['sample_id'])
 
-    def test_manual_policy_does_not_bypass_fcu_or_survey_gps(self):
+    def test_legacy_policy_cannot_block_fcu_or_survey_sampling(self):
         for entry in ('fcu', 'survey'):
             with self.subTest(entry=entry):
-                node = self.make_node({'require_gps': False}, dict(gps_position(), fix_status=-1))
+                node = self.make_node({'require_gps': True}, dict(gps_position(), fix_status=-1))
                 if entry == 'fcu':
-                    self.assertFalse(node._do_fcu_sample(42))
-                    result = json.loads(node.sampling_result_pub.messages[-1].data)
-                    self.assertEqual(result['outcome'], 'failed')
-                    self.assertEqual(result['reason'], 'gps_rejected')
-                    node._request_fcu_hold.assert_called_once()
+                    self.assertTrue(node._do_fcu_sample(42))
+                    node._request_fcu_hold.assert_not_called()
                 else:
-                    self.assertFalse(node._start_survey())
-                node._call_control_transaction.assert_not_called()
+                    node._survey_active = True
+                    self.assertEqual(node._start_survey_sample_once(node._load_config()), 'started')
+                node._call_control_transaction.assert_called_once()
+                self.assertNotIn('lat', node.current_sampling_context['gps_snapshot'])
 
     def test_automation_rejection_returns_terminal_failed_ack(self):
         node = self.make_node({'require_gps': False}, gps_position())

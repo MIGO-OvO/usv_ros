@@ -108,7 +108,6 @@ export interface LabConfig {
   readonly analytes?: readonly LabAnalyteConfig[]
   readonly sources?: readonly LabPollutionSourceConfig[]
   readonly auto_scan?: LabAutoScanParams
-  readonly allow_no_gps: boolean
   readonly bypass_pid_wait: boolean
   readonly include_lab_data_by_default: boolean
   readonly sim: {
@@ -249,7 +248,6 @@ export const fallbackConfig: LabConfig = {
     inward_margin_m: 1,
     max_waypoints: 200,
   },
-  allow_no_gps: true,
   bypass_pid_wait: true,
   include_lab_data_by_default: false,
   sim: {

@@ -71,7 +71,6 @@ const forbiddenLabTokens = [
 const requiredSettingsTokens = [
   'mapping_profile',
   'survey_min_distance_m',
-  'survey_require_gps',
   'survey_require_valid_spectrometer',
   'saveMappingProfile',
   '走航门控配置',

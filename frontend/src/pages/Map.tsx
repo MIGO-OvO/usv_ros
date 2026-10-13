@@ -100,7 +100,6 @@ interface MappingProfileConfig {
   survey_min_speed_mps?: number
   survey_max_speed_mps?: number
   survey_require_valid_spectrometer?: boolean
-  survey_require_gps?: boolean
   survey_max_position_age_s?: number
 }
 
@@ -1083,9 +1082,9 @@ export default function MapPage() {
                 <span className="text-right font-mono">
                   {formatNumber(surveyStatus?.mapping_profile?.survey_min_speed_mps, 2)}-{formatNumber(surveyStatus?.mapping_profile?.survey_max_speed_mps, 2)} m/s
                 </span>
-                <span>GPS / 分光</span>
+                <span>分光门控</span>
                 <span className="text-right">
-                  {surveyStatus?.mapping_profile?.survey_require_gps ? 'GPS' : 'GPS 可选'} · {surveyStatus?.mapping_profile?.survey_require_valid_spectrometer ? 'valid' : 'valid 可选'}
+                  {surveyStatus?.mapping_profile?.survey_require_valid_spectrometer ? '需要有效分光' : '分光可选'}
                 </span>
               </div>
             </CardContent>

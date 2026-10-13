@@ -63,16 +63,26 @@ class SamplingContextContractTests(unittest.TestCase):
         self.assertEqual(window['spectrometer']['frame_count'], 1)
         self.assertIsNotNone(window['timestamp_end'])
 
-    def test_web_direct_start_rejects_stale_or_missing_hardware_gps(self):
+    def test_web_direct_start_accepts_stale_or_missing_hardware_gps(self):
         self.server.standalone = False
-        for position in (None, gps_position(age=3)):
-            self.server._latest_real_gps = position
-            self.server.current_position = {'lat': 25, 'lng': 110, 'position_source': 'lab_sim'}
-            with patch.object(self.server, '_call_control_command') as control:
-                result = self.server.app.test_client().post('/api/mission/start')
-            self.assertEqual(result.status_code, 409)
-            control.assert_not_called()
-            self.assertIsNone(self.server.current_sample_window)
+        for index, position in enumerate((None, gps_position(age=3))):
+            with self.subTest(position=position):
+                self.server._latest_real_gps = position
+                self.server.current_position = {'lat': 25, 'lng': 110, 'position_source': 'lab_sim'}
+                with patch.object(self.server, '_publish_steps', return_value={'attempt_id': 'indoor-%d' % index}), \
+                        patch.object(self.server, '_call_control_command', return_value=(True, 'accepted', {})) as control:
+                    result = self.server.app.test_client().post('/api/mission/start')
+                self.assertTrue(result.get_json()['success'])
+                control.assert_called_once()
+                window = self.server.current_sample_window
+                self.assertIsNone(window['latitude'])
+                self.assertIsNone(window['longitude'])
+                self.assertIsNone(window['gps_start'])
+                self.assertFalse(window['simulated'])
+                self.server._automation_status_cb(msg(json.dumps({
+                    'status': 'finished', 'running': False,
+                    'sampling_context': dict(self.server._sampling_context),
+                })))
 
     def test_web_opt_out_records_no_coordinates_even_with_display_position(self):
         self.server.standalone = False
@@ -93,13 +103,21 @@ class SamplingContextContractTests(unittest.TestCase):
         self.server._close_sample_window_if_open()
         self.assertIsNone(window['latitude'])
 
-    def test_web_opt_out_rejects_non_boolean(self):
+    def test_web_legacy_request_flag_cannot_restore_the_gps_limit(self):
         self.server.standalone = False
-        with patch.object(self.server, '_call_control_command') as control:
-            for value in ('false', 0, None, {}):
+        self.server._latest_real_gps = None
+        for index, value in enumerate((True, 'false', 0, None, {})):
+            with self.subTest(value=value), \
+                    patch.object(self.server, '_publish_steps', return_value={'attempt_id': 'legacy-%d' % index}), \
+                    patch.object(self.server, '_call_control_command', return_value=(True, 'accepted', {})) as control:
                 response = self.server.app.test_client().post('/api/mission/start', json={'require_gps': value})
-                self.assertEqual(response.status_code, 409)
-        control.assert_not_called()
+                self.assertTrue(response.get_json()['success'])
+                control.assert_called_once()
+                self.assertIsNone(self.server.current_sample_window['latitude'])
+                self.server._automation_status_cb(msg(json.dumps({
+                    'status': 'finished', 'running': False,
+                    'sampling_context': dict(self.server._sampling_context),
+                })))
 
     def test_gps_status_uses_hardware_and_expires_without_new_messages(self):
         client = self.server.app.test_client()

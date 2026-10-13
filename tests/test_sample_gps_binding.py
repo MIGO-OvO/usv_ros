@@ -15,14 +15,18 @@ from scripts.lib.sample_recording.storage import SampleRecordingStorage
 class SampleGPSBindingTests(unittest.TestCase):
     def setUp(self):
         self.module = _load_script('gps_binding_trigger', 'scripts/mavlink_trigger_node.py')
-        self.node = self.module.MAVLinkTriggerNode()
-        self.node._latest_global_position = gps_position()
-        self.node._load_config = lambda: {'sampling_sequence': {'steps': [], 'loop_count': 1}}
-        self.node._start_injection_session = Mock(return_value=True)
-        self.node._call_automation_service = Mock(return_value=True)
-        self.node._cleanup_sampling_attempt = Mock(return_value=(True, False))
-        self.node._request_fcu_hold = Mock(return_value=True)
-        self.node.set_mode = Mock(return_value=True)
+        self.node = self.make_node()
+
+    def make_node(self):
+        node = self.module.MAVLinkTriggerNode()
+        node._latest_global_position = gps_position()
+        node._load_config = lambda: {'sampling_sequence': {'steps': [], 'loop_count': 1}}
+        node._start_injection_session = Mock(return_value=True)
+        node._call_automation_service = Mock(return_value=True)
+        node._cleanup_sampling_attempt = Mock(return_value=(True, False))
+        node._request_fcu_hold = Mock(return_value=True)
+        node.set_mode = Mock(return_value=True)
+        return node
 
     def test_manual_freezes_gps_before_first_hardware_call(self):
         def move(*args):
@@ -46,29 +50,32 @@ class SampleGPSBindingTests(unittest.TestCase):
     def message(payload):
         return type('Message', (), {'data': json.dumps(payload)})()
 
-    def test_stale_gps_rejects_every_real_entry_without_hardware(self):
+    def test_stale_gps_starts_every_real_entry_without_coordinates(self):
         for entry in ('manual', 'fcu', 'lab_real', 'survey'):
             with self.subTest(entry=entry):
-                self.node._latest_global_position = gps_position(age=2.1)
+                node = self.make_node()
+                node._latest_global_position = gps_position(age=2.1)
                 if entry == 'manual':
-                    self.assertFalse(self.node._do_manual_sample())
+                    self.assertTrue(node._do_manual_sample())
                 elif entry == 'fcu':
-                    self.node.default_on_fail = 'SKIP'
-                    self.assertFalse(self.node._do_fcu_sample(42))
-                    result = json.loads(self.node.sampling_result_pub.messages[-1].data)
-                    self.assertEqual(result['outcome'], 'failed')
+                    self.assertTrue(node._do_fcu_sample(42))
                 elif entry == 'lab_real':
-                    self.node._run_lab_sampling(1, 20, 100, {'data_source': 'real'})
+                    node._run_lab_sampling(1, 20, 100, {'data_source': 'real'})
                 else:
-                    self.assertFalse(self.node._start_survey())
-                self.node._start_injection_session.assert_not_called()
-                self.node._call_automation_service.assert_not_called()
-                self.assertFalse(self.node.is_sampling)
+                    node._survey_active = True
+                    self.assertEqual(node._start_survey_sample_once(node._load_config()), 'started')
+                node._call_automation_service.assert_called_once()
+                self.assertTrue(node.is_sampling)
+                record = sample_record(node.current_sampling_context)
+                self.assertIsNone(record['latitude'])
+                self.assertIsNone(record['longitude'])
+                self.assertFalse(record['simulated'])
 
     def test_fix_loss_immediately_invalidates_cached_good_fix(self):
         self.node._global_position_cb(gps_message(status=-1))
-        self.assertFalse(self.node._do_manual_sample())
-        self.node._start_injection_session.assert_not_called()
+        self.assertTrue(self.node._do_manual_sample())
+        self.node._call_automation_service.assert_called_once()
+        self.assertIsNone(sample_record(self.node.current_sampling_context)['latitude'])
 
     def test_invalid_positions_and_missing_receive_time_are_rejected(self):
         invalid = [dict(lat=float('nan')), dict(lon=181), dict(lat=-91),
@@ -82,10 +89,11 @@ class SampleGPSBindingTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     freeze_position(p)
 
-    def test_no_fix_zero_age_parameter_cannot_disable_real_gate(self):
+    def test_zero_age_parameter_does_not_archive_stale_coordinates(self):
         self.node.sampling_max_position_age_s = 0
         self.node._latest_global_position = gps_position(age=3)
-        self.assertFalse(self.node._do_manual_sample())
+        self.assertTrue(self.node._do_manual_sample())
+        self.assertIsNone(sample_record(self.node.current_sampling_context)['latitude'])
 
     def test_survey_next_sample_has_new_id_and_new_start_position(self):
         self.node._survey_active = True
@@ -181,20 +189,24 @@ class SampleGPSBindingTests(unittest.TestCase):
         self.assertEqual(self.node.current_sampling_context['gps_snapshot']['lat'], 30)
         self.assertFalse(self.node.current_sampling_context['simulated'])
 
-    def test_waypoint_rejects_after_hold_if_fix_has_expired(self):
+    def test_waypoint_starts_after_hold_without_expired_coordinates(self):
         self.node._get_waypoint_sampling_config = lambda *args: {
             'enabled': True, 'loop_count': 1, 'retry_count': 0, 'on_fail': 'SKIP', 'hold_before_sampling_s': 0}
         self.node._wait_until_stable = lambda *args: (True, '')
         self.node._latest_global_position = gps_position(age=3)
-        self.assertFalse(self.node._start_sampling_sequence(3))
-        self.node._start_injection_session.assert_not_called()
-        self.node._call_automation_service.assert_not_called()
+        self.assertTrue(self.node._start_sampling_sequence(3))
+        self.node._call_automation_service.assert_called_once()
+        self.assertIsNone(sample_record(self.node.current_sampling_context)['latitude'])
 
-    def test_survey_false_setting_does_not_bypass_real_gps_gate(self):
-        self.node._survey_active = True
-        self.node._latest_global_position = None
-        self.assertEqual(self.node._start_survey_sample_once({'survey_sampling': {'survey_require_gps': False}}), 'skipped')
-        self.node._call_automation_service.assert_not_called()
+    def test_survey_starts_without_gps_for_either_legacy_setting(self):
+        for require_gps in (False, True):
+            with self.subTest(require_gps=require_gps):
+                node = self.make_node()
+                node._survey_active = True
+                node._latest_global_position = None
+                config = {'survey_sampling': {'survey_require_gps': require_gps}}
+                self.assertEqual(node._start_survey_sample_once(config), 'started')
+                node._call_automation_service.assert_called_once()
 
     def test_duplicate_emission_and_window_open_are_idempotent(self):
         context = {'source': 'manual'}

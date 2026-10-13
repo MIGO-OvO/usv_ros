@@ -64,7 +64,7 @@ def freeze_position(position, max_age_s=2.0, simulated=False):
     else:
         if finite(p.get('fix_status')) is None or p['fix_status'] < 0:
             raise ValueError('gps_no_fix')
-        # Hard freshness gate uses only the Jetson-local monotonic receive
+        # Coordinate validity uses only the Jetson-local monotonic receive
         # time. header.stamp belongs to the FCU/MAVROS clock domain and stays
         # diagnostic-only; a wall-clock offset must not reject a fresh fix.
         elapsed = position_local_age_s(p)
@@ -81,12 +81,19 @@ def freeze_position(position, max_age_s=2.0, simulated=False):
 
 
 def bind_context(context, position, max_age_s=2.0, simulated=False):
-    """Call once immediately before acquisition; never replace an existing fix."""
+    """Freeze optional start coordinates; GPS validity never blocks real sampling."""
     if context.get('record_id'):
         return context
-    snapshot = freeze_position(position, max_age_s, simulated)
+    try:
+        snapshot = freeze_position(position, max_age_s, simulated)
+    except ValueError as exc:
+        if simulated:
+            raise
+        source = context.get('source') or 'unknown'
+        snapshot = {'position_source': str(source) + '_no_gps'}
+        context['gps_rejection_reason'] = str(exc)
     context.update(record_id=uuid.uuid4().hex, timestamp_start=time.time(),
-                   gps_snapshot=snapshot, simulated=bool(simulated))
+                   gps_snapshot=snapshot, simulated=bool(simulated), gps_required=False)
     return context
 
 
@@ -109,22 +116,12 @@ def sample_record(context, spectrometer=None, water_quality=None, timestamp_end=
     }
 
 
-def bind_automation_context(context, position, max_age_s=2.0, require_gps=True):
-    """Manual/Web automation may explicitly start with an unlocated record."""
-    if type(require_gps) is not bool:
-        raise ValueError('require_gps must be a boolean')
-    try:
-        return bind_context(context, position, max_age_s)
-    except ValueError as exc:
-        if require_gps:
-            raise
-        position_source = 'manual_no_gps' if context.get('source') == 'manual' else 'web_no_gps'
-        context.update(record_id=uuid.uuid4().hex, timestamp_start=time.time(),
-                       gps_snapshot={'position_source': position_source},
-                       simulated=False, gps_required=False, gps_rejection_reason=str(exc))
-        return context
+def bind_automation_context(context, position, max_age_s=2.0, require_gps=False):
+    """Compatibility wrapper: the retired require_gps argument is ignored."""
+    context.setdefault('source', 'web')
+    return bind_context(context, position, max_age_s)
 
 
-def bind_web_context(context, position, max_age_s=2.0, require_gps=True):
-    """Bind Web automation using its request or persisted GPS requirement."""
+def bind_web_context(context, position, max_age_s=2.0, require_gps=False):
+    """Bind optional Web coordinates, ignoring legacy GPS requirement flags."""
     return bind_automation_context(context, position, max_age_s, require_gps)
