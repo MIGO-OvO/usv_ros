@@ -1412,8 +1412,11 @@ class MAVLinkTriggerNode(object):
         """Preserve trigger pre-start settings, execute them after pump preparation."""
         configured = (config or {}).get('pump_settings', {}).get('injection_pump_policy', {})
         speed = self._default_injection_speed(config)
-        if source == 'survey' and configured.get('mode') in ('survey', 'automation'):
-            speed = configured.get('speed', speed)
+        mode = str(configured.get('mode', '')).lower()
+        if mode in ('automation', 'auto', 'sample', 'sampling', 'task') or (source == 'survey' and mode == 'survey'):
+            configured_speed = _float_or_none(configured.get('speed'))
+            if configured_speed is not None:
+                speed = max(0, min(100, int(configured_speed)))
         return {'mode': 'automation', 'speed': speed,
                 'lead_time_s': configured.get('lead_time_s', 0.0), 'stop_on_finish': True}
 
@@ -1995,12 +1998,12 @@ class MAVLinkTriggerNode(object):
 
     def run(self):
         """主循环。"""
-        self._init_services()
-        self.wait_for_mavros()
-        self._set_mission_state(MissionState.IDLE)
-        rospy.loginfo("MAVLink Trigger Node ready")
-
         self._trigger_srv = rospy.Service('/usv/trigger_sampling', Trigger, self._trigger_srv_cb)
+        # Manual payload control and owner renewals do not require MAVROS.
+        # Waiting here could expire an early QGC attempt's 5s owner lease and
+        # then overwrite its live mission state with IDLE.
+        threading.Thread(target=self._init_services, name='MAVROSServiceInit', daemon=True).start()
+        rospy.loginfo("MAVLink Trigger Node ready (MAVROS services initialize separately)")
 
         rate = rospy.Rate(1)
         prev_connected = False

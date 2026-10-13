@@ -14,6 +14,16 @@
 
 提交前审计新增回归：`test_sampling_terminal_contract.py`、`test_sampling_cleanup_ownership.py`，覆盖跨任务终态、早到响应、旧清理 RPC、显式停止和走航租约。Web 记录窗口按 attempt 串行化建立/清理，拒绝启动只回滚自身资源。
 
+### QGC 启动、进样泵与普通停止
+
+bridge 连接 router 后立即发送 component 191 心跳并接收命令；飞控心跳在接收循环中处理。trigger 的 MAVROS 服务初始化在独立线程中执行，采样 owner 每秒续约，启动等待不会覆盖已经开始的采样状态。
+
+QGC 手动点采样采用 Web 全局步骤和自动进样泵策略的 `speed`；缺少自动策略时沿用 `default_speed`。进样仍在泵组准备完成后开启。准备阶段通过现有 `USV_STAT=8` 上报，QGC 主按钮显示“停止采样准备”；进入采样步骤后才提供暂停/恢复。`31011` 在准备阶段和步骤执行期间均全局停止全部泵输出，并核对设备 `PIDQUERY → STOPALL_OK` 回应。
+
+QGC 发送层与面板响应期限一致：分光启动 40 秒（覆盖最多三次配置重试和首帧等待），停止类 `31011/31016/31019` 为 15 秒。期限是等待确认的上限，停止命令点击后即发送。更新 ROS 后重启 trigger/bridge/pump，并运行重新编译的 QGC。
+
+回归：`python -B -m unittest discover -s tests -p test_qgc_payload_startup.py`。台架验收：ROS 启动后立即使用 QGC 启动信号；对比 Web/QGC 相同配置的进样速度；分别在准备、运行、暂停阶段点击普通停止，确认泵组与进样泵停止且记录窗口关闭。
+
 ### 分光冷启动与现场诊断
 
 `connect()` 的成功仅表示串口已打开、设备身份与会话握手通过；发布 `serial_connected`，不会以 `connected` 暗示 I2C/ADS 配置成功。Web 的 Automation 和监控页常驻显示串口、I2C/ADS 运行配置、采集状态、事务阶段、最近错误及重试记录。`ready` 只表示 I2CMAP 和 ADSCFG 回显已验证；只有 ADSSTART ACK 后收到有效真实帧才表示启动成功。

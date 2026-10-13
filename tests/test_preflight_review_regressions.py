@@ -386,7 +386,7 @@ class SurveyAndQGCChainTests(unittest.TestCase):
             self.trigger._dispatch_command_long(command, 0, 0, 255, 190, 'test')
             self.trigger._send_command_ack.assert_called_with(
                 command, self.trigger_module.MAV_RESULT_FAILED, 255, 190)
-            self.assertEqual(bridge._status_code, bridge._MISSION_STATE_CODES['SAMPLING'])
+            self.assertEqual(bridge._status_code, bridge._MISSION_STATE_CODES['WAITING_STABLE'])
             self.assertFalse(bridge._automation_paused)
             self.assertEqual(bridge._automation_step, 0)
 

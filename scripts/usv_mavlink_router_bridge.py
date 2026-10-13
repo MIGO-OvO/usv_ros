@@ -79,6 +79,7 @@ class USVMavlinkRouterBridge(object):
         self._last_mission_state = "IDLE"
         self._automation_running = False
         self._automation_paused = False
+        self._automation_preflight_active = False
         self._mavros_connected = False
         self._pkt_count = 0
         self._automation_step = 0.0
@@ -124,7 +125,9 @@ class USVMavlinkRouterBridge(object):
         rospy.Subscriber("/mavros/state", State, self._mavros_state_cb, queue_size=5)
         rospy.loginfo("USV Router Bridge: sysid=%d compid=%d router=%s", self._sys_id, self._comp_id, self._router_url)
         self._conn = None
-        self._connect_router(wait_heartbeat=True)
+        # Advertise component 191 and receive commands immediately. FCU evidence
+        # is ingested by the receive loop; discovery must not block control.
+        self._connect_router()
 
     def _connect_router(self, wait_heartbeat=False):
         self._conn = mavutil.mavlink_connection(
@@ -273,6 +276,9 @@ class USVMavlinkRouterBridge(object):
         )
         self._automation_running = reported_running and not terminal_status
         self._automation_paused = bool(data_dict.get("paused", False)) and not terminal_status
+        preflight = data_dict.get('preflight', {})
+        self._automation_preflight_active = (
+            isinstance(preflight, dict) and bool(preflight.get('active')) and not terminal_status)
 
         pid_mode_str = str(data_dict.get("pid_mode", "idle")).lower()
         if "running" in pid_mode_str or "paused" in pid_mode_str:
@@ -287,6 +293,10 @@ class USVMavlinkRouterBridge(object):
         last_state = getattr(self, "_last_mission_state", "IDLE")
         if "error" in status_text or "fail" in status_text:
             self._status_code = self._MISSION_STATE_CODES["FAILED"]
+        elif self._automation_preflight_active:
+            # Preparation cannot be paused. Reuse the existing preparation/wait
+            # code so QGC offers STOP instead of the unsupported pause command.
+            self._status_code = self._MISSION_STATE_CODES["WAITING_STABLE"]
         elif self._automation_paused:
             self._status_code = self._MISSION_STATE_CODES["PAUSED"]
         elif self._automation_running and last_state in ("IDLE", "HOLD_NO_MISSION", "SAMPLING", "SAMPLING_DONE", "PAUSED"):
@@ -362,7 +372,10 @@ class USVMavlinkRouterBridge(object):
         if code is not None:
             with self._lock:
                 self._last_mission_state = state
-                if self._automation_running and state in ("IDLE", "HOLD_NO_MISSION"):
+                if (getattr(self, '_automation_preflight_active', False)
+                        and state in ("IDLE", "HOLD_NO_MISSION", "SAMPLING", "PAUSED")):
+                    code = self._MISSION_STATE_CODES["WAITING_STABLE"]
+                elif self._automation_running and state in ("IDLE", "HOLD_NO_MISSION"):
                     code = self._MISSION_STATE_CODES["SAMPLING"]
                 self._status_code = code
 
