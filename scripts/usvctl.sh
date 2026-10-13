@@ -48,7 +48,7 @@ Commands:
   status     Print process, hotspot, ROS, MAVROS, and bridge status
   hotspot    Start, stop, or inspect the USV Wi-Fi hotspot
   addr       Print SSH and Web access commands without ROS diagnostics
-  update     git pull --ff-only in the usv_ros repository
+  update     Back up local changes with git stash, then git pull --ff-only
   import     import a git bundle created by create_hotspot_update.bat
   build      Run catkin_make in the workspace root
   deploy     Stop, update, chmod runtime scripts, build, then start
@@ -136,7 +136,34 @@ ensure_scripts_executable() {
 update_system() {
     require_system_stopped "update"
     ctl_log "update repo: $PKG_DIR"
-    git -C "$PKG_DIR" pull --ff-only
+
+    local repo_status
+    local backup_ref
+    repo_status="$(git -C "$PKG_DIR" status --porcelain --untracked-files=all)"
+    if [[ -n "$repo_status" ]]; then
+        ctl_log "back up local changes (including untracked files) before update"
+        if ! git -C "$PKG_DIR" stash push --include-untracked \
+            -m "usvctl auto-stash before update $(date -u +%Y-%m-%dT%H:%M:%SZ)"; then
+            ctl_log "ERROR: could not stash local changes; update/deploy stopped."
+            return 1
+        fi
+
+        backup_ref="$(git -C "$PKG_DIR" rev-parse refs/stash)"
+        ctl_log "local changes saved in stash: $backup_ref (kept; not automatically restored)"
+        ctl_log "inspect backup: git -C \"$PKG_DIR\" stash show --stat $backup_ref"
+        ctl_log "restore manually (may conflict): git -C \"$PKG_DIR\" stash apply --index $backup_ref"
+
+        repo_status="$(git -C "$PKG_DIR" status --porcelain --untracked-files=all)"
+        if [[ -n "$repo_status" ]]; then
+            ctl_log "ERROR: local changes remain after stashing; update/deploy stopped."
+            return 1
+        fi
+    fi
+
+    if ! git -C "$PKG_DIR" pull --ff-only; then
+        ctl_log "ERROR: git pull --ff-only failed; update/deploy stopped. Any auto-stash above remains saved."
+        return 1
+    fi
 }
 
 import_system() {

@@ -265,7 +265,7 @@ usvstatus   # 查看进程、热点、ROS、MAVROS、bridge 状态
 usvhotspot  # 启停/查看备用 Wi-Fi 热点
 usvaddr     # 查看 SSH 与 Web 端口转发地址
 usvrestart  # 停止后重新启动，参数透传给 roslaunch
-usvupdate   # 只在 ~/usv_ws/src/usv_ros 执行 git pull --ff-only
+usvupdate   # 在 usv_ros 自动 stash 本地改动，再 git pull --ff-only
 usvbuild    # 在 ~/usv_ws 执行 catkin_make，参数透传给 catkin_make
 usvdeploy   # stop -> update -> chmod -> build -> start
 ```
@@ -286,6 +286,34 @@ usvctl deploy
 
 `usvupdate` 和 `usvbuild` 会在主系统运行时拒绝执行，避免一边拉代码或编译，一边运行旧节点。
 需要现场更新并重启时使用 `usvdeploy`，或先执行 `usvoff`。
+
+`usvupdate` / `usvdeploy` 更新前会自动用 `git stash push --include-untracked` 备份
+已跟踪文件的工作区、暂存区改动和未跟踪文件，再通过 `git pull --ff-only` 同步当前分支配置的远端上游。
+备份带有 `usvctl auto-stash before update` 时间标记，更新后保留，不自动恢复本地改动，
+确保构建使用更新后的代码。Git 忽略的数据、日志和缓存不纳入 stash。
+干净工作区不创建新备份，已有 stash 不删除；备份或拉取失败会停止部署，不继续构建和启动。
+本地已提交的分叉仍会被 `--ff-only` 拒绝，不会自动丢弃提交。
+
+命令会打印备份提交号和查看/恢复命令，也可手动查看：
+
+```bash
+git -C ~/usv_ws/src/usv_ros stash list
+# 将 <备份提交号> 替换为更新日志中的值；恢复可能与新代码冲突，先 usvoff
+git -C ~/usv_ws/src/usv_ros stash show --stat <备份提交号>
+git -C ~/usv_ws/src/usv_ros stash apply --index <备份提交号>
+```
+
+首次同步此功能时，Jetson 仍使用旧版更新脚本；在本次改动发布到远端后，先手动备份并拉取一次：
+
+```bash
+usvoff
+cd ~/usv_ws/src/usv_ros
+git stash push --include-untracked -m "manual backup before usvdeploy auto-stash update"
+git pull --ff-only
+usvdeploy
+```
+
+后续可直接运行 `usvdeploy`。
 
 如果 `~/.local/bin` 不在 `PATH`，安装脚本只会打印需要加入 `~/.bashrc` 的命令，不会自动修改用户配置。
 卸载：
