@@ -7,7 +7,7 @@ export interface DisplayPosition {
   stale?: boolean
 }
 
-/** Presentation only: never replaces the server's strict sampling admission. */
+/** Presentation only: record coordinates are validated separately by the server. */
 export function summarizeGps(gps: {
   gps_raw: DisplayPosition & { valid: boolean }
   global_position: DisplayPosition

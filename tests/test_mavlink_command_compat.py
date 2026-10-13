@@ -1114,7 +1114,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         node._call_automation_service = lambda action: True
         return node
 
-    def test_survey_gate_skips_without_gps_when_required_and_keeps_survey_active(self):
+    def test_survey_starts_without_gps_even_with_legacy_required_flag(self):
         module = _load_script("mavlink_trigger_node_survey_gate_no_gps_test", "scripts/mavlink_trigger_node.py")
         node = self._make_survey_gate_node(module, {
             "survey_sampling": {
@@ -1125,11 +1125,11 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
         result = node._start_survey_sample_once(node._load_config())
 
-        self.assertEqual(result, "skipped")
+        self.assertEqual(result, "started")
         self.assertTrue(node._survey_active)
-        self.assertFalse(node.is_sampling)
-        self.assertEqual(node.steps_pub.messages, [])
-        self.assertEqual(node.status_pub.messages[-1].data, "survey_gate_skipped:no_gps")
+        self.assertTrue(node.is_sampling)
+        self.assertEqual(len(node.steps_pub.messages), 1)
+        self.assertEqual(node.current_sampling_context['gps_snapshot'], {'position_source': 'survey_no_gps'})
 
     def test_survey_gate_caches_wgs84_global_position(self):
         module = _load_script("mavlink_trigger_node_survey_gate_gps_cache_test", "scripts/mavlink_trigger_node.py")
@@ -1144,7 +1144,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         self.assertAlmostEqual(node._latest_global_position["alt"], 4.5)
         self.assertIn("received_at", node._latest_global_position)
 
-    def test_survey_gate_skips_stale_gps_when_required(self):
+    def test_survey_starts_without_archiving_stale_gps(self):
         module = _load_script("mavlink_trigger_node_survey_gate_stale_gps_test", "scripts/mavlink_trigger_node.py")
         node = self._make_survey_gate_node(module, {
             "survey_sampling": {
@@ -1156,8 +1156,8 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
         result = node._start_survey_sample_once(node._load_config())
 
-        self.assertEqual(result, "skipped")
-        self.assertEqual(node.status_pub.messages[-1].data, "survey_gate_skipped:gps_stale")
+        self.assertEqual(result, "started")
+        self.assertEqual(node.current_sampling_context['gps_snapshot'], {'position_source': 'survey_no_gps'})
 
     def test_survey_gate_skips_speed_out_of_range(self):
         module = _load_script("mavlink_trigger_node_survey_gate_speed_test", "scripts/mavlink_trigger_node.py")
@@ -1232,7 +1232,8 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
         self.assertIn('<arg name="survey_interval_s" default="5.0" />', launch_text)
         self.assertIn('<arg name="survey_min_distance_m" default="0.0" />', launch_text)
-        self.assertIn('<arg name="survey_require_gps" default="true" />', launch_text)
+        self.assertIn('<arg name="survey_require_gps" default="false" />', launch_text)
+        self.assertNotIn('<param name="survey_require_gps"', launch_text)
         self.assertIn('<arg name="sampling_max_position_age_s" default="2.0" />', launch_text)
         self.assertIn('<arg name="survey_require_valid_spectrometer" default="false" />', launch_text)
 

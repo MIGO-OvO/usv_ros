@@ -780,11 +780,11 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
 
         self.assertEqual(save_resp.status_code, 200)
         self.assertEqual(initial["survey_min_distance_m"], 5.0)
-        self.assertTrue(initial["survey_require_gps"])
+        self.assertNotIn("survey_require_gps", initial)
         self.assertEqual(saved["survey_min_distance_m"], 7.5)
         self.assertEqual(saved["survey_min_speed_mps"], 0.25)
         self.assertEqual(saved["survey_max_speed_mps"], 1.8)
-        self.assertTrue(saved["survey_require_gps"])
+        self.assertNotIn("survey_require_gps", saved)
         self.assertTrue(saved["survey_require_valid_spectrometer"])
         self.assertEqual(saved["survey_max_position_age_s"], 4.0)
 

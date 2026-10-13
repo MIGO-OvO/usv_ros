@@ -173,7 +173,6 @@ DEFAULT_MAPPING_PROFILE = {
     "survey_min_speed_mps": 0.0,
     "survey_max_speed_mps": 0.0,
     "survey_require_valid_spectrometer": True,
-    "survey_require_gps": True,
     "survey_max_position_age_s": 2.0,
 }
 SURVEY_GATE_REASON_LABELS = {
@@ -308,7 +307,6 @@ def normalize_lab_config(config, allow_legacy_bare=True):
         "profile": profile,
         "position_source": position_source,
         "data_source": data_source,
-        "allow_no_gps": to_bool("allow_no_gps", True),
         "bypass_pid_wait": to_bool("bypass_pid_wait", True),
         "real_propulsion_enabled": to_bool("real_propulsion_enabled", False),
         "include_lab_data_by_default": to_bool("include_lab_data_by_default", False),
@@ -709,10 +707,6 @@ def normalize_mapping_profile_config(config):
         "survey_require_valid_spectrometer": _bool_or_default(
             raw.get("survey_require_valid_spectrometer", DEFAULT_MAPPING_PROFILE["survey_require_valid_spectrometer"]),
             DEFAULT_MAPPING_PROFILE["survey_require_valid_spectrometer"],
-        ),
-        "survey_require_gps": _bool_or_default(
-            raw.get("survey_require_gps", DEFAULT_MAPPING_PROFILE["survey_require_gps"]),
-            DEFAULT_MAPPING_PROFILE["survey_require_gps"],
         ),
         "survey_max_position_age_s": fnum("survey_max_position_age_s"),
     }
@@ -1614,12 +1608,7 @@ DEFAULT_CONFIG = {
     "sampling": {
         "sample_timeout_s": 0.0
     },
-    "automation_policy": {
-        # Web 自动化启动默认是否要求有效 GPS 定位。
-        # 服务器持久化：页面切换/刷新/服务重启后仍保持；单次启动可用
-        # /api/mission/start 的 require_gps 字段显式覆盖本默认值。
-        "require_gps": True
-    },
+    "automation_policy": {},
     "mapping_profile": copy.deepcopy(DEFAULT_MAPPING_PROFILE),
     "detection_settings": {
         "duration": 5.0,
@@ -1665,7 +1654,6 @@ DEFAULT_CONFIG = {
         "profile": "semi_hardware",
         "position_source": "lab_sim",
         "data_source": "simulated",
-        "allow_no_gps": True,
         "bypass_pid_wait": True,
         "real_propulsion_enabled": False,
         "include_lab_data_by_default": False,
@@ -1832,13 +1820,9 @@ class ConfigManager(object):
 
     @staticmethod
     def _normalize_automation_policy(data):
-        """Normalize the persisted web automation policy (require_gps default)."""
-        normalized = dict(DEFAULT_CONFIG.get('automation_policy', {}))
+        """Discard the retired GPS requirement from legacy configurations."""
         raw = data if isinstance(data, dict) else {}
-        value = raw.get('require_gps', True)
-        # Invalid persisted values fail closed; API updates reject them below.
-        normalized['require_gps'] = value if type(value) is bool else True
-        return normalized
+        return {key: value for key, value in raw.items() if key != 'require_gps'}
 
     @staticmethod
     def _normalize_mapping_profile(data):
@@ -1994,9 +1978,8 @@ class ConfigManager(object):
                     raise ValueError('pump_settings.%s must be an object' % key)
         if 'automation_policy' in data:
             policy = data['automation_policy']
-            if (not isinstance(policy, dict) or
-                    ('require_gps' in policy and type(policy['require_gps']) is not bool)):
-                raise ValueError('automation_policy.require_gps must be a JSON boolean')
+            if not isinstance(policy, dict):
+                raise ValueError('automation_policy must be an object')
         previous = copy.deepcopy(self.config)
         try:
             self._merge_config(data)
@@ -5143,9 +5126,8 @@ class WebConfigServer(object):
                 patch['waypoint_sampling'] = ConfigManager._normalize_waypoint_sampling(data['waypoint_sampling'])
             if 'automation_policy' in data:
                 policy = data['automation_policy']
-                if (not isinstance(policy, dict) or
-                        ('require_gps' in policy and type(policy['require_gps']) is not bool)):
-                    return jsonify(success=False, message='require_gps must be a JSON boolean'), 400
+                if not isinstance(policy, dict):
+                    return jsonify(success=False, message='automation_policy must be an object'), 400
                 patch['automation_policy'] = policy
 
             if not patch:
@@ -6271,16 +6253,8 @@ class WebConfigServer(object):
                         return jsonify(success=False, message='Sampling already active'), 409
                     previous_context = dict(self._sampling_context)
                     acquisition = {'source': 'web'}
-                    # 持久化配置提供默认 policy；请求 payload 里的 require_gps
-                    # 是本次任务的显式覆盖值，两份配置职责不同。
-                    automation_policy = self.config_manager.get().get('automation_policy', {})
-                    default_require_gps = bool(automation_policy.get('require_gps', True))
-                    try:
-                        bind_web_context(acquisition, self._latest_real_gps,
-                                         rospy.get_param('/mavlink_trigger_node/sampling_max_position_age_s', 2.0),
-                                         require_gps=request_data.get('require_gps', default_require_gps))
-                    except ValueError as exc:
-                        return jsonify(success=False, message=str(exc)), 409
+                    bind_web_context(acquisition, self._latest_real_gps,
+                                     rospy.get_param('/mavlink_trigger_node/sampling_max_position_age_s', 2.0))
                     sampling_sequence = request_data.get('sampling_sequence')
                     waypoint_sampling = request_data.get('waypoint_sampling')
                     config_patch = {}
@@ -6404,7 +6378,6 @@ class WebConfigServer(object):
             "position_source": lab_config.get("position_source", "lab_sim") if lab_config.get("enabled") else "real",
             "lab_options": {
                 "bypass_pid_wait": bool(lab_config.get("bypass_pid_wait", False)),
-                "allow_no_gps": bool(lab_config.get("allow_no_gps", True)),
                 "real_propulsion_enabled": bool(lab_config.get("real_propulsion_enabled", False)),
             },
         }

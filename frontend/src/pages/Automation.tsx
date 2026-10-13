@@ -1,6 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { useEffect, useRef, useState } from 'react'
-import { persistGpsPolicy } from '@/lib/gps-policy'
+import { useEffect, useState } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -106,11 +105,6 @@ export default function Automation() {
   const controls = getAutomationControlAvailability(automationState)
   const [steps, setSteps] = useState<Step[]>([])
   const [loopCount, setLoopCount] = useState(1)
-  // 服务器持久化 policy：初始 true 仅是 HTML 首帧兜底，fetchConfig 会立即
-  // 用 GET /api/config 的 automation_policy.require_gps 覆盖。
-  const [requireGps, setRequireGps] = useState(true)
-  const [savingGps, setSavingGps] = useState(false)
-  const gpsSavePending = useRef(false)
   const [pumpSettings, setPumpSettings] = useState<PumpSettings>({ ...DEFAULT_PUMP_SETTINGS })
   const [presetName, setPresetName] = useState('')
   const [relativeZeros, setRelativeZeros] = useState<Partial<Record<PumpAxis, string>>>({})
@@ -137,9 +131,6 @@ export default function Automation() {
         setSteps(normalizeSteps(data.sampling_sequence.steps))
         setLoopCount(data.sampling_sequence.loop_count ?? 1)
       }
-      if (data.automation_policy) {
-        setRequireGps(data.automation_policy.require_gps ?? true)
-      }
       if (data.pump_settings) {
         const policy = data.pump_settings.injection_pump_policy || {}
         const defaultSpeed = Number(data.pump_settings.default_speed ?? DEFAULT_PUMP_SETTINGS.default_speed) || 0
@@ -159,21 +150,6 @@ export default function Automation() {
       }
     } catch (error) {
       console.error(error)
-    }
-  }
-
-  const persistRequireGps = async (next: boolean) => {
-    if (gpsSavePending.current) return
-    gpsSavePending.current = true
-    setSavingGps(true)
-    try {
-      await persistGpsPolicy(next, requireGps, setRequireGps)
-    } catch (error) {
-      console.error(error)
-      toast({ title: 'GPS 策略保存失败', description: '已恢复保存前的设置，请重试', variant: 'destructive' })
-    } finally {
-      gpsSavePending.current = false
-      setSavingGps(false)
     }
   }
 
@@ -248,7 +224,6 @@ export default function Automation() {
       }
 
       const body: Record<string, unknown> = {
-        require_gps: requireGps,
         sampling_sequence: { steps, loop_count: loopCount },
         pump_settings: pumpSettings,
       }
@@ -427,7 +402,7 @@ export default function Automation() {
               )}
             </div>
           )}
-          <Button variant="outline" onClick={() => handleAction('start')} disabled={!controls.start || savingGps || pendingAction}>
+          <Button variant="outline" onClick={() => handleAction('start')} disabled={!controls.start || pendingAction}>
             <Play className="w-4 h-4 mr-2 text-emerald-500" /> 启动
           </Button>
           <Button variant="outline" onClick={() => handleAction('pause')} disabled={!controls.pause}>
@@ -520,17 +495,6 @@ export default function Automation() {
               <CardTitle>全局配置</CardTitle>
             </CardHeader>
             <CardContent className="space-y-4">
-              <div className="space-y-2">
-                <div className="flex items-center justify-between gap-3">
-                  <Label htmlFor="require-gps">启动时要求 GPS</Label>
-                  <Switch id="require-gps" checked={requireGps} onCheckedChange={(v) => void persistRequireGps(v)}
-                    disabled={automationRunning || automationPaused || savingGps} aria-describedby="require-gps-help" />
-                </div>
-                <p id="require-gps-help" className="text-xs text-muted-foreground">
-                  {requireGps ? '启动前校验有效定位；室内台架测试可关闭。' : '室内测试：允许无 GPS 执行真实泵控；无定位记录不进入地图。'}
-                  Web 自动化与 QGC 手动点采样共用此设置，刷新或重启后仍保持。航线与走航采样需要有效定位。
-                </p>
-              </div>
               <div className="space-y-2">
                 <Label>循环次数 (0 = 无限循环)</Label>
                 <NumericInput value={loopCount} onValueChange={(v) => setLoopCount(Math.max(0, v))} integer min={0} className="h-9" />

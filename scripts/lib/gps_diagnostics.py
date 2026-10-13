@@ -12,7 +12,7 @@ PARAMETERS = ('GPS1_TYPE', 'GPS_AUTO_CONFIG', 'SERIAL3_PROTOCOL')
 FIX_LABELS = {0: '未识别接收机', 1: '尚未定位', 2: '2D Fix', 3: '3D Fix',
               4: 'DGPS', 5: 'RTK Float', 6: 'RTK Fixed', 7: 'Static', 8: 'PPP'}
 # FCU/MAVROS header.stamp and the Jetson wall clock are separate domains; a
-# large offset is surfaced as a warning but never gates sampling admission.
+# large offset is surfaced as a warning but never blocks sampling.
 HEADER_CLOCK_OFFSET_WARN_S = 2.0
 
 
@@ -171,7 +171,7 @@ def diagnose(evidence=None, position=None, mavros=None, max_age_s=2.0, now=None)
         warnings.append('GPS已启用但无原始GPS数据' if config['fresh'] and config['gps1_type'] not in (None, 0) else 'GPS配置未知；缺帧不能单独证明接收机未识别。')
         warnings.append('检查 GPS 配置、接线及 MAVLink GPS_RAW_INT 消息流；本面板不修改飞控参数或消息速率。')
     if clock_offset is not None and abs(clock_offset) > HEADER_CLOCK_OFFSET_WARN_S:
-        warnings.append('NavSatFix 时间戳与本机时钟偏差 %.1fs（跨时钟域信息仅作诊断，不影响采样准入）' % clock_offset)
+        warnings.append('NavSatFix 时间戳与本机时钟偏差 %.1fs（跨时钟域信息仅作诊断，不影响采样启动）' % clock_offset)
     sys_status, version = section('SYS_STATUS'), section('AUTOPILOT_VERSION')
     for key in ('gps_present', 'gps_enabled', 'gps_health'):
         sys_status.setdefault(key, None)

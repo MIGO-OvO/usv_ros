@@ -2931,7 +2931,6 @@ class PumpControlNode(object):
             self.lab_mode_enabled = bool(data.get("lab_mode", False))
             self.lab_options = {
                 "bypass_pid_wait": bool(lab_options.get("bypass_pid_wait", True)),
-                "allow_no_gps": bool(lab_options.get("allow_no_gps", True)),
                 "real_propulsion_enabled": bool(lab_options.get("real_propulsion_enabled", False)),
             }
             self.last_automation_failure = {}
