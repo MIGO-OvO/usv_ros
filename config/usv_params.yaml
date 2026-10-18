@@ -39,7 +39,7 @@ pump:
 
 # ==================== 自动化引擎参数 ====================
 automation:
-  pid_wait_timeout: 60.0         # PID 完成等待超时 (秒)
+  pid_wait_timeout: 120.0        # ROS PID 等待上限；不覆盖检测板自身 PID_TIMEOUT
   default_interval: 1000         # 默认步骤间隔 (毫秒)
 
   # 示例采样序列
