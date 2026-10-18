@@ -2146,6 +2146,7 @@ class WebConfigServer(object):
         self.route_source = "none"
         self.current_waypoint_seq = None
         self.latest_automation_status = {}
+        self._sampling_results = OrderedDict()
         self._sampling_context = {}
         self._web_attempt_id = None
         self._web_start_lock = threading.Lock()
@@ -2230,6 +2231,7 @@ class WebConfigServer(object):
             self.mission_sub = rospy.Subscriber('/usv/mission_status', String, self._mission_status_cb)
             self.trigger_status_sub = rospy.Subscriber('/usv/trigger_status', String, self._trigger_status_cb)
             self.automation_status_sub = rospy.Subscriber('/usv/automation_status', String, self._automation_status_cb)
+            self.sampling_result_sub = rospy.Subscriber('/usv/sampling_result', String, self._sampling_result_cb)
             self.control_events_sub = rospy.Subscriber('/usv/control_events', String, self._control_event_cb)
             self.manual_status_sub = rospy.Subscriber('/usv/manual_status', String, self._manual_status_cb)
             self.lab_sim_status_sub = rospy.Subscriber('/usv/lab_sim/status', String, self._lab_sim_status_cb)
@@ -2264,6 +2266,7 @@ class WebConfigServer(object):
             self.mission_sub = None
             self.trigger_status_sub = None
             self.automation_status_sub = None
+            self.sampling_result_sub = None
             self.control_events_sub = None
             self.manual_status_sub = None
             self.lab_sim_status_sub = None
@@ -2611,7 +2614,7 @@ class WebConfigServer(object):
     @staticmethod
     def _automation_terminal(data):
         status = str(data.get('status', '') or '').lower()
-        return any(token in status for token in ('finish', 'done', 'stop', 'error', 'fail', 'owner_lost'))
+        return any(token in status for token in ('finish', 'done', 'stop', 'error', 'fail', 'owner_lost', 'timeout', 'cancel'))
 
     def _finish_owned_recording(self, data):
         if not isinstance(data, dict) or self.current_sample_window is None:
@@ -2621,13 +2624,53 @@ class WebConfigServer(object):
         if (not expected or not isinstance(context, dict) or context.get('attempt_id') != expected
                 or not self._automation_terminal(data)):
             return False
+        source = self.current_sample_window.get('source')
+        if source in ('manual', 'fcu', 'survey', 'lab') and not data.get('outcome'):
+            # Trigger owns final cleanup for these jobs. Pump 'finished' alone
+            # can still be followed by a failed cleanup/result from trigger.
+            return False
         self.automation_running = False
         self.automation_paused = False
+        window = self.current_sample_window
+        status = str(data.get('status', '')).lower()
+        reason = data.get('terminal_reason') or context.get('terminal_reason') or status
+        cleanup_failed = bool(data.get('cleanup_failed', context.get('cleanup_failed', False)))
+        outcome = data.get('outcome') or 'failed'
+        if data.get('outcome'):
+            if cleanup_failed and outcome == 'succeeded':
+                outcome = 'failed'
+        elif status == 'finished' and reason in ('finished', 'completed') and not cleanup_failed:
+            outcome = 'succeeded'
+        elif status in ('stopped', 'cancelled') and reason in ('stopped', 'cancelled', 'operator_stop') and not cleanup_failed:
+            outcome = 'cancelled'
+        window.update(outcome=outcome, terminal_reason=reason, cleanup_failed=cleanup_failed)
+        for key in ('preflight_phase', 'terminal_reason_at', 'spectrometer_age_s', 'owner_age_s'):
+            window[key] = data.get(key, context.get(key))
         self._close_sample_window_if_open()
         if self.data_recording_source not in ('survey', 'lab'):
             self._stop_data_recording_if_active()
         self._sampling_context = {}
         return True
+
+    def _sampling_result_cb(self, msg):
+        try:
+            result = json.loads(msg.data)
+            if (not isinstance(result, dict) or not isinstance(result.get('attempt_id'), str)
+                    or not result['attempt_id'] or len(result['attempt_id']) > 64
+                    or result.get('source') not in ('manual', 'fcu', 'survey', 'lab')
+                    or result.get('outcome') not in ('succeeded', 'failed', 'cancelled', 'skipped')):
+                return
+            record = result.get('sample_record') or {}
+            data = dict(result, status='finished', terminal_reason=result.get('reason'),
+                        sampling_context={'attempt_id': result['attempt_id'], 'source': result['source']},
+                        spectrometer_age_s=record.get('spectrometer_age_s'), owner_age_s=record.get('owner_age_s'))
+        except (ValueError, TypeError, AttributeError):
+            return
+        with self._sample_lifecycle_lock:
+            self._sampling_results.setdefault(result['attempt_id'], data)
+            while len(self._sampling_results) > 32:
+                self._sampling_results.popitem(last=False)
+            self._finish_owned_recording(self._sampling_results[result['attempt_id']])
 
     def _automation_status_cb(self, msg):
         with self._sample_lifecycle_lock:
@@ -2710,14 +2753,15 @@ class WebConfigServer(object):
             source = "lab" if self._lab_mission_recording_active() else "trigger"
             self._start_data_recording_if_needed(source=source)
             self._start_sample_window_if_needed()
-            self._finish_owned_recording(self.latest_automation_status)
+            self._finish_owned_recording(self._sampling_results.get(self._recording_attempt_id(), self.latest_automation_status))
         elif (
             'sampling_stopped' in status
             or 'survey_stopped' in status
             or 'manual_start_rejected' in status
             or 'start_failed' in status
         ):
-            if self._recording_attempt_id() and not self._finish_owned_recording(self.latest_automation_status):
+            if self._recording_attempt_id() and not self._finish_owned_recording(
+                    self._sampling_results.get(self._recording_attempt_id(), self.latest_automation_status)):
                 return
             if 'sampling_stopped' in status or 'survey_stopped' in status:
                 self._close_sample_window_if_open()
@@ -3766,6 +3810,16 @@ class WebConfigServer(object):
                     json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8"),
                 )
                 archive.writestr(root + "/summary.csv", self._mission_csv_text(data).encode("utf-8"))
+                # Window closure is a storage lifecycle, never a success result.
+                results = io.StringIO()
+                columns = ['sample_id', 'attempt_id', 'state', 'outcome', 'terminal_reason',
+                           'preflight_phase', 'terminal_reason_at', 'cleanup_failed',
+                           'spectrometer_age_s', 'owner_age_s']
+                writer = csv.DictWriter(results, fieldnames=columns, extrasaction='ignore')
+                writer.writeheader()
+                for window in self.sample_storage.list_windows(data):
+                    writer.writerow(dict(window, outcome=window.get('outcome') or 'unknown'))
+                archive.writestr(root + '/sample_results.csv', results.getvalue().encode('utf-8'))
                 with archive.open(root + "/raw.csv", "w") as csv_file:
                     for chunk in self._iter_mission_raw_csv_chunks(data):
                         csv_file.write(chunk.encode("utf-8"))
@@ -4154,7 +4208,8 @@ class WebConfigServer(object):
         return candidates[-1]
 
     def _call_control_command(self, action, payload=None, source="web"):
-        payload = payload or {}
+        payload = dict(payload or {})
+        payload['_issued_monotonic'] = time.monotonic()
         try:
             rospy.wait_for_service('/usv/control_command', timeout=2.0)
             service = rospy.ServiceProxy('/usv/control_command', ControlCommand)

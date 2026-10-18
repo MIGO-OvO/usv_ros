@@ -257,6 +257,8 @@ class TriggerReviewTests(unittest.TestCase):
 
     def test_successful_qgc_pause_resume_ack_and_mission_follow_pump_response(self):
         self.node._call_automation_service.return_value = True
+        self.node.is_sampling = True
+        self.node.current_sampling_context = {'attempt_id': 'active-pause-resume'}
         for command, state in ((31012, self.module.MissionState.PAUSED),
                                (31013, self.module.MissionState.SAMPLING)):
             self.node._dispatch_command_long(command, 0, 0, 255, 190, 'test')
@@ -279,7 +281,7 @@ class SurveyAndQGCChainTests(unittest.TestCase):
         self.requests = []
         def control(**request):
             payload = json.loads(request['payload_json'])
-            self.requests.append((request['action'], payload))
+            self.requests.append((request['action'], {k: v for k, v in payload.items() if not k.startswith('_')}))
             ok, message, result = self.node._execute_control_action(request['action'], payload)
             return SimpleNamespace(success=ok, message=message, result_json=json.dumps(result))
         self.trigger_module.rospy.ServiceProxy = lambda name, *args: (

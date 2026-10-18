@@ -16,14 +16,13 @@ class AutomationColdStartTests(unittest.TestCase):
         self.step = {'name': 'cold start', 'interval': 0,
                      'A': {'enable': 'E', 'direction': 'F', 'speed': '8', 'angle': '1440'}}
 
-    def test_first_step_without_spectrometer_frames_sends_motor_command(self):
+    def test_first_real_step_without_spectrometer_frames_cannot_move(self):
         self.node.pid_mode = False
         self.node.automation_engine._running.set()
-        self.assertTrue(self.node._send_automation_step(self.step))
-        self.node.send_command.assert_called_once()
-        self.assertIsNone(self.node._current_step_spectro_timestamp)
+        self.assertFalse(self.node._send_automation_step(self.step))
+        self.node.send_command.assert_not_called()
 
-    def test_configured_lab_cold_start_runs_real_engine_to_completion(self):
+    def test_configured_lab_cold_start_cannot_report_real_completion(self):
         self.node.lab_mode_enabled = True
         self.node.spectro_state = 'configured'
         self.node.pid_mode = False
@@ -33,9 +32,17 @@ class AutomationColdStartTests(unittest.TestCase):
             self.node.automation_engine._thread.join(2)
         self.assertFalse(self.node.automation_engine.is_running())
         statuses = [json.loads(m.data) for m in self.publishers['/usv/automation_status'].messages]
-        self.assertEqual(statuses[-1]['status'], 'finished')
-        self.assertFalse(statuses[-1]['last_error'])
-        self.assertTrue(self.node.send_command.called)
+        self.assertFalse(any(s['status'] == 'finished' for s in statuses))
+        self.assertEqual(statuses[-1]['terminal_reason'], 'spectrometer_not_ready')
+        self.assertFalse(any(call.args and call.args[0].startswith('AEF') for call in self.node.send_command.call_args_list))
+
+    def test_mechanical_debug_uses_explicit_manual_control_without_sample_success(self):
+        self.node.manual_mode_enabled = True
+        ok, _, _ = self.node._execute_control_action('manual_step', {'step': self.step})
+        self.assertTrue(ok)
+        self.node.send_command.assert_called_once()
+        statuses = [json.loads(m.data) for m in self.publishers['/usv/automation_status'].messages]
+        self.assertFalse(any(s['status'] == 'finished' for s in statuses))
 
     def test_real_mode_without_acquisition_still_rejects_sample_wait(self):
         self.node.lab_mode_enabled = False

@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import Mock
 
 from gps_fixtures import gps_position
+from command_fixtures import remote_command, wait_commands
 from test_mavlink_command_compat import _load_script
 from scripts.lib.sample_recording.record import bind_context, bind_web_context, sample_record
 
@@ -35,8 +36,8 @@ class SamplingWithoutGPSTests(unittest.TestCase):
                 with self.subTest(position=position, entry=entry):
                     node = self.make_node(position)
                     if entry == 'manual':
-                        node._mavlink_cmd_rx_cb(types.SimpleNamespace(
-                            data=[31010.0, 0.0, 0.0, 1.0, 191.0, 255.0, 190.0]))
+                        node._mavlink_cmd_rx_cb(remote_command(node, 31010))
+                        wait_commands(node)
                         self.assertEqual(node.cmd_ack_pub.messages[-1].data[1], 0.0)
                     elif entry == 'fcu':
                         self.assertTrue(node._do_fcu_sample(42))

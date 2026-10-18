@@ -1,4 +1,5 @@
 import unittest
+import os
 import subprocess
 import stat
 import tempfile
@@ -146,7 +147,7 @@ class BootServiceScriptTests(unittest.TestCase):
         self.assertIn('case "${1:-full}" in', text)
 
     def test_addr_skips_jetson_usb_and_docker_bridge_addresses(self):
-        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT if os.name == 'nt' else None) as tmp:
             fake_ip = Path(tmp) / "ip"
             fake_ip.write_bytes(
                 b"""#!/usr/bin/env bash
@@ -182,18 +183,18 @@ exit 1
             )
             result = subprocess.run(
                 ["bash", "-lc", command],
-                text=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=True,
             )
+            result.stdout = result.stdout.decode('utf-8')
 
         self.assertIn("lan_ip: 10.33.44.167 iface=wlan0", result.stdout)
         self.assertIn("ssh: ssh jetson@10.33.44.167", result.stdout)
         self.assertNotIn("ssh jetson@192.168.55.1", result.stdout)
 
     def test_status_flags_internet_wifi_band_mismatch(self):
-        with tempfile.TemporaryDirectory(dir=REPO_ROOT) as tmp:
+        with tempfile.TemporaryDirectory(dir=REPO_ROOT if os.name == 'nt' else None) as tmp:
             fake_ip = Path(tmp) / "ip"
             fake_ip.write_bytes(
                 b"""#!/usr/bin/env bash
@@ -260,12 +261,11 @@ exit 1
             )
             result = subprocess.run(
                 ["bash", "-lc", command],
-                text=True,
-                encoding="utf-8",
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 check=True,
             )
+            result.stdout = result.stdout.decode('utf-8')
 
         self.assertIn("internet: route=present iface=wlan0 source=external band=5g", result.stdout)
         self.assertIn("target_iface=wlan0 target_band=2.4g", result.stdout)

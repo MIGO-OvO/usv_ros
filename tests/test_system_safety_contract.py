@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from test_mavlink_command_compat import _load_script as load_mav, FakeConnection, RecordingMav
 from test_hardware_runtime_sync import _load_script as load_runtime
+from measurement_fixtures import prepare_measurement, acknowledge
 
 
 class BridgeSafetyTests(unittest.TestCase):
@@ -110,6 +111,7 @@ class PumpSafetyTests(unittest.TestCase):
         # has its own real-worker regressions in test_automation_preflight.py.
         self.module.rospy.is_shutdown = lambda: False
         self.node.serial_conn = types.SimpleNamespace(is_open=True)
+        prepare_measurement(self.node)
         def send(command):
             self.sent.append(command)
             if command.strip() == 'PIDQUERY':
@@ -153,7 +155,7 @@ class PumpSafetyTests(unittest.TestCase):
 
     def test_ads_ack_waits_for_data_and_silence_changes_runtime_state(self):
         with patch.object(self.module.time, 'monotonic', return_value=10.0):
-            self.node._on_text_received('ADS_OK:START')
+            acknowledge(self.node, 'ADSSTART')
         self.assertEqual(self.node.spectro_state, 'starting')
         with patch.object(self.module.time, 'monotonic', return_value=20.0):
             self.node._check_spectro_freshness()
@@ -164,7 +166,7 @@ class PumpSafetyTests(unittest.TestCase):
 
     def test_stopped_spectrometer_does_not_later_become_stale(self):
         self.node._last_valid_spectro_at = 10.0
-        self.node._on_text_received('ADS_OK:STOP')
+        acknowledge(self.node, 'ADSSTOP')
         with patch.object(self.module.time, 'monotonic', return_value=20.0):
             self.node._check_spectro_freshness()
         self.assertEqual(self.node.spectro_state, 'stopped')

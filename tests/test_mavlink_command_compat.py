@@ -7,6 +7,7 @@ import types
 import unittest
 import time
 from gps_fixtures import gps_position
+from command_fixtures import wait_commands
 from pathlib import Path
 
 
@@ -86,7 +87,7 @@ def _install_fake_ros_modules():
     rospy.ServiceProxy = lambda *args, **kwargs: None
     rospy.Service = lambda *args, **kwargs: None
     rospy.init_node = lambda *args, **kwargs: None
-    rospy.get_param = lambda name, default=None: default
+    rospy.get_param = lambda name, default=None: ':memory:' if name in ('~command_ledger', '~session_file') else default
     rospy.wait_for_service = lambda *args, **kwargs: None
     rospy.loginfo = lambda *args, **kwargs: None
     rospy.logwarn = lambda *args, **kwargs: None
@@ -230,6 +231,7 @@ class FailingOnceNamedValueMav(RecordingMav):
 class MavlinkCommandCompatibilityTests(unittest.TestCase):
     def _install_injection_session_recorder(self, node, accepted=True):
         calls = []
+        node.sampling_result_pub = RecordingPublisher()
         node._latest_global_position = gps_position()
         if not hasattr(node, 'state_lock'):
             node.state_lock = threading.Lock()
@@ -265,7 +267,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
     def test_router_bridge_forwards_usv_command_long_to_internal_bus(self):
         module = _load_script("usv_mavlink_router_bridge_test", "scripts/usv_mavlink_router_bridge.py")
-        bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
+        bridge = module.USVMavlinkRouterBridge()
         bridge._conn = FakeConnection([
             FakeCommandLong(31010, 1.5, 2.5, 1, 191, 255, 190),
         ])
@@ -276,12 +278,12 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         self.assertEqual(len(bridge._cmd_rx_pub.messages), 1)
         self.assertEqual(
             bridge._cmd_rx_pub.messages[0].data,
-            [31010.0, 1.5, 2.5, 1.0, 191.0, 255.0, 190.0],
+            [31010.0, 1.5, 2.5, 1.0, 191.0, 255.0, 190.0, 0.0, 0.0, 0.0],
         )
 
     def test_router_bridge_queues_command_ack_for_single_socket_writer(self):
         module = _load_script("usv_mavlink_router_bridge_ack_fast_path_test", "scripts/usv_mavlink_router_bridge.py")
-        bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
+        bridge = module.USVMavlinkRouterBridge()
         bridge._lock = threading.Lock()
         bridge._diag_tx_total = 0
         bridge._diag_pub_errors = 0
@@ -301,7 +303,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
     def test_trigger_node_accepts_forwarded_internal_command_bus(self):
         module = _load_script("mavlink_trigger_node_test", "scripts/mavlink_trigger_node.py")
-        node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node = module.MAVLinkTriggerNode()
         node._source_system_id = 1
         node._source_component_id = 191
         node.is_sampling = False
@@ -320,9 +322,11 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         node._send_command_ack = fake_ack
 
         msg = sys.modules["std_msgs.msg"].Float32MultiArray()
-        msg.data = [31010.0, 0.0, 0.0, 1.0, 191.0, 255.0, 190.0]
+        node._mavlink_tcp_session = 1
+        msg.data = [31010.0, 0.0, 0.0, 1.0, 191.0, 255.0, 190.0, 1.0, 1.0, 1.0]
 
         node._mavlink_cmd_rx_cb(msg)
+        wait_commands(node)
 
         self.assertEqual(handled, [(31010, 0.0, 0.0)])
         self.assertEqual(
@@ -676,7 +680,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
     def test_router_bridge_updates_automation_named_values_from_structured_status(self):
         module = _load_script("usv_mavlink_router_bridge_automation_test", "scripts/usv_mavlink_router_bridge.py")
-        bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
+        bridge = module.USVMavlinkRouterBridge()
         bridge._lock = threading.Lock()
         bridge._automation_step = 0.0
         bridge._automation_total = 0.0
@@ -706,7 +710,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
     def test_router_bridge_clears_sampling_status_when_web_started_automation_finishes(self):
         module = _load_script("usv_mavlink_router_bridge_web_finish_test", "scripts/usv_mavlink_router_bridge.py")
-        bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
+        bridge = module.USVMavlinkRouterBridge()
         bridge._lock = threading.Lock()
         bridge._automation_step = 1.0
         bridge._automation_total = 1.0
@@ -732,7 +736,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
     def test_router_bridge_treats_finished_status_as_terminal_even_if_running_flag_is_stale(self):
         module = _load_script("usv_mavlink_router_bridge_stale_running_finish_test", "scripts/usv_mavlink_router_bridge.py")
-        bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
+        bridge = module.USVMavlinkRouterBridge()
         bridge._lock = threading.Lock()
         bridge._automation_step = 1.0
         bridge._automation_total = 1.0
@@ -759,7 +763,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
     def test_router_bridge_keeps_sampling_status_for_pending_fcu_done(self):
         module = _load_script("usv_mavlink_router_bridge_fcu_done_guard_test", "scripts/usv_mavlink_router_bridge.py")
-        bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
+        bridge = module.USVMavlinkRouterBridge()
         bridge._lock = threading.Lock()
         bridge._automation_step = 1.0
         bridge._automation_total = 1.0
@@ -785,7 +789,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
     def test_router_bridge_sends_baseline_named_values_with_payload(self):
         module = _load_script("usv_mavlink_router_bridge_baseline_payload_test", "scripts/usv_mavlink_router_bridge.py")
-        bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
+        bridge = module.USVMavlinkRouterBridge()
         bridge._boot_time = 0
         bridge._pkt_count = 10
         bridge._diag_tx_total = 0
@@ -795,6 +799,9 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         mav = RecordingMav()
         bridge._conn = types.SimpleNamespace(mav=mav)
 
+        bridge._field_received_at = {field: time.monotonic() for fields in module.SOURCE_FIELDS.values() for field in fields}
+        bridge._field_received_at.update({'PUMP_' + axis: time.monotonic() for axis in 'XYZA'})
+        bridge._field_received_at['USV_STAT'] = time.monotonic()
         bridge._send_payload(
             voltage=1.23,
             absorbance=0.12,
@@ -828,8 +835,8 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         sent_values = dict(mav.named_values)
         self.assertEqual(sent_values["USV_LOOP"], 1.0)
         self.assertEqual(sent_values["USV_LTOT"], 3.0)
-        self.assertEqual(len(mav.named_values), 24)
-        self.assertEqual(bridge._diag_tx_named, 24)
+        self.assertEqual(len(mav.named_values), 26)
+        self.assertEqual(bridge._diag_tx_named, 26)
 
     def test_rover_nav_script_time_is_the_only_mission_sampling_trigger(self):
         workspace_root = _workspace_root()
@@ -840,7 +847,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         self.assertIn('gcs().send_named_float("USV_SMPL"', mode_auto)
     def test_router_bridge_reconnects_and_keeps_payload_alive_after_socket_write_failure(self):
         module = _load_script("usv_mavlink_router_bridge_reconnect_payload_test", "scripts/usv_mavlink_router_bridge.py")
-        bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
+        bridge = module.USVMavlinkRouterBridge()
         bridge._boot_time = 0
         bridge._pkt_count = 10
         bridge._diag_tx_total = 0
@@ -877,14 +884,17 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
             spectrometer_valid=1.0,
         )
 
+        self.assertEqual(reconnects, [])
+        self.assertIsNone(bridge._conn)
+        self.assertEqual(len(recovered_mav.named_values), 0)
+        self.assertEqual(bridge._diag_tx_named, 0)
+        # Recovery belongs to the next loop, not a replay of the failed batch.
+        self.assertTrue(bridge._reconnect_router())
         self.assertEqual(reconnects, [True])
-        self.assertEqual(len(recovered_mav.named_values), 24)
-        self.assertEqual(recovered_mav.named_values[0][0], "USV_VOLT")
-        self.assertEqual(bridge._diag_tx_named, 24)
 
     def test_router_bridge_caches_spectrometer_valid_from_voltage_payload(self):
         module = _load_script("usv_mavlink_router_bridge_valid_payload_test", "scripts/usv_mavlink_router_bridge.py")
-        bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
+        bridge = module.USVMavlinkRouterBridge()
         bridge._lock = threading.Lock()
         bridge._voltage = 0.0
         bridge._absorbance = 0.0
@@ -902,7 +912,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
     def test_router_bridge_adds_system_health_named_value_fields(self):
         module = _load_script("usv_mavlink_router_bridge_health_payload_test", "scripts/usv_mavlink_router_bridge.py")
-        bridge = module.USVMavlinkRouterBridge.__new__(module.USVMavlinkRouterBridge)
+        bridge = module.USVMavlinkRouterBridge()
         bridge._lock = threading.Lock()
         bridge._boot_time = 0.0
         bridge._pkt_count = 7
@@ -938,25 +948,28 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         )
 
         sent = dict(mav.named_values)
-        self.assertEqual(len(mav.named_values), 24)
+        # No measurement/angle/automation source callback was received.
+        self.assertEqual(set(sent), set(module.DEFAULT_HEALTH_FIELDS) | {'USV_PKT', 'USV_SCNT', 'USV_VLD', 'USV_BSET', 'USV_ADS', 'USV_PROTO'})
         self.assertAlmostEqual(sent["USV_JTMP"], 55.2)
         self.assertAlmostEqual(sent["USV_ETMP"], 43.2)
         self.assertAlmostEqual(sent["USV_JCPU"], 12.5)
         self.assertAlmostEqual(sent["USV_JMEM"], 34.0)
         self.assertAlmostEqual(sent["USV_EHEAP"], 37.5)
-        self.assertEqual(bridge._diag_tx_named, 24)
+        self.assertEqual(bridge._diag_tx_named, 11)
 
     def test_trigger_node_set_baseline_uses_latest_valid_voltage(self):
         module = _load_script("mavlink_trigger_node_baseline_valid_test", "scripts/mavlink_trigger_node.py")
         node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
         node.spectrometer_command_pub = RecordingPublisher()
         node.latest_spectrometer_payload = {"valid": True, "voltage": 1.234}
+        calls = []
+        node._call_control_command = lambda action, payload: calls.append((action, payload)) or True
 
         accepted = node.handle_mavlink_command(31017, 0.0, 0.0)
 
         self.assertTrue(accepted)
-        payload = json.loads(node.spectrometer_command_pub.messages[-1].data)
-        self.assertEqual(payload, {"cmd": "set_baseline", "reference_voltage": 1.234})
+        self.assertEqual(calls, [('spectrometer_baseline', {'reference_voltage': 1.234})])
+        self.assertEqual(node.spectrometer_command_pub.messages, [])
 
     def test_trigger_node_set_baseline_rejects_missing_valid_voltage(self):
         module = _load_script("mavlink_trigger_node_baseline_missing_test", "scripts/mavlink_trigger_node.py")
@@ -977,6 +990,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         node._survey_active = True
         node._survey_sample_active = True
         node._survey_interval = 5.0
+        node.sampling_result_pub = RecordingPublisher()
         node.current_waypoint = 4
         states = []
         statuses = []
@@ -1244,6 +1258,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
         node.is_sampling = True
         node._survey_sample_active = False
         node.current_waypoint = 9
+        node.sampling_result_pub = RecordingPublisher()
         states = []
         statuses = []
         failures = []

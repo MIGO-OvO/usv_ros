@@ -131,7 +131,8 @@ class StopAndSurveyRaceTests(unittest.TestCase):
                 if not release.wait(2):
                     raise AssertionError('launch barrier not released')
                 response = transaction(action, payload)
-                self.wait_phase('compensating')  # force real motion before the RPC response
+                if response[0]:
+                    self.wait_phase('compensating')
                 return response
             return transaction(action, payload)
         self.trigger._call_control_transaction = delayed
@@ -154,7 +155,8 @@ class StopAndSurveyRaceTests(unittest.TestCase):
         self.assertFalse(starter.is_alive())
         self.assertFalse(stopper.is_alive())
         self.assertTrue(results['stop'])
-        self.join()
+        if self.node._preflight_thread:
+            self.join()
         late = self.commands[results['commands_at_stop']:]
         self.assertFalse(any(re.match(r'[XYZA]E', command) or command.startswith('PUMP:SET:') for command in late), late)
         self.assertEqual(self.trigger.current_mission_state, self.trigger_module.MissionState.IDLE)

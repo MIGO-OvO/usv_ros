@@ -13,6 +13,7 @@ from scripts.lib.automation_preflight import (
     AutomationPreflight, PreflightError, calibrated_offsets, involved_axes, normalize_preflight,
 )
 from test_hardware_runtime_sync import _load_script
+from measurement_fixtures import prepare_measurement, fresh_measurement
 
 
 class PreflightWorkerTests(unittest.TestCase):
@@ -27,7 +28,7 @@ class PreflightWorkerTests(unittest.TestCase):
         self.zeros = {'X': 123.0, 'Y': 45.0, 'Z': 210.0, 'A': 18.0}
         Path(self.node.calibration_file).write_text(json.dumps({'offsets': self.zeros}), encoding='utf-8')
         self.node.serial_conn = SimpleNamespace(is_open=True)
-        self.node.spectro_config['enabled'] = False
+        prepare_measurement(self.node)
         self.node._on_angle_received({'X': 150.0, 'Y': 5.0, 'Z': 345.0, 'A': 18.0})
         self.node._on_health_received({'timestamp_ms': 1000})
         self.node._on_text_received('ANGLE_AGE_CH_MS:1,1,1,1')
@@ -49,6 +50,7 @@ class PreflightWorkerTests(unittest.TestCase):
             self.node._preflight_thread.join(2)
 
     def send(self, command):
+        fresh_measurement(self.node)
         self.commands.append(command.strip())
         preparation = self.node._preflight
         phase = preparation.snapshot()['phase'] if preparation else 'idle'
@@ -293,7 +295,7 @@ class PreflightWorkerTests(unittest.TestCase):
             with self.subTest(fault=fault):
                 self.node._controller_fault = None
                 self.block_phase = 'homing'
-                self.assertTrue(self.start()[0])
+                self.assertTrue(self.start(attempt_id='preflight-' + fault)[0])
                 self.wait_phase('homing')
                 if fault == 'owner':
                     self.node._owner_last_seen = time.monotonic() - 6

@@ -57,6 +57,13 @@ type SampleWindow = {
   readonly mode?: string
   readonly source?: string
   readonly state?: string
+  readonly attempt_id?: string | null
+  readonly outcome?: string | null
+  readonly terminal_reason?: string | null
+  readonly preflight_phase?: string | null
+  readonly cleanup_failed?: boolean
+  readonly spectrometer_age_s?: number | null
+  readonly owner_age_s?: number | null
   readonly waypoint_seq?: number | null
   readonly mavlink_sample_id?: number | null
   readonly start_time?: string
@@ -122,6 +129,10 @@ async function fetchJson<T>(url: string, init?: RequestInit): Promise<ApiRespons
   const json = await res.json() as ApiResponse<T>
   if (!res.ok || !json.success) throw new Error(json.error ?? json.message ?? '请求失败')
   return json
+}
+
+function outcomeText(outcome?: string | null): string {
+  return ({ succeeded: '成功', failed: '失败', cancelled: '已取消', skipped: '已跳过' } as Record<string, string>)[outcome ?? ''] ?? '结果未知'
 }
 
 function fmt(value: number | null | undefined, digits = 4): string {
@@ -469,6 +480,7 @@ export default function Data() {
                     <div className="mt-1 text-xs text-muted-foreground truncate">{sample.sample_id}</div>
                     <div className="mt-2 text-xs text-muted-foreground">
                       有效 {sample.spectrometer?.valid_count ?? 0}/{sample.spectrometer?.frame_count ?? 0}
+                      {` · ${outcomeText(sample.outcome)}`}
                       {sample.manual_result?.status === 'recorded' && ` · ${sample.manual_result.analyte ?? '结果'} ${fmt(sample.manual_result.concentration)} ${sample.manual_result.unit ?? ''}`}
                     </div>
                   </button>
@@ -501,7 +513,11 @@ export default function Data() {
                   <div><div className="text-muted-foreground">模式/来源</div><div>{sampleDetail.mode ?? '-'} / {sampleDetail.source ?? '-'}</div></div>
                   <div><div className="text-muted-foreground">航点</div><div>#{sampleDetail.waypoint_seq ?? '-'}</div></div>
                   <div><div className="text-muted-foreground">时长</div><div>{fmt(sampleDetail.duration_s, 3)} s</div></div>
-                  <div><div className="text-muted-foreground">状态</div><div>{sampleDetail.state ?? '-'}</div></div>
+                  <div><div className="text-muted-foreground">记录 / 任务结果</div><div>{sampleDetail.state ?? '-'} / {outcomeText(sampleDetail.outcome)}</div></div>
+                  <div className="col-span-2 break-words"><div className="text-muted-foreground">终止首因 / 准备阶段</div><div>{sampleDetail.terminal_reason || '-'} / {sampleDetail.preflight_phase || '-'}</div></div>
+                  <div><div className="text-muted-foreground">停止清理</div><div>{sampleDetail.cleanup_failed ? '失败，需核验' : sampleDetail.outcome ? '未报告失败' : '未知'}</div></div>
+                  <div><div className="text-muted-foreground">测量 / 控制者龄期</div><div>{fmt(sampleDetail.spectrometer_age_s, 2)} / {fmt(sampleDetail.owner_age_s, 2)} s</div></div>
+                  <div className="col-span-2 md:col-span-4 break-all"><div className="text-muted-foreground">执行标识</div><div>{sampleDetail.attempt_id || '未记录'}</div></div>
                   <div className="md:col-span-2"><div className="text-muted-foreground">GPS 起点</div><div>{gpsText(sampleDetail.gps_start)}</div></div>
                   <div className="md:col-span-2"><div className="text-muted-foreground">GPS 终点</div><div>{gpsText(sampleDetail.gps_end)}</div></div>
                 </div>

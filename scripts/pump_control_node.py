@@ -39,6 +39,8 @@ import struct
 import sys
 import threading
 import time
+import uuid
+from contextlib import contextmanager
 
 import serial
 import rospy
@@ -109,6 +111,7 @@ TERMINAL_REASONS = {
     'pid_fail',
     'spectrometer_frame_timeout',
     'spectrometer_stale',
+    'spectrometer_not_ready',
     'watchdog_tripped',
     'owner_lost',
     'serial_disconnected',
@@ -187,8 +190,9 @@ def perform_detector_handshake(serial_conn, timeout=2.0):
         while time.time() < deadline:
             if time.time() >= next_probe:
                 cmd = commands[probe_count % len(commands)]
-                serial_conn.write(cmd.encode('utf-8'))
-                serial_conn.flush()
+                encoded = cmd.encode('utf-8')
+                if serial_conn.write(encoded) != len(encoded):
+                    raise serial.SerialException('incomplete detector handshake write')
                 probe_count += 1
                 next_probe = time.time() + 0.5
             chunk = serial_conn.read(1)
@@ -530,8 +534,15 @@ class PumpControlNode(object):
         self.serial_reader = None
         self._serial_fault_connection = None
         self._last_control_keepalive = 0.0
-        self.serial_lock = threading.Lock()
+        self.serial_lock = threading.RLock()
         self._control_lock = threading.RLock()
+        self._action_cancel = threading.Event()
+        self._action_local = threading.local()
+        self._automation_cancel = self._action_cancel
+        self._stop_requested = False
+        self._stop_requests = 0
+        self._stop_cutoff = time.monotonic()
+        self._cancelled_attempts = {}
         self._connection_lock = threading.RLock()
         self._keepalive_stop = None
         self._keepalive_thread = None
@@ -547,6 +558,8 @@ class PumpControlNode(object):
         self._terminal_lock = threading.RLock()
         self._terminal_finalized = False
         self._cleanup_failed = False
+        self._prior_cleanup_failed = False
+        self._calibration = {}
         self._stop_in_progress = False
         self.preflight_config = normalize_preflight({})
         self.calibration_file = os.path.expanduser(rospy.get_param(
@@ -615,6 +628,7 @@ class PumpControlNode(object):
         # No averaged frame has arrived yet; cold-start steps still need a snapshot.
         self._latest_spectro_received_at = None
         self.spectro_state = "idle"
+        self._ads_state = 0  # unknown, stopped, starting, acquiring, error, stop-unconfirmed
         self._last_published_spectro_status = None
         self._spectro_sequence = 0
         self._spectro_agg_frames = []
@@ -630,6 +644,7 @@ class PumpControlNode(object):
             raise ValueError('spectro_stale_stop_timeout must be in [measurement_timeout, 60] seconds')
         self.spectro_reference_voltage = float(self.spectro_config.get('reference_voltage', 0.0))
         self.spectro_baseline_voltage = float(self.spectro_config.get('baseline_voltage', 0.0))
+        self._spectro_reference_context = None
         # All control/configuration entry points share _control_lock; the
         # reader thread publishes matching ACK lines into
         # the pending _text_txn so waiting never blocks the serial callback.
@@ -692,9 +707,11 @@ class PumpControlNode(object):
         self.i2c_map_apply_srv = rospy.Service('/usv/i2c_map_apply', Trigger, self._i2c_map_apply_callback)
         self.control_command_srv = rospy.Service('/usv/control_command', ControlCommand, self._control_command_callback)
         self.injection_pump_worker = InjectionPumpWorker(
-            send_command=lambda command: self.send_command(command),
+            send_command=lambda command, valid: self.send_command(command, valid=valid),
             on_success=self._handle_injection_worker_success,
             on_failure=self._handle_injection_worker_failure,
+            guard_lock=self.serial_lock,
+            context=lambda: (id(self.serial_conn), self._action_cancel, self.sampling_context.get('attempt_id')),
         )
 
         rospy.loginfo("Pump Control Node initialized")
@@ -709,31 +726,31 @@ class PumpControlNode(object):
 
     def _connect_locked(self):
         self.disconnect()
+        connection = None
         try:
-            self.serial_conn = serial.Serial()
-            self.serial_conn.port = self.serial_port
-            self.serial_conn.baudrate = self.baudrate
-            self.serial_conn.timeout = self.timeout
-            self.serial_conn.write_timeout = self.timeout
-            self.serial_conn.rtscts = False
-            self.serial_conn.dsrdtr = False
-            self.serial_conn.dtr = False
-            self.serial_conn.rts = False
-            self.serial_conn.open()
-            self.serial_conn.reset_input_buffer()
-            self.serial_conn.reset_output_buffer()
-            ok, identity = perform_detector_handshake(self.serial_conn, timeout=max(2.5, self.timeout))
+            connection = serial.Serial()
+            connection.port = self.serial_port
+            connection.baudrate = self.baudrate
+            connection.timeout = self.timeout
+            connection.write_timeout = self.timeout
+            connection.rtscts = False
+            connection.dsrdtr = False
+            connection.dtr = False
+            connection.rts = False
+            connection.open()
+            connection.reset_input_buffer()
+            connection.reset_output_buffer()
+            ok, identity = perform_detector_handshake(connection, timeout=max(2.5, self.timeout))
             if not ok:
-                self.serial_conn.close()
                 raise serial.SerialException("detector handshake failed: %s" % identity)
             rospy.loginfo("Detector handshake: %s", identity)
             if 'CAP=WATCHDOG1' not in identity:
-                self.serial_conn.close()
                 raise serial.SerialException('detector firmware lacks WATCHDOG1; update the matched firmware')
             with self.serial_lock:
-                self.serial_conn.write(b'WATCHDOG:ARM\r\n')
+                self.serial_conn = connection
+                if self.serial_conn.write(b'WATCHDOG:ARM\r\n') != len(b'WATCHDOG:ARM\r\n'):
+                    raise serial.SerialException('incomplete watchdog ARM write')
                 self._serial_fault_connection = None
-            self._controller_fault = None
             self._last_control_keepalive = time.monotonic()
             self._start_keepalive_worker()
             self._publish_injection_pump_status()
@@ -751,6 +768,13 @@ class PumpControlNode(object):
                 on_error=lambda error: self._on_serial_reader_error(error, reader_connection)
             )
 
+            if self._controller_fault or self._cleanup_failed:
+                # Transport recovery is not proof of output shutdown. Reuse the
+                # ordered STOP confirmation before allowing a new action owner.
+                if not self._confirm_all_outputs_stopped() or not self._spectro_stop()[0]:
+                    raise serial.SerialException('recovery stop not confirmed')
+            self._controller_fault = None
+
             # Transport identity and configuration readiness are independent.
             # Keepalive is already running throughout settling/ACK waits.
             self._spectro_ready_after = time.monotonic() + SPECTRO_SERIAL_SETTLE_S
@@ -760,6 +784,7 @@ class PumpControlNode(object):
             self._spectro_reply_sync_failed = False
             self._spectro_cleanup_error = None
             self.spectro_state = 'idle'
+            self._ads_state = 0
             self._publish_status('serial_connected')
             self._publish_automation_status(self._last_automation_status_text)
             configured = self._apply_runtime_configuration()
@@ -772,6 +797,8 @@ class PumpControlNode(object):
             return True
 
         except Exception as e:
+            if connection is not None and connection is not self.serial_conn:
+                connection.close()
             self.disconnect()
             rospy.logerr("Failed to connect: %s", str(e))
             self._publish_status("error: " + str(e))
@@ -783,6 +810,12 @@ class PumpControlNode(object):
             self._disconnect_locked()
 
     def _disconnect_locked(self):
+        with self.serial_lock:
+            self._action_cancel.set()
+            self._action_cancel = threading.Event()
+            self._stop_cutoff = time.monotonic()
+        if self.injection_pump_worker:
+            self.injection_pump_worker.invalidate()
         self._stop_keepalive_worker()
         if self.serial_reader:
             self.serial_reader.stop()
@@ -845,7 +878,8 @@ class PumpControlNode(object):
                     raise serial.SerialException('serial port closed')
                 if self._controller_fault:
                     continue
-                connection.write(b'WATCHDOG:KEEPALIVE\r\n')
+                if connection.write(b'WATCHDOG:KEEPALIVE\r\n') != len(b'WATCHDOG:KEEPALIVE\r\n'):
+                    raise serial.SerialException('incomplete watchdog keepalive write')
                 self._last_control_keepalive = time.monotonic()
             except (serial.SerialException, OSError) as exc:
                 failed = True
@@ -878,7 +912,13 @@ class PumpControlNode(object):
             if connection is not None and connection is self._serial_fault_connection:
                 return False  # failed cleanup writes must not spawn more recovery
             self._serial_fault_connection = connection
+            self._action_cancel.set()
+            self._action_cancel = threading.Event()
+            self._stop_cutoff = time.monotonic()
+            if self.injection_pump_worker:
+                self.injection_pump_worker.invalidate()
             self._controller_fault = self._controller_fault or 'disconnected'
+            self._end_calibration('failed', 'serial_disconnected')
             self._spectro_config_state = 'disconnected'
             if self._automation_is_active():
                 self._set_terminal_reason('serial_disconnected')
@@ -1043,7 +1083,62 @@ class PumpControlNode(object):
             rospy.logwarn('Failed to refresh runtime hardware settings: %s', str(e))
         return False
 
-    def send_command(self, command):
+    @contextmanager
+    def _action_scope(self):
+        """Capture cancellation before waiting for the ordinary control lock."""
+        previous = getattr(self._action_local, 'cancel', None)
+        with self.serial_lock:
+            self._action_local.cancel = previous or self._action_cancel
+        try:
+            yield
+        finally:
+            self._action_local.cancel = previous
+
+    def _action_cancelled(self):
+        token = getattr(self._action_local, 'cancel', None)
+        if token is None and threading.current_thread() in (
+                self.automation_engine._thread, self._preflight_thread):
+            token = self._automation_cancel
+        return bool(token is not None and token.is_set())
+
+    def _request_output_stop(self, command='STOPALL'):
+        """Invalidate ordinary work and issue the first halt before any join/ACK."""
+        with self.serial_lock:
+            if command == 'STOPALL':
+                self._end_calibration('cancelled', 'operator_stop')
+            if command == 'ADSSTOP':
+                self._ads_state = 5
+                self._spectro_start_ack_at = None
+            # Record the initiating cause before a failed safety write can
+            # report cleanup_failed. A pre-registered fault still wins.
+            self._set_terminal_reason('operator_stop')
+            self._stop_requests += 1
+            self._stop_requested = True
+            self._stop_in_progress = True
+            self._action_cancel.set()
+            self._action_cancel = threading.Event()
+            self._stop_cutoff = time.monotonic()
+            if self.injection_pump_worker:
+                self.injection_pump_worker.invalidate()
+            # _running is an Event: do not wait for the engine's operation lock.
+            self.automation_engine._running.clear()
+            if self._preflight:
+                self._preflight.cancelled.set()
+                self._preflight.changed.set()
+            # Preserve the single text waiter; cancelled callers relinquish it.
+            if self._text_txn is not None or self._spectro_txn_phase in (
+                    'i2c_map', 'ads_config', 'start', 'wait_frame', 'settling', 'retry_sync'):
+                self._spectro_reply_sync_required = True
+            success = self.send_command(command)
+        return success
+
+    def _finish_output_stop(self):
+        with self.serial_lock:
+            self._stop_requests -= 1
+            self._stop_requested = self._stop_requests > 0
+            self._stop_in_progress = self._stop_requested
+
+    def send_command(self, command, valid=None):
         """发送指令到电机控制板；返回 True 仅表示写入串口成功。"""
         if not self.serial_conn or not self.serial_conn.is_open:
             rospy.logwarn("Serial not connected")
@@ -1055,13 +1150,32 @@ class PumpControlNode(object):
                 command = command.upper()
 
             with self.serial_lock:
+                if valid is not None and not valid():
+                    return False
+                safety_command = command.strip().upper() in (
+                    'STOPALL', 'PIDSTOP', 'PIDTESTSTOP', 'CALSTOP', 'PUMP:OFF',
+                    'PUMP:SET:0', 'ADSSTOP', 'PIDQUERY', 'ADSSTATUS?',
+                    self.command_generator.generate_stop_command().strip().upper())
+                if (self._action_cancelled() or self._stop_requested) and not safety_command:
+                    return False
+                calibration = self._calibration
+                if calibration.get('active') and not safety_command:
+                    normalized = command.strip().upper()
+                    if normalized == calibration.get('command') and not calibration.get('written'):
+                        calibration['written'] = True
+                    elif normalized not in ('CALSTATUS', 'WATCHDOG:KEEPALIVE', 'HELLO?', 'DET?',
+                                            'PUMP:STATUS', 'ANGLE?', 'I2CMAP?', 'STRESS:STATUS?'):
+                        return False
                 if not self.serial_conn or not self.serial_conn.is_open:
                     return False
                 connection = self.serial_conn
                 if not command.endswith(COMMAND_TERMINATOR):
                     command += COMMAND_TERMINATOR
-                connection.write(command.encode('utf-8'))
-                connection.flush()
+                encoded = command.encode('utf-8')
+                if connection.write(encoded) != len(encoded):
+                    raise serial.SerialException('incomplete command write')
+                # pyserial write_timeout bounds write(), not POSIX tcdrain().
+                # Do not flush here: protocol ACKs provide applied evidence.
             rospy.logdebug("Sent: %s", command.strip())
             return True
 
@@ -1075,7 +1189,7 @@ class PumpControlNode(object):
 
     def _apply_runtime_configuration(self):
         """连接后同步 I2C 映射和 ADS 采样配置。"""
-        with self._control_lock:
+        with self._action_scope(), self._control_lock:
             try:
                 return self._apply_runtime_configuration_locked()
             finally:
@@ -1139,17 +1253,19 @@ class PumpControlNode(object):
         transaction may run at a time (guaranteed by _control_lock); the
         wait happens on the caller thread, never inside the reader callback.
         """
-        with self._control_lock:
+        with self._action_scope(), self._control_lock:
             return self._send_and_wait_text_locked(command, success_prefixes, error_prefixes, timeout)
 
     def _send_and_wait_text_locked(self, command, success_prefixes, error_prefixes, timeout):
+        if self._action_cancelled():
+            return False, 'cancelled'
         # Also covers standalone services and raw/topic configuration clients.
         # No setter may bypass a previous timeout or failed reply barrier.
         if command.startswith(('I2CMAP:', 'ADSCFG:')) or command in ('ADSSTART', 'I2CMAP?'):
             synced, error = self._ensure_spectro_reply_sync()
             if not synced:
                 return False, error
-        stop_confirmation = command in ('STOPALL', 'PIDQUERY')
+        stop_confirmation = command in ('STOPALL', 'PIDQUERY', 'ADSSTOP')
         if self._controller_fault and not stop_confirmation and command not in ('ADSSTOP', 'I2CMAP?', 'ADSSTATUS?'):
             return False, self._controller_fault
         success = tuple(success_prefixes or ())
@@ -1157,6 +1273,7 @@ class PumpControlNode(object):
         if not success:
             return False, 'no success prefix configured'
         txn = {'event': threading.Event(), 'line': None, 'received_at': None,
+               'cancel': getattr(self._action_local, 'cancel', None),
                'success': success, 'error': errors}
         with self._text_txn_lock:
             self._text_txn = txn
@@ -1165,6 +1282,9 @@ class PumpControlNode(object):
             if not self.send_command(command):
                 return False, 'serial send failed'
             while not txn['event'].wait(min(0.05, max(0.0, deadline - time.monotonic()))):
+                if self._action_cancelled():
+                    self._spectro_reply_sync_required = True
+                    return False, 'cancelled'
                 if self._controller_fault and not stop_confirmation:
                     return False, self._controller_fault
                 if time.monotonic() >= deadline:
@@ -1174,6 +1294,8 @@ class PumpControlNode(object):
                         self._spectro_reply_sync_failed = True
                     return False, 'timeout'
             line = txn['line'] or ''
+            if self._action_cancelled():
+                return False, 'cancelled'
             if txn['received_at'] is None or txn['received_at'] > deadline:
                 if not stop_confirmation:
                     self._spectro_reply_sync_required = True
@@ -1357,10 +1479,12 @@ class PumpControlNode(object):
         -> wait for the first valid spectrometer frame. Serial writes alone
         never imply success.
         """
-        with self._control_lock:
+        with self._action_scope(), self._control_lock:
             self._spectro_cleanup_error = None
             self._spectro_start_ack_at = None
             try:
+                if self._action_cancelled() or self._stop_requested:
+                    return False, 'cancelled by stop'
                 if self._controller_fault or self._automation_is_active():
                     self._spectro_txn_phase = 'start_failed'
                     self._last_spectro_txn_error = self._controller_fault or 'automation active'
@@ -1430,8 +1554,12 @@ class PumpControlNode(object):
             self._spectro_config_state = 'settling'
             self._publish_automation_status(self._last_automation_status_text)
             while time.monotonic() < self._spectro_ready_after and not self._controller_fault:
+                if self._action_cancelled():
+                    return False, 'cancelled'
                 time.sleep(max(0.0, min(0.02, self._spectro_ready_after - time.monotonic())))
         for attempt in range(1, SPECTRO_INIT_ATTEMPTS + 1):
+            if self._action_cancelled():
+                return False, 'cancelled'
             self._spectro_txn_attempt = attempt
             ok = self._apply_i2c_mapping()
             if ok and (start or self.spectro_config.get('enabled', True)):
@@ -1464,10 +1592,15 @@ class PumpControlNode(object):
                 self._last_spectro_txn_error = error + '; retry synchronization: ' + reply
                 return False, self._last_spectro_txn_error
             self._spectro_reply_sync_required = False
-            time.sleep(SPECTRO_RETRY_BACKOFF_S * attempt)
+            deadline = time.monotonic() + SPECTRO_RETRY_BACKOFF_S * attempt
+            while time.monotonic() < deadline:
+                if self._action_cancelled():
+                    return False, 'cancelled'
+                time.sleep(min(0.02, max(0.0, deadline - time.monotonic())))
         return False, self._last_spectro_txn_error
 
     def _start_configured_spectrometer(self):
+        self._ads_state = 2
         self._clear_spectro_reference()
         self._spectro_start_ack_at = None
         self._last_valid_spectro_at = None
@@ -1504,6 +1637,12 @@ class PumpControlNode(object):
     def _cleanup_failed_spectro_start(self):
         # Bounded secondary cleanup; never replace the startup phase/error.
         try:
+            if self._action_cancelled():
+                # A start may already have reached the detector. Send a safe
+                # stop, but never let this obsolete waiter own a new ACK.
+                self.send_command('ADSSTOP')
+                self._spectro_cleanup_error = 'stop confirmation pending after cancellation'
+                return
             ok, response = self._spectro_stop(timeout=1.0)
             if not ok:
                 self._spectro_cleanup_error = response
@@ -1522,7 +1661,7 @@ class PumpControlNode(object):
         ack_seen_at = self._spectro_start_ack_at
         deadline = (ack_seen_at if ack_seen_at is not None else time.monotonic()) + max(0.0, float(timeout))
         while True:
-            if self._controller_fault:
+            if self._controller_fault or self._action_cancelled():
                 return False
             if (ack_seen_at is not None and self._last_valid_spectro_at is not None
                     and ack_seen_at <= self._last_valid_spectro_at <= deadline
@@ -1538,10 +1677,15 @@ class PumpControlNode(object):
         return self.prepare_and_start_spectrometer()
 
     def _spectro_stop(self, timeout=2.0):
+        self._ads_state = 5
+        self._spectro_start_ack_at = None
         self._invalidate_spectro('stopped')
         self._spectro_agg_frames = []
         self._spectro_agg_started = None
         success, message = self._send_and_wait_text('ADSSTOP', ('ADS_OK:STOP',), ('ADS_ERR:',), timeout=timeout)
+        if not success:
+            self._ads_state = 5
+        self._publish_automation_status(self._last_automation_status_text)
         return success, message if message != 'timeout' else 'Spectrometer stop timeout'
 
     def _is_injection_pump_command(self, command):
@@ -1607,6 +1751,10 @@ class PumpControlNode(object):
         command = self._build_injection_pump_command(enabled=enabled, speed=speed)
         rospy.loginfo("[InjectionPump] queue command: %s", command)
         worker = getattr(self, "injection_pump_worker", None)
+        if command in ('PUMP:OFF', 'PUMP:SET:0') and worker is not None:
+            worker.invalidate()
+            # Safety writes never wait behind queued/dequeued ordinary work.
+            return self.send_command(command)
         if worker is None:
             success = self.send_command(command)
             if success:
@@ -1618,6 +1766,8 @@ class PumpControlNode(object):
     def _send_injection_pump_raw_command(self, command, wait=False):
         """Queue a raw PUMP:* command without blocking other command sources."""
         worker = getattr(self, "injection_pump_worker", None)
+        if command.strip().upper() in ('PUMP:OFF', 'PUMP:SET:0'):
+            return self._send_injection_pump_command(enabled=False, wait=wait)
         if worker is None:
             success = self.send_command(command)
             if success:
@@ -1696,6 +1846,10 @@ class PumpControlNode(object):
 
     def _send_automation_step(self, step):
         """自动化引擎步骤发送钩子。"""
+        if not self._real_measurement_ready():
+            if not self._wait_for_new_spectro_sample(self._latest_spectro_received_at):
+                self._set_terminal_reason('spectrometer_not_ready')
+                return False
         self._current_auto_step = dict(step or {})
         self._current_step_spectro_timestamp = self._latest_spectro_received_at
         step_name = step.get("name", "未命名步骤")
@@ -1791,19 +1945,19 @@ class PumpControlNode(object):
 
     def _wait_for_new_spectro_sample(self, previous_timestamp):
         """ADS 采集中时等待一条新的有效分光样本。"""
-        if not self.spectro_config.get('enabled', True):
-            return True
-        recovering = (self.spectro_state == 'stale' and self._last_valid_spectro_at is not None
-                      and time.monotonic() - self._last_valid_spectro_at < self.spectro_stale_stop_timeout)
-        if self.spectro_state != 'acquiring' and not recovering:
-            return bool(self.lab_mode_enabled)
+        if not self._real_measurement_ready(allow_recovery=True):
+            self._set_terminal_reason('spectrometer_not_ready')
+            return False
         timeout = max(0.1, self.spectro_sample_wait_timeout)
         deadline = time.monotonic() + timeout
         previous_timestamp = previous_timestamp or 0.0
         while self.automation_engine.is_running() and time.monotonic() < deadline:
             if self.automation_engine.is_paused():
                 return False
-            if self.latest_spectro and self.latest_spectro.get('valid', False):
+            if not self._real_measurement_ready(allow_recovery=True):
+                self._set_terminal_reason('spectrometer_not_ready')
+                return False
+            if self._real_measurement_ready():
                 if self._latest_spectro_received_at > previous_timestamp:
                     return True
             time.sleep(0.02)
@@ -1984,24 +2138,84 @@ class PumpControlNode(object):
         """测试结果回调。"""
         rospy.loginfo("PID test result: %s", result)
 
+    def _end_calibration(self, outcome, reason):
+        if self._calibration.get('active'):
+            self._calibration.update(active=False, outcome=outcome,
+                                     reason=self._calibration.get('reason') or reason)
+
+    def _calibration_text(self, text):
+        calibration = self._calibration
+        if not calibration.get('active') or not calibration.get('written'):
+            return
+        if text.startswith('CAL_START:'):
+            calibration['started'] = True
+        elif not calibration.get('started'):
+            return
+        elif text.startswith('CAL_FAIL:'):
+            calibration['reason'] = calibration.get('reason') or text[:80]
+        elif text.startswith('CAL_DONE:'):
+            axis = text[9:10]
+            if axis in calibration['axes'] and axis not in calibration['done']:
+                calibration['done'] += axis
+        elif text == 'CAL_COMPLETE:ALL_DONE':
+            calibration['complete'] = True
+        elif text == 'CAL_STOPPED':
+            success = (calibration['complete'] and not calibration['reason']
+                       and set(calibration['done']) == set(calibration['axes']))
+            self._end_calibration('succeeded' if success else 'failed',
+                                  '' if success else 'calibration_incomplete')
+            if not success:
+                self._controller_fault = self._controller_fault or calibration['reason']
+
+    def _check_calibration(self):
+        with self.serial_lock:
+            calibration = self._calibration
+            if not calibration.get('active'):
+                return
+            reason = calibration.get('reason')
+            if not reason and time.monotonic() >= calibration['deadline']:
+                reason = 'calibration_timeout'
+            if not reason:
+                return
+            self._end_calibration('failed', reason)
+            self._controller_fault = self._controller_fault or reason
+        self._request_output_stop()
+        try:
+            self.send_command('CALSTOP')
+        finally:
+            self._finish_output_stop()
+        self._publish_automation_status(self._last_automation_status_text)
+
     def _on_text_received(self, text):
         """文本响应回调。"""
         if self._preflight and not text.startswith('PUMP_'):
             self._preflight.notify_text(text)
-        if text == 'ADS_OK:START':
-            # Startup deadline only, never measurement freshness.
-            self._spectro_start_ack_at = time.monotonic()
-            frame_timeout = self._first_spectro_frame_timeout()
-            self._spectro_first_frame_deadline = self._spectro_start_ack_at + frame_timeout
-            self.spectro_state = 'starting'
-            self._publish_spectro_status('starting')
-        if text == 'ADS_OK:STOP':
-            # STOP must finish its state changes before its waiter can retry.
-            self.spectro_state = 'stopped'
-            self._last_valid_spectro_at = None
-            self._spectro_start_ack_at = None
-            self._spectro_first_frame_deadline = None
-            self._publish_spectro_status('stopped')
+        with self.serial_lock, self._text_txn_lock:
+            self._calibration_text(text)
+            txn = self._text_txn
+            matched = bool(txn is not None and not txn['event'].is_set() and (
+                any(text.startswith(prefix) for prefix in txn['success'])
+                or any(text.startswith(prefix) for prefix in txn['error']))
+                and not (txn.get('cancel') and txn['cancel'].is_set()))
+            if matched:
+                if text == 'ADS_OK:START':
+                    # Startup deadline only, never measurement freshness.
+                    self._spectro_start_ack_at = time.monotonic()
+                    self._spectro_first_frame_deadline = self._spectro_start_ack_at + self._first_spectro_frame_timeout()
+                    self.spectro_state = 'starting'
+                    self._ads_state = 2
+                elif text == 'ADS_OK:STOP':
+                    self.spectro_state = 'stopped'
+                    self._ads_state = 1
+                    self._last_valid_spectro_at = None
+                    self._spectro_start_ack_at = None
+                    self._spectro_first_frame_deadline = None
+                # State and reply belong to this exact, uncancelled waiter.
+                txn['line'] = text
+                txn['received_at'] = time.monotonic()
+                txn['event'].set()
+        if matched and text in ('ADS_OK:START', 'ADS_OK:STOP'):
+            self._publish_spectro_status(self.spectro_state)
         if text == 'WATCHDOG_TRIPPED' or text.startswith('WATCHDOG_ERR:'):
             self._controller_fault = 'watchdog_tripped'
             self._invalidate_spectro('watchdog_tripped')
@@ -2009,17 +2223,6 @@ class PumpControlNode(object):
                 self._set_terminal_reason('watchdog_tripped')
                 self._auto_stop_callback(None)
             return
-        # Publish the ACK line to a pending verified configuration transaction.
-        # Existing handlers below keep their side effects (spectro_state,
-        # status telemetry), so the capture must not swallow the line.
-        with self._text_txn_lock:
-            txn = self._text_txn
-            if txn is not None and not txn['event'].is_set() and (
-                    any(text.startswith(prefix) for prefix in txn['success'])
-                    or any(text.startswith(prefix) for prefix in txn['error'])):
-                txn['line'] = text
-                txn['received_at'] = time.monotonic()
-                txn['event'].set()
         # 自动化运行时提升日志级别，便于排查 PID_DONE 等固件消息
         if self.automation_engine.is_running():
             rospy.loginfo("MCU text: %s", text)
@@ -2236,6 +2439,7 @@ class PumpControlNode(object):
             return
         with self._terminal_lock:
             self._cleanup_failed = True
+            self._prior_cleanup_failed = True
             self._controller_fault = self._controller_fault or 'cleanup_failed'
             self._set_terminal_reason('cleanup_failed')
 
@@ -2256,7 +2460,9 @@ class PumpControlNode(object):
         if data.get('valid', False):
             self._last_valid_spectro_at = time.monotonic()
             self._spectro_invalid_published = False
-            self.spectro_state = 'acquiring'
+            if self._spectro_start_ack_at is not None and self._ads_state in (2, 3, 4):
+                self.spectro_state = 'acquiring'
+                self._ads_state = 3
         elif data.get('i2c_error', False):
             self.spectro_state = 'i2c_error'
         elif data.get('not_configured', False):
@@ -2317,21 +2523,25 @@ class PumpControlNode(object):
             payload = json.loads(msg.data)
         except (TypeError, ValueError):
             return
-        with self._control_lock:
+        with self.serial_lock:
             attempt = self.sampling_context.get('attempt_id')
             if isinstance(payload, dict) and attempt and payload.get('attempt_id') == attempt:
                 self._owner_last_seen = time.monotonic()
 
     def _check_sampling_owner(self):
-        with self._control_lock:
+        with self.serial_lock:
             if ((self._automation_is_active() or self.inject_pump_enabled) and self.sampling_context.get('attempt_id')
                     and self._owner_last_seen is not None
                     and time.monotonic() - self._owner_last_seen > 5.0):
                 self._controller_fault = 'owner_lost'
                 if self._automation_is_active():
                     self._set_terminal_reason('owner_lost')
-                self._auto_stop_callback(None)
-                self._publish_automation_status('owner_lost')
+                attempt = self.sampling_context['attempt_id']
+            else:
+                return
+        # Scoped cleanup rechecks the owner before its first hardware write.
+        self._execute_control_action('automation_cleanup', {'attempt_id': attempt})
+        self._publish_automation_status('owner_lost')
 
     def _accumulate_spectro_sample(self, data, received_at):
         """把有效原始帧累积进输出窗口，窗口到点输出平均帧。"""
@@ -2369,6 +2579,7 @@ class PumpControlNode(object):
         absorbance = self._calculate_absorbance(avg_voltage)
         payload = {
             'voltage': round(avg_voltage, 9),
+            'source_monotonic': time.monotonic(),
             'sample_voltage': round(avg_voltage, 9),
             'voltage_std': round(voltage_std, 9),
             'raw_count': len(frames),
@@ -2423,21 +2634,57 @@ class PumpControlNode(object):
         self._publish_detector_health_payload(payload)
 
     def _spectro_reference_ready(self):
-        return (self.spectro_reference_voltage - self.spectro_baseline_voltage) > 1e-6
+        return (self._spectro_reference_context is not None
+                and self._spectro_reference_context[0] is self.serial_conn
+                and self._spectro_reference_context == self._spectro_reference_signature()
+                and math.isfinite(self.spectro_reference_voltage)
+                and math.isfinite(self.spectro_baseline_voltage)
+                and self.spectro_reference_voltage - self.spectro_baseline_voltage > 1e-6)
+
+    def _spectro_reference_signature(self):
+        return (self.serial_conn, self._spectro_start_ack_at, self._build_ads_config_command(),
+                json.dumps(self.i2c_mapping, sort_keys=True), self.spectro_baseline_voltage,
+                self.spectro_reference_voltage)
+
+    def _real_measurement_ready(self, require_reference=True, allow_recovery=False):
+        sample = self.latest_spectro or {}
+        now = time.monotonic()
+        if self._last_valid_spectro_at is None:
+            return False
+        age = now - self._last_valid_spectro_at
+        fresh = (self.spectro_state == 'acquiring' and age <= self.measurement_timeout
+                 and sample.get('valid') and not sample.get('stale'))
+        # Recovery permits waiting only, never initial admission, a new motion,
+        # baseline capture or sample completion. Explicit device errors fail.
+        recovering = (allow_recovery and self.spectro_state in ('acquiring', 'stale')
+                      and age < self.spectro_stale_stop_timeout
+                      and (sample.get('valid') or sample.get('status') == 'stale'))
+        return bool(self.serial_conn and self.serial_conn.is_open and not self._controller_fault
+                    and self.spectro_config.get('enabled', True)
+                    and self._spectro_config_state == 'ready' and (fresh or recovering)
+                    and self._spectro_start_ack_at is not None and self._last_valid_spectro_at is not None
+                    and self._spectro_start_ack_at <= self._last_valid_spectro_at <= now
+                    and not sample.get('simulated')
+                    and (not require_reference or self._spectro_reference_ready()))
 
     def _clear_spectro_reference(self):
+        self._spectro_reference_context = None
         self.spectro_reference_voltage = 0.0
         self.spectro_config['reference_voltage'] = 0.0
 
     def _set_spectro_reference_voltage(self, voltage):
+        if not self._real_measurement_ready(require_reference=False):
+            return False, 'spectrometer_not_ready: fresh real measurement required for baseline'
         try:
             reference_voltage = float(voltage)
         except (TypeError, ValueError):
             return False, 'invalid reference voltage'
-        if reference_voltage - self.spectro_baseline_voltage <= 1e-6:
+        if (not math.isfinite(reference_voltage) or not math.isfinite(self.spectro_baseline_voltage)
+                or reference_voltage - self.spectro_baseline_voltage <= 1e-6):
             return False, 'reference voltage must be above baseline voltage'
         self.spectro_reference_voltage = reference_voltage
         self.spectro_config['reference_voltage'] = reference_voltage
+        self._spectro_reference_context = self._spectro_reference_signature()
         self._publish_spectro_config_snapshot()
         self._publish_spectro_status('baseline_set')
         rospy.loginfo('Spectrometer baseline reference set to %.6f V', reference_voltage)
@@ -2526,7 +2773,7 @@ class PumpControlNode(object):
 
     def _set_manual_mode(self, enabled):
         enabled = bool(enabled)
-        if enabled and self._automation_is_active():
+        if enabled and (self._automation_is_active() or self._calibration.get('active')):
             return False, "Cannot enter manual mode while automation is active"
         self.manual_mode_enabled = enabled
         self._publish_manual_status()
@@ -2596,8 +2843,74 @@ class PumpControlNode(object):
         return self._control_response(success, message, result)
 
     def _execute_control_action(self, action, payload):
-        with self._control_lock:
+        # These clients run on the same Jetson, where monotonic is shared
+        # across processes. Preserve the original admission time across RPC
+        # waits; an old RPC arriving after STOP must not become a new action.
+        if action not in ('manual_stop_all', 'automation_cleanup', 'injection_off', 'spectrometer_stop'):
+            issued = payload.get('_issued_monotonic', time.monotonic())
+            if (not isinstance(issued, (int, float)) or not math.isfinite(issued)
+                    or issued <= self._stop_cutoff or issued > time.monotonic()):
+                return False, 'Request predates stop/session or has invalid admission time', {}
+        if action == 'automation_cleanup':
+            attempt = payload.get('attempt_id')
+            with self.serial_lock:
+                if not isinstance(attempt, str) or not attempt:
+                    return False, 'Cleanup requires attempt_id', {'cleanup': 'failed'}
+                self._cancelled_attempts[attempt] = time.monotonic()
+                if len(self._cancelled_attempts) > 256:
+                    oldest = next(iter(self._cancelled_attempts))
+                    self._stop_cutoff = max(self._stop_cutoff, self._cancelled_attempts.pop(oldest))
+                if attempt != self.sampling_context.get('attempt_id'):
+                    return False, 'Cleanup owner was superseded', {'cleanup': 'superseded', 'attempt_id': attempt}
+                first_write = self._request_output_stop()
             try:
+                with self._control_lock:
+                    if not first_write:
+                        self._record_cleanup_result(False)
+                    return self._execute_control_action_locked(action, payload)
+            finally:
+                self._finish_output_stop()
+        if action == 'manual_stop_all':
+            response = self._auto_stop_callback(None, confirm_stop=payload.get('confirm_stop') is True)
+            return response.success, response.message, {}
+        if action == 'injection_off':
+            if self._automation_is_active():
+                response = self._auto_stop_callback(None)
+                return response.success, response.message, self._injection_status_result()
+            first_write = self._request_output_stop('PUMP:OFF')
+            try:
+                success = self._send_injection_pump_command(enabled=False) and first_write
+                if not success:
+                    self._record_cleanup_result(False)
+                return success, 'Injection stop sent' if success else 'Injection stop failed', self._injection_status_result()
+            finally:
+                self._finish_output_stop()
+        if action == 'spectrometer_stop':
+            # Cancel a startup before waiting for the text transaction lock.
+            # Real sampling cannot continue after acquisition is stopped.
+            active = self._automation_is_active() or self._calibration.get('active', False)
+            first_write = self._request_output_stop('STOPALL' if active else 'ADSSTOP')
+            with self._control_lock:
+                try:
+                    if not first_write:
+                        self._record_cleanup_result(False)
+                    if active:
+                        self._auto_stop_locked(None)
+                    synced, message = self._ensure_spectro_reply_sync()
+                    if not synced:
+                        return False, message, {}
+                    success, message = self._spectro_stop()
+                    return bool(success and first_write), message, {}
+                finally:
+                    self._finish_output_stop()
+        with self._action_scope(), self._control_lock:
+            try:
+                if self._action_cancelled() or self._stop_requested:
+                    return False, 'cancelled by stop', {}
+                if self._calibration.get('active'):
+                    return False, 'Calibration is active; stop it before another action', {}
+                if payload.get('_issued_monotonic', time.monotonic()) <= self._stop_cutoff:
+                    return False, 'Request predates stop/session', {}
                 return self._execute_control_action_locked(action, payload)
             finally:
                 if action in ('spectrometer_i2c_map', 'spectrometer_configure'):
@@ -2626,6 +2939,8 @@ class PumpControlNode(object):
                                                      'spectrometer_configure', 'spectrometer_i2c_map', 'spectrometer_start'):
             return False, 'Configuration/manual output rejected during automation', {}
         if action == 'automation_start':
+            if payload.get('attempt_id') in self._cancelled_attempts:
+                return False, 'Automation attempt was cancelled before admission', {}
             if self._automation_is_active() or self.manual_mode_enabled:
                 return False, 'Automation start rejected: controller busy', {}
             config = dict(payload)
@@ -2636,6 +2951,47 @@ class PumpControlNode(object):
                 return False, 'Invalid automation configuration', {}
             response = self._auto_start_callback(None)
             return response.success, response.message, dict(self.sampling_context)
+
+        if action in ('automation_resume', 'automation_pause'):
+            if payload.get('attempt_id') != self.sampling_context.get('attempt_id'):
+                return False, 'Automation owner was superseded', {}
+            response = (self._auto_resume_callback(None) if action == 'automation_resume'
+                        else self._auto_pause_callback(None))
+            return response.success, response.message, dict(self.sampling_context)
+
+        if action == 'calibration_start':
+            if self._automation_is_active() or self.manual_mode_enabled:
+                return False, 'Calibration rejected: controller busy', {}
+            # Ordered read barrier drains previous CAL_START replies. No retry:
+            # an unknown start must be stopped before another motion request.
+            synced, reply = self._send_and_wait_text('CALSTATUS', ('CAL_STATUS:',), ('CAL_ERR:',))
+            if not synced:
+                return False, 'Calibration reply barrier: ' + reply, {}
+            axes = str(payload.get('axes', 'XYZA'))
+            if not axes or any(axis not in 'XYZA' for axis in axes):
+                return False, 'Invalid calibration axes', {}
+            mask = sum(1 << 'XYZA'.index(axis) for axis in set(axes))
+            with self.serial_lock:
+                self._calibration = {'active': True, 'started': False, 'written': False,
+                    'command': 'CAL' + axes, 'axes': ''.join(sorted(set(axes))), 'done': '',
+                    'complete': False, 'reason': '', 'outcome': '',
+                    'attempt_id': uuid.uuid4().hex, 'deadline': time.monotonic() + 17.0,
+                    'mavlink_request': payload.get('mavlink_request')}
+            success, reply = self._send_and_wait_text('CAL' + axes, ('CAL_START:mask=0x%X' % mask,),
+                                                      ('CAL_ERR:', 'BUSY:', 'WATCHDOG_ERR:'))
+            if success:
+                self._calibration['started'] = True
+                self._publish_status('calibrate_started')
+            if not success:
+                self._end_calibration('failed', 'calibration_start_unconfirmed')
+                self._request_output_stop()
+                try:
+                    self.send_command('CALSTOP')
+                    self._controller_fault = self._controller_fault or 'calibration_start_unconfirmed'
+                finally:
+                    self._finish_output_stop()
+            self._publish_automation_status(self._last_automation_status_text)
+            return success, reply, dict(self._calibration)
 
         if action == "manual_mode":
             success, message = self._set_manual_mode(bool(payload.get("enabled", False)))
@@ -2668,10 +3024,13 @@ class PumpControlNode(object):
                 return False, 'Invalid injection owner attempt_id', {}
             # Claim pre-start output under the same lock used by scoped cleanup.
             # Unowned manual commands also supersede a previous task's output.
-            self.sampling_context = {
-                'attempt_id': attempt, 'source': str(payload.get('source', 'manual')),
-                'sample_id': payload.get('sample_id'), 'waypoint_seq': payload.get('waypoint_seq'),
-            }
+            with self.serial_lock:
+                if self.injection_pump_worker:
+                    self.injection_pump_worker.invalidate()
+                self.sampling_context = {
+                    'attempt_id': attempt, 'source': str(payload.get('source', 'manual')),
+                    'sample_id': payload.get('sample_id'), 'waypoint_seq': payload.get('waypoint_seq'),
+                }
             self._configuration_ready = False
             self._owner_last_seen = time.monotonic()
             speed = payload.get("speed")
@@ -2743,7 +3102,20 @@ class PumpControlNode(object):
         }
 
     def _cmd_callback(self, msg):
-        with self._control_lock:
+        if msg.data.strip().upper() in ('STOP', 'STOPALL', self.command_generator.generate_stop_command().strip().upper()):
+            self._auto_stop_callback(None)
+            return
+        if msg.data.strip().upper() == 'ADSSTOP':
+            self._execute_control_action('spectrometer_stop', {})
+            return
+        command = msg.data.strip().upper()
+        if command == 'CALSTOP':
+            self._auto_stop_callback(None)
+            return
+        if command.startswith('CAL') and command != 'CALSTATUS':
+            self._execute_control_action('calibration_start', {'axes': command[3:]})
+            return
+        with self._action_scope(), self._control_lock:
             self._raw_command_locked(msg)
 
     def _raw_command_locked(self, msg):
@@ -2800,7 +3172,9 @@ class PumpControlNode(object):
         self.send_command(cmd_upper)
 
     def _step_callback(self, msg):
-        with self._control_lock:
+        with self._action_scope(), self._control_lock:
+            if self._action_cancelled() or self._stop_requested:
+                return
             self._manual_step_locked(msg)
 
     def _manual_step_locked(self, msg):
@@ -2831,7 +3205,14 @@ class PumpControlNode(object):
             rospy.logerr("Invalid step JSON: %s", str(e))
 
     def _spectro_cmd_callback(self, msg):
-        with self._control_lock:
+        try:
+            payload = json.loads(msg.data)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict) and str(payload.get('cmd', '')).strip().lower() == 'stop':
+            self._execute_control_action('spectrometer_stop', {})
+            return
+        with self._action_scope(), self._control_lock:
             try:
                 self._spectro_cmd_locked(msg)
             finally:
@@ -2912,7 +3293,9 @@ class PumpControlNode(object):
         return TriggerResponse(success=success, message=message)
 
     def _steps_callback(self, msg):
-        with self._control_lock:
+        with self._action_scope(), self._control_lock:
+            if self._action_cancelled() or self._stop_requested:
+                return False
             return self._load_steps_locked(msg)
 
     def _load_steps_locked(self, msg):
@@ -2978,12 +3361,16 @@ class PumpControlNode(object):
                           step_names)
             if not steps:
                 rospy.logwarn("Automation steps payload received but step list is empty")
-            self.sampling_context = {
-                'source': source,
-                'sample_id': sample_id if source == 'fcu' else None,
-                'waypoint_seq': data.get('waypoint_seq'),
-                'attempt_id': data.get('attempt_id'),
-            }
+            with self.serial_lock:
+                if self.injection_pump_worker:
+                    self.injection_pump_worker.invalidate()
+                self.sampling_context = {
+                    'source': source,
+                    'sample_id': sample_id if source == 'fcu' else None,
+                    'waypoint_seq': data.get('waypoint_seq'),
+                    'attempt_id': data.get('attempt_id'),
+                    'mavlink_request': data.get('mavlink_request'),
+                }
             self._owner_last_seen = time.monotonic()
             self._configuration_ready = bool(attempt_id)
             return True
@@ -2998,13 +3385,17 @@ class PumpControlNode(object):
         return self._auto_stop_callback(req)
 
     def _auto_start_callback(self, req):
-        with self._control_lock:
+        with self._action_scope(), self._control_lock:
             return self._auto_start_locked(req)
 
     def _auto_start_locked(self, req):
         """启动自动化服务回调。"""
+        if self._action_cancelled() or self._stop_requested:
+            return TriggerResponse(success=False, message='cancelled by stop')
         if self._controller_fault:
             return TriggerResponse(success=False, message='Controller fault: reconnect required')
+        if self._calibration.get('active'):
+            return TriggerResponse(success=False, message='Calibration is active')
         rejected = self._reject_if_manual_mode("Automation start")
         if rejected:
             return rejected
@@ -3026,6 +3417,10 @@ class PumpControlNode(object):
         # Web UI never shows a stale cause.
         self._reset_terminal()
         self.last_automation_failure = {}
+        if not self._real_measurement_ready():
+            self._set_terminal_reason('spectrometer_not_ready')
+            self._publish_automation_status('rejected')
+            return TriggerResponse(success=False, message='spectrometer_not_ready: prepare real acquisition and baseline before sampling')
 
         rospy.loginfo("Automation start requested: %d steps, loop_count=%s, pid_mode=%s, pid_precision=%.3f",
                       step_count,
@@ -3033,6 +3428,7 @@ class PumpControlNode(object):
                       self.pid_mode,
                       self.pid_precision)
         self._preflight_connection = self.serial_conn
+        self._automation_cancel = self._action_cancel
         self._preflight = AutomationPreflight(
             self._send_preflight_command, self._check_preflight_active,
             self._preflight_angles, self._publish_preflight_status)
@@ -3058,6 +3454,8 @@ class PumpControlNode(object):
         if self._controller_fault:
             raise PreflightError(self._terminal_reason or 'controller_fault',
                                  'Preflight controller fault: ' + self._controller_fault)
+        if not self._real_measurement_ready(allow_recovery=True):
+            raise PreflightError('spectrometer_not_ready', 'Preflight requires fresh real acquisition and baseline')
         if (self.serial_conn is not self._preflight_connection or
                 not self.serial_conn or not self.serial_conn.is_open):
             raise PreflightError('serial_disconnected', 'Preflight serial session changed or disconnected')
@@ -3067,8 +3465,13 @@ class PumpControlNode(object):
 
     def _send_preflight_command(self, command, before_send=None):
         # Waits happen outside this lock so STOP and owner renewals remain live.
+        while not self._real_measurement_ready():
+            self._preflight._check()  # Includes cancellation, oil sensor/progress and owner checks.
+            self._preflight.changed.wait(0.02)
         with self._control_lock:
             self._check_preflight_active()
+            if not self._real_measurement_ready():
+                return False
             if before_send:
                 before_send()
             return self.send_command(command)
@@ -3128,15 +3531,24 @@ class PumpControlNode(object):
             self._set_terminal_reason(reason)
             self.last_automation_failure = {'reason': str(exc), 'preflight_phase': preparation.snapshot()['phase']}
             with preparation.lock:
-                preparation.state.update(phase='failed', active=False, error=str(exc))
+                preparation.state.update(interrupted_phase=preparation.state['phase'],
+                                         phase='failed', active=False, error=str(exc))
             self._on_automation_status('failed')
 
-    def _auto_stop_callback(self, req):
+    def _auto_stop_callback(self, req, confirm_stop=False):
+        first_write = self._request_output_stop()
         with self._control_lock:
-            return self._auto_stop_locked(req)
+            try:
+                if not first_write:
+                    self._record_cleanup_result(False)
+                return self._auto_stop_locked(req, confirm_stop=confirm_stop)
+            finally:
+                self._finish_output_stop()
 
     def _auto_stop_locked(self, req, confirm_stop=False):
         """停止自动化服务回调。"""
+        if self.injection_pump_worker:
+            self.injection_pump_worker.invalidate()
         self._configuration_ready = False
         if self._preflight and self._preflight.snapshot()['active']:
             self._preflight.cancel()
@@ -3145,7 +3557,8 @@ class PumpControlNode(object):
         rospy.loginfo("Automation stop requested (terminal_reason=%s)", self._terminal_reason)
         self._stop_in_progress = True
         try:
-            if self.automation_engine.is_running() or self.automation_engine.is_paused():
+            if (self.automation_engine.is_running() or self.automation_engine.is_paused()
+                    or (self.automation_engine._thread and self.automation_engine._thread.is_alive())):
                 try:
                     self.automation_engine.stop()
                 except Exception as exc:
@@ -3164,7 +3577,7 @@ class PumpControlNode(object):
                 success = bool(success and confirmed and not self._controller_fault)
                 self._record_cleanup_result(success)
         finally:
-            self._stop_in_progress = False
+            self._stop_in_progress = self._stop_requested
         message = "Automation stopped and pumps halted" if success else "Automation stopped but pump halt failed"
         self._log_automation_terminal()
         status = 'cleanup_failed' if confirm_stop and not success else 'stopped'
@@ -3246,8 +3659,9 @@ class PumpControlNode(object):
 
     def _injection_on_callback(self, req):
         """开启进样泵服务。"""
-        with self._control_lock:
-            if self._controller_fault or self._automation_is_active():
+        with self._action_scope(), self._control_lock:
+            if (self._controller_fault or self._automation_is_active()
+                    or self._action_cancelled() or self._stop_requested):
                 return TriggerResponse(success=False, message='Controller fault or automation active')
             return self._injection_on_locked(req)
 
@@ -3262,8 +3676,8 @@ class PumpControlNode(object):
 
     def _injection_off_callback(self, req):
         """关闭进样泵服务。"""
-        success = self._send_injection_pump_command(enabled=False)
-        return TriggerResponse(success=success, message="Injection pump off" if success else "Injection pump off failed")
+        success, message, _ = self._execute_control_action('injection_off', {})
+        return TriggerResponse(success=success, message=message)
 
     def _injection_status_callback(self, req):
         """获取进样泵状态服务。"""
@@ -3278,6 +3692,13 @@ class PumpControlNode(object):
 
     def _auto_resume_callback(self, req):
         """恢复自动化服务回调。"""
+        with self._action_scope(), self._control_lock:
+            if (self._action_cancelled() or self._stop_requested or self._controller_fault
+                    or not self._real_measurement_ready()):
+                return TriggerResponse(success=False, message='Resume rejected: cancelled, fault or measurement unavailable')
+            return self._auto_resume_locked()
+
+    def _auto_resume_locked(self):
         if not self.automation_engine.is_running():
             return TriggerResponse(success=False, message="Automation is not running")
         if not self.automation_engine.is_paused():
@@ -3423,9 +3844,15 @@ class PumpControlNode(object):
                        if self._owner_last_seen is not None else None)
         payload = {
             "status": status_text,
+            "source_monotonic": now,
+            "ads_state": self._current_ads_state(),
+            "calibration": dict(self._calibration),
             "preflight": preflight,
             "terminal_reason": self._terminal_reason,
+            "terminal_reason_at": self._terminal_reason_at,
+            "preflight_phase": preflight.get('interrupted_phase', preflight.get('phase', 'idle')),
             "cleanup_failed": self._cleanup_failed,
+            "prior_cleanup_failed": self._prior_cleanup_failed,
             "sampling_context": dict(self.sampling_context),
             "sample_id": self.sampling_context.get('sample_id'),
             "source": self.sampling_context.get('source', 'unknown'),
@@ -3466,6 +3893,15 @@ class PumpControlNode(object):
         msg.data = json.dumps(payload, ensure_ascii=False)
         self.automation_status_pub.publish(msg)
 
+    def _current_ads_state(self):
+        if not self.serial_conn or not self.serial_conn.is_open or self.serial_conn is self._serial_fault_connection:
+            return 0
+        if self._ads_state == 3 and (self._last_valid_spectro_at is None
+                or time.monotonic() - self._last_valid_spectro_at > self.measurement_timeout
+                or self.spectro_state != 'acquiring'):
+            return 4
+        return self._ads_state
+
     def get_current_angles(self):
         """获取当前角度。"""
         with self.angles_lock:
@@ -3493,12 +3929,17 @@ class PumpControlNode(object):
             return
 
         rate = rospy.Rate(10)
+        last_status_at = 0.0
 
         while not rospy.is_shutdown():
+            self._check_calibration()
             self._check_spectro_freshness()
             self._check_sampling_owner()
             if self._preflight and self._preflight.snapshot()['active']:
                 self._publish_preflight_status()
+            if time.monotonic() - last_status_at >= 1.0:
+                self._publish_automation_status(self._last_automation_status_text)
+                last_status_at = time.monotonic()
             # 周期性状态日志
             angles = self.get_current_angles()
             rospy.logdebug_throttle(5, "Angles: %s", angles)

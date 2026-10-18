@@ -123,6 +123,8 @@ class AutomationPreflight:
         self.cancelled.set()
         self.changed.set()
         with self.lock:
+            if self.state['phase'] != 'cancelled':
+                self.state['interrupted_phase'] = self.state['phase']
             self.state.update(phase='cancelled', active=False)
 
     def stage(self, phase, **extra):

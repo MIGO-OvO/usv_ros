@@ -111,6 +111,12 @@ def sample_record(context, spectrometer=None, water_quality=None, timestamp_end=
         'waypoint_id': context.get('waypoint_seq'), 'mission_id': context.get('mission_id'),
         'mavlink_sample_id': context.get('sample_id') if context.get('source') == 'fcu' else None,
         'simulated': bool(context.get('simulated', False)),
+        'attempt_id': context.get('attempt_id'),
+        'preflight_phase': context.get('preflight_phase'),
+        'terminal_reason_at': context.get('terminal_reason_at'),
+        'cleanup_failed': bool(context.get('cleanup_failed', False)),
+        'spectrometer_age_s': context.get('spectrometer_age_s'),
+        'owner_age_s': context.get('owner_age_s'),
         'spectrometer': copy.deepcopy(spectrometer or {}),
         'water_quality': copy.deepcopy(water_quality or {'concentration': None, 'unit': None}),
     }

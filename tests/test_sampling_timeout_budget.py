@@ -6,6 +6,7 @@ from unittest.mock import Mock, patch
 from scripts.lib.automation_engine import AutomationEngine
 from scripts.lib.automation_preflight import AutomationPreflight, PreflightError
 import test_field_transactions as field
+from measurement_fixtures import prepare_measurement
 
 
 class TimeoutBudgetTests(unittest.TestCase):
@@ -90,15 +91,20 @@ class SpectroTimeoutBudgetTests(unittest.TestCase):
         self.assertEqual(self.node._terminal_reason, 'spectrometer_stale')
 
     def test_sample_wait_recovers_with_new_frame_after_old_two_second_deadline(self):
+        prepare_measurement(self.node)
+        self.node._spectro_start_ack_at = 98.0
+        self.node._spectro_reference_context = self.node._spectro_reference_signature()
         self.node.spectro_state = 'stale'
         self.node._last_valid_spectro_at = 99.0
-        self.node.latest_spectro = {'valid': False}
+        self.node.latest_spectro = {'valid': False, 'status': 'stale', 'stale': True}
         self.node.automation_engine.is_running = Mock(return_value=True)
         self.node.automation_engine.is_paused = Mock(return_value=False)
         now = [102.0]
         def sleep(seconds):
             now[0] += seconds
             if now[0] >= 105.0:
+                self.node.spectro_state = 'acquiring'
+                self.node._last_valid_spectro_at = now[0]
                 self.node.latest_spectro = {'valid': True}
                 self.node._latest_spectro_received_at = now[0]
         clock = types.SimpleNamespace(monotonic=lambda: now[0], sleep=sleep)
@@ -119,6 +125,7 @@ class SpectroTimeoutBudgetTests(unittest.TestCase):
                 patch.object(self.module, 'InjectionPumpWorker', return_value=None):
             node = self.module.PumpControlNode()
         self.assertEqual(node.automation_engine.PID_WAIT_TIMEOUT, 180.0)
+        prepare_measurement(node)
         node._reject_if_manual_mode = Mock(return_value=None)
         node.automation_engine.steps = [{}]
         node._configuration_ready = True

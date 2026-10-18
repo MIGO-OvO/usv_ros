@@ -166,6 +166,7 @@ class SampleRecordingStorage(object):
     ) -> dict[str, object]:
         with self._write_lock:
             window["state"] = "closed"
+            window.setdefault('outcome', 'unknown')
             window["end_time"] = datetime.now(timezone.utc).replace(tzinfo=None).isoformat(timespec="milliseconds") + "Z"
             window['timestamp_end'] = time.time()
             duration = self._duration_s(window)

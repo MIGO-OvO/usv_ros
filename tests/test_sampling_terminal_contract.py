@@ -16,7 +16,10 @@ class SamplingTerminalContractTests(unittest.TestCase):
         self.node = self.case.node
         self.queued = []
 
-        def capture_thread(target, kwargs=None, daemon=True):
+        real_thread = self.case.trigger_module.threading.Thread
+        def capture_thread(target, kwargs=None, daemon=True, **options):
+            if target.__name__ == '_command_loop':
+                return real_thread(target=target, kwargs=kwargs or {}, daemon=daemon, **options)
             return types.SimpleNamespace(start=lambda: self.queued.append((target, kwargs or {})))
 
         patcher = patch.object(self.case.trigger_module.threading, 'Thread', side_effect=capture_thread)
