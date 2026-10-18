@@ -56,6 +56,10 @@ class SamplingContextContractTests(unittest.TestCase):
         self.assertEqual(point['position_age_s'], context['gps_snapshot']['position_age_s'])
         self.server._automation_status_cb(msg(json.dumps({
             'status': 'finished', 'running': False, 'sampling_context': context})))
+        self.assertIsNone(window['timestamp_end'])
+        self.server._sampling_result_cb(msg(json.dumps({
+            'source': 'fcu', 'attempt_id': 'bound-A', 'outcome': 'succeeded',
+            'reason': 'completed', 'cleanup_failed': False})))
         self.assertEqual(window['latitude'], 30)
         self.assertEqual(window['gps_start']['lng'], 120)
         self.assertEqual(window['gps_end']['lng'], 121)
@@ -223,8 +227,9 @@ class SamplingContextContractTests(unittest.TestCase):
 
     def test_early_matching_terminal_is_consumed_after_window_opens(self):
         context = {'source': 'fcu', 'sample_id': 42, 'attempt_id': 'fast-A'}
-        self.server._automation_status_cb(msg(json.dumps({
-            'status': 'finished', 'running': False, 'sampling_context': context,
+        self.server._sampling_result_cb(msg(json.dumps({
+            'source': 'fcu', 'attempt_id': 'fast-A', 'outcome': 'succeeded',
+            'reason': 'completed', 'cleanup_failed': False,
         })))
         self.server._trigger_status_cb(msg('sampling_context:' + json.dumps(context)))
         self.server._trigger_status_cb(msg('sampling_started'))

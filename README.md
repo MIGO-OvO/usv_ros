@@ -1,12 +1,21 @@
 # usv_ros
 
+## 2026-10 跨端采样安全修复
+
+- 必须与匹配的 DetFirmware、ArduRover 和 QGC 成套更新。26 个显示遥测字段（含 `USV_LOOP/LTOT/ADS/PROTO`）；`USV_ADS` 为 0 未知、1 停止已确认、2 启动中、3 采集中、4 错误、5 停止未确认。旧 QGC/ROS 组合不用于自动任务验收。
+- STOP 使用独立有界通道，先取消旧工作再发送；注射泵队列在连接换代、取消、期限届满后不得重放。重连恢复需真实 STOPALL 与 ADSSTOP 确认，串口写成功不代表硬件停止。
+- 真实采样准入要求当前会话的真实新鲜帧与有效基线，GPS 仍可选。运行断流 2 秒后数据无效，在默认 10 秒有界窗口内可等待恢复；恢复前不发下一条运动命令，不用旧数据完成步骤，现有输出可能继续运行。设备错误、owner 丢失与停止不等待这个窗口。
+- 请求身份由 SQLite 持久化去重，普通动作先落盘再执行；停止先执行再持久化，不让磁盘等待阻塞首次停止。不要删除请求账本或清空 QGC 请求身份文件来“解锁”，编号冲突需停机维护。失败/取消保留首因、准备阶段和清理失败标记；Web 按 trigger 最终结果关窗，并导出 `sample_results.csv`。
+- 校准收到全部轴完成、校准完成及停止状态后才成功，17 秒期限内允许 STOP 抢占。日志工具 `scripts/rotate_runtime_logs.py` 默认仅预览，`--rotate` 才操作三类运行日志；10 MiB × 5，copytruncate 存在小窗口丢行风险，不用于故障证据归档。
+- 离线验证：`python -B tests/run_non_map_tests.py`。地图测试按要求跳过，设备烧录、Jetson/台架/实船验收由操作者执行；ROS 等待延长不解除检测板独立 30 秒 PID 限时。
+
 ## safety1 成套升级注意
 
 本版本需匹配带 `CAP=WATCHDOG1` 的 DetFirmware，旧固件会拒绝连接；ROS 每 500 ms 续约设备心跳，设备超过 3 秒失联停机且不因迟到心跳恢复。所有停止入口取消自动化；重连先取消旧事务。Web/trigger 通过 `ControlCommand.automation_start` 原子装载并启动本次步骤，`sampling_context` 和 `attempt_id` 用于归档及 5 秒 owner 续约。
 
 终态通过结构化 `automation_status` 的 attempt/source/sample_id 关联，快任务提前终态缓存到启动确认后消费。内部清理通过 `ControlCommand.automation_cleanup` 在同一控制锁内校验 attempt 并停止全部输出，结果为 `stopped/failed/superseded`；旧 owner 清理不能干扰新任务。失败或已锁存的会话故障不算清理成功，人工 31011/STOPALL 仍为全局停止。走航间隔保持采样 owner 续约、进样关闭，停止会取消整个调度，MANUAL/RTL 接管不被迟到失败覆盖。
 
-飞控需更新为采样超时默认 HOLD、支持 `USV_FAIL` 的匹配版本。22 个显示遥测名称及 31010..31019 命令号不变；分光超过 2 秒未更新时置无效。`USV_DONE/USV_FAIL` 尚无端到端 ACK 或跨飞控重启会话保证，不能以本地发送成功当作船态证明。
+飞控需更新为采样超时默认 HOLD、支持 `USV_FAIL` 的匹配版本。当前 26 个显示遥测字段，31010..31019 命令号不变；分光超过 2 秒未更新时置无效。`USV_DONE/USV_FAIL` 尚无端到端 ACK 或跨飞控重启会话保证，不能以本地发送成功当作船态证明。
 
 船载热点/LAN 的 API 写操作默认无需登录，现有前端可直接进行分光、泵控和自动采样；跨源/跨站写请求仍拒绝。仅设置进程环境 `USV_WEB_REQUIRE_AUTH=1` 才启用认证，并必须同时配置 `USV_WEB_CONTROL_TOKEN`（至少 16 字符，否则服务拒绝启动）；仅设置 token 不启用认证。认证模式下本机和远程写操作均需 Bearer 或 HTTP Basic（用户名 `operator`，密码为令牌），浏览器先访问 `/api/control/auth`。环境变更后重启 Web 服务。不把令牌保存到源码或配置 JSON。默认模式下任何可达客户端都可调用控制 API，同源检查不能替代身份认证；非可信网络应启用认证并通过 HTTPS/VPN 和网络访问隔离保护。
 
@@ -152,7 +161,7 @@ ESP32 检测装置主控
 已实现的核心能力包括：
 
 - `mavlink-routerd` 串口复用：MAVROS 与自定义 bridge 分离。
-- 22 个 QGC 载荷遥测字段：`USV_VOLT`、`USV_ABS`、`PUMP_X/Y/Z/A`、`USV_STAT`、`USV_PKT`、
+- 26 个 QGC 载荷遥测字段（含 `USV_LOOP/LTOT/ADS/PROTO`）：`USV_VOLT`、`USV_ABS`、`PUMP_X/Y/Z/A`、`USV_STAT`、`USV_PKT`、
   `USV_STEP`、`USV_STOT`、`USV_SCNT`、`USV_PERR`、`USV_PMOD`、`USV_BSET`、`USV_REF`、`USV_BASE`、`USV_VLD`。
   其中 5 个系统健康字段为 `USV_JTMP`、`USV_ETMP`、`USV_JCPU`、`USV_JMEM`、`USV_EHEAP`。
 - 检测装置身份握手：`HELLO?` / `DET?` 必须返回 `DET_ID:USV_DETECTOR*`。
@@ -815,9 +824,9 @@ bridge 兼容飞控以 `NAMED_VALUE_FLOAT` 发出的原生任务触发：
 - trigger 通过 `/usv/sampling_result`（`std_msgs/String` JSON，非 latched）发布 `source=fcu`、`sample_id`（整数 1..65535）、`outcome`、`reason`。
 - `outcome=succeeded` 表示正常完成；`skipped` 仅由 FCU 采样失败且 `sampling_on_fail=SKIP` 产生。二者允许 bridge 发送匹配 ID 的 `USV_DONE`，但 SKIP 提示为 Skipped，不冒充成功。
 - `failed` / `cancelled` 不发送 `USV_DONE`。HOLD/ABORT 失败策略、FCU 主动取消请求 HOLD；启动失败同样进入失败策略。FCU 忙碌拒绝只报告失败，不中断正在运行的其他采样。
-- `sampling_stopped` 仅表示记录生命周期结束，仍关闭 Web 采样窗口，不能作为采样成功或飞控放行依据。自动化引擎正常结束报 `finished`，直接停止报 `stopped`，失败报 `failed`。
+- `sampling_stopped` 与 pump `finished` 不作为真实任务成功或飞控放行依据。Web 真实窗口等待匹配 `/usv/sampling_result` 最终结果后关窗，保留真实首因和清理结果。自动化引擎正常结束报 `finished`，直接停止报 `stopped`，失败报 `failed`。
 - bridge 在下发内部命令前登记 ID；忽略最近同 ID 重复触发、重复结果、ID 不匹配结果、非 FCU 结果和非法结果。新 ID 会清除尚未发送的旧完成通知。
-- FCU 采样仍不启用旧 waypoint 自动重试路径，避免重试丢失脚本 ID。成功完成不由 ROS 延迟切换模式；既有 22 个遥测字段、MAVLink 命令号、固件和 QGC 均不变。
+- FCU 采样仍不启用旧 waypoint 自动重试路径，避免重试丢失脚本 ID；成功完成不由 ROS 延迟切换模式。命令号保持不变，本轮 26 字段与关联协议需匹配新版固件和 QGC。
 - **部署要求**：停止系统后，成套更新并重启 trigger、bridge 和 pump（自动化引擎），不要混用新旧进程。旧 bridge 仍会把 `sampling_stopped` 当成完成；新 bridge 配旧 trigger 则不会发送完成通知。
 - **剩余边界**：HOLD 请求不是模式确认；飞控 `NAV_SCRIPT_TIME` 自身超时仍可结束等待，本修复不修改该 P1 行为。结果队列不保证端到端可靠送达；飞控重启/16 位 ID 回绕没有跨启动会话标识，重启后应协调重启 ROS 并重新确认任务，不将本修复视为完整的跨重启事务协议。
 
@@ -829,7 +838,7 @@ bridge 兼容飞控以 `NAMED_VALUE_FLOAT` 发出的原生任务触发：
 bridge 发送：
 
 - `HEARTBEAT`：1 Hz。
-- `NAMED_VALUE_FLOAT`：2 Hz，每轮 22 个字段。
+- `NAMED_VALUE_FLOAT`：26 个字段按源/字段新鲜度发送，源回调停止后不以缓存续命；飞控按每链路独立游标在 2 Hz 调度中公平转发。
 
 | 字段 | 说明 |
 |---|---|
@@ -840,7 +849,10 @@ bridge 发送：
 | `USV_PKT` | 载荷包计数 |
 | `USV_STEP` | 当前自动化步骤号 |
 | `USV_STOT` | 自动化总步骤数 |
-| `USV_SCNT` | 样本计数 |
+| `USV_LOOP` / `USV_LTOT` | 当前轮次 / 总轮次 |
+| `USV_SCNT` | 采样启动次数，不是成功次数 |
+| `USV_ADS` | 采集状态：0 未知、1 停止已确认、2 启动中、3 采集中、4 错误、5 停止未确认 |
+| `USV_PROTO` | 关联事件和明确采集状态协议能力版本 |
 | `USV_PERR` | PID 误差 |
 | `USV_PMOD` | PID 模式：0 空闲、1 运行、2 完成、3 错误 |
 | `USV_BSET` | baseline 是否已设置，0/1 |
@@ -863,7 +875,7 @@ rostopic echo /usv/radio_status
 
 ## 实验仿真与坐标 Schema v2
 
-实验模式（Lab）在无飞控/检测装置硬件时做半实物仿真，源码集中在 `scripts/lib/lab_sim/`、`scripts/lab_sim_node.py`、`scripts/mavlink_trigger_node.py` 与 `scripts/web_config_server.py`，不改动 MAVLink 命令号、`USV_SMPL/USV_DONE` 语义和 22 个遥测字段。
+实验模式（Lab）在无飞控/检测装置硬件时做半实物仿真，源码集中在 `scripts/lib/lab_sim/`、`scripts/lab_sim_node.py`、`scripts/mavlink_trigger_node.py` 与 `scripts/web_config_server.py`，不改变 MAVLink 命令号和 `USV_SMPL/USV_DONE` 语义；当前载荷字段清单为上文 26 项。lab_real 不能使用仿真或机械调试豁免绕过真实测量门禁。
 
 ### 坐标 Schema v2 与 CRS 边界
 
