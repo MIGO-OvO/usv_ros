@@ -276,7 +276,7 @@ class SpectrometerColdStartTests(unittest.TestCase):
         self.assertTrue(self.node._apply_spectro_config())
         self.assertEqual(self.node._spectro_config_state, 'ads_configured')
 
-    def test_warm_start_does_not_receive_cold_first_frame_grace(self):
+    def test_warm_start_accepts_valid_frame_within_startup_grace(self):
         self.ack_sender(frame=False)
         now = [100.0]
         def sleep(seconds):
@@ -285,9 +285,9 @@ class SpectrometerColdStartTests(unittest.TestCase):
                 self.node._on_spectro_received({'valid': True, 'voltage': 1.2})
         clock = types.SimpleNamespace(monotonic=lambda: now[0], time=lambda: now[0], sleep=sleep)
         with patch.object(self.module, 'time', clock):
-            self.assertFalse(self.node.prepare_and_start_spectrometer()[0])
-        self.assertLess(now[0], 102.1)
-        self.assertEqual(self.node._spectro_txn_phase, 'frame_timeout')
+            self.assertTrue(self.node.prepare_and_start_spectrometer()[0])
+        self.assertLess(now[0], 104.0)
+        self.assertEqual(self.node._spectro_txn_phase, 'running')
 
     def test_frame_received_after_first_frame_deadline_is_not_success(self):
         self.node._spectro_start_ack_at = 100.0

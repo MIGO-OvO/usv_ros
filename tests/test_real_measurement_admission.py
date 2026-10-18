@@ -1,6 +1,7 @@
 """Real sampling may never use lab/disabled-ADS as a measurement bypass."""
 import time
 import unittest
+from unittest.mock import patch
 
 import test_automation_preflight as preparation
 from measurement_fixtures import prepare_measurement, fresh_measurement
@@ -66,6 +67,27 @@ class RealMeasurementAdmissionTests(unittest.TestCase):
         self.node._on_text_received('ADS_OK:STOP')
         self.assertEqual(self.node.spectro_state, 'acquiring')
         self.assertEqual(self.node._spectro_start_ack_at, original)
+
+    def test_recovery_allows_waiting_but_never_admits_new_attempt_or_invalid_device(self):
+        for invalid in (None, 'disabled', 'baseline', 'simulated', 'fault', 'i2c_error'):
+            with self.subTest(invalid=invalid):
+                prepare_measurement(self.node)
+                now = time.monotonic()
+                with patch.object(self.fixture.module.time, 'monotonic', return_value=now + 3):
+                    self.node._check_spectro_freshness()
+                    if invalid == 'disabled':
+                        self.node.spectro_config['enabled'] = False
+                    elif invalid == 'baseline':
+                        self.node._clear_spectro_reference()
+                    elif invalid == 'simulated':
+                        self.node.latest_spectro['simulated'] = True
+                    elif invalid == 'fault':
+                        self.node._controller_fault = 'serial_disconnected'
+                    elif invalid == 'i2c_error':
+                        self.node.spectro_state = 'i2c_error'
+                    self.assertFalse(self.node._real_measurement_ready())
+                    self.assertEqual(self.node._real_measurement_ready(allow_recovery=True), invalid is None)
+                self.node._controller_fault = None
 
 
 if __name__ == '__main__':

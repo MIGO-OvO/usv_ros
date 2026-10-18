@@ -160,7 +160,7 @@ class FeedbackReviewTests(unittest.TestCase):
             self.assertGreater(runner.travel['degrees'], 0.7)
             frozen = runner.travel['angle']
             rejected = False
-            for index in range(61, 200):
+            for index in range(61, 400):
                 clock[0] = index * 0.02
                 runner.notify_angles({'A': (frozen + (0.02 if index % 2 else -0.02)) % 360})
                 try:

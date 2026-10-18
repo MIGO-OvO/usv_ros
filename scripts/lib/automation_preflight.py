@@ -92,9 +92,9 @@ class AutomationPreflight:
     # for quantization/noise, independent of the formal step PID setting.
     PID_PRECISION_DEG = 0.1
     ACK_TIMEOUT = 2.0
-    PID_TIMEOUT = 60.0
+    PID_TIMEOUT = 120.0
     ANGLE_TIMEOUT = 1.0
-    PROGRESS_TIMEOUT = 2.0
+    PROGRESS_TIMEOUT = 5.0
     SEPARATION_TOLERANCE_DEG = 0.5
 
     def __init__(self, send, check_active, angles, publish):
@@ -299,7 +299,7 @@ class AutomationPreflight:
                     # finite-J step truncation and encoder noise, bounded to 5%.
                     tolerance = min(self.SEPARATION_TOLERANCE_DEG, goal * 0.05)
                     return self.travel['degrees'] >= goal - tolerance
-                self._wait(completed, goal / (rpm * 6.0) * 1.5 + 2.0,
+                self._wait(completed, goal / (rpm * 6.0) * 2.0 + 10.0,
                            'controller_fault', 'Oil pump did not complete separation travel')
                 self.command('%sDFV0J0' % axis)
             finally:

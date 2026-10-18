@@ -421,8 +421,8 @@ class FieldTransactionTests(unittest.TestCase):
         started = time.monotonic()
         self.assertFalse(self.node.prepare_and_start_spectrometer()[0])
         elapsed = time.monotonic() - started
-        self.assertGreaterEqual(elapsed, 2.0)
-        self.assertLess(elapsed, 3.5)
+        self.assertGreaterEqual(elapsed, 4.0)
+        self.assertLess(elapsed, 5.5)
         self.assertEqual(sent[-1], 'ADSSTOP')
         self.assertEqual(self.node._spectro_txn_phase, 'frame_timeout')
         self.assertIsNone(self.node._spectro_cleanup_error)

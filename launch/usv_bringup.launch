@@ -23,7 +23,8 @@
     <arg name="pump_timeout" default="1.0" />
     <arg name="pid_mode" default="true" />
     <arg name="pid_precision" default="0.1" />
-    <arg name="spectro_sample_wait_timeout" default="2.0" />
+    <arg name="spectro_sample_wait_timeout" default="10.0" />
+    <arg name="spectro_stale_stop_timeout" default="10.0" />
 
     <!-- 分光检测器参数已并入 pump_control_node，通过 usv_params.yaml 下发 -->
 
@@ -91,6 +92,7 @@
         <param name="pid_mode" value="$(arg pid_mode)" />
         <param name="pid_precision" value="$(arg pid_precision)" />
         <param name="spectro_sample_wait_timeout" value="$(arg spectro_sample_wait_timeout)" />
+        <param name="spectro_stale_stop_timeout" value="$(arg spectro_stale_stop_timeout)" />
     </node>
 
     <!-- 分光功能已并入 pump_control_node -->
