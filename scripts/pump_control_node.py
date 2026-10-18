@@ -567,6 +567,7 @@ class PumpControlNode(object):
         self._preflight = None
         self._preflight_thread = None
         self._preflight_connection = None
+        self._preflight_attempt_id = None
         self._automation_injection_prepared = False
 
         # 指令生成器
@@ -762,7 +763,7 @@ class PumpControlNode(object):
                 on_angle=self._on_angle_received,
                 on_pid=self._on_pid_data_received,
                 on_test=self._on_test_result_received,
-                on_spectro=self._on_spectro_received,
+                on_spectro=lambda data: self._on_spectro_received(data, reader_connection),
                 on_health=self._on_health_received,
                 on_text=self._on_text_received,
                 on_error=lambda error: self._on_serial_reader_error(error, reader_connection)
@@ -1817,7 +1818,7 @@ class PumpControlNode(object):
         policy = self._normalize_injection_pump_policy(self.injection_pump_policy)
         return policy if policy.get("mode") == "automation" else None
 
-    def _start_injection_for_automation_policy(self):
+    def _start_injection_for_automation_policy(self, current=None):
         policy = self._injection_policy_for_automation()
         if not policy:
             return True
@@ -1825,6 +1826,11 @@ class PumpControlNode(object):
         # a physical pause, but never repeat the lead time on every step.
         if self._automation_injection_prepared and self.inject_pump_enabled:
             return True
+        if current is not None and not current():
+            return False
+        if (not self._real_measurement_ready() and
+                not self._wait_for_new_spectro_sample(self._latest_spectro_received_at, current)):
+            return False
         speed = int(policy.get("speed", 0) or 0)
         if speed <= 0:
             self._update_injection_pump_state(enabled=False, error="Injection pump policy speed is 0")
@@ -1846,9 +1852,23 @@ class PumpControlNode(object):
 
     def _send_automation_step(self, step):
         """自动化引擎步骤发送钩子。"""
+        connection = self.serial_conn
+        attempt = self.sampling_context.get('attempt_id')
+        cancel = self._automation_cancel
+        def current():
+            if (connection is not self.serial_conn or attempt != self.sampling_context.get('attempt_id')
+                    or cancel.is_set() or self._action_cancelled() or self._stop_requested
+                    or self._controller_fault):
+                return False
+            if attempt and (self._owner_last_seen is None or time.monotonic() - self._owner_last_seen > 5.0):
+                self._set_terminal_reason('owner_lost')
+                self._controller_fault = 'owner_lost'
+                return False
+            return True
         if not self._real_measurement_ready():
-            if not self._wait_for_new_spectro_sample(self._latest_spectro_received_at):
-                self._set_terminal_reason('spectrometer_not_ready')
+            if not self._wait_for_new_spectro_sample(self._latest_spectro_received_at, current):
+                if not self.automation_engine.is_paused() and current():
+                    self._set_terminal_reason('spectrometer_not_ready')
                 return False
         self._current_auto_step = dict(step or {})
         self._current_step_spectro_timestamp = self._latest_spectro_received_at
@@ -1865,16 +1885,31 @@ class PumpControlNode(object):
                       ",".join(enabled_motors) if enabled_motors else "无",
                       "启用" if pump_enabled else "关闭")
 
-        if not self._start_injection_for_automation_policy():
+        if not self._start_injection_for_automation_policy(current):
             rospy.logerr("[Automation] 进样泵任务策略启动失败: %s", step_name)
             return False
 
         command = self.command_generator.generate_command(step, mode="auto")
-        if command and not self.automation_engine.run_while_active(
-                lambda: self.send_command(command)):
-            if not self.automation_engine.is_paused():
-                rospy.logerr("[Automation] 步骤发送失败: %s", step_name)
-            return False
+        if command:
+            def write_current():
+                # Recheck after lead AND after waiting for the engine/serial
+                # locks. Session swaps, cancellation and frame updates share
+                # this boundary with the actual write.
+                with self.serial_lock:
+                    return current() and self._real_measurement_ready() and self.send_command(command)
+            while True:
+                if not current():
+                    return False
+                if (not self._real_measurement_ready() and
+                        not self._wait_for_new_spectro_sample(self._latest_spectro_received_at, current)):
+                    return False
+                if self.automation_engine.run_while_active(write_current):
+                    break
+                if current() and not self.automation_engine.is_paused() and not self._real_measurement_ready():
+                    continue  # A new short gap at the write boundary permits waiting only.
+                if not self.automation_engine.is_paused():
+                    rospy.logerr("[Automation] 步骤发送失败: %s", step_name)
+                return False
         if command:
             rospy.loginfo("[Automation] 指令已发送: %s", command.strip())
             # 设置 PID 目标角度，使 PID 完成检测能正常工作
@@ -1943,8 +1978,10 @@ class PumpControlNode(object):
             time.sleep(min(0.05, max(0.0, end_time - time.time())))
         return self.automation_engine.is_running() and not self.automation_engine.is_paused()
 
-    def _wait_for_new_spectro_sample(self, previous_timestamp):
+    def _wait_for_new_spectro_sample(self, previous_timestamp, current=None):
         """ADS 采集中时等待一条新的有效分光样本。"""
+        if current is not None and not current():
+            return False
         if not self._real_measurement_ready(allow_recovery=True):
             self._set_terminal_reason('spectrometer_not_ready')
             return False
@@ -1952,6 +1989,8 @@ class PumpControlNode(object):
         deadline = time.monotonic() + timeout
         previous_timestamp = previous_timestamp or 0.0
         while self.automation_engine.is_running() and time.monotonic() < deadline:
+            if current is not None and not current():
+                return False
             if self.automation_engine.is_paused():
                 return False
             if not self._real_measurement_ready(allow_recovery=True):
@@ -2444,7 +2483,15 @@ class PumpControlNode(object):
             self._set_terminal_reason('cleanup_failed')
 
 
-    def _on_spectro_received(self, data):
+    def _on_spectro_received(self, data, connection=None):
+        # A stopped reader can still finish a callback during reconnection.
+        # Serialize its session check, measurement/fault update and motion gate.
+        with self.serial_lock:
+            if connection is not None and connection is not self.serial_conn:
+                return
+            self._receive_current_spectro(data)
+
+    def _receive_current_spectro(self, data):
         """分光数据回调：原始帧照发，有效帧按输出周期聚合平均后发布。"""
         received_at = time.time()
         self._spectro_sequence += 1
@@ -2479,6 +2526,23 @@ class PumpControlNode(object):
             self._accumulate_spectro_sample(data, received_at)
         else:
             self._invalidate_spectro('test_data' if data.get('simulated') else self.spectro_state)
+            if (any(data.get(flag) for flag in ('i2c_error', 'not_configured', 'saturated', 'simulated'))
+                    and self._automation_is_active()):
+                with self._terminal_lock:
+                    if self._terminal_finalized:
+                        return
+                    self._set_terminal_reason('spectrometer_not_ready')
+                    self._controller_fault = self._controller_fault or 'spectrometer_' + self.spectro_state
+                    self._ads_state = 4
+                    preparation = self._preflight
+                    if preparation and preparation.snapshot()['active']:
+                        with preparation.lock:
+                            preparation.error = preparation.error or PreflightError(
+                                'spectrometer_not_ready', 'Explicit spectrometer error: ' + self.spectro_state)
+                            preparation.changed.set()
+                    # No ACK waits or joins on the reader. The existing worker
+                    # wakes, stops outputs and publishes its terminal result.
+                    self.automation_engine.notify_failure('Spectrometer error: ' + self.spectro_state)
 
     def _invalidate_spectro(self, reason):
         self._spectro_agg_frames = []
@@ -2495,6 +2559,8 @@ class PumpControlNode(object):
         self._publish_spectro_status(reason)
 
     def _check_spectro_freshness(self):
+        if self.spectro_state in ('i2c_error', 'not_configured', 'saturated'):
+            return  # Explicit device errors must not become ordinary silence.
         # A START ACK can age out startup, but cannot make a measurement fresh.
         # Startup (ACK received, no valid frame yet) and runtime acquisition
         # silence are two distinct states with two distinct terminal reasons.
@@ -3428,6 +3494,7 @@ class PumpControlNode(object):
                       self.pid_mode,
                       self.pid_precision)
         self._preflight_connection = self.serial_conn
+        self._preflight_attempt_id = self.sampling_context.get('attempt_id')
         self._automation_cancel = self._action_cancel
         self._preflight = AutomationPreflight(
             self._send_preflight_command, self._check_preflight_active,
@@ -3446,15 +3513,16 @@ class PumpControlNode(object):
     def _publish_preflight_status(self):
         self._publish_automation_status('preflight')
 
-    def _check_preflight_active(self):
-        if self._preflight.cancelled.is_set():
+    def _check_preflight_active(self, require_measurement=True):
+        if (self._preflight.cancelled.is_set() or self._automation_cancel.is_set() or self._stop_requested
+                or self._preflight_attempt_id != self.sampling_context.get('attempt_id')):
             raise PreflightCancelled()
         if rospy.is_shutdown():
             raise PreflightError('controller_fault', 'ROS shutdown during Preflight')
         if self._controller_fault:
             raise PreflightError(self._terminal_reason or 'controller_fault',
                                  'Preflight controller fault: ' + self._controller_fault)
-        if not self._real_measurement_ready(allow_recovery=True):
+        if require_measurement and not self._real_measurement_ready(allow_recovery=True):
             raise PreflightError('spectrometer_not_ready', 'Preflight requires fresh real acquisition and baseline')
         if (self.serial_conn is not self._preflight_connection or
                 not self.serial_conn or not self.serial_conn.is_open):
@@ -3464,13 +3532,14 @@ class PumpControlNode(object):
             raise PreflightError('owner_lost', 'Preflight owner heartbeat lost')
 
     def _send_preflight_command(self, command, before_send=None):
+        stopping = command == 'PUMP:OFF' or command in tuple(axis + 'DFV0J0' for axis in MOTOR_NAMES)
         # Waits happen outside this lock so STOP and owner renewals remain live.
-        while not self._real_measurement_ready():
+        while not stopping and not self._real_measurement_ready():
             self._preflight._check()  # Includes cancellation, oil sensor/progress and owner checks.
             self._preflight.changed.wait(0.02)
-        with self._control_lock:
-            self._check_preflight_active()
-            if not self._real_measurement_ready():
+        with self._control_lock, self.serial_lock:
+            self._check_preflight_active(require_measurement=not stopping)
+            if not stopping and not self._real_measurement_ready():
                 return False
             if before_send:
                 before_send()

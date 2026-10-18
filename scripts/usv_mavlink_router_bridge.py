@@ -18,7 +18,7 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 from scripts.lib.gps_diagnostics import GPSDiagnosticsCache, PARAMETERS
 from scripts.lib.mavlink_tcp_transport import MAVLinkTCPTransport, connect_router
-from scripts.lib.payload_protocol import encode_event, next_transport_session
+from scripts.lib.payload_protocol import encode_event, next_transport_session, SAFETY_COMMANDS
 
 import rospy
 from std_msgs.msg import String, Float32MultiArray
@@ -547,27 +547,57 @@ class USVMavlinkRouterBridge(object):
                 previous = self._recent_events.get(key)
                 if previous and event['seq'] <= previous['seq']:
                     return
+                # Keep one unsent admission/terminal plus the latest progress.
+                # A terminal dominates all older evidence for this request.
+                pending = previous['pending'][:] if previous else []
+                if event['phase'] == 'progress':
+                    pending = [item for item in pending if item['phase'] != 'progress']
+                else:
+                    pending = []
+                pending.append({'text': text, 'phase': event['phase']})
                 self._recent_events[key] = {'text': text, 'seq': event['seq'],
+                                           'command': event['command'], 'pending': pending,
                                            'expires': time.monotonic() + 30.0, 'sent_at': -1.0}
                 self._recent_events.move_to_end(key)
                 while len(self._recent_events) > 32:
-                    self._recent_events.popitem(last=False)
+                    # Protect unsent STOP/terminal evidence under pressure.
+                    # At equal priority evict the oldest; even all-STOP floods
+                    # remain bounded and must fail closed at the requester.
+                    retired = min(self._recent_events, key=lambda item:
+                        0 if not self._recent_events[item]['pending'] else
+                        4 if self._recent_events[item]['command'] in SAFETY_COMMANDS else
+                        3 if self._recent_events[item]['pending'][-1]['phase'] == 'terminal' else
+                        2 if self._recent_events[item]['pending'][0]['phase'] == 'request' else 1)
+                    del self._recent_events[retired]
         except (ValueError, TypeError, KeyError):
             rospy.logwarn('Invalid correlated payload event')
 
     def _send_payload_event(self):
-        # One bounded message per cycle; rotate all recent outcomes fairly.
+        # One bounded message per cycle. New transitions precede history;
+        # STOP precedes terminals, then FIFO admissions/progress. Round-robin
+        # replay only uses otherwise idle cycles and cannot delay a first send.
         now = time.monotonic()
         text = None
+        selected = None
         with self._lock:
             for key in list(self._recent_events):
                 event = self._recent_events[key]
                 if now >= event['expires']:
                     del self._recent_events[key]
-                elif text is None and now - event['sent_at'] >= 1.0:
-                    text = event['text']
-                    event['sent_at'] = now
-                    self._recent_events.move_to_end(key)
+            fresh = [(0 if event['command'] in SAFETY_COMMANDS else
+                      1 if event['pending'][0]['phase'] == 'terminal' else 2, key)
+                     for key, event in self._recent_events.items() if event['pending']]
+            if fresh:
+                selected = min(fresh, key=lambda item: item[0])[1]
+                event = self._recent_events[selected]
+                text = event['pending'].pop(0)['text']
+            else:
+                for key, event in self._recent_events.items():
+                    if now - event['sent_at'] >= 1.0:
+                        selected, text = key, event['text']
+                        break
+            if selected is not None:
+                self._recent_events.move_to_end(selected)
         if text is None:
             return
         self._event_chunk_id = self._event_chunk_id % 65535 + 1
@@ -576,8 +606,11 @@ class USVMavlinkRouterBridge(object):
             chunk = raw[offset:offset + 50]
             if not self._mav_send_with_retry(lambda: self._conn.mav.statustext_send(
                     mavutil.mavlink.MAV_SEVERITY_NOTICE, chunk, self._event_chunk_id, seq), 'USVE1'):
-                break
+                return
             self._diag_tx_total += 1
+        with self._lock:
+            if self._recent_events.get(selected) is event:
+                event['sent_at'] = now
 
     def _send_statustext(self, text, severity):
         if self._mav_send_with_retry(

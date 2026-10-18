@@ -270,6 +270,12 @@ class AutomationEngine(object):
             "PID 电机 {} 固件报告异常: {}".format(motor, reason_text)
         )
 
+    def notify_failure(self, message):
+        """Wake the worker on an external fault; cleanup runs on that worker."""
+        if self._running.is_set() and not self._failed:
+            self._handle_error(message)
+            self._pid_complete_event.set()
+
     def get_status(self):
         """
         获取当前状态。
@@ -536,7 +542,8 @@ class AutomationEngine(object):
 
             # 动态睡眠策略
             if remaining > 0.01:
-                sleep_time = remaining * 0.75
+                # External faults/STOP must interrupt even a long interval.
+                sleep_time = min(remaining * 0.75, 0.05)
                 sleep_time = max(sleep_time, 0.005)
                 t1 = get_time()
                 time.sleep(sleep_time)
@@ -544,7 +551,7 @@ class AutomationEngine(object):
                 error_correction += (t2 - t1) - sleep_time
             else:
                 # 短间隔使用忙等待
-                while get_time() + error_correction < deadline:
+                while self._running.is_set() and get_time() + error_correction < deadline:
                     if deadline - get_time() > 0.002:
                         time.sleep(0.001)
 
