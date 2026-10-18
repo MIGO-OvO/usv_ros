@@ -66,7 +66,7 @@ if [[ ! -f "$BUNDLE_PATH" ]]; then
 fi
 
 if [[ "$DO_RESTART" == "true" ]]; then
-    "$SCRIPT_DIR/stop_usv_all.sh"
+    bash "$SCRIPT_DIR/stop_usv_all.sh"
 else
     if [[ -f "$RUN_DIR/usv_system.pid" ]]; then
         pid="$(cat "$RUN_DIR/usv_system.pid" 2>/dev/null || true)"
@@ -109,7 +109,7 @@ if [[ "$DO_BUILD" == "true" ]]; then
 fi
 
 if [[ "$DO_RESTART" == "true" ]]; then
-    "$SCRIPT_DIR/start_usv_all.sh"
+    bash "$SCRIPT_DIR/start_usv_all.sh"
 fi
 
 log_import "done"

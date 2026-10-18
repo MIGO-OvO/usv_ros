@@ -78,8 +78,8 @@ class UsvCliScriptTests(unittest.TestCase):
 
         self.assertIn("hotspot_system()", text)
         self.assertIn("addr_system()", text)
-        self.assertIn('sudo -E "$SCRIPT_DIR/setup_hotspot.sh" "$@"', text)
-        self.assertIn('sudo -E "$SCRIPT_DIR/stop_hotspot.sh"', text)
+        self.assertIn('sudo -E bash "$SCRIPT_DIR/setup_hotspot.sh" "$@"', text)
+        self.assertIn('sudo -E bash "$SCRIPT_DIR/stop_hotspot.sh"', text)
         self.assertIn('"$SCRIPT_DIR/status_usv_all.sh" hotspot', text)
         self.assertIn('"$SCRIPT_DIR/status_usv_all.sh" addr', text)
         self.assertIn("usvhotspot)", text)

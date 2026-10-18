@@ -263,7 +263,7 @@ chmod +x src/usv_ros/scripts/*.sh src/usv_ros/scripts/*.py
 
 ```bash
 cd ~/usv_ws
-./src/usv_ros/scripts/install_usv_commands.sh install
+bash src/usv_ros/scripts/install_usv_commands.sh install
 ```
 
 安装脚本会创建以下 symlink，不需要 sudo：
@@ -279,6 +279,20 @@ usvupdate   # 在 usv_ros 自动 stash 本地改动，再 git pull --ff-only
 usvbuild    # 在 ~/usv_ws 执行 catkin_make，参数透传给 catkin_make
 usvdeploy   # stop -> update -> chmod -> build -> start
 ```
+
+全局命令通过 Bash 调用下级 Shell 脚本，不依赖这些 `.sh` 文件的执行位，
+避免更新或 stash 恢复仓库权限后再次出现 `Permission denied`。
+入口 `usvctl.sh` 的执行位由安装器设置，Git 也记录为可执行。
+这不替代文件读取、目录访问或设备权限；热点启停仍保留原有 sudo 授权，
+不需要配置全局免密 sudo。ROS Python 节点的执行权限仍按首次赋权/部署步骤处理。
+
+旧版本遇到 `usvstatus: line 92: ... Permission denied` 时，可先无需赋权查看状态：
+
+```bash
+bash ~/usv_ws/src/usv_ros/scripts/status_usv_all.sh
+```
+
+同步包含此修复的代码后，执行一次上述安装命令，再用 `usvstatus` 验证。
 
 也可以使用统一入口：
 

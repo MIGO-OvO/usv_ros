@@ -77,19 +77,19 @@ require_system_stopped() {
 }
 
 start_system() {
-    "$SCRIPT_DIR/start_usv_all.sh" "$@"
+    bash "$SCRIPT_DIR/start_usv_all.sh" "$@"
 }
 
 stop_system() {
-    "$SCRIPT_DIR/stop_usv_all.sh"
+    bash "$SCRIPT_DIR/stop_usv_all.sh"
 }
 
 restart_system() {
-    "$SCRIPT_DIR/restart_usv_all.sh" "$@"
+    bash "$SCRIPT_DIR/restart_usv_all.sh" "$@"
 }
 
 status_system() {
-    "$SCRIPT_DIR/status_usv_all.sh"
+    bash "$SCRIPT_DIR/status_usv_all.sh"
 }
 
 hotspot_system() {
@@ -101,20 +101,20 @@ hotspot_system() {
     case "$action" in
         on|start)
             if [[ "$(id -u)" -eq 0 ]]; then
-                "$SCRIPT_DIR/setup_hotspot.sh" "$@"
+                bash "$SCRIPT_DIR/setup_hotspot.sh" "$@"
             else
-                sudo -E "$SCRIPT_DIR/setup_hotspot.sh" "$@"
+                sudo -E bash "$SCRIPT_DIR/setup_hotspot.sh" "$@"
             fi
             ;;
         off|stop)
             if [[ "$(id -u)" -eq 0 ]]; then
-                "$SCRIPT_DIR/stop_hotspot.sh"
+                bash "$SCRIPT_DIR/stop_hotspot.sh"
             else
-                sudo -E "$SCRIPT_DIR/stop_hotspot.sh"
+                sudo -E bash "$SCRIPT_DIR/stop_hotspot.sh"
             fi
             ;;
         status)
-            "$SCRIPT_DIR/status_usv_all.sh" hotspot
+            bash "$SCRIPT_DIR/status_usv_all.sh" hotspot
             ;;
         *)
             ctl_log "ERROR: unknown hotspot action: $action"
@@ -125,7 +125,7 @@ hotspot_system() {
 }
 
 addr_system() {
-    "$SCRIPT_DIR/status_usv_all.sh" addr
+    bash "$SCRIPT_DIR/status_usv_all.sh" addr
 }
 
 ensure_scripts_executable() {
@@ -167,7 +167,7 @@ update_system() {
 }
 
 import_system() {
-    "$SCRIPT_DIR/import_hotspot_update.sh" "$@"
+    bash "$SCRIPT_DIR/import_hotspot_update.sh" "$@"
 }
 
 build_system() {

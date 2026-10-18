@@ -37,6 +37,8 @@ class UsvCliUpdateTests(unittest.TestCase):
         self._run(["git", "clone", str(self.remote), str(self.upstream)])
         for name in ("usvctl.sh", "common_env.sh"):
             self._write(self.upstream, "scripts/" + name, (SCRIPTS_DIR / name).read_text(encoding="utf-8"))
+        # Match the tracked executable mode of the public CLI entry point.
+        (self.upstream / "scripts/usvctl.sh").chmod(0o755)
         self._write(self.upstream, ".gitignore", "*.log\n")
         for name in ("mavlink_trigger_node.py", "pump_control_node.py", "web_config_server.py"):
             self._write(self.upstream, "scripts/" + name, "initial code\n")
@@ -76,6 +78,30 @@ class UsvCliUpdateTests(unittest.TestCase):
     def _update(self):
         return self._run(["bash", str(self.repo / "scripts/usvctl.sh"), "update"], check=False)
 
+    def test_commands_accept_readable_non_executable_shell_scripts(self):
+        commands = (
+            ("start", "start_usv_all.sh", ["port:=a b"]),
+            ("stop", "stop_usv_all.sh", []),
+            ("restart", "restart_usv_all.sh", ["port:=a b"]),
+            ("status", "status_usv_all.sh", []),
+            ("addr", "status_usv_all.sh", ["addr"]),
+            ("hotspot", "status_usv_all.sh", ["hotspot"]),
+            ("import", "import_hotspot_update.sh", ["bundle path", "--build"]),
+        )
+        for command, script, expected_args in commands:
+            with self.subTest(command=command):
+                self._write(self.repo, "scripts/" + script,
+                            '#!/usr/bin/env bash\nprintf "called\\n"\nprintf "<%s>\\n" "$@"\nexit 7\n')
+                (self.repo / "scripts" / script).chmod(0o644)
+                args = [] if command in ("addr", "hotspot") else expected_args
+                result = self._run([
+                    "bash", str(self.repo / "scripts/usvctl.sh"), command, *args,
+                ], check=False)
+                self.assertEqual(result.returncode, 7, result.stdout)
+                self.assertIn("called", result.stdout)
+                for arg in expected_args:
+                    self.assertIn("<" + arg + ">", result.stdout)
+
     def _deploy(self):
         self.env["USV_TEST_EVENTS"] = str(self.root / "deploy.events")
         driver = r'''
@@ -87,6 +113,49 @@ start_system() { printf 'start %s\n' "$*" >> "$USV_TEST_EVENTS"; }
 deploy_system test_arg:=value
 '''
         return self._run(["bash", "-c", driver, "usv-test", str(self.repo / "scripts/usvctl.sh")], check=False)
+
+    def test_installed_status_survives_update_removing_manual_execute_bit(self):
+        self._write(self.upstream, "scripts/status_usv_all.sh",
+                    '#!/usr/bin/env bash\necho status-ok\n')
+        self._commit(self.upstream, "status without execute bit")
+        self._git(self.upstream, "push", "origin", "main")
+        self.assertEqual(self._update().returncode, 0)
+        status = self.repo / "scripts/status_usv_all.sh"
+        status.chmod(0o755)
+        self._write(self.repo, "scripts/install_usv_commands.sh",
+                    (SCRIPTS_DIR / "install_usv_commands.sh").read_text(encoding="utf-8"))
+        self.env["USV_COMMAND_DIR"] = str(self.root / "bin")
+        self._run(["bash", str(self.repo / "scripts/install_usv_commands.sh"), "install"])
+        self._push_update()
+
+        result = self._update()
+
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertFalse(status.stat().st_mode & 0o111)
+        result = self._run([str(self.root / "bin/usvstatus")], check=False)
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("status-ok", result.stdout)
+
+    def test_restart_runs_non_executable_children_and_stops_on_failure(self):
+        self._write(self.repo, "scripts/restart_usv_all.sh",
+                    (SCRIPTS_DIR / "restart_usv_all.sh").read_text(encoding="utf-8"))
+        self._write(self.repo, "scripts/start_usv_all.sh",
+                    '#!/usr/bin/env bash\nprintf "start <%s>\\n" "$@"\n')
+        for stop_code in (0, 9):
+            with self.subTest(stop_code=stop_code):
+                self._write(self.repo, "scripts/stop_usv_all.sh",
+                            '#!/usr/bin/env bash\necho stopped\nexit %d\n' % stop_code)
+                for name in ("restart_usv_all.sh", "start_usv_all.sh", "stop_usv_all.sh"):
+                    (self.repo / "scripts" / name).chmod(0o644)
+                result = self._run([
+                    "bash", str(self.repo / "scripts/usvctl.sh"), "restart", "port:=a b",
+                ], check=False)
+                self.assertEqual(result.returncode, stop_code, result.stdout)
+                self.assertIn("stopped", result.stdout)
+                if stop_code == 0:
+                    self.assertIn("start <port:=a b>", result.stdout)
+                else:
+                    self.assertNotIn("start", result.stdout)
 
     def test_update_backs_up_staged_unstaged_deleted_and_untracked_files(self):
         self._write(self.repo, "old-local.txt", "previous backup\n")
