@@ -31,10 +31,17 @@ QGC 发送层与面板响应期限一致：分光启动 40 秒（覆盖最多三
 - 新串口会话握手后等待 0.5 秒稳定期，独立 watchdog keepalive 持续运行。
 - 一次点击执行 `I2CMAP → ADSCFG → ADSSTART → 首个有效帧`。瞬时 I2C 错误或 ACK 超时最多尝试 3 次，退避 0.15 / 0.30 秒；每次重新发送并校验配置回显。参数错误、回显不匹配、控制器故障直接失败。
 - 重试前消费独立 `ADS_STATUS:` 响应，排空前次迟到 ACK；ADSSTART 失败先确认 ADSSTOP。清理失败不重试；响应同步失败要求重连，避免后续点击误用旧 ACK。固件文本命令按顺序处理是该屏障的协议依据。
-- ACK 预算仍为 2 秒。新会话首次采集首帧预算为 4 秒（从 START ACK 计时）；成功后暖启动首帧及运行 freshness 使用原 `measurement_timeout`（默认 2 秒）。无效、模拟、过期或截止后到达的帧不算成功。4 秒是有界冷启动容错预算，仍须在 Jetson/ESP32 上验证实际延迟分布。
+- ACK 预算仍为 2 秒。冷、暖启动首帧预算均至少为 4 秒（从 START ACK 计时）；运行数据 freshness 使用 `measurement_timeout`（默认 2 秒）。无效、模拟、过期或截止后到达的帧不算成功。4 秒是有界启动容错预算，仍须在 Jetson/ESP32 上验证实际延迟分布。
 - 失败阶段分别见 `serial_failed`、`i2c_map_failed`、`ads_config_failed`、`start_failed`、`frame_timeout`；`spectrometer_last_txn_error` 保留主要原因，重试恢复后该字段清空，但本次重试记录仍可展开查看。自动化 `terminal_reason` 保持独立。
 
 回归：`python -B -m pytest tests/test_spectrometer_cold_start.py tests/test_field_transactions.py tests/test_terminal_reasons.py`；前端：`cd frontend && node --test scripts/test-spectrometer-diagnostics.mjs`。部署时更新前端构建产物并重启 `pump_control_node`、`web_config_server`；本次没有更改串口协议或固件。实机验收：冷上电一次启动、前两次瞬时 I2C 失败的同次点击恢复、配置失败显示、串口拔插、首帧延迟/缺失、运行断流及物理输出停止。
+
+### 2026-10-19 采样超时热修复（仅 ROS）
+
+- 正式步骤和 preflight 共用 `/automation/pid_wait_timeout`（默认 120 秒，可用节点私有 `~pid_wait_timeout` 覆盖，范围 1–600 秒）。现在配置实际生效，且等待使用单调时钟；必须收到 `PID_DONE` 才算完成。**检测板仍有独立的 30 秒 `PID_MOVE_TIMEOUT`；收到板端 `PID_TIMEOUT/PID_FAIL` 仍立即失败，本补丁不能解除该固件限制。**
+- 新分光平均样本等待默认 10 秒；冷、暖启动首帧至少等 4 秒。运行断流 2 秒仍置数据无效，不用旧值完成步骤；断流超过 `spectro_stale_stop_timeout`（默认 10 秒，launch 可覆盖，最大 60 秒）才终止整次任务。该恢复窗口内输出可能继续运行；不是对无效测量的放行。明确的控制器故障、失联、owner 丢失和停止路径不变。
+- 油相分隔无净正向进展期限由 2 秒改为 5 秒，总期限为 `理论行程时间 × 2 + 10 秒`。仍核验真实角度行程；1 秒角度反馈中断、跳变、传感器异常和持续停滞仍失败，不按时间猜测完成。
+- 离线回归：`python -B -m unittest discover -s tests -p test_sampling_timeout_budget.py`。跳过地图测试；Jetson/台架/实船验收由操作者执行，建议先小剂量验证停止和恢复行为。停止系统后执行 `usvdeploy` 更新并重启，用现场终态区分 ROS 等待超时与板端 `PID_TIMEOUT`。
 
 [![ROS Noetic](https://img.shields.io/badge/ROS-Noetic-22314E?logo=ros&logoColor=white)](https://wiki.ros.org/noetic)
 [![Python](https://img.shields.io/badge/Python-3.8-3776AB?logo=python&logoColor=white)](https://www.python.org/)

@@ -37,7 +37,7 @@ class AutomationEngine(object):
     """
 
     # PID 等待超时时间 (秒)
-    PID_WAIT_TIMEOUT = 60.0
+    PID_WAIT_TIMEOUT = 120.0
 
     def __init__(self, command_generator, send_command_func, log_func=None):
         """
@@ -452,7 +452,7 @@ class AutomationEngine(object):
         Returns:
             bool: True 表示完成，False 表示超时或中断
         """
-        start_time = time.time()
+        start_time = time.monotonic()
         last_log_time = start_time
 
         self.log("等待 PID 完成: {}".format(self._pending_pid_motors))
@@ -462,13 +462,13 @@ class AutomationEngine(object):
             if self._paused.is_set():
                 return False
 
-            elapsed = time.time() - start_time
+            elapsed = time.monotonic() - start_time
 
             # 每 10 秒打一次等待状态
-            if time.time() - last_log_time >= 10:
+            if time.monotonic() - last_log_time >= 10:
                 self.log("仍在等待 PID 完成 ({:.0f}s): 待完成={}".format(
                     elapsed, self._pending_pid_motors))
-                last_log_time = time.time()
+                last_log_time = time.monotonic()
 
             # 检查超时
             if elapsed > self.PID_WAIT_TIMEOUT:

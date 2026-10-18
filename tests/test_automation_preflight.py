@@ -258,7 +258,7 @@ class PreflightWorkerTests(unittest.TestCase):
 
     def test_pid_completion_timeout_stops_and_preserves_reason(self):
         self.block_phase = 'homing'
-        with patch.object(self.module.AutomationPreflight, 'PID_TIMEOUT', 0.03):
+        with patch.object(self.node, 'pid_wait_timeout', 0.03):
             self.assertTrue(self.start()[0])
             self.join()
         self.assertEqual(self.status()['terminal_reason'], 'pid_timeout')

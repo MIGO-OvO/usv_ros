@@ -515,7 +515,11 @@ class PumpControlNode(object):
         self.pid_precision = rospy.get_param('~pid_precision', 0.1)
         self.auto_injection_command_delay = float(rospy.get_param('~auto_injection_command_delay', 0.15))
         self.auto_injection_retry_delay = float(rospy.get_param('~auto_injection_retry_delay', 0.2))
-        self.spectro_sample_wait_timeout = float(rospy.get_param('~spectro_sample_wait_timeout', 2.0))
+        self.spectro_sample_wait_timeout = float(rospy.get_param('~spectro_sample_wait_timeout', 10.0))
+        self.pid_wait_timeout = float(rospy.get_param(
+            '~pid_wait_timeout', rospy.get_param('/automation/pid_wait_timeout', 120.0)))
+        if not math.isfinite(self.pid_wait_timeout) or not 1.0 <= self.pid_wait_timeout <= 600.0:
+            raise ValueError('pid_wait_timeout must be finite and in [1, 600] seconds')
 
         self.i2c_mapping = rospy.get_param('~i2c_mapping', rospy.get_param('/i2c_mapping', DEFAULT_I2C_MAPPING))
         self.spectro_config = rospy.get_param('~spectrometer', rospy.get_param('/spectrometer', DEFAULT_SPECTRO_CONFIG))
@@ -566,6 +570,7 @@ class PumpControlNode(object):
         self.automation_engine.on_error = self._on_automation_error
         self.automation_engine.on_step_command = self._send_automation_step
         self.automation_engine.on_step_wait = self._wait_for_automation_step
+        self.automation_engine.PID_WAIT_TIMEOUT = self.pid_wait_timeout
 
         # 自动化诊断上下文
         self._current_auto_step = None
@@ -617,6 +622,12 @@ class PumpControlNode(object):
         self._last_valid_spectro_at = None
         self._spectro_invalid_published = False
         self.measurement_timeout = max(0.1, float(rospy.get_param('~measurement_timeout', 2.0)))
+        # Stale data remains invalid after measurement_timeout. Allow a short
+        # acquisition gap to recover before aborting the entire sampling task.
+        self.spectro_stale_stop_timeout = float(rospy.get_param('~spectro_stale_stop_timeout', 10.0))
+        if (not math.isfinite(self.spectro_stale_stop_timeout)
+                or not self.measurement_timeout <= self.spectro_stale_stop_timeout <= 60.0):
+            raise ValueError('spectro_stale_stop_timeout must be in [measurement_timeout, 60] seconds')
         self.spectro_reference_voltage = float(self.spectro_config.get('reference_voltage', 0.0))
         self.spectro_baseline_voltage = float(self.spectro_config.get('baseline_voltage', 0.0))
         # All control/configuration entry points share _control_lock; the
@@ -1471,8 +1482,8 @@ class PumpControlNode(object):
             self._cleanup_failed_spectro_start()
             return False, message if message != 'timeout' else 'Spectrometer start timeout'
         self._spectro_txn_phase = 'wait_frame'
-        # Only the first acquisition in a freshly handshaken serial session
-        # gets startup grace. Running freshness and all ACK waits stay unchanged.
+        # Every acquisition needs startup grace, including a warm restart.
+        # Running freshness and all ACK waits stay unchanged.
         frame_timeout = self._first_spectro_frame_timeout()
         self._spectro_first_frame_deadline = self._spectro_start_ack_at + frame_timeout if self._spectro_start_ack_at is not None else None
         self._publish_automation_status(self._last_automation_status_text)
@@ -1488,8 +1499,7 @@ class PumpControlNode(object):
         return True, message
 
     def _first_spectro_frame_timeout(self):
-        return (max(self.measurement_timeout, SPECTRO_COLD_FIRST_FRAME_S)
-                if self._spectro_cold_start_pending else self.measurement_timeout)
+        return max(self.measurement_timeout, SPECTRO_COLD_FIRST_FRAME_S)
 
     def _cleanup_failed_spectro_start(self):
         # Bounded secondary cleanup; never replace the startup phase/error.
@@ -1783,12 +1793,14 @@ class PumpControlNode(object):
         """ADS 采集中时等待一条新的有效分光样本。"""
         if not self.spectro_config.get('enabled', True):
             return True
-        if self.spectro_state != 'acquiring':
+        recovering = (self.spectro_state == 'stale' and self._last_valid_spectro_at is not None
+                      and time.monotonic() - self._last_valid_spectro_at < self.spectro_stale_stop_timeout)
+        if self.spectro_state != 'acquiring' and not recovering:
             return bool(self.lab_mode_enabled)
         timeout = max(0.1, self.spectro_sample_wait_timeout)
-        deadline = time.time() + timeout
+        deadline = time.monotonic() + timeout
         previous_timestamp = previous_timestamp or 0.0
-        while self.automation_engine.is_running() and time.time() < deadline:
+        while self.automation_engine.is_running() and time.monotonic() < deadline:
             if self.automation_engine.is_paused():
                 return False
             if self.latest_spectro and self.latest_spectro.get('valid', False):
@@ -2295,7 +2307,8 @@ class PumpControlNode(object):
                 reason = 'spectrometer_stale'
             self.spectro_state = 'stale'
             self._invalidate_spectro('stale')
-            if self._automation_is_active() and self.spectro_config.get('enabled', True):
+            stop_due = awaiting_first or time.monotonic() - freshness_at >= self.spectro_stale_stop_timeout
+            if stop_due and self._automation_is_active() and self.spectro_config.get('enabled', True):
                 self._set_terminal_reason(reason)
                 self._auto_stop_callback(None)
 
@@ -3023,6 +3036,7 @@ class PumpControlNode(object):
         self._preflight = AutomationPreflight(
             self._send_preflight_command, self._check_preflight_active,
             self._preflight_angles, self._publish_preflight_status)
+        self._preflight.PID_TIMEOUT = self.pid_wait_timeout
         self._preflight_thread = threading.Thread(
             target=self._run_preflight, name='AutomationPreflight', daemon=True)
         self._publish_preflight_status()
