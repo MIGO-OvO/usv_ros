@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from test_mavlink_command_compat import _load_script, FakeConnection, RecordingMav
 from gps_fixtures import gps_position
+from command_fixtures import wait_commands
 
 
 class ForwardPublisher:
@@ -46,6 +47,7 @@ class FCUSamplingResultTests(unittest.TestCase):
         self.bridge._conn = FakeConnection([msg])
         self.bridge._cmd_rx_pub = ForwardPublisher(self.node._mavlink_cmd_rx_cb)
         self.bridge._receive_mavlink_messages()
+        wait_commands(self.node)
 
     def results(self):
         return [json.loads(msg.data) for msg in self.node.sampling_result_pub.messages]
@@ -221,7 +223,10 @@ class FCUSamplingResultTests(unittest.TestCase):
 
     def test_finished_before_start_acceptance_cannot_mask_start_failure(self):
         queued = []
-        def capture_thread(target, kwargs, daemon):
+        real_thread = self.trigger_module.threading.Thread
+        def capture_thread(target, kwargs=None, daemon=True, **options):
+            if target.__name__ == '_command_loop':
+                return real_thread(target=target, kwargs=kwargs or {}, daemon=daemon, **options)
             return types.SimpleNamespace(start=lambda: queued.append((target, kwargs)))
         def reject_start(action):
             if action != 'start':

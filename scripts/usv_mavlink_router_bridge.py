@@ -11,12 +11,14 @@ import threading
 import time
 import os
 import sys
-from collections import deque
+from collections import deque, OrderedDict
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 from scripts.lib.gps_diagnostics import GPSDiagnosticsCache, PARAMETERS
+from scripts.lib.mavlink_tcp_transport import MAVLinkTCPTransport, connect_router
+from scripts.lib.payload_protocol import encode_event, next_transport_session
 
 import rospy
 from std_msgs.msg import String, Float32MultiArray
@@ -39,6 +41,13 @@ DEFAULT_HEALTH_FIELDS = {
     "USV_JCPU": -1.0,
     "USV_JMEM": -1.0,
     "USV_EHEAP": -1.0,
+}
+
+SOURCE_FIELDS = {
+    'spectro': ('USV_VOLT', 'USV_ABS', 'USV_BSET', 'USV_REF', 'USV_BASE', 'USV_VLD'),
+    'automation': ('USV_STEP', 'USV_STOT', 'USV_LOOP', 'USV_LTOT', 'USV_PMOD', 'USV_ADS'),
+    'pid': ('USV_PERR',),
+    'health': tuple(DEFAULT_HEALTH_FIELDS),
 }
 
 # USV 自定义命令范围
@@ -66,6 +75,8 @@ class USVMavlinkRouterBridge(object):
         self._gps_request_index = 0
         self._wait_heartbeat_timeout = float(rospy.get_param("~wait_heartbeat_timeout", WAIT_HEARTBEAT_TIMEOUT))
         self._lock = threading.Lock()
+        self._field_received_at = {}
+        self._ads_state = 0
         self._voltage = 0.0
         self._absorbance = 0.0
         self._baseline_set = 0.0
@@ -92,9 +103,23 @@ class USVMavlinkRouterBridge(object):
         self._health_fields = DEFAULT_HEALTH_FIELDS.copy()
         self._health_received_at = None
         self._boot_time = time.time()
+        self._boot_monotonic = time.monotonic()
         self._last_heartbeat = 0.0
         self._last_reconnect_attempt = 0.0
-        self._diag_last_report = time.time()
+        self._diag_last_report = time.monotonic()
+        self._transport = None
+        self._last_full_write_at = None
+        self._tcp_session = 0
+        self._session_path = os.path.expanduser(rospy.get_param('~session_file', '~/.ros/usv_bridge_sessions.sqlite3'))
+        self._session_pub = rospy.Publisher('/usv/mavlink_session', Float32MultiArray, queue_size=5, latch=True)
+        self._protocol_at = None
+        self._protocol_version = 0
+        self._recent_events = OrderedDict()
+        self._event_chunk_id = 0
+        self._reconnect_reason = None
+        self._transport_counts = dict.fromkeys(('generated_frames', 'fully_written_frames',
+            'fully_written_bytes', 'short_writes', 'would_block', 'send_errors',
+            'receive_errors', 'dropped_session_items'), 0)
         self._diag_pub = rospy.Publisher("/usv/bridge_diagnostics", String, queue_size=5)
         self._diag_tx_total = 0        # 总发送包数
         self._diag_tx_heartbeat = 0    # 心跳包数
@@ -113,6 +138,8 @@ class USVMavlinkRouterBridge(object):
         self._cmd_rx_pub = rospy.Publisher("/usv/mavlink_cmd_rx", Float32MultiArray, queue_size=5)
         self._radio_status_pub = rospy.Publisher("/usv/radio_status", String, queue_size=5)
         rospy.Subscriber("/usv/mavlink_cmd_ack", Float32MultiArray, self._cmd_ack_cb)
+        rospy.Subscriber('/usv/payload_protocol', String, self._protocol_cb)
+        rospy.Subscriber('/usv/payload_event', String, self._payload_event_cb)
         rospy.Subscriber("/usv/spectrometer_voltage", String, self._voltage_cb)
         rospy.Subscriber("/usv/pump_angles", String, self._angles_cb)
         rospy.Subscriber("/usv/pump_status", String, self._pump_status_cb)
@@ -127,16 +154,25 @@ class USVMavlinkRouterBridge(object):
         self._conn = None
         # Advertise component 191 and receive commands immediately. FCU evidence
         # is ingested by the receive loop; discovery must not block control.
-        self._connect_router()
+        try:
+            self._connect_router()
+        except Exception as exc:
+            self._retire_router('connect: %s' % exc)
 
     def _connect_router(self, wait_heartbeat=False):
-        self._conn = mavutil.mavlink_connection(
-            self._router_url,
-            source_system=self._sys_id,
-            source_component=self._comp_id,
-            autoreconnect=True,
-            force_connected=True,
-        )
+        self._conn = connect_router(mavutil, self._router_url, self._sys_id, self._comp_id)
+        # Keep pymavlink framing/parsing; replace its swallowed TCP errors and
+        # single-send write at the actual byte boundary. The loop owns recovery.
+        if getattr(self._conn, 'port', None) is not None:
+            self._transport = MAVLinkTCPTransport(self._conn.port, self._transport_counts)
+            self._conn.write = self._transport.write
+            transport, connection = self._transport, self._conn
+            self._conn.recv = lambda n=None: transport.recv(n or connection.mav.bytes_needed())
+        self._tcp_session = next_transport_session(self._session_path)
+        message = Float32MultiArray()
+        message.data = [float(self._tcp_session)]
+        self._session_pub.publish(message)
+        self._gps_cache.records.pop('HEARTBEAT', None)
         if wait_heartbeat:
             self._wait_router_heartbeat()
         return True
@@ -154,7 +190,7 @@ class USVMavlinkRouterBridge(object):
             self._diag_pub_errors += 1
 
     def _reconnect_router(self):
-        now = time.time()
+        now = time.monotonic()
         if now - self._last_reconnect_attempt < RECONNECT_BACKOFF_SEC:
             return False
         self._last_reconnect_attempt = now
@@ -168,27 +204,43 @@ class USVMavlinkRouterBridge(object):
                     pass
             return self._connect_router(wait_heartbeat=False)
         except Exception as exc:
+            self._retire_router('connect: %s' % exc)
             rospy.logwarn("Router bridge: reconnect failed: %s", str(exc))
             return False
 
+    def _retire_router(self, reason):
+        self._reconnect_reason = str(reason)
+        connection, self._conn = self._conn, None
+        if self._transport and self._transport.last_write_at is not None:
+            self._last_full_write_at = self._transport.last_write_at
+        self._transport = None
+        message = Float32MultiArray()
+        message.data = [0.0]
+        self._session_pub.publish(message)
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                pass
+        with self._lock:
+            for pending in (self._pending_acks, self._pending_statustexts,
+                            self._pending_usv_done, self._pending_usv_fail):
+                self._transport_counts['dropped_session_items'] += len(pending)
+                pending.clear()
+            self._recent_events.clear()
+
     def _mav_send_with_retry(self, send_fn, label):
+        # Historical method name retained for callers; no cross-session replay.
+        if self._conn is None:
+            return False
         try:
             send_fn()
             return True
         except Exception as exc:
             self._record_send_error()
             rospy.logwarn("Failed to send %s: %s", label, str(exc))
-
-        if not self._reconnect_router():
-            return False
-
-        try:
-            send_fn()
-            return True
-        except Exception as exc:
-            self._record_send_error()
-            rospy.logwarn("Failed to send %s after reconnect: %s", label, str(exc))
-            return False
+            self._retire_router('%s: %s' % (label, exc))
+        return False
 
     def _voltage_cb(self, msg):
         try:
@@ -211,6 +263,15 @@ class USVMavlinkRouterBridge(object):
             self._baseline_voltage = self._finite_float(data.get("baseline_voltage"), 0.0)
             self._spectrometer_valid = 1.0 if valid else 0.0
             self._spectrometer_received_at = time.monotonic()
+            self._mark_source_locked('spectro', data)
+
+    def _mark_source_locked(self, source, data):
+        now = time.monotonic()
+        issued = data.get('source_monotonic', now)
+        if not isinstance(issued, (int, float)) or not math.isfinite(issued) or not 0 <= issued <= now:
+            return
+        for field in SOURCE_FIELDS[source]:
+            self._field_received_at[field] = issued
 
     def _angles_cb(self, msg):
         try:
@@ -226,9 +287,14 @@ class USVMavlinkRouterBridge(object):
             except Exception:
                 pass
         with self._lock:
+            if not isinstance(data, dict):
+                return
             for motor in ("X", "Y", "Z", "A"):
                 if motor in data:
-                    self._pump_angles[motor] = float(data[motor])
+                    value = self._finite_float(data[motor], float('nan'))
+                    if math.isfinite(value):
+                        self._pump_angles[motor] = value
+                        self._field_received_at['PUMP_' + motor] = time.monotonic()
 
     def _pump_status_cb(self, msg):
         try:
@@ -256,8 +322,14 @@ class USVMavlinkRouterBridge(object):
                 self._fcu_sample_id = 0
 
     def _apply_automation_status_locked(self, data_dict):
-        if not isinstance(data_dict, dict):
+        if not isinstance(data_dict, dict) or not data_dict:
             return
+
+        self._mark_source_locked('automation', data_dict)
+        ads = data_dict.get('ads_state')
+        self._ads_state = ads if type(ads) is int and 0 <= ads <= 5 else 0
+        calibration = data_dict.get('calibration', {})
+        self._calibration_active = isinstance(calibration, dict) and bool(calibration.get('active'))
 
         self._automation_step = float(data_dict.get("automation_step", 0.0) or 0.0)
         self._automation_total = float(data_dict.get("automation_total", 0.0) or 0.0)
@@ -291,7 +363,14 @@ class USVMavlinkRouterBridge(object):
             self._pid_mode = 0.0
 
         last_state = getattr(self, "_last_mission_state", "IDLE")
-        if "error" in status_text or "fail" in status_text:
+        automation_at = self._field_received_at.get('USV_STEP', float('-inf'))
+        if ("error" in status_text or "fail" in status_text or self._automation_preflight_active
+                or self._automation_paused or last_state in ("IDLE", "HOLD_NO_MISSION", "SAMPLING", "SAMPLING_DONE", "PAUSED")):
+            self._field_received_at['USV_STAT'] = automation_at
+        if self._calibration_active:
+            self._status_code = self._MISSION_STATE_CODES["CALIBRATING"]
+            self._field_received_at['USV_STAT'] = automation_at
+        elif "error" in status_text or "fail" in status_text:
             self._status_code = self._MISSION_STATE_CODES["FAILED"]
         elif self._automation_preflight_active:
             # Preparation cannot be paused. Reuse the existing preparation/wait
@@ -372,18 +451,28 @@ class USVMavlinkRouterBridge(object):
         if code is not None:
             with self._lock:
                 self._last_mission_state = state
-                if (getattr(self, '_automation_preflight_active', False)
+                automation_at = self._field_received_at.get('USV_STEP', float('-inf'))
+                automation_fresh = time.monotonic() - automation_at <= 3.0
+                state_at = time.monotonic()
+                if automation_fresh and getattr(self, '_calibration_active', False):
+                    code = self._MISSION_STATE_CODES["CALIBRATING"]
+                    state_at = automation_at
+                elif (automation_fresh and getattr(self, '_automation_preflight_active', False)
                         and state in ("IDLE", "HOLD_NO_MISSION", "SAMPLING", "PAUSED")):
                     code = self._MISSION_STATE_CODES["WAITING_STABLE"]
-                elif self._automation_running and state in ("IDLE", "HOLD_NO_MISSION"):
+                    state_at = automation_at
+                elif automation_fresh and self._automation_running and state in ("IDLE", "HOLD_NO_MISSION"):
                     code = self._MISSION_STATE_CODES["SAMPLING"]
+                    state_at = automation_at
                 self._status_code = code
+                self._field_received_at['USV_STAT'] = state_at
 
     def _pid_error_cb(self, msg):
         try:
             data = json.loads(msg.data)
             with self._lock:
                 self._pid_error = float(data.get("error", 0.0) or 0.0)
+                self._mark_source_locked('pid', data)
         except Exception:
             pass
 
@@ -401,6 +490,7 @@ class USVMavlinkRouterBridge(object):
             with self._lock:
                 self._health_fields = fields
                 self._health_received_at = time.monotonic()
+                self._mark_source_locked('health', data)
         except Exception:
             pass
 
@@ -423,12 +513,71 @@ class USVMavlinkRouterBridge(object):
 
     def _cmd_ack_cb(self, msg):
         try:
-            command, result, target_sys, target_comp = msg.data
+            if len(msg.data) not in (4, 5):
+                return
+            if len(msg.data) == 5 and (self._conn is None or msg.data[4] != self._tcp_session):
+                return
+            command, result, target_sys, target_comp = msg.data[:4]
             ack = (int(command), int(result), int(target_sys), int(target_comp))
             with self._lock:
                 self._pending_acks.append(ack)
         except Exception as exc:
             rospy.logwarn("Failed to queue COMMAND_ACK: %s", str(exc))
+
+    def _protocol_cb(self, msg):
+        try:
+            data = json.loads(msg.data)
+            stamp = float(data['source_monotonic'])
+            if not 0 <= time.monotonic() - stamp <= 3.0:
+                return
+            with self._lock:
+                self._protocol_version = 1 if data.get('version') == 1 else 0
+                self._protocol_at = stamp
+        except (ValueError, TypeError, KeyError):
+            pass
+
+    def _payload_event_cb(self, msg):
+        try:
+            event = json.loads(msg.data)
+            text = encode_event(event)
+            key = (event['sender_system'], event['sender_component'], event['session'], event['request'])
+            with self._lock:
+                if self._conn is None or event['tcp_session'] != self._tcp_session:
+                    return
+                previous = self._recent_events.get(key)
+                if previous and event['seq'] <= previous['seq']:
+                    return
+                self._recent_events[key] = {'text': text, 'seq': event['seq'],
+                                           'expires': time.monotonic() + 30.0, 'sent_at': -1.0}
+                self._recent_events.move_to_end(key)
+                while len(self._recent_events) > 32:
+                    self._recent_events.popitem(last=False)
+        except (ValueError, TypeError, KeyError):
+            rospy.logwarn('Invalid correlated payload event')
+
+    def _send_payload_event(self):
+        # One bounded message per cycle; rotate all recent outcomes fairly.
+        now = time.monotonic()
+        text = None
+        with self._lock:
+            for key in list(self._recent_events):
+                event = self._recent_events[key]
+                if now >= event['expires']:
+                    del self._recent_events[key]
+                elif text is None and now - event['sent_at'] >= 1.0:
+                    text = event['text']
+                    event['sent_at'] = now
+                    self._recent_events.move_to_end(key)
+        if text is None:
+            return
+        self._event_chunk_id = self._event_chunk_id % 65535 + 1
+        raw = text.encode('ascii') + b'\x00'
+        for seq, offset in enumerate(range(0, len(raw), 50)):
+            chunk = raw[offset:offset + 50]
+            if not self._mav_send_with_retry(lambda: self._conn.mav.statustext_send(
+                    mavutil.mavlink.MAV_SEVERITY_NOTICE, chunk, self._event_chunk_id, seq), 'USVE1'):
+                break
+            self._diag_tx_total += 1
 
     def _send_statustext(self, text, severity):
         if self._mav_send_with_retry(
@@ -457,7 +606,7 @@ class USVMavlinkRouterBridge(object):
         return False
 
     def _send_usv_done(self, sample_id):
-        t = int((time.time() - self._boot_time) * 1000) & 0xFFFFFFFF
+        t = int((time.monotonic() - self._boot_monotonic) * 1000) & 0xFFFFFFFF
         sent = self._mav_send_with_retry(
             lambda: self._conn.mav.named_value_float_send(t, b"USV_DONE\x00\x00", float(sample_id)),
             "USV_DONE",
@@ -470,13 +619,20 @@ class USVMavlinkRouterBridge(object):
 
     def _receive_mavlink_messages(self):
         """接收 QGC 发来的 COMMAND_LONG，并兼容转发到旧内部总线。"""
-        while True:
+        if self._conn is None:
+            return
+        deadline = time.monotonic() + 0.01
+        for _ in range(64):
+            if time.monotonic() >= deadline:
+                break
             try:
                 msg = self._conn.recv_match(blocking=False)
             except Exception as exc:
                 with self._lock:
                     self._diag_pub_errors += 1
                 rospy.logwarn_throttle(5.0, "Failed to receive MAVLink: %s", str(exc))
+                self._transport_counts['receive_errors'] += 1
+                self._retire_router('receive: %s' % exc)
                 break
             if not msg:
                 break
@@ -572,6 +728,9 @@ class USVMavlinkRouterBridge(object):
                     float(target_component),
                     float(ack_target_system),
                     float(ack_target_component),
+                    float(getattr(msg, 'param3', 0) or 0),
+                    float(getattr(msg, 'param4', 0) or 0),
+                    float(self._tcp_session),
                 ]
                 self._cmd_rx_pub.publish(rx_msg)
 
@@ -588,8 +747,10 @@ class USVMavlinkRouterBridge(object):
 
     def _publish_diagnostics(self):
         now = time.time()
+        last_write = (self._transport.last_write_at if self._transport and self._transport.last_write_at is not None
+                      else self._last_full_write_at)
         with self._lock:
-            uptime = now - self._boot_time
+            uptime = time.monotonic() - self._boot_monotonic
             diag = {
                 "ts": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)),
                 "uptime_s": int(uptime),
@@ -604,6 +765,13 @@ class USVMavlinkRouterBridge(object):
                 "pkt_count": self._pkt_count,
                 "rate_hz": TELEMETRY_RATE_HZ,
                 "router_url": self._router_url,
+                "tcp_session": self._tcp_session,
+                "tcp_connected": self._conn is not None,
+                "reconnect_reason": self._reconnect_reason,
+                "transport": dict(self._transport_counts),
+                "fcu_heartbeat_age_s": (time.monotonic() - self._gps_cache.records['HEARTBEAT']['received_monotonic']
+                    if 'HEARTBEAT' in self._gps_cache.records else None),
+                "last_complete_write_age_s": time.monotonic() - last_write if last_write is not None else None,
             }
         try:
             msg = String()
@@ -649,9 +817,11 @@ class USVMavlinkRouterBridge(object):
                 self._diag_tx_heartbeat += 1
 
     def _send_payload(self, voltage, absorbance, angles, status, automation_step, automation_total, current_loop, total_loops, sample_count, pid_error, pid_mode, baseline_set, reference_voltage, baseline_voltage, spectrometer_valid, health_fields=None):
-        t = int((time.time() - self._boot_time) * 1000) & 0xFFFFFFFF
+        t = int((time.monotonic() - self._boot_monotonic) * 1000) & 0xFFFFFFFF
         health = dict(DEFAULT_HEALTH_FIELDS)
         health.update(health_fields if health_fields is not None else getattr(self, "_health_fields", {}))
+        with self._lock:
+            protocol = self._protocol_version if self._protocol_at is not None and time.monotonic() - self._protocol_at < 3.0 else 0
         fields = (
             (b"USV_VOLT\x00\x00", voltage),
             (b"USV_ABS\x00\x00\x00", absorbance),
@@ -677,25 +847,42 @@ class USVMavlinkRouterBridge(object):
             (b"USV_JCPU\x00\x00", health["USV_JCPU"]),
             (b"USV_JMEM\x00\x00", health["USV_JMEM"]),
             (b"USV_EHEAP\x00", health["USV_EHEAP"]),
+            (b"USV_ADS\x00\x00\x00", self._ads_state),
+            (b"USV_PROTO\x00", float(protocol)),
         )
 
-        def send_batch():
-            for name, value in fields:
-                self._conn.mav.named_value_float_send(t, name, value)
-
-        if self._mav_send_with_retry(send_batch, "payload telemetry"):
-            self._pkt_count = (self._pkt_count + 1) % 65536
+        sent_all = True
+        for name, value in fields:
+            field = name.rstrip(b'\x00').decode('ascii')
             with self._lock:
-                self._diag_tx_total += len(fields)
-                self._diag_tx_named += len(fields)
+                age = time.monotonic() - self._field_received_at.get(field, float('-inf'))
+            limit = self._measurement_timeout if field in SOURCE_FIELDS['spectro'] else 3.0
+            if field not in ('USV_PKT', 'USV_SCNT', 'USV_PROTO') and age > limit:
+                if field in ('USV_VLD', 'USV_BSET', 'USV_ADS'):
+                    value = 0.0  # Explicit unknown/invalid is safe; never renew an old true value.
+                else:
+                    continue
+            if not self._mav_send_with_retry(
+                    lambda: self._conn.mav.named_value_float_send(t, name, value), 'payload telemetry'):
+                sent_all = False
+                break
+            with self._lock:
+                self._diag_tx_total += 1
+                self._diag_tx_named += 1
+        if sent_all:
+            self._pkt_count = (self._pkt_count + 1) % 65536
 
     def run(self):
         rate = rospy.Rate(TELEMETRY_RATE_HZ)
         while not rospy.is_shutdown():
+            if self._conn is None:
+                self._reconnect_router()
+            if self._transport:
+                self._transport.begin_cycle()
             # 命令接收始终运行，不依赖 MAVROS 连接状态
             self._receive_mavlink_messages()
 
-            now = time.time()
+            now = time.monotonic()
             if now - self._last_heartbeat >= (1.0 / HEARTBEAT_RATE_HZ):
                 self._send_heartbeat()
                 self._last_heartbeat = now
@@ -736,7 +923,7 @@ class USVMavlinkRouterBridge(object):
 
             # Safety outcomes precede routine ACKs, logs and bulk telemetry.
             for sample_id in pending_fail:
-                t = int((time.time() - self._boot_time) * 1000) & 0xFFFFFFFF
+                t = int((time.monotonic() - self._boot_monotonic) * 1000) & 0xFFFFFFFF
                 self._mav_send_with_retry(
                     lambda: self._conn.mav.named_value_float_send(t, b'USV_FAIL\x00\x00', float(sample_id)),
                     'USV_FAIL')
@@ -746,6 +933,7 @@ class USVMavlinkRouterBridge(object):
                 self._send_command_ack(command, result, target_sys, target_comp)
             for text, severity in pending_st:
                 self._send_statustext(text, severity)
+            self._send_payload_event()
 
             self._send_payload(voltage, absorbance, angles, status, automation_step, automation_total, current_loop, total_loops, sample_count, pid_error, pid_mode, baseline_set, reference_voltage, baseline_voltage, spectrometer_valid, health_fields)
 

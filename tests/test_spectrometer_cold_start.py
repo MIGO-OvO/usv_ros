@@ -81,14 +81,23 @@ class SpectrometerColdStartTests(unittest.TestCase):
 
     def test_start_ack_state_is_applied_before_transaction_wakes(self):
         self.ack_sender()
-        publish = self.node._publish_spectro_status
-        def on_status(state):
-            if state == 'starting':
-                self.assertFalse(self.node._text_txn['event'].is_set())
-                self.assertIsNotNone(self.node._spectro_start_ack_at)
-            return publish(state)
-        self.node._publish_spectro_status = on_status
+        send = self.node.send_command
+        observed = []
+        def on_send(command):
+            if command == 'ADSSTART':
+                event = self.node._text_txn['event']
+                wake = event.set
+                def verify_before_wake():
+                    self.assertIsNotNone(self.node._spectro_start_ack_at)
+                    self.assertEqual(self.node.spectro_state, 'starting')
+                    self.assertEqual(self.node._ads_state, 2)
+                    observed.append(True)
+                    wake()
+                event.set = verify_before_wake
+            return send(command)
+        self.node.send_command = on_send
         self.assertTrue(self.node.prepare_and_start_spectrometer()[0])
+        self.assertEqual(observed, [True])
 
     def test_cold_frame_grace_does_not_relax_runtime_freshness(self):
         sent = self.ack_sender(frame=False)

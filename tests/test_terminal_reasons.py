@@ -13,6 +13,7 @@ from unittest.mock import Mock
 from types import SimpleNamespace
 
 from test_hardware_runtime_sync import _load_script
+from measurement_fixtures import prepare_measurement, acknowledge
 
 
 class TerminalReasonTests(unittest.TestCase):
@@ -184,6 +185,7 @@ class TerminalReasonTests(unittest.TestCase):
         self.node.automation_engine.start = Mock(return_value=False)
         self.node.stop_all_pumps = Mock(return_value=True)
         self.node.serial_conn = SimpleNamespace(is_open=True)
+        prepare_measurement(self.node)
         self.node.send_command = lambda command: self.node._on_text_received('PIDPARAM:0.14,0.015,0.06,1,8') or True
         self.assertTrue(self.node._auto_start_callback(None).success)
         self.node._preflight_thread.join(2)
@@ -276,7 +278,7 @@ class TerminalReasonTests(unittest.TestCase):
 
     def test_start_ack_never_becomes_measurement_freshness(self):
         self.node._last_valid_spectro_at = None
-        self.node._on_text_received('ADS_OK:START')
+        acknowledge(self.node, 'ADSSTART')
         self.assertEqual(self.node.spectro_state, 'starting')
         self.assertIsNone(self.node._last_valid_spectro_at)
         self.assertEqual(self.node._spectro_txn_phase, 'idle')

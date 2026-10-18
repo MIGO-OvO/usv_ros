@@ -422,69 +422,9 @@ print_ros_nodes() {
         echo "mavros_link: DISCONNECTED (飞控未连通)"
     fi
 
-    # Bridge 诊断摘要
-    local bridge_diag
-    bridge_diag="$(timeout "$DIAG_CHECK_TIMEOUT" rostopic echo -n 1 /usv/bridge_diagnostics 2>/dev/null || true)"
-    if [[ -z "$bridge_diag" ]]; then
-        echo "bridge_diag: UNKNOWN (超时未响应)"
-    else
-        # 兼容 rostopic echo 的多种输出：
-        # 1) 纯 JSON
-        # 2) data: "{...}" 包装
-        # 3) Python dict 单引号格式
-        echo "$bridge_diag" | python3 -c "
-import sys, json, re, ast
-text = sys.stdin.read().strip()
-obj = None
-candidates = []
-
-# 纯 {...}
-for m in re.finditer(r'\{.*?\}', text):
-    candidates.append(m.group())
-
-# data: '...'/"..." 包装
-for m in re.finditer(r'data:\s*[\"\'](.*)[\"\']', text):
-    candidates.append(m.group(1))
-
-# 整体文本也尝试一次
-candidates.append(text)
-
-for raw in candidates:
-    raw = raw.strip()
-    if not raw:
-        continue
-    try:
-        obj = json.loads(raw)
-        break
-    except Exception:
-        pass
-    try:
-        parsed = ast.literal_eval(raw)
-        if isinstance(parsed, dict):
-            obj = parsed
-            break
-        if isinstance(parsed, str):
-            try:
-                obj = json.loads(parsed)
-                break
-            except Exception:
-                parsed2 = ast.literal_eval(parsed)
-                if isinstance(parsed2, dict):
-                    obj = parsed2
-                    break
-    except Exception:
-        pass
-
-if not isinstance(obj, dict):
-    print('bridge_diag: PARSE_ERROR (no structured payload found)')
-else:
-    print('bridge_diag: mavros={} tx={} pkt={} drops={}'.format(
-        obj.get('mavros_connected', '?'),
-        obj.get('tx_total', '?'),
-        obj.get('pkt_count', '?'),
-        obj.get('mavros_drops', '?')))
-" 2>/dev/null || echo "bridge_diag: PARSE_ERROR"
-    fi
+    # Read std_msgs/String.data directly; distinguish no publisher from timeout.
+    timeout "$((DIAG_CHECK_TIMEOUT + 2))" python3 "$SCRIPT_DIR/bridge_diagnostics.py" \
+        --timeout "$DIAG_CHECK_TIMEOUT" || true
 }
 
 case "${1:-full}" in

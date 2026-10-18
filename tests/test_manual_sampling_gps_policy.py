@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from gps_fixtures import gps_position
+from command_fixtures import remote_command, wait_commands
 from test_mavlink_command_compat import _load_script
 from scripts.lib.sample_recording.models import make_window
 
@@ -29,9 +30,11 @@ class ManualSamplingGPSPolicyTests(unittest.TestCase):
 
     @staticmethod
     def send_start(node):
-        node._mavlink_cmd_rx_cb(types.SimpleNamespace(
-            data=[31010.0, 0.0, 0.0, 1.0, 191.0, 255.0, 190.0]))
-        return node.cmd_ack_pub.messages[-1].data
+        node._mavlink_cmd_rx_cb(remote_command(node, 31010))
+        wait_commands(node)
+        ack = node.cmd_ack_pub.messages[-1].data
+        assert ack[4] == node._mavlink_tcp_session
+        return ack[:4]
 
     def test_opt_out_starts_missing_lost_and_stale_gps(self):
         for position in (None, dict(gps_position(), fix_status=-1), gps_position(age=3)):

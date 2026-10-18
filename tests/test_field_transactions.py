@@ -6,6 +6,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 from test_hardware_runtime_sync import _load_script
+from measurement_fixtures import prepare_measurement, fresh_measurement, acknowledge
 
 
 MAP_ACK = 'I2CMAP_OK:X=0,Y=3,Z=4,A=7,SPEC=2'
@@ -17,6 +18,7 @@ class FakeSerial:
         self.is_open = False
         self.writes = []
         self.changed = threading.Condition()
+        self.on_write = None
 
     def open(self):
         self.is_open = True
@@ -38,6 +40,9 @@ class FakeSerial:
         with self.changed:
             self.writes.append((time.monotonic(), data, threading.current_thread()))
             self.changed.notify_all()
+        if self.on_write:
+            self.on_write(data)
+        return len(data)
 
     def wait_keepalives(self, count, timeout=2):
         with self.changed:
@@ -69,8 +74,36 @@ class FieldTransactionTests(unittest.TestCase):
         self.enterContext(patch.object(self.module.serial, 'Serial', side_effect=serial_factory))
         self.enterContext(patch.object(self.module, 'perform_detector_handshake',
                                       return_value=(True, 'DET_ID:USV_DETECTOR,CAP=WATCHDOG1')))
-        self.enterContext(patch.object(self.module, 'PumpSerialReader'))
+        reader = self.enterContext(patch.object(self.module, 'PumpSerialReader'))
+        def reader_started(**callbacks):
+            def reply(data):
+                responses = {b'PIDQUERY\r\n': 'PIDPARAM:X,Kp=1', b'STOPALL\r\n': 'STOPALL_OK',
+                             b'ADSSTOP\r\n': 'ADS_OK:STOP'}
+                if data in responses:
+                    callbacks['on_text'](responses[data])
+            ports[-1].on_write = reply
+        reader.return_value.start.side_effect = reader_started
         return ports
+
+    def test_recovery_requires_stop_confirmation_and_preserves_cleanup_history(self):
+        ports = self.serial_environment()
+        self.node._apply_runtime_configuration = Mock()
+        self.node._record_cleanup_result(False)
+        self.assertTrue(self.node.connect())
+        self.assertTrue(any(b'STOPALL' in data for _, data, _ in ports[-1].writes))
+        self.assertTrue(any(b'ADSSTOP' in data for _, data, _ in ports[-1].writes))
+        self.assertIsNone(self.node._controller_fault)
+        self.node._reset_terminal()
+        self.node._publish_automation_status('idle')
+        self.assertTrue(json.loads(self.pubs['/usv/automation_status'].messages[-1].data)['prior_cleanup_failed'])
+
+    def test_recovery_with_unconfirmed_ads_stop_is_not_ready(self):
+        self.serial_environment()
+        self.node._record_cleanup_result(False)
+        with patch.object(self.node, '_spectro_stop', return_value=(False, 'ADS_ERR:STOP_I2C')):
+            self.assertFalse(self.node.connect())
+        self.assertIsNone(self.node.serial_conn)
+        self.assertEqual(self.node._controller_fault, 'cleanup_failed')
 
     def ack_sender(self, *, mapping=MAP_ACK, config=CFG_ACK, start='ADS_OK:START',
                    stop='ADS_OK:STOP', frame=True):
@@ -146,17 +179,16 @@ class FieldTransactionTests(unittest.TestCase):
         self.node._reconnect_after_reader_error(old)
         self.assertIs(self.node.serial_conn, new)
 
-    def test_real_write_and_flush_errors_latch_transport_fault_before_return(self):
-        for operation in ('write', 'flush'):
+    def test_write_errors_and_short_writes_latch_transport_fault_before_return(self):
+        for operation in ('error', 'short'):
             for existing_fault in (None, 'watchdog_tripped'):
                 with self.subTest(operation=operation, existing_fault=existing_fault):
                     port = FakeSerial()
                     port.open()
                     self.node.serial_conn = port
                     self.node._controller_fault = existing_fault
-                    error = (self.module.serial.SerialException('device write failed')
-                             if operation == 'write' else OSError('device flush failed'))
-                    setattr(port, operation, Mock(side_effect=error))
+                    port.write = (Mock(side_effect=self.module.serial.SerialException('device write failed'))
+                                  if operation == 'error' else Mock(return_value=1))
                     dispatched = threading.Event()
                     def recover(connection):
                         self.assertIs(connection, port)
@@ -174,6 +206,14 @@ class FieldTransactionTests(unittest.TestCase):
                     self.assertFalse(status['serial_connected'])
                     self.assertEqual(status['spectrometer_config_state'], 'disconnected')
                     self.assertEqual(status['controller_fault'], existing_fault or 'disconnected')
+
+    def test_successful_write_does_not_use_unbounded_serial_drain(self):
+        port = FakeSerial()
+        port.open()
+        self.node.serial_conn = port
+        port.flush = Mock(side_effect=AssertionError('flush is not bounded by write_timeout'))
+        self.assertTrue(self.node.send_command('ADSSTATUS?'))
+        port.flush.assert_not_called()
 
     def test_cleanup_write_failure_does_not_dispatch_recursive_recovery(self):
         port = FakeSerial()
@@ -351,7 +391,7 @@ class FieldTransactionTests(unittest.TestCase):
     def test_start_ack_is_not_measurement_freshness(self):
         for timestamp in (None, 123.0):
             self.node._last_valid_spectro_at = timestamp
-            self.node._on_text_received('ADS_OK:START')
+            acknowledge(self.node, 'ADSSTART')
             self.assertEqual(self.node.spectro_state, 'starting')
             self.assertEqual(self.node._last_valid_spectro_at, timestamp)
         self.node._on_spectro_received({'valid': True, 'voltage': 1.2})
@@ -542,15 +582,18 @@ class FieldTransactionTests(unittest.TestCase):
         for count in (1, 5):
             with self.subTest(count=count):
                 self.node.lab_mode_enabled = True
+                prepare_measurement(self.node)
                 self.node.pid_mode = False
                 self.node.send_command = Mock(return_value=True)
                 self.node.automation_engine.send_command = self.node.send_command
                 self.node._reset_terminal()
                 self.node.automation_engine.set_steps([{'name': 'one', 'interval': 0}])
                 self.node.automation_engine.loop_count = count
-                with patch.object(self.node, '_wait_seconds_with_pause', return_value=True):
-                    self.assertTrue(self.node.automation_engine.start())
-                    self.node.automation_engine._thread.join(2)
+                self.node.automation_engine.on_step_wait = lambda step: (
+                    fresh_measurement(self.node) or self.node._wait_for_automation_step(step))
+                self.assertTrue(self.node.automation_engine.start())
+                self.node.automation_engine._thread.join(2)
+                self.assertFalse(self.node.automation_engine._thread.is_alive())
                 payload = json.loads(self.pubs['/usv/automation_status'].messages[-1].data)
                 self.assertEqual(payload['status'], 'finished')
                 self.assertEqual((payload['current_loop'], payload['total_loops']), (count, count))

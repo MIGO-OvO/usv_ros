@@ -15,7 +15,7 @@ class PayloadStartupTests(unittest.TestCase):
         module = _load_script('qgc_startup_bridge', 'scripts/usv_mavlink_router_bridge.py')
         connection = Mock()
         connection.wait_heartbeat.return_value = None
-        with patch.object(module.mavutil, 'mavlink_connection', return_value=connection):
+        with patch.object(module, 'connect_router', return_value=connection), patch.object(module, 'next_transport_session', return_value=1):
             bridge = module.USVMavlinkRouterBridge()
         connection.wait_heartbeat.assert_not_called()
         bridge._send_heartbeat()

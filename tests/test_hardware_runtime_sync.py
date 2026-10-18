@@ -588,7 +588,9 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
 
         self.assertEqual(stop_resp.status_code, 200)
         self.assertEqual(control_calls[-1]["action"], "spectrometer_stop")
-        self.assertEqual(json.loads(control_calls[-1]["payload_json"]), {"cmd": "stop"})
+        payload = json.loads(control_calls[-1]["payload_json"])
+        self.assertGreater(payload.pop('_issued_monotonic'), 0)
+        self.assertEqual(payload, {"cmd": "stop"})
         self.assertEqual(publishers["/usv/spectrometer_command"].messages, [])
 
     def test_web_trigger_status_starts_and_stops_data_recording_once(self):
@@ -3024,7 +3026,9 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertTrue(body["success"])
         self.assertAlmostEqual(body["reference_voltage"], 1.234)
         self.assertEqual(control_calls[-1]["action"], "spectrometer_baseline")
-        self.assertEqual(json.loads(control_calls[-1]["payload_json"]), {
+        payload = json.loads(control_calls[-1]["payload_json"])
+        self.assertGreater(payload.pop('_issued_monotonic'), 0)
+        self.assertEqual(payload, {
             "cmd": "set_baseline",
             "reference_voltage": 1.234,
         })
@@ -3074,7 +3078,9 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertTrue(body["success"])
         self.assertAlmostEqual(body["reference_voltage"], 1.456789)
         self.assertEqual(control_calls[-1]["action"], "spectrometer_baseline")
-        self.assertEqual(json.loads(control_calls[-1]["payload_json"]), {
+        payload = json.loads(control_calls[-1]["payload_json"])
+        self.assertGreater(payload.pop('_issued_monotonic'), 0)
+        self.assertEqual(payload, {
             "cmd": "set_baseline",
             "reference_voltage": 1.456789,
         })
@@ -3330,13 +3336,16 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertIn("manual", auto_response.message.lower())
 
     def test_pump_node_injection_policy_starts_before_automation_step(self):
+        from measurement_fixtures import prepare_measurement
         module, _, string_cls = _load_script(
             "pump_control_node_injection_policy_step_test",
             "scripts/pump_control_node.py",
         )
         node = module.PumpControlNode()
+        prepare_measurement(node)
         sent = []
-        node.send_command = lambda cmd: sent.append(cmd) or True
+        node.send_command = lambda cmd, valid=None: (valid is None or valid()) and (sent.append(cmd) or True)
+        self.addCleanup(node.injection_pump_worker.stop)
         node.pid_mode = False
         node._latest_spectro_received_at = 0.0
         node._steps_callback(string_cls(json.dumps({
@@ -3409,11 +3418,13 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertNotIn("PUMP:SET:60", sent)
 
     def test_pump_node_automation_step_ignores_legacy_injection_pump_config(self):
+        from measurement_fixtures import prepare_measurement
         module, _, _ = _load_script(
             "pump_control_node_auto_step_legacy_injection_pump_test",
             "scripts/pump_control_node.py",
         )
         node = module.PumpControlNode()
+        prepare_measurement(node)
         node.inject_pump_speed = 0
         sent = []
         node.send_command = lambda cmd: sent.append(cmd) or True
@@ -3490,7 +3501,8 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         node = module.PumpControlNode()
         node.inject_pump_speed = 60
         sent = []
-        node.send_command = lambda cmd: sent.append(cmd) or True
+        node.send_command = lambda cmd, valid=None: (valid is None or valid()) and (sent.append(cmd) or True)
+        self.addCleanup(node.injection_pump_worker.stop)
 
         response = node._injection_on_callback(None)
 
@@ -4001,11 +4013,13 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(node._last_spectro_txn_error, "no valid spectrometer frame after start")
 
     def test_pump_node_spectrometer_baseline_command_sets_reference_voltage(self):
+        from measurement_fixtures import prepare_measurement
         module, _, string_cls = _load_script(
             "pump_control_node_spectro_baseline_reference_test",
             "scripts/pump_control_node.py",
         )
         node = module.PumpControlNode()
+        prepare_measurement(node)
 
         node._spectro_cmd_callback(string_cls(json.dumps({
             "cmd": "set_baseline",

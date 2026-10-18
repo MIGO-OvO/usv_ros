@@ -8,6 +8,7 @@ from unittest.mock import patch
 import test_fcu_sampling_result as fcu_results
 from test_hardware_runtime_sync import _load_script
 from gps_fixtures import gps_position
+from measurement_fixtures import prepare_measurement
 
 
 class SamplingCleanupOwnershipTests(unittest.TestCase):
@@ -53,6 +54,7 @@ class SamplingCleanupOwnershipTests(unittest.TestCase):
             'injection_off', {'source': source, 'reason': reason})[0]
 
     def start_web_b(self):
+        prepare_measurement(self.pump)
         self.assertTrue(self.pump._execute_control_action('injection_on', {'speed': 30})[0])
         self.assertTrue(self.pump._execute_control_action('automation_start', {
             'source': 'web', 'attempt_id': 'B', 'pid_mode': False,
