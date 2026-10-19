@@ -176,7 +176,10 @@ class PumpSafetyTests(unittest.TestCase):
         self.node.automation_engine._running.set()
         observed = []
         self.node.disconnect = lambda: None
-        self.node.connect = lambda: observed.append(self.node.automation_engine.is_running()) or True
+        def connect(require_spectro_stop=None):
+            observed.append(self.node.automation_engine.is_running())
+            return True
+        self.node.connect = connect
         result = self.node._reconnect_callback(None)
         self.assertTrue(result.success)
         self.assertEqual(observed, [False])
