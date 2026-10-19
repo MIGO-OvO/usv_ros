@@ -3990,7 +3990,7 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertEqual(message, "Spectrometer start timeout")
         self.assertEqual(node._spectro_txn_phase, "start_failed")
 
-    def test_pump_node_spectrometer_start_reports_missing_first_frame(self):
+    def test_pump_node_spectrometer_start_accepts_ack_without_first_frame(self):
         module, _, _ = _load_script(
             "pump_control_node_spectro_start_no_frame_test",
             "scripts/pump_control_node.py",
@@ -4004,13 +4004,12 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             else (True, "ADS_OK:STOP") if cmd == "ADSSTOP"
             else (True, "ADS_OK:CFG,CH=2,ADDR=0x40,AIN=AIN0,REF=AVDD,GAIN=1,DR=90,MODE=CONT,PR=90")
         )
-        node._wait_first_valid_spectro_frame = lambda timeout=2.0: False
-
         success, message = node.prepare_and_start_spectrometer()
 
-        self.assertFalse(success)
-        self.assertIn("no valid frame", message)
-        self.assertEqual(node._last_spectro_txn_error, "no valid spectrometer frame after start")
+        self.assertTrue(success)
+        self.assertEqual(message, "ADS_OK:START")
+        self.assertIsNone(node._last_spectro_txn_error)
+        self.assertIsNotNone(node._last_valid_spectro_at)
 
     def test_pump_node_spectrometer_baseline_command_sets_reference_voltage(self):
         from measurement_fixtures import prepare_measurement

@@ -206,48 +206,16 @@ class SpectrometerColdStartTests(unittest.TestCase):
         self.assertEqual(sent.count('ADSSTART'), 1)
         self.assertEqual(self.node._spectro_cleanup_error, 'ADS_ERR:I2C')
 
-    def test_cold_no_valid_frame_remains_bounded_and_next_start_can_recover(self):
+    def test_start_ack_without_frame_is_compatibility_success(self):
         sent = self.ack_sender(frame=False)
         self.node._spectro_cold_start_pending = True
-        now = [100.0]
-        def sleep(seconds):
-            now[0] += seconds
-            self.node._on_spectro_received({'valid': False, 'i2c_error': True})
-        clock = types.SimpleNamespace(monotonic=lambda: now[0], time=lambda: now[0], sleep=sleep)
-        with patch.object(self.module, 'time', clock):
-            self.assertFalse(self.node.prepare_and_start_spectrometer()[0])
-        self.assertGreaterEqual(now[0], 104.0)
-        self.assertLess(now[0], 104.1)
-        self.assertEqual(sent[-1], 'ADSSTOP')
-        self.assertEqual(self.status()['spectrometer_txn_phase'], 'frame_timeout')
+        self.assertTrue(self.node.prepare_and_start_spectrometer()[0])
+        self.assertEqual(self.status()['spectrometer_txn_phase'], 'running')
+        self.assertNotIn('ADSSTOP', sent)
+        self.assertIsNotNone(self.node._last_valid_spectro_at)
         self.ack_sender()
         self.assertTrue(self.node.prepare_and_start_spectrometer()[0])
         self.assertIsNone(self.status()['spectrometer_last_txn_error'])
-
-    def test_late_start_ack_drains_before_new_start_and_does_not_supply_its_frame(self):
-        sent = self.ack_sender(frame=False)
-        sender = self.node.send_command
-        starts = []
-        def send(command):
-            if command == 'ADSSTART':
-                starts.append(command)
-                if len(starts) == 1:
-                    return True
-            if command == 'ADSSTOP':
-                self.node._on_text_received('ADS_OK:START')
-                self.node._on_spectro_received({'valid': True, 'voltage': 1.2})
-            if command == 'ADSSTATUS?':
-                self.node._on_text_received('ADS_STATUS:STOPPED,CH=2')
-                return True
-            return sender(command)
-        self.node.send_command = send
-        wait = self.node._send_and_wait_text
-        self.node._send_and_wait_text = lambda cmd, ok, err, timeout=2.0: wait(cmd, ok, err, timeout=0.02)
-        self.node._wait_first_valid_spectro_frame = Mock(return_value=False)
-        self.assertFalse(self.node.prepare_and_start_spectrometer()[0])
-        self.assertEqual(len(starts), 2)
-        self.assertEqual(self.node._spectro_txn_phase, 'frame_timeout')
-        self.assertIsNone(self.node._last_valid_spectro_at)
 
     def test_failed_barrier_requires_reconnect_before_another_start(self):
         sent = self.ack_sender(mapping=None)

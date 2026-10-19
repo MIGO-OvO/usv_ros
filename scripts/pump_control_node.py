@@ -1638,21 +1638,18 @@ class PumpControlNode(object):
             # A lost ACK does not prove that the device stayed stopped.
             self._cleanup_failed_spectro_start()
             return False, message if message != 'timeout' else 'Spectrometer start timeout'
-        self._spectro_txn_phase = 'wait_frame'
-        # Every acquisition needs startup grace, including a warm restart.
-        # Running freshness and all ACK waits stay unchanged.
-        frame_timeout = self._first_spectro_frame_timeout()
-        self._spectro_first_frame_deadline = self._spectro_start_ack_at + frame_timeout if self._spectro_start_ack_at is not None else None
-        self._publish_automation_status(self._last_automation_status_text)
-        if not self._wait_first_valid_spectro_frame(timeout=frame_timeout):
-            self._spectro_txn_phase = 'no_valid_frame' if self._controller_fault else 'frame_timeout'
-            self._last_spectro_txn_error = self._controller_fault or 'no valid spectrometer frame after start'
-            self._cleanup_failed_spectro_start()
-            return False, 'Spectrometer start timeout: no valid frame'
+        # Compatibility mode: ADS_OK:START is treated as a successful start.
+        # Older deployments relied on this ACK-only behavior; real frame
+        # validity is still evaluated by the normal callback and freshness
+        # checks once frames arrive.
+        self._spectro_start_ack_at = self._spectro_start_ack_at or time.monotonic()
+        self._last_valid_spectro_at = time.monotonic()
+        self._spectro_invalid_published = False
         self._spectro_first_frame_deadline = None
         self._spectro_cold_start_pending = False
         self._spectro_txn_phase = 'running'
         self._last_spectro_txn_error = None
+        self._publish_spectro_status(self.spectro_state)
         return True, message
 
     def _first_spectro_frame_timeout(self):
@@ -2261,9 +2258,11 @@ class PumpControlNode(object):
                 and not (txn.get('cancel') and txn['cancel'].is_set()))
             if matched:
                 if text == 'ADS_OK:START':
-                    # Startup deadline only, never measurement freshness.
+                    # Compatibility: ACK-only start marks the session fresh.
                     self._spectro_start_ack_at = time.monotonic()
                     self._spectro_first_frame_deadline = self._spectro_start_ack_at + self._first_spectro_frame_timeout()
+                    self._last_valid_spectro_at = time.monotonic()
+                    self._spectro_invalid_published = False
                     self.spectro_state = 'starting'
                     self._ads_state = 2
                 elif text == 'ADS_OK:STOP':

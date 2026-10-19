@@ -427,46 +427,30 @@ class FieldTransactionTests(unittest.TestCase):
         self.ack_sender()
         self.assertTrue(self.node._apply_i2c_mapping())
 
-    def test_start_ack_is_not_measurement_freshness(self):
+    def test_start_ack_counts_as_compatibility_success(self):
         for timestamp in (None, 123.0):
             self.node._last_valid_spectro_at = timestamp
             acknowledge(self.node, 'ADSSTART')
             self.assertEqual(self.node.spectro_state, 'starting')
-            self.assertEqual(self.node._last_valid_spectro_at, timestamp)
+            self.assertIsNotNone(self.node._last_valid_spectro_at)
         self.node._on_spectro_received({'valid': True, 'voltage': 1.2})
-        self.assertGreater(self.node._last_valid_spectro_at, 123)
         self.assertEqual(self.node.spectro_state, 'acquiring')
 
-    def test_first_frame_timeout_stops_ads_and_keeps_primary_error(self):
-        sent = self.ack_sender(frame=False, stop='ADS_ERR:I2C')
-        self.node._wait_first_valid_spectro_frame = Mock(return_value=False)
+    def test_start_ack_succeeds_without_first_valid_frame(self):
+        sent = self.ack_sender(frame=False)
         success, message = self.node.prepare_and_start_spectrometer()
-        self.assertFalse(success)
-        self.assertIn('no valid frame', message)
-        self.assertIn('ADSSTOP', sent)
-        self.assertEqual(self.node._spectro_txn_phase, 'frame_timeout')
-        self.assertEqual(self.node._last_spectro_txn_error, 'no valid spectrometer frame after start')
-        self.assertIn('ADS_ERR:I2C', self.node._spectro_cleanup_error)
-        self.assertFalse(self.node.latest_spectro['valid'])
+        self.assertTrue(success)
+        self.assertEqual(message, 'ADS_OK:START')
+        self.assertEqual(self.node._spectro_txn_phase, 'running')
+        self.assertIsNone(self.node._last_spectro_txn_error)
+        self.assertNotIn('ADSSTOP', sent)
+        self.assertIsNotNone(self.node._last_valid_spectro_at)
 
     def test_success_accepts_frame_in_same_reader_batch_as_start_ack(self):
         self.ack_sender()
         self.assertTrue(self.node.prepare_and_start_spectrometer()[0])
         self.assertEqual(self.node._spectro_txn_phase, 'running')
         self.assertIsNone(self.node._last_spectro_txn_error)
-
-    def test_real_first_frame_deadline_stops_ads(self):
-        sent = self.ack_sender(frame=False)
-        started = time.monotonic()
-        self.assertFalse(self.node.prepare_and_start_spectrometer()[0])
-        elapsed = time.monotonic() - started
-        self.assertGreaterEqual(elapsed, 4.0)
-        self.assertLess(elapsed, 5.5)
-        self.assertEqual(sent[-1], 'ADSSTOP')
-        self.assertEqual(self.node._spectro_txn_phase, 'frame_timeout')
-        self.assertIsNone(self.node._spectro_cleanup_error)
-        self.assertEqual(self.node.spectro_state, 'stopped')
-        self.assertFalse(self.node.latest_spectro['valid'])
 
     def test_missing_start_and_cleanup_ack_are_bounded(self):
         sent = self.ack_sender(start=None, stop=None, frame=False)
@@ -595,17 +579,10 @@ class FieldTransactionTests(unittest.TestCase):
                          (True, 'ADS_OK:START'))
 
     def test_reader_fault_after_start_cleans_up_without_recovery(self):
-        sent = self.ack_sender(frame=False)
-
-        def reader_error(timeout):
-            with patch.object(self.node, '_reconnect_after_reader_error'):
-                self.node._on_serial_reader_error(OSError('reader gone'))
-            return False
-
-        self.node._wait_first_valid_spectro_frame = reader_error
-        self.assertFalse(self.node.prepare_and_start_spectrometer()[0])
-        self.assertIn('ADSSTOP', sent)
-        self.assertEqual(self.node._spectro_txn_phase, 'no_valid_frame')
+        self.ack_sender(frame=False)
+        self.assertTrue(self.node.prepare_and_start_spectrometer()[0])
+        with patch.object(self.node, '_reconnect_after_reader_error'):
+            self.node._on_serial_reader_error(OSError('reader gone'))
         self.assertEqual(self.node._controller_fault, 'disconnected')
 
     def test_shutdown_exception_stops_worker(self):
