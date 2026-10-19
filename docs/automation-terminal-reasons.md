@@ -1,6 +1,6 @@
 # 自动化终止原因契约（Automation Terminal Reasons）
 
-Updated: 2026-09-29
+Updated: 2026-10-19
 
 现场不再需要 SSH 判断任务为何停止。`pump_control_node` 对每次自动化终止记录唯一的
 结构化 `terminal_reason`，通过 `/usv/automation_status` 与 Web `status` 事件下发，
@@ -13,11 +13,12 @@ Updated: 2026-09-29
 | `completed` | 引擎自行跑完全部步骤（`finished`） | 正常结束 |
 | `operator_stop` | 操作员停止，且此前无故障原因 | 正常结束 |
 | `operator_pause` | 操作员暂停（保留给暂停终态使用） | 正常结束 |
-| `pid_timeout` | 固件 `PID_TIMEOUT:`，或引擎 PID 等待 60s 超时 | 任务失败 |
+| `pid_timeout` | 固件 `PID_TIMEOUT:`，或 ROS 引擎等待超预算（默认 120s）；板端仍独立限时 30s | 任务失败 |
 | `pid_fail` | 固件 `PID_FAIL:` | 任务失败 |
 | `spectrometer_start_failed` | 分光启动事务在 I2CMAP/ADSCFG/START 阶段失败 | 任务失败 |
-| `spectrometer_frame_timeout` | START ACK 后 `measurement_timeout` 内没有有效帧 | 任务失败 |
-| `spectrometer_stale` | 采集中有效帧中断超过 `measurement_timeout` | 任务失败 |
+| `spectrometer_frame_timeout` | START ACK 后首帧预算内没有有效帧（至少 4s） | 任务失败 |
+| `spectrometer_stale` | 采集中断流超过独立静默终止预算（默认 10s） | 任务失败 |
+| `spectrometer_not_ready` | 当前真实测量/基线不合法，或活动任务收到明确设备错误/测试帧 | 任务失败，明确错误锁存 |
 | `watchdog_tripped` | 固件 `WATCHDOG_TRIPPED` / `WATCHDOG_ERR:` | 安全停止 |
 | `owner_lost` | `/usv/sampling_owner` 心跳超过 5s 未续约 | 安全停止 |
 | `serial_disconnected` | 串口读线程异常或 keepalive 写失败 | 安全停止 |
@@ -79,7 +80,13 @@ PID_FAIL:X    -> 自动化失败，terminal_reason=pid_fail，立即终止
 - 启动阶段（`spectro_state == 'starting'`）的过期判定使用 `_spectro_start_ack_at`，
   超时映射为 `spectrometer_frame_timeout`。
 - 运行阶段的有效性只由真实有效帧（`_emit_spectro_average`）推进，
-  中断超时映射为 `spectrometer_stale`。
+  帧龄超过 `measurement_timeout`（默认 2s）即无效；普通短断流允许有界等待，超过
+  `spectro_stale_stop_timeout`（默认 10s）才以 `spectrometer_stale` 终止。
+- `I2C_ERROR`、`NOT_CONFIGURED`、`SATURATED` 与测试帧不是普通静默。活动任务立即记录
+  `spectrometer_not_ready` 首因并通知引擎工作线程停止清理，reader 回调不等待依赖自身接收的 ACK；
+  后续 freshness 检查不把明确设备错误改成 stale。新有效帧不自动清除故障或恢复泵。
+- preflight 的可信当前任务 OFF/四轴 disable 不等待有效帧，但仍校验任务、owner、取消和串口会话。
+  新运动保持门禁，恢复进样 lead 结束后还在最终串口写入边界复查测量和作用域。
 
 ## Watchdog 契约
 
@@ -94,11 +101,6 @@ keepalive 线程在重连后自行退出，不会写入新会话。
 
 ## Web 自动化 GPS 策略
 
-- 持久化位置：`sampling_config.json` 的 `automation_policy.require_gps`（默认 `true`）。
-- `GET /api/config` 返回该字段；`POST /api/config` 与任务配置 import/export 保留该字段。
-- Automation 页面 mount 时用服务器值初始化开关，切换即持久化；页面切换、刷新、
-  Web 服务重启后保持。
-- `POST /api/mission/start` 的 `require_gps` 字段仍为本次任务的显式覆盖值，
-  未提供时回退到持久化默认值。
-- 该策略只影响 Web 自动化；FCU NAV_SCRIPT_TIME、航点采样、survey 采样与实船
-  SampleRecord 的严格 GPS 门控不变。
+- 真实设备手动点采样无需 GPS；必须有当前串口会话的真实有效测量、合法基线和配置。
+- 无定位记录显式保存定位缺失，不伪造坐标；定位仍用于航行与走航距离条件，不替代测量有效性。
+- 旧 `require_gps` 兼容入参不重新引入手动采样 GPS 门禁。详见根文档 `docs/current/80_sample_gps_binding.md`。

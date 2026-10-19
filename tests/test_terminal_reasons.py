@@ -268,13 +268,15 @@ class TerminalReasonTests(unittest.TestCase):
         self.node._check_spectro_freshness()
         self.assertEqual(self.node._terminal_reason, 'spectrometer_frame_timeout')
 
-    def test_invalid_startup_frame_does_not_hide_frame_deadline(self):
+    def test_explicit_startup_error_wins_over_later_frame_deadline(self):
         self.activate_automation()
         self.node._spectro_start_ack_at = time.monotonic() - 10
         self.node._last_valid_spectro_at = None
         self.node._on_spectro_received({'valid': False, 'i2c_error': True})
         self.node._check_spectro_freshness()
-        self.assertEqual(self.node._terminal_reason, 'spectrometer_frame_timeout')
+        self.assertEqual(self.node._terminal_reason, 'spectrometer_not_ready')
+        self.assertEqual(self.node.spectro_state, 'i2c_error')
+        self.assertFalse(self.node.automation_engine._running.is_set())
 
     def test_start_ack_never_becomes_measurement_freshness(self):
         self.node._last_valid_spectro_at = None
