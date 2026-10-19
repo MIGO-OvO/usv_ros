@@ -11,6 +11,15 @@ from unittest.mock import patch
 
 from test_mavlink_command_compat import _load_script as load_bridge
 
+# Imported at module scope: other test modules install fake ROS modules into
+# sys.modules while they run, so a late import could see a polluted tree.
+try:
+    from pymavlink.dialects.v20 import ardupilotmega as _ARDUPILOTMEGA
+    _PYMAVLINK_ERROR = None
+except ImportError as _exc:  # pragma: no cover - offline environments
+    _ARDUPILOTMEGA = None
+    _PYMAVLINK_ERROR = _exc
+
 
 def build_unknown_outer_frame(payload):
     """A syntactically valid v2 frame with an id the dialect does not know."""
@@ -27,11 +36,9 @@ def build_unknown_outer_frame(payload):
 class FramingContractTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        try:
-            from pymavlink.dialects.v20 import ardupilotmega
-        except ImportError:  # pragma: no cover - offline environments
-            raise unittest.SkipTest('pymavlink required for framing contracts')
-        cls.dialect = ardupilotmega
+        if _ARDUPILOTMEGA is None:  # pragma: no cover - offline environments
+            raise unittest.SkipTest('pymavlink required for framing contracts: %s' % _PYMAVLINK_ERROR)
+        cls.dialect = _ARDUPILOTMEGA
 
     def parser(self):
         class Sink:
