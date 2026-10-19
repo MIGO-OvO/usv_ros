@@ -4010,7 +4010,9 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         self.assertTrue(success)
         self.assertEqual(message, "ADS_OK:START")
         self.assertIsNone(node._last_spectro_txn_error)
-        self.assertIsNotNone(node._last_valid_spectro_at)
+        # The ACK confirms the command; it does not create a sample.
+        self.assertIsNotNone(node._spectro_start_ack_at)
+        self.assertIsNone(node._last_valid_spectro_at)
 
     def test_pump_node_spectrometer_baseline_command_sets_reference_voltage(self):
         from measurement_fixtures import prepare_measurement

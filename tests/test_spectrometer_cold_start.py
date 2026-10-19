@@ -102,20 +102,19 @@ class SpectrometerColdStartTests(unittest.TestCase):
     def test_cold_frame_grace_does_not_relax_runtime_freshness(self):
         sent = self.ack_sender(frame=False)
         self.node._spectro_cold_start_pending = True
-        now = [100.0]
-        def sleep(seconds):
-            now[0] += seconds
+        self.assertTrue(self.node.prepare_and_start_spectrometer()[0])
+        self.assertNotIn('ADSSTOP', sent)
+        self.assertFalse(self.node._spectro_cold_start_pending)
+        # ACK without data: started, but nothing is measured yet.
+        self.assertEqual(self.node.spectro_state, 'starting')
+        self.assertIsNone(self.node._last_valid_spectro_at)
+        self.assertFalse(self.node._real_measurement_ready(require_reference=False))
+        self.node._on_spectro_received({'valid': True, 'voltage': 1.2})
+        self.assertEqual(self.node.spectro_state, 'acquiring')
+        with patch.object(self.module.time, 'monotonic',
+                          return_value=self.node._last_valid_spectro_at + self.node.measurement_timeout + 0.1):
             self.node._check_spectro_freshness()
-            if now[0] >= 102.6 and self.node._last_valid_spectro_at is None:
-                self.node._on_spectro_received({'valid': True, 'voltage': 1.2})
-        clock = types.SimpleNamespace(monotonic=lambda: now[0], time=lambda: now[0], sleep=sleep)
-        with patch.object(self.module, 'time', clock):
-            self.assertTrue(self.node.prepare_and_start_spectrometer()[0])
-            self.assertNotIn('ADSSTOP', sent)
-            self.assertFalse(self.node._spectro_cold_start_pending)
-            now[0] += 2.1
-            self.node._check_spectro_freshness()
-            self.assertEqual(self.node.spectro_state, 'stale')
+        self.assertEqual(self.node.spectro_state, 'stale')
 
     def test_disconnected_start_names_serial_stage(self):
         self.node.send_command = Mock(return_value=False)
@@ -212,7 +211,8 @@ class SpectrometerColdStartTests(unittest.TestCase):
         self.assertTrue(self.node.prepare_and_start_spectrometer()[0])
         self.assertEqual(self.status()['spectrometer_txn_phase'], 'running')
         self.assertNotIn('ADSSTOP', sent)
-        self.assertIsNotNone(self.node._last_valid_spectro_at)
+        self.assertIsNotNone(self.node._spectro_start_ack_at)
+        self.assertIsNone(self.node._last_valid_spectro_at)
         self.ack_sender()
         self.assertTrue(self.node.prepare_and_start_spectrometer()[0])
         self.assertIsNone(self.status()['spectrometer_last_txn_error'])

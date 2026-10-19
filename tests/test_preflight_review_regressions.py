@@ -146,7 +146,7 @@ class FeedbackReviewTests(unittest.TestCase):
 
     def test_low_rpm_quantized_motion_can_progress_but_stationary_jitter_cannot(self):
         clock = [0.0]
-        runner = self.module.AutomationPreflight(lambda command: True, lambda: None,
+        runner = self.module.AutomationPreflight(lambda command: True, lambda require_measurement=True: None,
             lambda axes, require_health=False: {'A': 0}, lambda: None)
         runner.travel = {'axis': 'A', 'angle': 359.9, 'at': 0.0, 'degrees': 0.0,
                          'rpm': 0.1, 'progress_at': 0.0, 'progress_degrees': 0.0}
