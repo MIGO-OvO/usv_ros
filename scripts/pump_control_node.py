@@ -436,7 +436,10 @@ class PumpSerialReader(object):
             "status": status,
             "raw_code": struct.unpack("<i", data[8:12])[0],
             "voltage": struct.unpack("<f", data[12:16])[0],
-            "valid": bool(status & SPECTRO_STATUS_VALID) and not bool(status & 0x1E),
+            # Saturation is a normal in-line bubble condition, not an
+            # invalid frame: keep the numeric sample and expose the flag.
+            "valid": bool(status & SPECTRO_STATUS_VALID) and not bool(
+                status & (SPECTRO_STATUS_I2C_ERROR | SPECTRO_STATUS_NOT_CONFIG | SPECTRO_STATUS_TEST)),
             "simulated": bool(status & SPECTRO_STATUS_TEST),
             "i2c_error": bool(status & SPECTRO_STATUS_I2C_ERROR),
             "not_configured": bool(status & SPECTRO_STATUS_NOT_CONFIG),
@@ -2532,6 +2535,11 @@ class PumpControlNode(object):
             if self._spectro_start_ack_at is not None and self._ads_state in (2, 3, 4):
                 self.spectro_state = 'acquiring'
                 self._ads_state = 3
+            if data.get('saturated'):
+                # Bubbles routinely drive the detector to full scale. Keep the
+                # sample and let the operator judge it; never stop the run for
+                # this alone.
+                rospy.logwarn_throttle(2.0, 'Spectrometer saturated; sample retained for operator review')
         elif data.get('i2c_error', False):
             self.spectro_state = 'i2c_error'
         elif data.get('not_configured', False):
@@ -2548,7 +2556,7 @@ class PumpControlNode(object):
             self._accumulate_spectro_sample(data, received_at)
         else:
             self._invalidate_spectro('test_data' if data.get('simulated') else self.spectro_state)
-            if (any(data.get(flag) for flag in ('i2c_error', 'not_configured', 'saturated', 'simulated'))
+            if (any(data.get(flag) for flag in ('i2c_error', 'not_configured', 'simulated'))
                     and self._automation_is_active()):
                 with self._terminal_lock:
                     if self._terminal_finalized:

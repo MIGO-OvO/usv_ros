@@ -150,6 +150,7 @@ def _install_fake_ros_modules():
     rospy.logerr = lambda *args, **kwargs: None
     rospy.logdebug = lambda *args, **kwargs: None
     rospy.logdebug_throttle = lambda *args, **kwargs: None
+    rospy.logwarn_throttle = lambda *args, **kwargs: None
     rospy.sleep = lambda *args, **kwargs: None
     rospy.is_shutdown = lambda: True
     rospy.Rate = lambda hz: types.SimpleNamespace(sleep=lambda: None)

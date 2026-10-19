@@ -94,6 +94,16 @@ class PumpSafetyTests(unittest.TestCase):
         self.assertFalse(received[0]['valid'])
         self.assertTrue(received[0]['simulated'])
 
+    def test_saturated_frame_remains_operator_data(self):
+        received = []
+        reader = self.module.PumpSerialReader(None)
+        reader.on_spectro_received = received.append
+        frame = struct.pack('<BBIBBifBB', 0x55, 0xDD, 10, 2, 0x09, 8388607, 3.3, 0, 10)
+        reader._parse_spectro_packet(frame)
+        self.assertTrue(received[0]['valid'])
+        self.assertTrue(received[0]['saturated'])
+        self.assertFalse(received[0]['i2c_error'])
+
     def test_invalid_frame_invalidates_previously_published_average(self):
         self.node._emit_spectro_average([{'voltage': 1.2, 'valid': True, 'timestamp_ms': 1}])
         self.node._on_spectro_received({'voltage': 0.0, 'valid': False, 'i2c_error': True})
