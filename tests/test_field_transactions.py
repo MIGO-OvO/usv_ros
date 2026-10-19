@@ -294,6 +294,45 @@ class FieldTransactionTests(unittest.TestCase):
         self.assertEqual(status['spectrometer_txn_phase'], 'serial_failed')
         self.assertIn('serial send failed', status['spectrometer_last_txn_error'])
 
+    def test_maintenance_reconnect_does_not_require_recovery_ads_stop(self):
+        """A healthy explicit reconnect is not transport-fault recovery.
+
+        The detector may be idle with no ADS configured, so ADSSTOP can return
+        an error even though no acquisition can be running. That must not make
+        a normal hardware-configuration reconnect fail.
+        """
+        self.serial_environment()
+        self.node._apply_runtime_configuration = Mock()
+        self.assertTrue(self.node.connect())
+        self.node._controller_fault = None
+        self.node._cleanup_failed = False
+        self.node._spectro_stop = Mock(return_value=(False, 'ADS_ERR:STOP_I2C'))
+        result = self.node._reconnect_callback(None)
+        self.assertTrue(result.success)
+        self.node._spectro_stop.assert_not_called()
+
+    def test_maintenance_reconnect_stops_active_ads_before_configuration(self):
+        self.serial_environment()
+        self.node._apply_runtime_configuration = Mock()
+        self.assertTrue(self.node.connect())
+        self.node._controller_fault = None
+        self.node._cleanup_failed = False
+        self.node.spectro_state = 'acquiring'
+        self.node._spectro_stop = Mock(return_value=(False, 'ADS_ERR:STOP_I2C'))
+        result = self.node._reconnect_callback(None)
+        self.assertFalse(result.success)
+        self.node._spectro_stop.assert_called_once()
+
+    def test_fault_reconnect_still_requires_recovery_ads_stop(self):
+        self.serial_environment()
+        self.node._apply_runtime_configuration = Mock()
+        self.assertTrue(self.node.connect())
+        self.node._spectro_stop = Mock(return_value=(False, 'ADS_ERR:STOP_I2C'))
+        self.node._controller_fault = 'disconnected'
+        result = self.node._reconnect_callback(None)
+        self.assertFalse(result.success)
+        self.node._spectro_stop.assert_called_once()
+
     def test_reconnect_stops_old_worker_and_disconnect_stops_new_worker(self):
         ports = self.serial_environment()
         self.node._apply_runtime_configuration = Mock()

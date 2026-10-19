@@ -720,12 +720,12 @@ class PumpControlNode(object):
         rospy.loginfo("  PID Mode: %s (precision: %.2f)", self.pid_mode, self.pid_precision)
         self._publish_manual_status()
 
-    def connect(self):
+    def connect(self, require_spectro_stop=None):
         """连接串口。"""
         with self._control_lock, self._connection_lock:
-            return self._connect_locked()
+            return self._connect_locked(require_spectro_stop)
 
-    def _connect_locked(self):
+    def _connect_locked(self, require_spectro_stop=None):
         self.disconnect()
         connection = None
         try:
@@ -769,11 +769,18 @@ class PumpControlNode(object):
                 on_error=lambda error: self._on_serial_reader_error(error, reader_connection)
             )
 
-            if self._controller_fault or self._cleanup_failed:
+            recovery = bool(self._controller_fault or self._cleanup_failed)
+            if recovery:
                 # Transport recovery is not proof of output shutdown. Reuse the
                 # ordered STOP confirmation before allowing a new action owner.
-                if not self._confirm_all_outputs_stopped() or not self._spectro_stop()[0]:
+                if not self._confirm_all_outputs_stopped():
                     raise serial.SerialException('recovery stop not confirmed')
+            # A fault recovery always verifies the ADS stop. A healthy
+            # maintenance reconnect only does so when an acquisition was
+            # active, so an idle/unconfigured ADS cannot block reconnecting.
+            if recovery or require_spectro_stop:
+                if not self._spectro_stop()[0]:
+                    raise serial.SerialException('spectrometer stop not confirmed')
             self._controller_fault = None
 
             # Transport identity and configuration readiness are independent.
@@ -948,6 +955,9 @@ class PumpControlNode(object):
             return self._reconnect_locked(req)
 
     def _reconnect_locked(self, req):
+        previous_fault = self._controller_fault
+        spectro_was_active = (self.spectro_state in ('starting', 'acquiring', 'stale', 'stopping')
+                              or self._spectro_config_state in ('configured', 'starting', 'stopping'))
         try:
             self._latch_serial_fault(self.serial_conn)
             self._controller_fault = 'reconnecting'
@@ -964,7 +974,20 @@ class PumpControlNode(object):
             self.baudrate = new_baud
             self.timeout = new_timeout
 
-            if self.connect():
+            # This service is also used for a normal hardware-configuration
+            # apply. Only a real prior fault or failed cleanup needs the
+            # ordered STOP/ADSSTOP recovery gate; a healthy maintenance
+            # reconnect must not fail because an idle, unconfigured ADS
+            # returns ADS_ERR:STOP_I2C.
+            fault_after_stop = self._controller_fault
+            if fault_after_stop == 'reconnecting':
+                fault_after_stop = previous_fault
+            if fault_after_stop or self._cleanup_failed:
+                self._controller_fault = fault_after_stop or 'reconnecting'
+            else:
+                self._controller_fault = None
+
+            if self.connect(require_spectro_stop=spectro_was_active):
                 msg = "Serial reconnected to %s @ %d; spectrometer configuration: %s" % (
                     self.serial_port, self.baudrate, self._spectro_config_state)
                 if self._last_spectro_txn_error:
