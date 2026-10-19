@@ -91,12 +91,19 @@ class StopAndSurveyRaceTests(unittest.TestCase):
         self.assertFalse(self.node._execute_control_action('injection_on', {'speed': 60})[0])
         self.assertEqual(self.trigger.current_mission_state, self.trigger_module.MissionState.FAILED)
 
-    def test_existing_fault_cannot_be_cleared_by_successful_stop_ack(self):
+    def test_successful_stop_is_reported_for_itself_while_control_fault_remains(self):
+        """Stop result and current device fault are two separate answers.
+
+        The operator must see that the stop physically succeeded, while a real
+        control-session fault (owner loss) keeps blocking new motion until its
+        own recovery condition is proven.
+        """
         self.node._controller_fault = 'owner_lost'
         self.node._set_terminal_reason('owner_lost')
-        self.assertFalse(self.trigger.handle_mavlink_command(31011))
+        self.assertTrue(self.trigger.handle_mavlink_command(31011))
         self.assertEqual(self.node._controller_fault, 'owner_lost')
         self.assertEqual(self.status()['terminal_reason'], 'owner_lost')
+        self.assertFalse(self.trigger.handle_mavlink_command(31010))
 
     def test_stop_before_first_survey_acquisition_finishes_without_touching_other_owner(self):
         self.assertTrue(self.node._execute_control_action('injection_on', {

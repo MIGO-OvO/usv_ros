@@ -117,9 +117,10 @@ class USVMavlinkRouterBridge(object):
         self._recent_events = OrderedDict()
         self._event_chunk_id = 0
         self._reconnect_reason = None
-        self._transport_counts = dict.fromkeys(('generated_frames', 'fully_written_frames',
-            'fully_written_bytes', 'short_writes', 'would_block', 'send_errors',
+        self._transport_counts = dict.fromkeys(('generated_frames', 'fully_written_frames',            'fully_written_bytes', 'short_writes', 'would_block', 'send_errors',
             'receive_errors', 'dropped_session_items'), 0)
+        self._bad_data_counts = {}
+        self._bad_data_last_reason = ''
         self._diag_pub = rospy.Publisher("/usv/bridge_diagnostics", String, queue_size=5)
         self._diag_tx_total = 0        # 总发送包数
         self._diag_tx_heartbeat = 0    # 心跳包数
@@ -382,7 +383,14 @@ class USVMavlinkRouterBridge(object):
             self._status_code = self._MISSION_STATE_CODES["SAMPLING"]
         elif not self._automation_running:
             sampling_state = last_state in ("IDLE", "HOLD_NO_MISSION", "SAMPLING", "SAMPLING_DONE", "PAUSED")
-            if terminal_status and sampling_state and getattr(self, "_fcu_sample_id", 0) <= 0:
+            # An explicit, completed stop is the current device state. The
+            # previous failure stays visible through terminal_reason and the
+            # request ledger, but it must not pin USV_STAT to FAILED forever:
+            # gating on last_state here left the operator locked out after a
+            # run that ended during preparation.
+            run_stopped = (terminal_status and not self._automation_paused
+                           and getattr(self, "_fcu_sample_id", 0) <= 0)
+            if run_stopped and (sampling_state or "stop" in status_text):
                 self._last_mission_state = "IDLE"
                 self._status_code = self._MISSION_STATE_CODES["IDLE"]
             elif last_state in ("IDLE", "HOLD_NO_MISSION"):
@@ -672,6 +680,10 @@ class USVMavlinkRouterBridge(object):
 
             msg_type = msg.get_type()
             if msg_type == "BAD_DATA":
+                # A rejected frame is a diagnosable event, not a disconnect and
+                # not a command. Classify it so the field can tell a corrupt
+                # stream from an unknown-but-legal message id.
+                self._count_bad_data(getattr(msg, 'reason', '') or '')
                 continue
 
             if hasattr(self, '_gps_cache'):
@@ -778,6 +790,31 @@ class USVMavlinkRouterBridge(object):
             except Exception as exc:
                 rospy.logwarn("Failed to forward COMMAND_LONG: %s", str(exc))
 
+    @staticmethod
+    def _bad_data_class(reason):
+        text = str(reason or '').lower()
+        if 'crc' in text:
+            return 'bad_crc'
+        if 'unknown' in text and 'message' in text:
+            return 'unknown_message_id'
+        if 'length' in text or 'short' in text:
+            return 'bad_length'
+        if 'signature' in text or 'signing' in text:
+            return 'bad_signature'
+        return 'other'
+
+    def _count_bad_data(self, reason):
+        """Classify a rejected inbound frame for diagnostics only.
+
+        Nothing here dispatches a command or retires the session: the parser
+        already refused those bytes, and resynchronisation is its job.
+        """
+        bucket = self._bad_data_class(reason)
+        with self._lock:
+            self._bad_data_counts[bucket] = self._bad_data_counts.get(bucket, 0) + 1
+            self._bad_data_counts['total'] = self._bad_data_counts.get('total', 0) + 1
+            self._bad_data_last_reason = str(reason or '')[:120]
+
     def _publish_diagnostics(self):
         now = time.time()
         last_write = (self._transport.last_write_at if self._transport and self._transport.last_write_at is not None
@@ -802,6 +839,8 @@ class USVMavlinkRouterBridge(object):
                 "tcp_connected": self._conn is not None,
                 "reconnect_reason": self._reconnect_reason,
                 "transport": dict(self._transport_counts),
+                "bad_data": dict(self._bad_data_counts),
+                "bad_data_last_reason": self._bad_data_last_reason,
                 "fcu_heartbeat_age_s": (time.monotonic() - self._gps_cache.records['HEARTBEAT']['received_monotonic']
                     if 'HEARTBEAT' in self._gps_cache.records else None),
                 "last_complete_write_age_s": time.monotonic() - last_write if last_write is not None else None,

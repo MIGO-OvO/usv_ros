@@ -240,6 +240,13 @@ class MAVLinkTriggerNode(object):
             for safety in (False, True)
         }
         self._command_context = threading.local()
+        # Rejections are decided on the shared RX path, where a disk write must
+        # never delay a STOP. A single bounded worker owns the persistence so
+        # the request still gets a correlated result instead of an orphan
+        # reservation that every retry silently replays.
+        self._notice_queue = queue.Queue(maxsize=32)
+        self._notice_thread = None
+        self._notice_lock = threading.Lock()
         self._request_ledger = None
         self._protocol_failed = False
         self._ledger_path = os.path.expanduser(rospy.get_param(
@@ -1321,7 +1328,43 @@ class MAVLinkTriggerNode(object):
         if rejected:
             # Do not write the ledger from the shared RX callback. No physical
             # work was admitted; the volatile reservation still prevents replay.
+            # The correlated rejection is persisted out of band below, so the
+            # requester never waits for an event this node will not produce.
+            self._queue_request_rejection(request, 'command_lane_busy')
             self._send_command_ack(command, MAV_RESULT_TEMPORARILY_REJECTED, sender_system, sender_component, ack_session)
+
+    def _queue_request_rejection(self, request, reason):
+        """Persist a correlated rejection without blocking MAVLink reception."""
+        if request is None:
+            return
+        with self._notice_lock:
+            if self._notice_thread is None:
+                self._notice_thread = threading.Thread(
+                    target=self._notice_loop, daemon=True, name='PayloadRejectionNotice')
+                self._notice_thread.start()
+        try:
+            self._notice_queue.put_nowait((request, reason))
+        except queue.Full:
+            # The standard ACK still reports the rejection; the bounded queue
+            # only decides whether a retry can replay a stored result.
+            rospy.logwarn('Payload rejection notice queue full; ACK only')
+
+    def _notice_loop(self):
+        while not rospy.is_shutdown():
+            try:
+                request, reason = self._notice_queue.get(timeout=0.5)
+            except queue.Empty:
+                with self._notice_lock:
+                    if self._notice_queue.empty():
+                        self._notice_thread = None
+                        return
+                continue
+            try:
+                self._emit_request_event(request, 'request', 'rejected', reason)
+            except Exception as exc:
+                rospy.logerr('Payload rejection notice failed: %s', exc)
+            finally:
+                self._notice_queue.task_done()
 
     def _command_loop(self, safety):
         lane = self._command_lanes[safety]
@@ -1338,6 +1381,7 @@ class MAVLinkTriggerNode(object):
             self._command_context.issued_at = issued_at
             self._command_context.request = request
             self._command_context.ack_session = ack_session
+            self._command_context.last_reason = ''
             self._command_context.deferred_events = [] if safety else None
             try:
                 if request is not None and not safety:
@@ -1402,9 +1446,10 @@ class MAVLinkTriggerNode(object):
             ack_result = MAV_RESULT_FAILED
 
         self._send_command_ack(command, ack_result, sender_system, sender_component)
+        failure_reason = '' if success else (
+            getattr(context, 'last_reason', '') or 'command_rejected_or_cancelled')
         self._emit_request_event(getattr(context, 'request', None), 'request',
-                                 'accepted' if success else 'failed',
-                                 '' if success else 'command_rejected_or_cancelled')
+                                 'accepted' if success else 'failed', failure_reason)
 
     def _handle_command_long_payload(self, msg):
         """
@@ -1635,11 +1680,21 @@ class MAVLinkTriggerNode(object):
                 payload_json=json.dumps(payload),
             )
             rospy.loginfo("Control command %s: %s", action, getattr(resp, "message", ""))
+            if not getattr(resp, "success", False):
+                # Keep the backend's own wording: a flat "rejected" leaves the
+                # operator unable to tell a stale detector from a busy lane.
+                self._record_command_reason(getattr(resp, "message", ""))
             result = json.loads(getattr(resp, 'result_json', '') or '{}')
             return bool(getattr(resp, "success", False)), result if isinstance(result, dict) else {}
         except Exception as e:
             rospy.logerr("Control command error: %s", str(e))
+            self._record_command_reason(str(e))
             return False, {}
+
+    def _record_command_reason(self, message):
+        reason = str(message or '').strip()
+        if reason:
+            self._command_context.last_reason = reason[:80]
 
     def _cleanup_sampling_attempt(self, context, reason):
         attempt = (context or {}).get('attempt_id')
