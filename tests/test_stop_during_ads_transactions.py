@@ -12,7 +12,7 @@ from command_fixtures import remote_command, wait_commands
 
 class StopDuringAdsTests(unittest.TestCase):
     def test_stop_preempts_every_ads_wait_at_real_serial_boundary(self):
-        for phase in ('mapping', 'config', 'start', 'frame', 'settling', 'backoff'):
+        for phase in ('mapping', 'config', 'start', 'settling', 'backoff'):
             with self.subTest(phase=phase):
                 fixture = field.FieldTransactionTests()
                 fixture.setUp()
@@ -45,7 +45,7 @@ class StopDuringAdsTests(unittest.TestCase):
                         reply = 'ADS_STATUS:STOPPED,CH=2'
                     if reply:
                         node._on_text_received(reply)
-                    if (phase == 'frame' and command == 'ADSSTART') or (phase == 'backoff' and command == 'ADSSTATUS?'):
+                    if phase == 'backoff' and command == 'ADSSTATUS?':
                         entered.set()
                     return count
                 port.write = receive

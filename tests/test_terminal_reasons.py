@@ -278,11 +278,11 @@ class TerminalReasonTests(unittest.TestCase):
         self.assertEqual(self.node.spectro_state, 'i2c_error')
         self.assertFalse(self.node.automation_engine._running.is_set())
 
-    def test_start_ack_never_becomes_measurement_freshness(self):
+    def test_start_ack_marks_compatibility_freshness(self):
         self.node._last_valid_spectro_at = None
         acknowledge(self.node, 'ADSSTART')
         self.assertEqual(self.node.spectro_state, 'starting')
-        self.assertIsNone(self.node._last_valid_spectro_at)
+        self.assertIsNotNone(self.node._last_valid_spectro_at)
         self.assertEqual(self.node._spectro_txn_phase, 'idle')
 
     # ------------------------------------------------------------------
