@@ -4,6 +4,7 @@ No serial device is opened. Writes, firmware replies and raw binary frames cross
 the production serial/engine/parser seams; clock substitution is labelled below.
 """
 import functools
+import json
 import struct
 import threading
 import time
@@ -58,7 +59,7 @@ class RemainingMeasurementPathTests(unittest.TestCase):
         self.assertTrue(self.motion.wait(1), 'real engine never entered the formal step')
         self.node.injection_pump_policy['lead_time_s'] = lead
 
-    def send_binary_fault(self, status=0x09):
+    def send_binary_fault(self, status=0x03):
         reader = self.module.PumpSerialReader(self.node.serial_conn)
         reader.on_spectro_received = self.node._on_spectro_received
         frame = bytearray(b'\x55\xdd' + struct.pack('<IBBif', 123, 2, status, 32767, 2.048))
@@ -159,19 +160,23 @@ class RemainingMeasurementPathTests(unittest.TestCase):
         self.assertTrue(self.motion.wait(0.7), 'new real frame did not release the resumed step')
         self.assertEqual(self.formal_motion_count, 2)
 
-    def test_saturated_binary_frame_aborts_real_pid_wait_without_reader_ack_wait(self):
+    def test_saturated_binary_frame_is_retained_as_data_and_does_not_stop(self):
         self.start_engine()
         before = len(self.writes)
-        started = time.monotonic()
-        self.send_binary_fault(0x09)  # VALID | SATURATED, production parser rejects valid.
-        self.assertLess(time.monotonic() - started, 0.2, 'serial reader callback blocked on cleanup/ACK')
-        self.assertFalse(self.node.latest_spectro['valid'])
-        self.await_terminal()
-        self.assertIn('STOPALL', self.writes[before:])
-        self.assertEqual(self.node._terminal_reason, 'spectrometer_not_ready')
-        self.assertEqual(self.node.last_automation_failure['spectrometer_state'], 'saturated')
+        self.send_binary_fault(0x09)  # VALID | SATURATED, a bubble/full-scale sample.
+        time.sleep(0.15)
+        raw_messages = [json.loads(message.data)
+                        for message in self.fixture.pubs['/usv/spectrometer_raw'].messages[-10:]]
+        saturated = [message for message in raw_messages if message.get('saturated')]
+        self.assertTrue(saturated)
+        self.assertTrue(saturated[-1]['valid'])
+        time.sleep(0.1)
+        self.assertFalse(self.node._terminal_finalized)
+        self.assertIsNone(self.node._controller_fault)
+        self.assertNotIn('STOPALL', self.writes[before:])
+        self.assertTrue(self.node.automation_engine.is_running())
 
-    def test_saturated_binary_frame_interrupts_long_engine_interval(self):
+    def test_saturated_binary_frame_does_not_interrupt_long_engine_interval(self):
         self.reply_done = True
         waiting = threading.Event()
         wait_interval = self.node.automation_engine._wait_interval
@@ -182,15 +187,17 @@ class RemainingMeasurementPathTests(unittest.TestCase):
         self.start_engine(interval=6000)
         self.assertTrue(waiting.wait(1))
         self.send_binary_fault(0x09)
-        self.await_terminal()
-        self.assertEqual(self.node._terminal_reason, 'spectrometer_not_ready')
+        time.sleep(0.1)
+        self.assertFalse(self.node._terminal_finalized)
+        self.assertIsNone(self.node._controller_fault)
+        self.assertTrue(self.node.automation_engine.is_running())
 
     def test_explicit_spectro_error_is_not_relabelled_as_silence(self):
-        self.send_binary_fault(0x09)
+        self.send_binary_fault(0x03)  # VALID | I2C error.
         with patch.object(self.module.time, 'monotonic', return_value=time.monotonic() + 11):
             self.node._check_spectro_freshness()
-        self.assertEqual(self.node.spectro_state, 'saturated')
-        self.assertEqual(self.node.latest_spectro['status'], 'saturated')
+        self.assertEqual(self.node.spectro_state, 'i2c_error')
+        self.assertEqual(self.node.latest_spectro['status'], 'i2c_error')
 
     def resume_into_lead(self):
         paused, lead_started = threading.Event(), threading.Event()
@@ -282,7 +289,7 @@ class RemainingMeasurementPathTests(unittest.TestCase):
 
     def test_new_valid_frame_does_not_clear_latched_explicit_fault_or_resume_pumps(self):
         self.start_engine()
-        self.send_binary_fault(0x09)
+        self.send_binary_fault(0x03)
         self.await_terminal()
         fault = self.node._controller_fault
         before = len(self.writes)
