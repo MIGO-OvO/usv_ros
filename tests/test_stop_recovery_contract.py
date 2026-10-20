@@ -249,10 +249,12 @@ class PreflightStaleMeasurementTests(unittest.TestCase):
         node._last_valid_spectro_at = time.monotonic() - node.spectro_stale_stop_timeout - 1.0
         node._preflight.stage('homing')
         self.assertFalse(node._measurement_required_now(), 'homing must not read the detector')
-        with patch.object(node, '_stop_stale_acquisition', wraps=node._stop_stale_acquisition) as stop:
-            for _ in range(3):
-                node._check_spectro_freshness()
-        self.assertFalse(stop.called, 'mechanical preparation was cancelled by a detector time-out')
+        node._auto_stop_locked = Mock(
+            return_value=self.module.TriggerResponse(success=True, message='stopped'))
+        for _ in range(3):
+            node._check_spectro_freshness()
+        self.assertFalse(node._auto_stop_locked.called,
+                         'mechanical preparation was cancelled by a detector time-out')
         self.assertTrue(node._preflight.snapshot()['active'])
         self.assertIsNone(node._terminal_reason)
         self.assertEqual(node.spectro_state, 'stale')
@@ -261,25 +263,66 @@ class PreflightStaleMeasurementTests(unittest.TestCase):
         self.assertTrue(node._measurement_required_now())
         self.assertIsNotNone(node._measurement_owner())
 
-    def test_late_stale_check_cannot_cancel_the_task_that_replaced_it(self):
-        """Ownership is verified under the same lock the stop path uses."""
+    def test_late_stale_reading_cannot_stop_or_invalidate_the_new_task(self):
+        """The check is bound to the session and attempt it read."""
         node = self.node
         node.sampling_context = {'attempt_id': 'attempt-A'}
         node.automation_engine._running.set()
         node.send_command = Mock(return_value=True)
         node._auto_stop_locked = Mock(
             return_value=self.module.TriggerResponse(success=True, message='stopped'))
-        owner = node._measurement_owner()
-        self.assertIsNotNone(owner)
-        # Attempt A is stopped and attempt B legitimately starts.
-        node._request_output_stop()
-        node._finish_output_stop()
-        node.sampling_context = {'attempt_id': 'attempt-B'}
-        node.automation_engine._running.set()
-        self.assertFalse(node._stop_stale_acquisition(owner, 'spectrometer_stale'))
+        # Runtime silence, not a cold start: the runtime-stale branch is the
+        # one that would invalidate data and stop the acquisition.
+        node._spectro_start_ack_at = None
+        node._spectro_first_frame_deadline = None
+        node._last_valid_spectro_at = time.monotonic() - node.spectro_stale_stop_timeout - 1.0
+        original = node._measurement_snapshot
+
+        def snapshot_then_hand_over():
+            snapshot = original()
+            # Attempt A stops and attempt B starts with a new frame and owner
+            # while this check is still deciding what the old reading means.
+            node._request_output_stop()
+            node._finish_output_stop()
+            node.sampling_context = {'attempt_id': 'attempt-B'}
+            node.automation_engine._running.set()
+            node._on_spectro_received({'voltage': 1.25, 'valid': True})
+            return snapshot
+
+        node._measurement_snapshot = snapshot_then_hand_over
+        node._check_spectro_freshness()
         node._auto_stop_locked.assert_not_called()
         self.assertEqual(node.sampling_context['attempt_id'], 'attempt-B')
         self.assertTrue(node.automation_engine._running.is_set())
+        self.assertTrue(node.latest_spectro.get('valid'), 'the new frame must stay valid')
+        self.assertNotEqual(node.spectro_state, 'stale')
+
+    def test_valid_frame_after_the_reading_is_not_marked_stale_again(self):
+        """The hand-over of the same attempt consumes the frame this check saw."""
+        node = self.node
+        node.sampling_context = {'attempt_id': 'attempt-handover'}
+        node.automation_engine._running.set()
+        node.send_command = Mock(return_value=True)
+        node._auto_stop_locked = Mock(
+            return_value=self.module.TriggerResponse(success=True, message='stopped'))
+        # Runtime silence, not a cold start: the runtime-stale branch is the
+        # one that would invalidate data and stop the acquisition.
+        node._spectro_start_ack_at = None
+        node._spectro_first_frame_deadline = None
+        node._last_valid_spectro_at = time.monotonic() - node.spectro_stale_stop_timeout - 1.0
+        original = node._measurement_snapshot
+
+        def snapshot_then_new_frame():
+            snapshot = original()
+            node._on_spectro_received({'voltage': 1.4, 'valid': True})
+            return snapshot
+
+        node._measurement_snapshot = snapshot_then_new_frame
+        node._check_spectro_freshness()
+        node._auto_stop_locked.assert_not_called()
+        self.assertTrue(node.latest_spectro.get('valid'))
+        self.assertEqual(node.spectro_state, 'acquiring')
+        self.assertIsNone(node._terminal_reason)
 
 
 class PayloadStatusAfterStopTests(unittest.TestCase):
