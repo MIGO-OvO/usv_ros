@@ -238,7 +238,7 @@ class MAVLinkTriggerNode(object):
         self._command_generation = 0
         self._command_lanes = {
             safety: {'queue': queue.Queue(maxsize=4 if safety else 1),
-                     'thread': None, 'busy': 0}
+                     'thread': None, 'busy': 0, 'command': None}
             for safety in (False, True)
         }
         self._command_context = threading.local()
@@ -1257,9 +1257,15 @@ class MAVLinkTriggerNode(object):
             self._enqueue_command_long(CMD_STOP_SAMPLING, 0, 0, 0, 0, 'TCP session retired')
 
     @staticmethod
-    def _ack_for_outcome(outcome):
-        return {'accepted': MAV_RESULT_ACCEPTED,
-                'rejected': MAV_RESULT_TEMPORARILY_REJECTED}.get(outcome, MAV_RESULT_FAILED)
+    def _ack_for_event(event):
+        if event.get('phase') == 'progress':
+            return MAV_RESULT_IN_PROGRESS
+        if event.get('phase') == 'terminal' and event.get('outcome') == 'succeeded':
+            return MAV_RESULT_ACCEPTED
+        if event.get('phase') == 'request':
+            return {'accepted': MAV_RESULT_ACCEPTED,
+                    'rejected': MAV_RESULT_TEMPORARILY_REJECTED}.get(event.get('outcome'), MAV_RESULT_FAILED)
+        return MAV_RESULT_FAILED
 
     def _replay_request(self, request, previous, command, sender_system, sender_component, ack_session):
         """Answer a repeated identity with its stored answer, never with a second action."""
@@ -1267,7 +1273,7 @@ class MAVLinkTriggerNode(object):
             message = String()
             message.data = json.dumps(dict(previous, tcp_session=request['tcp_session']))
             self._event_pub.publish(message)
-            self._send_command_ack(command, self._ack_for_outcome(previous.get('outcome')),
+            self._send_command_ack(command, self._ack_for_event(previous),
                                    sender_system, sender_component, ack_session)
             return
         # The first copy is still being processed: say so instead of staying
@@ -1300,10 +1306,11 @@ class MAVLinkTriggerNode(object):
         with self._command_dispatch_lock:
             lane = self._command_lanes[safety]
             if safety:
-                # A STOP is never refused. Identical repeats and other stop
-                # scopes queue behind the running one so each request still
-                # gets its own answer instead of a rejection to retry by hand.
-                generation = self._command_generation + 1
+                # Distinct STOP scopes queue behind the running one. Only a
+                # full safety queue refuses admission, without cancellation.
+                cancels = (command != CMD_STOP_SURVEY or self._survey_active
+                           or self._command_lanes[False]['command'] == CMD_START_SURVEY)
+                generation = self._command_generation + int(cancels)
                 try:
                     lane['queue'].put_nowait((generation, time.monotonic(), request, ack_session, (
                         command, param1, param2, sender_system, sender_component, log_prefix)))
@@ -1318,6 +1325,7 @@ class MAVLinkTriggerNode(object):
                 rejected = True
             else:
                 lane['busy'] += 1
+                lane['command'] = command
                 lane['queue'].put_nowait((self._command_generation, time.monotonic(), request, ack_session, (
                     command, param1, param2, sender_system, sender_component, log_prefix)))
             if lane['thread'] is None and lane['busy']:
@@ -1366,6 +1374,8 @@ class MAVLinkTriggerNode(object):
                 self._command_context.ack_session = None
                 with self._command_dispatch_lock:
                     lane['busy'] -= 1
+                    if not safety:
+                        lane['command'] = None
                 lane['queue'].task_done()
 
     def _dispatch_command_long(self, command, param1, param2, sender_system, sender_component, log_prefix):
@@ -2175,20 +2185,25 @@ class MAVLinkTriggerNode(object):
 
         config = self._load_config() or self._get_default_config()
         gate = self._survey_gate_config(config)
-        # A scheduler is not a pump owner. Acquire attempt/lease only when an
-        # acquisition is actually dispatched, so pre-first STOP is local.
-        self.current_sampling_context = None
-        # Each survey acquisition below creates its own UUID and start snapshot.
-        self._survey_owner_attempt_id = None
-        self._survey_generation = uuid.uuid4().hex
-        self._survey_request = getattr(self._command_context, 'request', None)
-        self._survey_interval = max(1.0, float(interval) if interval > 0 else gate["survey_interval_s"])
-        self._survey_active = True
-        self._survey_thread = threading.Thread(target=self._survey_loop, args=(self._survey_generation,), daemon=True)
-        rospy.loginfo("Survey started, interval=%.1fs", self._survey_interval)
-        self._set_mission_state(MissionState.SURVEYING, "{:.1f}".format(self._survey_interval))
-        self._publish_status("survey_started")
-        self._survey_thread.start()
+        # STOP admission and activation share this short critical section:
+        # either STOP cancels the pending START, or it observes an active survey.
+        with self._command_dispatch_lock:
+            generation = getattr(self._command_context, 'generation', None)
+            if generation is not None and generation != self._command_generation:
+                self._record_command_reason('superseded_by_stop')
+                return False
+            # The scheduler gets an attempt/lease only when dispatching a sample.
+            self.current_sampling_context = None
+            self._survey_owner_attempt_id = None
+            self._survey_generation = uuid.uuid4().hex
+            self._survey_request = getattr(self._command_context, 'request', None)
+            self._survey_interval = max(1.0, float(interval) if interval > 0 else gate["survey_interval_s"])
+            self._survey_active = True
+            self._survey_thread = threading.Thread(target=self._survey_loop, args=(self._survey_generation,), daemon=True)
+            rospy.loginfo("Survey started, interval=%.1fs", self._survey_interval)
+            self._set_mission_state(MissionState.SURVEYING, "{:.1f}".format(self._survey_interval))
+            self._publish_status("survey_started")
+            self._survey_thread.start()
         return True
 
     def _stop_survey(self):

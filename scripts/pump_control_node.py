@@ -2636,8 +2636,8 @@ class PumpControlNode(object):
         start_ack_at = snapshot['start_ack_at']
         awaiting_first = (start_ack_at is not None and
                           (last_valid_at is None or last_valid_at < start_ack_at))
-        if (awaiting_first and self._spectro_first_frame_deadline is not None
-                and now <= self._spectro_first_frame_deadline):
+        if (awaiting_first and snapshot['first_frame_deadline'] is not None
+                and now <= snapshot['first_frame_deadline']):
             # Cold start grace belongs to "awaiting the first frame", not to a
             # particular transaction phase: the ACK already closed the
             # transaction while the detector is still warming up.
@@ -2660,13 +2660,13 @@ class PumpControlNode(object):
             'reason': 'spectrometer_frame_timeout' if awaiting_first else 'spectrometer_stale',
             'stop_due': bool(awaiting_first or now - freshness_at >= self.spectro_stale_stop_timeout),
             'enabled': bool(snapshot['enabled']),
-            'owner': self._measurement_owner(),
+            'owner': snapshot['owner'],
+            'task': snapshot['task'],
             'connection': snapshot['connection'],
             'start_ack_at': snapshot['start_ack_at'],
             'last_valid_at': snapshot['last_valid_at'],
             'state': snapshot['state'],
-            'sequence': snapshot['sequence'],
-            'read_at': now,
+            'fault': snapshot['fault'],
         }
 
     def _stale_observation_current(self, observation):
@@ -2686,6 +2686,13 @@ class PumpControlNode(object):
             return False  # a valid frame arrived after this reading
         if self.spectro_state != observation['state']:
             return False  # a newer explicit device state supersedes the reading
+        if self._controller_fault != observation['fault']:
+            return False
+        if (self._action_cancel is not observation['task'][0]
+                or self.sampling_context.get('attempt_id') != observation['task'][1]):
+            return False  # even a mechanical PRE reading belongs to one task
+        if self._measurement_owner() != observation['owner']:
+            return False  # mechanical PRE must not become a runtime stop decision
         return True
 
     def _commit_stale_observation(self, observation):
@@ -2710,15 +2717,17 @@ class PumpControlNode(object):
                 with self._terminal_lock:
                     if self._terminal_finalized:
                         stop_due = False
-            if not stop_due:
-                return True
-            self._set_terminal_reason(observation['reason'])
-            attempt = owner[1]
-            preparation = self._preflight
-            if (preparation is not None and preparation.snapshot()['active']
-                    and (attempt is None or self._preflight_attempt_id == attempt)):
-                preparation.cancel()
-            first_write = self._request_output_stop()
+                if not stop_due:
+                    return True
+                self._set_terminal_reason(observation['reason'])
+                attempt = owner[1]
+                preparation = self._preflight
+                if (preparation is not None and preparation.snapshot()['active']
+                        and (attempt is None or self._preflight_attempt_id == attempt)):
+                    preparation.cancel()
+                # Claim this stop under the same protection as the recheck.
+                # ACK waits and worker joins below must leave the reader free.
+                first_write = self._request_output_stop()
             try:
                 if not first_write:
                     self._record_cleanup_result(False)
@@ -2877,6 +2886,9 @@ class PumpControlNode(object):
                 'state': self.spectro_state,
                 'connection': self.serial_conn,
                 'connection_open': bool(self.serial_conn and self.serial_conn.is_open),
+                'first_frame_deadline': self._spectro_first_frame_deadline,
+                'task': (self._action_cancel, self.sampling_context.get('attempt_id')),
+                'owner': self._measurement_owner(),
                 'fault': self._controller_fault,
                 'config_state': self._spectro_config_state,
                 'enabled': bool(self.spectro_config.get('enabled', True)),

@@ -8,6 +8,7 @@ Covers the two P0 defects that made a failed run unrecoverable:
   the success branch never released the latch.
 """
 import json
+import threading
 import time
 import unittest
 from types import SimpleNamespace
@@ -323,6 +324,147 @@ class PreflightStaleMeasurementTests(unittest.TestCase):
         self.assertTrue(node.latest_spectro.get('valid'))
         self.assertEqual(node.spectro_state, 'acquiring')
         self.assertIsNone(node._terminal_reason)
+
+
+class FreshnessInterleavingTests(unittest.TestCase):
+    """Pause a real freshness read, then run the production PRE/engine/STOP."""
+
+    def setUp(self):
+        self.fixture = preflight_fixture.PreflightWorkerTests()
+        self.fixture.setUp()
+        self.addCleanup(self.fixture.doCleanups)
+        self.node = self.fixture.node
+        self.node.automation_engine.start = self.fixture.real_engine_start
+        self.running = threading.Event()
+        publish = self.node._on_automation_status
+        def status(value):
+            publish(value)
+            if str(value).startswith('running'):
+                self.running.set()
+        self.node.automation_engine.on_status_update = status
+
+    def start(self, attempt, mechanical=False):
+        self.running.clear()
+        self.fixture.block_phase = 'compensating' if mechanical else None
+        self.assertTrue(self.fixture.start(
+            attempt_id=attempt, steps=[{'X': {'enable': 'E'}, 'interval': 60000}])[0])
+        if mechanical:
+            self.fixture.wait_phase('compensating')
+        else:
+            self.assertTrue(self.running.wait(2))
+            self.fixture.join()
+            self.assertTrue(self.node.automation_engine.is_running())
+
+    def age_measurement(self):
+        with self.node.serial_lock:
+            self.node._spectro_start_ack_at = time.monotonic() - 100
+            self.node._last_valid_spectro_at = time.monotonic() - 60
+            self.node._spectro_reference_context = self.node._spectro_reference_signature()
+
+    def pause_check(self):
+        entered, release = threading.Event(), threading.Event()
+        errors = []
+        original = self.node._measurement_snapshot
+        def snapshot():
+            value = original()
+            if threading.current_thread() is worker:
+                entered.set()
+                if not release.wait(4):
+                    raise AssertionError('freshness barrier not released')
+            return value
+        def check():
+            try:
+                self.node._check_spectro_freshness()
+            except Exception as exc:
+                errors.append(exc)
+        worker = threading.Thread(target=check)
+        self.node._measurement_snapshot = snapshot
+        worker.start()
+        self.assertTrue(entered.wait(2))
+        def finish():
+            release.set()
+            worker.join(3)
+            self.node._measurement_snapshot = original
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(errors, [])
+        self.addCleanup(finish)
+        return finish
+
+    def current_facts(self):
+        node = self.node
+        return (list(self.fixture.commands), dict(node.latest_spectro),
+                list(node._spectro_agg_frames), node._spectro_agg_started,
+                node._terminal_reason, node._cleanup_failed, node.spectro_state)
+
+    def test_mechanical_read_cannot_stop_the_same_attempt_after_real_handoff(self):
+        self.start('same-attempt', mechanical=True)
+        self.age_measurement()
+        finish = self.pause_check()
+        fresh_measurement(self.node)  # original reader callback
+        self.fixture.block_phase = None
+        self.node._on_text_received('PID_DONE:X,abs=360,err=0')
+        self.assertTrue(self.running.wait(2))
+        self.fixture.join()
+        self.assertTrue(self.node.automation_engine.is_running())
+        before = self.current_facts()
+        finish()
+        self.assertEqual(self.current_facts(), before)
+        self.assertIsNone(self.node._terminal_reason)
+
+    def test_old_runtime_read_cannot_touch_a_new_confirmed_attempt(self):
+        self.start('old-attempt')
+        self.age_measurement()
+        finish = self.pause_check()
+        response = self.node._execute_control_action('manual_stop_all', {'confirm_stop': True})
+        self.assertTrue(response[0], response)
+        self.assertFalse(self.node.automation_engine._thread.is_alive())
+        self.assertIn('STOPALL', self.fixture.commands)
+        prepare_measurement(self.node)
+        self.start('new-attempt')
+        before = self.current_facts()
+        finish()
+        self.assertEqual(self.current_facts(), before)
+        self.assertEqual(self.node.sampling_context['attempt_id'], 'new-attempt')
+        self.assertTrue(self.node.automation_engine.is_running())
+
+    def test_current_runtime_new_frame_survives_an_older_timeout_decision(self):
+        self.start('same-runtime')
+        self.age_measurement()
+        finish = self.pause_check()
+        fresh_measurement(self.node)
+        self.node._on_spectro_received({'voltage': 1.21, 'valid': True})
+        before = self.current_facts()
+        finish()
+        self.assertEqual(self.current_facts(), before)
+        self.assertTrue(self.node.latest_spectro['valid'])
+        self.assertTrue(self.node.automation_engine.is_running())
+
+    def test_real_continuous_timeout_requires_this_stops_confirmation(self):
+        self.start('timeout')
+        self.age_measurement()
+        self.node._check_spectro_freshness()
+        self.assertFalse(self.node.automation_engine._thread.is_alive())
+        self.assertEqual(self.node._terminal_reason, 'spectrometer_stale')
+        self.assertFalse(self.node._cleanup_failed)
+        self.assertIn('PIDQUERY', self.fixture.commands)
+        self.assertEqual(self.node._stop_requests, 0)
+
+    def test_continuous_timeout_does_not_report_a_rejected_stop_as_success(self):
+        self.start('timeout-stop-failed')
+        self.age_measurement()
+        send = self.fixture.send
+        def reject_stop(command):
+            if command.strip() == 'STOPALL':
+                self.fixture.commands.append('STOPALL')
+                self.node._on_text_received('CMD_ERR:STOP')
+                return True
+            return send(command)
+        self.node.send_command = reject_stop
+        self.node._check_spectro_freshness()
+        self.assertFalse(self.node.automation_engine._thread.is_alive())
+        self.assertTrue(self.node._cleanup_failed)
+        self.assertEqual(self.fixture.status()['status'], 'cleanup_failed')
+        self.assertEqual(self.node._stop_requests, 0)
 
 
 class PayloadStatusAfterStopTests(unittest.TestCase):
