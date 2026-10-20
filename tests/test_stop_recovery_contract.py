@@ -147,6 +147,20 @@ class ConfirmedStopTests(unittest.TestCase):
         self.assertFalse(extra['outputs_stop'])
         self.assertEqual(message, 'ADS_OK:STOP')
 
+    def test_spectrometer_stop_does_not_claim_a_manual_injection_pump_stopped(self):
+        self.connected()
+        self.node.inject_pump_enabled = True
+        self.node._automation_is_active = Mock(return_value=False)
+        self.node._spectro_stop = Mock(return_value=(True, 'ADS_OK:STOP'))
+        self.node._ensure_spectro_reply_sync = Mock(return_value=(True, ''))
+        success, message, extra = self.node._execute_control_action('spectrometer_stop', {})
+        # Stopping the detector on its own is a success for its own scope.
+        self.assertTrue(success)
+        self.assertTrue(extra['ads_stop'])
+        # No automation output was stopped here, so no such claim is made.
+        self.assertFalse(extra['outputs_stop'])
+        self.assertIn('not stopped by this command', message)
+
     def test_recovered_stop_allows_a_new_measurement_baseline(self):
         """After a confirmed stop the detector recovery path must be open."""
         self.connected()
@@ -206,6 +220,66 @@ class PreflightStaleMeasurementTests(unittest.TestCase):
         self.assertIn('XEBR27.000P0.1', sent)
         self.assertIn('XEFR360.000P0.1', sent)
         self.assertIn('PUMP:SET:60', fixture.commands)
+
+    def test_background_freshness_cannot_cancel_a_slow_mechanical_preparation(self):
+        """The real background check runs while the mechanical PRE blocks."""
+        fixture = self.fixture
+        node = self.node
+        node.sampling_context = {'attempt_id': 'preflight-slow'}
+        node._preflight_attempt_id = 'preflight-slow'
+        node._owner_last_seen = time.monotonic()
+        node._preflight = self.module.AutomationPreflight(
+            node._send_preflight_command, node._check_preflight_active,
+            node._preflight_angles, node._publish_preflight_status)
+        # A send that acknowledges commands but never refreshes the detector.
+        def silent_send(command):
+            fixture.commands.append(command.strip())
+            if command.strip() == 'PIDQUERY':
+                node._on_text_received('PIDPARAM:0.14,0.015,0.06,1,8')
+            elif command.strip() == 'PUMP:OFF':
+                node._on_text_received('PUMP_OK:OFF')
+            elif command.strip() == 'STOPALL':
+                node._on_text_received('STOPALL_OK')
+            return True
+        node.send_command = silent_send
+        # Runtime silence, not a cold start: the stale branch is the one that
+        # would stop a running acquisition.
+        node._spectro_start_ack_at = None
+        node._spectro_first_frame_deadline = None
+        node._last_valid_spectro_at = time.monotonic() - node.spectro_stale_stop_timeout - 1.0
+        node._preflight.stage('homing')
+        self.assertFalse(node._measurement_required_now(), 'homing must not read the detector')
+        with patch.object(node, '_stop_stale_acquisition', wraps=node._stop_stale_acquisition) as stop:
+            for _ in range(3):
+                node._check_spectro_freshness()
+        self.assertFalse(stop.called, 'mechanical preparation was cancelled by a detector time-out')
+        self.assertTrue(node._preflight.snapshot()['active'])
+        self.assertIsNone(node._terminal_reason)
+        self.assertEqual(node.spectro_state, 'stale')
+        # The same gate flips at the hand-off to formal acquisition.
+        node._preflight.stage('verifying')
+        self.assertTrue(node._measurement_required_now())
+        self.assertIsNotNone(node._measurement_owner())
+
+    def test_late_stale_check_cannot_cancel_the_task_that_replaced_it(self):
+        """Ownership is verified under the same lock the stop path uses."""
+        node = self.node
+        node.sampling_context = {'attempt_id': 'attempt-A'}
+        node.automation_engine._running.set()
+        node.send_command = Mock(return_value=True)
+        node._auto_stop_locked = Mock(
+            return_value=self.module.TriggerResponse(success=True, message='stopped'))
+        owner = node._measurement_owner()
+        self.assertIsNotNone(owner)
+        # Attempt A is stopped and attempt B legitimately starts.
+        node._request_output_stop()
+        node._finish_output_stop()
+        node.sampling_context = {'attempt_id': 'attempt-B'}
+        node.automation_engine._running.set()
+        self.assertFalse(node._stop_stale_acquisition(owner, 'spectrometer_stale'))
+        node._auto_stop_locked.assert_not_called()
+        self.assertEqual(node.sampling_context['attempt_id'], 'attempt-B')
+        self.assertTrue(node.automation_engine._running.is_set())
 
 
 class PayloadStatusAfterStopTests(unittest.TestCase):

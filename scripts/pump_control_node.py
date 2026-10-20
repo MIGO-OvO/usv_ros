@@ -2593,7 +2593,7 @@ class PumpControlNode(object):
         else:
             self._invalidate_spectro('test_data' if data.get('simulated') else self.spectro_state)
             if (any(data.get(flag) for flag in ('i2c_error', 'not_configured', 'simulated'))
-                    and self._automation_is_active()):
+                    and self._measurement_required_now()):
                 with self._terminal_lock:
                     if self._terminal_finalized:
                         return
@@ -2643,17 +2643,50 @@ class PumpControlNode(object):
             # transaction while the detector is still warming up.
             return
         freshness_at = start_ack_at if awaiting_first else last_valid_at
-        if freshness_at is not None and now - freshness_at > self.measurement_timeout:
-            if awaiting_first:
-                reason = 'spectrometer_frame_timeout'
-            else:
-                reason = 'spectrometer_stale'
-            self.spectro_state = 'stale'
-            self._invalidate_spectro('stale')
-            stop_due = awaiting_first or now - freshness_at >= self.spectro_stale_stop_timeout
-            if stop_due and self._automation_is_active() and snapshot['enabled']:
-                self._set_terminal_reason(reason)
-                self._auto_stop_callback(None)
+        if freshness_at is None or now - freshness_at <= self.measurement_timeout:
+            return
+        reason = 'spectrometer_frame_timeout' if awaiting_first else 'spectrometer_stale'
+        self.spectro_state = 'stale'
+        self._invalidate_spectro('stale')
+        stop_due = awaiting_first or now - freshness_at >= self.spectro_stale_stop_timeout
+        if not stop_due or not snapshot['enabled']:
+            return
+        # Mechanical preparation is not a measurement consumer, and an attempt
+        # that already ended must not be able to stop its successor.
+        owner = self._measurement_owner()
+        if owner is None:
+            return
+        self._stop_stale_acquisition(owner, reason)
+
+    def _stop_stale_acquisition(self, owner, reason):
+        """Stop only the attempt that still owns the detector-backed task.
+
+        Ownership is verified while holding the same lock the stop path uses,
+        so a check that resumed after its task ended cannot cancel the run that
+        replaced it, and the stop itself is never a blind global STOP.
+        """
+        with self._control_lock:
+            if not self._owns_measurement_task(owner):
+                rospy.logwarn('Measurement gate ignored: attempt %s already ended',
+                              owner[1] or 'unowned')
+                return False
+            if self._terminal_finalized or not self._measurement_required_now():
+                return False
+            self._set_terminal_reason(reason)
+            preparation = self._preflight
+            if (preparation is not None and preparation.snapshot()['active']
+                    and (owner[1] is None or self._preflight_attempt_id == owner[1])):
+                preparation.cancel()
+            first_write = self._request_output_stop()
+            try:
+                if not first_write:
+                    self._record_cleanup_result(False)
+                response = self._auto_stop_locked(None, confirm_stop=True)
+            finally:
+                self._finish_output_stop()
+        rospy.logwarn('Measurement gate stopped attempt %s (%s): %s',
+                      owner[1] or 'unowned', reason, response.message)
+        return bool(response.success)
 
     def _owner_heartbeat_cb(self, msg):
         try:
@@ -2886,6 +2919,56 @@ class PumpControlNode(object):
             or (worker is not None and worker.is_alive())
         )
 
+    # Preparation phases that only move mechanics. None of them reads the
+    # detector, so a silent spectrometer must not cancel them.
+    MECHANICAL_PREFLIGHT_PHASES = ('checking', 'homing', 'compensating', 'separating', 'injection')
+
+    def _measurement_required_now(self):
+        """Whether the phase that owns the task actually needs real samples.
+
+        Foreground preparation and the background freshness check share this
+        one answer: homing, the 360 deg compensation, oil separation and the
+        injection pre-start never pause on a detector time-out, while the
+        hand-off to formal acquisition and the acquisition itself still demand
+        a fresh frame and a baseline for the current session.
+        """
+        preparation = self._preflight
+        if preparation is not None:
+            snapshot = preparation.snapshot()
+            if snapshot['active']:
+                return snapshot['phase'] not in self.MECHANICAL_PREFLIGHT_PHASES
+        engine = self.automation_engine
+        # ``_running`` is the engine's own claim on the hardware; ``is_running``
+        # additionally needs a live worker thread, which is briefly false while
+        # the worker is winding down.
+        running = getattr(engine, '_running', None)
+        if running is not None and running.is_set():
+            return True
+        return bool(getattr(engine, 'is_paused', lambda: False)())
+
+    def _measurement_owner(self):
+        """Token for the attempt that owns the detector-backed work, or None.
+
+        The cancel event is replaced by every output stop, so it doubles as the
+        task generation this node already uses: a check that took its snapshot
+        before that stop can no longer act on the run that replaced it.
+        """
+        with self._terminal_lock:
+            if self._terminal_finalized:
+                return None
+        if not self._measurement_required_now():
+            return None
+        return (self._action_cancel, self.sampling_context.get('attempt_id'))
+
+    def _owns_measurement_task(self, owner):
+        token, attempt = owner
+        if self._action_cancel is not token:
+            return False
+        current = self.sampling_context.get('attempt_id')
+        if attempt is not None and current != attempt:
+            return False
+        return True
+
     def _spectrometer_is_active(self):
         return self.spectro_state in ("starting", "acquiring")
 
@@ -3055,17 +3138,19 @@ class PumpControlNode(object):
         if action == 'spectrometer_stop':
             # Cancel a startup before waiting for the text transaction lock.
             # Real sampling cannot continue after acquisition is stopped.
-            active = self._automation_is_active() or self._calibration.get('active', False)
-            first_write = self._request_output_stop('STOPALL' if active else 'ADSSTOP')
+            owns_outputs = bool(self._automation_is_active() or self._calibration.get('active', False))
+            first_write = self._request_output_stop('STOPALL' if owns_outputs else 'ADSSTOP')
             with self._control_lock:
                 try:
                     if not first_write:
                         self._record_cleanup_result(False)
-                    # Two independent scopes: pumps/injection only when this
-                    # call stopped them, ADS on its own stop confirmation.
-                    outputs_confirmed = not active
+                    # Two independent scopes. ADS stop is proven only by
+                    # ADS_OK:STOP; the pump outputs are proven only by the stop
+                    # action this call actually performed. A manual injection
+                    # pump keeps running, so it must not be reported as halted.
+                    outputs_confirmed = False
                     outputs_ok = True
-                    if active:
+                    if owns_outputs:
                         stopped = self._auto_stop_locked(None, confirm_stop=True)
                         outputs_ok = bool(stopped.success)
                         outputs_confirmed = outputs_ok
@@ -3075,6 +3160,10 @@ class PumpControlNode(object):
                                                 'outputs_stop': outputs_confirmed}
                     success, message = self._spectro_stop()
                     ads_ok = bool(success and first_write)
+                    if not owns_outputs:
+                        # Nothing else was stopped here, so say so instead of
+                        # implying the whole payload is quiet.
+                        message = '%s; pump outputs not stopped by this command' % message
                     return (bool(ads_ok and outputs_ok), message,
                             {'ads_stop': ads_ok, 'outputs_stop': outputs_confirmed})
                 finally:
