@@ -95,6 +95,7 @@ MAVLINK_MSG_ID_COMMAND_LONG = 76
 MAV_RESULT_ACCEPTED = 0
 MAV_RESULT_TEMPORARILY_REJECTED = 1
 MAV_RESULT_FAILED = 4
+MAV_RESULT_IN_PROGRESS = 5
 
 CONFIG_FILE = os.path.expanduser("~/usv_ws/config/sampling_config.json")
 
@@ -236,27 +237,18 @@ class MAVLinkTriggerNode(object):
         self._command_dispatch_lock = threading.Lock()
         self._command_generation = 0
         self._command_lanes = {
-            safety: {'queue': queue.Queue(maxsize=1), 'thread': None, 'busy': False}
+            safety: {'queue': queue.Queue(maxsize=4 if safety else 1),
+                     'thread': None, 'busy': 0}
             for safety in (False, True)
         }
         self._command_context = threading.local()
-        # Rejections are decided on the shared RX path, where a disk write must
-        # never delay a STOP. A single bounded worker owns the persistence so
-        # the request still gets a correlated result instead of an orphan
-        # reservation that every retry silently replays.
-        self._notice_queue = queue.Queue(maxsize=32)
-        self._notice_thread = None
-        self._notice_lock = threading.Lock()
+        # Request correlation lives in memory. The journal is a diagnostic
+        # trace: it is written after a result exists and can never admit,
+        # reject or delay a command.
         self._request_ledger = None
-        self._protocol_failed = False
         self._ledger_path = os.path.expanduser(rospy.get_param(
-            '~command_ledger', '~/.ros/usv_payload_requests.sqlite3'))
+            '~command_ledger', '~/.ros/usv_payload_requests.jsonl'))
         self._request_ledger_lock = threading.Lock()
-        try:
-            self._request_ledger = RequestLedger(self._ledger_path)
-        except Exception as exc:
-            self._protocol_failed = True
-            rospy.logerr('Payload request ledger startup failed: %s', exc)
         self._event_pub = rospy.Publisher('/usv/payload_event', String, queue_size=32)
         self._protocol_pub = rospy.Publisher('/usv/payload_protocol', String, queue_size=1)
         self._mavlink_tcp_session = 0
@@ -1237,8 +1229,6 @@ class MAVLinkTriggerNode(object):
             rospy.logerr("Error handling forwarded COMMAND_LONG payload: %s", str(e))
 
     def _ledger(self):
-        if self._protocol_failed:
-            raise OSError('Payload request persistence fault is latched; maintenance required')
         with self._request_ledger_lock:
             if self._request_ledger is None:
                 self._request_ledger = RequestLedger(self._ledger_path)
@@ -1247,19 +1237,11 @@ class MAVLinkTriggerNode(object):
     def _emit_request_event(self, context, phase, outcome='', reason='', **details):
         if not isinstance(context, dict):
             return
-        deferred = getattr(self._command_context, 'deferred_events', None)
-        if deferred is not None:
-            deferred.append((context, phase, outcome, reason, details))
-            return
-        try:
-            event = self._ledger().event(context, phase, outcome, reason, **details)
-            if event is not None:
-                message = String()
-                message.data = json.dumps(event)
-                self._event_pub.publish(message)
-        except Exception as exc:
-            self._protocol_failed = True
-            rospy.logerr('Payload event persistence failed: %s', exc)
+        event = self._ledger().event(context, phase, outcome, reason, **details)
+        if event is not None:
+            message = String()
+            message.data = json.dumps(event)
+            self._event_pub.publish(message)
 
     def _mavlink_session_cb(self, msg):
         if len(msg.data) != 1:
@@ -1274,6 +1256,25 @@ class MAVLinkTriggerNode(object):
             # pump cancellation before waiting on any old ordinary service.
             self._enqueue_command_long(CMD_STOP_SAMPLING, 0, 0, 0, 0, 'TCP session retired')
 
+    @staticmethod
+    def _ack_for_outcome(outcome):
+        return {'accepted': MAV_RESULT_ACCEPTED,
+                'rejected': MAV_RESULT_TEMPORARILY_REJECTED}.get(outcome, MAV_RESULT_FAILED)
+
+    def _replay_request(self, request, previous, command, sender_system, sender_component, ack_session):
+        """Answer a repeated identity with its stored answer, never with a second action."""
+        if previous is not None:
+            message = String()
+            message.data = json.dumps(dict(previous, tcp_session=request['tcp_session']))
+            self._event_pub.publish(message)
+            self._send_command_ack(command, self._ack_for_outcome(previous.get('outcome')),
+                                   sender_system, sender_component, ack_session)
+            return
+        # The first copy is still being processed: say so instead of staying
+        # silent, so the requester stops waiting for an answer that will not
+        # arrive on this path.
+        self._send_command_ack(command, MAV_RESULT_IN_PROGRESS, sender_system, sender_component, ack_session)
+
     def _enqueue_command_long(self, command, param1, param2, sender_system, sender_component, log_prefix, request=None):
         """Two bounded lanes: a blocked ordinary RPC cannot occupy STOP admission."""
         if not CMD_START_SAMPLING <= command <= CMD_SPECTROMETER_STOP:
@@ -1282,89 +1283,55 @@ class MAVLinkTriggerNode(object):
             return
         safety = command in SAFETY_COMMANDS
         ack_session = request['tcp_session'] if request else self._mavlink_tcp_session
-        if self._protocol_failed and not safety:
-            self._send_command_ack(command, MAV_RESULT_FAILED, sender_system, sender_component, ack_session)
-            return
         if request is not None:
             try:
                 if request['tcp_session'] != self._mavlink_tcp_session:
                     raise ValueError('Retired TCP session')
                 admitted, previous = self._ledger().reserve(request, param1, param2)
                 if not admitted:
-                    if previous is not None:
-                        message = String()
-                        message.data = json.dumps(dict(previous, tcp_session=request['tcp_session']))
-                        self._event_pub.publish(message)
+                    self._replay_request(request, previous, command,
+                                         sender_system, sender_component, ack_session)
                     return  # Never repeat physical work, including a STOP.
             except ValueError as exc:
                 rospy.logerr('Payload request rejected: %s', exc)
                 self._send_command_ack(command, MAV_RESULT_FAILED, sender_system, sender_component, ack_session)
                 return
-            except Exception as exc:
-                # Disk faults must not seal the safety exit. Latch off all new
-                # actions; only attempt STOP, never claim a durable result.
-                self._protocol_failed = True
-                rospy.logerr('Payload persistence unavailable; new actions locked: %s', exc)
-                if not safety:
-                    self._send_command_ack(command, MAV_RESULT_FAILED, sender_system, sender_component, ack_session)
-                    return
-                request = None
         rejected = False
         with self._command_dispatch_lock:
             lane = self._command_lanes[safety]
-            if lane['busy'] or (not safety and self._command_lanes[True]['busy']):
+            if safety:
+                # A STOP is never refused. Identical repeats and other stop
+                # scopes queue behind the running one so each request still
+                # gets its own answer instead of a rejection to retry by hand.
+                generation = self._command_generation + 1
+                try:
+                    lane['queue'].put_nowait((generation, time.monotonic(), request, ack_session, (
+                        command, param1, param2, sender_system, sender_component, log_prefix)))
+                except queue.Full:
+                    rejected = True
+                else:
+                    # Bump only for an admitted stop: a refused one must not
+                    # cancel the ordinary command that is still running.
+                    self._command_generation = generation
+                    lane['busy'] += 1
+            elif lane['busy'] or self._command_lanes[True]['busy']:
                 rejected = True
             else:
-                if safety:
-                    self._command_generation += 1
-                lane['busy'] = True
+                lane['busy'] += 1
                 lane['queue'].put_nowait((self._command_generation, time.monotonic(), request, ack_session, (
                     command, param1, param2, sender_system, sender_component, log_prefix)))
-                if lane['thread'] is None:
-                    lane['thread'] = threading.Thread(
-                        target=self._command_loop, args=(safety,), daemon=True,
-                        name='PayloadStop' if safety else 'PayloadCommand')
-                    lane['thread'].start()
+            if lane['thread'] is None and lane['busy']:
+                lane['thread'] = threading.Thread(
+                    target=self._command_loop, args=(safety,), daemon=True,
+                    name='PayloadStop' if safety else 'PayloadCommand')
+                lane['thread'].start()
         if rejected:
-            # Do not write the ledger from the shared RX callback. No physical
-            # work was admitted; the volatile reservation still prevents replay.
-            # The correlated rejection is persisted out of band below, so the
-            # requester never waits for an event this node will not produce.
-            self._queue_request_rejection(request, 'command_lane_busy')
-            self._send_command_ack(command, MAV_RESULT_TEMPORARILY_REJECTED, sender_system, sender_component, ack_session)
-
-    def _queue_request_rejection(self, request, reason):
-        """Persist a correlated rejection without blocking MAVLink reception."""
-        if request is None:
-            return
-        with self._notice_lock:
-            if self._notice_thread is None:
-                self._notice_thread = threading.Thread(
-                    target=self._notice_loop, daemon=True, name='PayloadRejectionNotice')
-                self._notice_thread.start()
-        try:
-            self._notice_queue.put_nowait((request, reason))
-        except queue.Full:
-            # The standard ACK still reports the rejection; the bounded queue
-            # only decides whether a retry can replay a stored result.
-            rospy.logwarn('Payload rejection notice queue full; ACK only')
-
-    def _notice_loop(self):
-        while not rospy.is_shutdown():
-            try:
-                request, reason = self._notice_queue.get(timeout=0.5)
-            except queue.Empty:
-                with self._notice_lock:
-                    if self._notice_queue.empty():
-                        self._notice_thread = None
-                        return
-                continue
-            try:
-                self._emit_request_event(request, 'request', 'rejected', reason)
-            except Exception as exc:
-                rospy.logerr('Payload rejection notice failed: %s', exc)
-            finally:
-                self._notice_queue.task_done()
+            # No physical work was admitted. Answer on the existing publish
+            # path so a retry replays this rejection instead of executing: the
+            # rejection is a real correlated result, not a leftover reservation.
+            self._emit_request_event(request, 'request', 'rejected', 'command_lane_busy')
+            self._send_command_ack(command, MAV_RESULT_TEMPORARILY_REJECTED,
+                                   sender_system, sender_component, ack_session)
 
     def _command_loop(self, safety):
         lane = self._command_lanes[safety]
@@ -1382,14 +1349,7 @@ class MAVLinkTriggerNode(object):
             self._command_context.request = request
             self._command_context.ack_session = ack_session
             self._command_context.last_reason = ''
-            self._command_context.deferred_events = [] if safety else None
             try:
-                if request is not None and not safety:
-                    try:
-                        self._ledger().persist(request, args[1], args[2])
-                    except Exception:
-                        self._protocol_failed = True
-                        raise
                 if safety or generation == self._command_generation:
                     self._dispatch_command_long(*args)
                 else:
@@ -1400,26 +1360,12 @@ class MAVLinkTriggerNode(object):
                 self._emit_request_event(request, 'request', 'failed', 'command_exception')
                 self._send_command_ack(args[0], MAV_RESULT_FAILED, args[3], args[4])
             finally:
-                events = self._command_context.deferred_events
-                self._command_context.deferred_events = None
-                if safety:
-                    # Physical STOP and its ACK precede all persistence. The
-                    # safety lane stays busy until durable completion, blocking
-                    # new actions even if the disk stalls here.
-                    try:
-                        if request is not None:
-                            self._ledger().persist(request, args[1], args[2])
-                        for event_context, phase, outcome, reason, details in events:
-                            self._emit_request_event(event_context, phase, outcome, reason, **details)
-                    except Exception as exc:
-                        self._protocol_failed = True
-                        rospy.logerr('STOP attempted; persistence unavailable: %s', exc)
                 self._command_context.generation = None
                 self._command_context.issued_at = None
                 self._command_context.request = None
                 self._command_context.ack_session = None
                 with self._command_dispatch_lock:
-                    lane['busy'] = False
+                    lane['busy'] -= 1
                 lane['queue'].task_done()
 
     def _dispatch_command_long(self, command, param1, param2, sender_system, sender_component, log_prefix):
@@ -1435,7 +1381,8 @@ class MAVLinkTriggerNode(object):
         success = self.handle_mavlink_command(command, param1, param2)
         context = getattr(self, '_command_context', None)
         generation = getattr(context, 'generation', None)
-        if generation is not None and generation != self._command_generation:
+        if (generation is not None and generation != self._command_generation
+                and command not in SAFETY_COMMANDS):
             success = False  # A late ordinary RPC response cannot undo STOP.
 
         if success:
@@ -2367,12 +2314,9 @@ class MAVLinkTriggerNode(object):
             message.data = getattr(self, '_mission_payload', self.current_mission_state)
             self.mission_status_pub.publish(message)
             capability = String()
-            try:
-                self._ledger()
-                capability.data = json.dumps({'version': 1, 'source_monotonic': time.monotonic()})
-            except Exception as exc:
-                rospy.logerr('Payload request ledger unavailable: %s', exc)
-                capability.data = json.dumps({'version': 0, 'source_monotonic': time.monotonic()})
+            # Request correlation is always available in memory; the journal is
+            # optional diagnostics and cannot withdraw this capability.
+            capability.data = json.dumps({'version': 1, 'source_monotonic': time.monotonic()})
             self._protocol_pub.publish(capability)
 
             rospy.logdebug_throttle(10, "Mode: %s, Armed: %s, Sampling: %s, Connected: %s, v=%.3f, yaw=%.3f",
