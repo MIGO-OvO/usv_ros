@@ -18,7 +18,8 @@ if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
 from scripts.lib.gps_diagnostics import GPSDiagnosticsCache, PARAMETERS
 from scripts.lib.mavlink_tcp_transport import MAVLinkTCPTransport, connect_router
-from scripts.lib.payload_protocol import encode_event, next_transport_session, SAFETY_COMMANDS
+from scripts.lib.payload_protocol import encode_event, next_transport_session, SAFETY_COMMANDS, RequestLedger, request_context
+from scripts.lib.automation_preflight import calibrated_offsets, relative_angles
 
 import rospy
 from std_msgs.msg import String, Float32MultiArray
@@ -110,10 +111,14 @@ class USVMavlinkRouterBridge(object):
         self._transport = None
         self._last_full_write_at = None
         self._tcp_session = 0
+        self.calibration_file = os.path.expanduser(rospy.get_param(
+            '~calibration_file', '~/usv_ws/config/calibration.json'))
         self._session_path = os.path.expanduser(rospy.get_param('~session_file', '~/.ros/usv_bridge_sessions.sqlite3'))
         self._session_pub = rospy.Publisher('/usv/mavlink_session', Float32MultiArray, queue_size=5, latch=True)
         self._protocol_at = None
         self._protocol_version = 0
+        self._executor_id = ''
+        self._request_routes = RequestLedger()
         self._recent_events = OrderedDict()
         self._event_chunk_id = 0
         self._reconnect_reason = None
@@ -137,6 +142,7 @@ class USVMavlinkRouterBridge(object):
         self._fcu_sample_id = 0          # current sampling id from FCU NAV_SCRIPT_TIME
         self._last_fcu_sample_id = 0     # suppress retransmitted triggers, including terminal ones
         self._cmd_rx_pub = rospy.Publisher("/usv/mavlink_cmd_rx", Float32MultiArray, queue_size=5)
+        self._payload_command_pub = rospy.Publisher('/usv/payload_command', String, queue_size=20)
         self._radio_status_pub = rospy.Publisher("/usv/radio_status", String, queue_size=5)
         rospy.Subscriber("/usv/mavlink_cmd_ack", Float32MultiArray, self._cmd_ack_cb)
         rospy.Subscriber('/usv/payload_protocol', String, self._protocol_cb)
@@ -539,7 +545,10 @@ class USVMavlinkRouterBridge(object):
             if not 0 <= time.monotonic() - stamp <= 3.0:
                 return
             with self._lock:
-                self._protocol_version = 1 if data.get('version') == 1 else 0
+                instance = data.get('executor', '')
+                valid = isinstance(instance, str) and len(instance) == 32 and all(ch in '0123456789abcdef' for ch in instance)
+                self._executor_id = instance if valid else ''
+                self._protocol_version = 1 if data.get('version') == 1 and valid else 0
                 self._protocol_at = stamp
         except (ValueError, TypeError, KeyError):
             pass
@@ -552,6 +561,7 @@ class USVMavlinkRouterBridge(object):
             with self._lock:
                 if self._conn is None or event['tcp_session'] != self._tcp_session:
                     return
+                self._request_routes.observe(event)
                 previous = self._recent_events.get(key)
                 if previous and event['seq'] <= previous['seq']:
                     return
@@ -777,7 +787,10 @@ class USVMavlinkRouterBridge(object):
                     float(getattr(msg, 'param4', 0) or 0),
                     float(self._tcp_session),
                 ]
-                self._cmd_rx_pub.publish(rx_msg)
+                if rx_msg.data[7] or rx_msg.data[8]:
+                    self._forward_payload_command(rx_msg.data)
+                else:
+                    self._cmd_rx_pub.publish(rx_msg)
 
                 rospy.loginfo(
                     "Forward COMMAND_LONG cmd=%d target=%d/%d from=%d/%d",
@@ -888,7 +901,40 @@ class USVMavlinkRouterBridge(object):
                 self._diag_tx_total += 1
                 self._diag_tx_heartbeat += 1
 
+    def _forward_payload_command(self, values):
+        context = request_context(values[7], values[8], values[9], int(values[0]), int(values[5]), int(values[6]))
+        if int(values[3]) not in (0, self._sys_id) or int(values[4]) not in (0, self._comp_id):
+            return
+        with self._lock:
+            admitted, _ = self._request_routes.reserve(context, values[1], values[2])
+            record = self._request_routes.records[self._request_routes.key(context)]
+            if admitted:
+                record['executor'] = self._executor_id
+            executor = record['executor']
+            if not executor or executor != self._executor_id:
+                event = self._request_routes.event(context, 'request', 'failed', 'executor_restarted')
+            else:
+                event = None
+        if event is not None:
+            message = String()
+            message.data = json.dumps(event)
+            self._payload_event_cb(message)
+            return
+        # Carry the owner through delivery too: a new trigger can subscribe
+        # before its capability heartbeat reaches this bridge.
+        message = String()
+        message.data = json.dumps({'executor': executor, 'values': values})
+        self._payload_command_pub.publish(message)
+
     def _send_payload(self, voltage, absorbance, angles, status, automation_step, automation_total, current_loop, total_loops, sample_count, pid_error, pid_mode, baseline_set, reference_voltage, baseline_voltage, spectrometer_valid, health_fields=None):
+        try:
+            # Web atomically replaces this file; reload before every display frame.
+            with open(self.calibration_file, encoding='utf-8') as handle:
+                zeros = calibrated_offsets(json.load(handle))
+        except (OSError, TypeError, ValueError, AttributeError):
+            zeros = {}
+        angles = {axis: value if value is not None else -1.0
+                  for axis, value in relative_angles(angles, zeros).items()}
         t = int((time.monotonic() - self._boot_monotonic) * 1000) & 0xFFFFFFFF
         health = dict(DEFAULT_HEALTH_FIELDS)
         health.update(health_fields if health_fields is not None else getattr(self, "_health_fields", {}))

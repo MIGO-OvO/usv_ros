@@ -10,8 +10,18 @@ interface PumpAngles {
   A: number
 }
 
+type RelativeAngles = { [K in keyof PumpAngles]: number | null }
+
+interface CalibrationStatus {
+  active?: boolean
+  stopping?: boolean
+  outcome?: string
+  reason?: string
+  attempt_id?: string
+}
+
 interface AngleTelemetry {
-  angles: PumpAngles
+  angles: RelativeAngles
   raw_angles: PumpAngles
   source: string
   received_at: number | null
@@ -274,7 +284,8 @@ interface AppState {
   automationSpectroState: string | null
   automationSpectroAgeS: number | null
   automationOwnerAgeS: number | null
-  pumpAngles: PumpAngles
+  calibrationStatus: CalibrationStatus
+  pumpAngles: RelativeAngles
   rawAngles: PumpAngles
   angleTelemetry: AngleTelemetry
   currentVoltage: number
@@ -374,7 +385,8 @@ export const useAppStore = create<AppState>((set, get) => ({
   automationSpectroState: null,
   automationSpectroAgeS: null,
   automationOwnerAgeS: null,
-  pumpAngles: DEFAULT_ANGLES,
+  calibrationStatus: {},
+  pumpAngles: { X: null, Y: null, Z: null, A: null },
   rawAngles: DEFAULT_ANGLES,
   angleTelemetry: DEFAULT_ANGLE_TELEMETRY,
   currentVoltage: 0,
@@ -542,6 +554,8 @@ export const useAppStore = create<AppState>((set, get) => ({
         automationOwnerAgeS: data.owner_age_s ?? null,
       })
     })
+
+    socket.on('calibration_status', (data: CalibrationStatus) => set({ calibrationStatus: data }))
 
     socket.on('angles', (data: PumpAngles) => {
       if (!angleSnapshotSupported) {

@@ -323,6 +323,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
         msg = sys.modules["std_msgs.msg"].Float32MultiArray()
         node._mavlink_tcp_session = 1
+        msg.executor = node._executor_id
         msg.data = [31010.0, 0.0, 0.0, 1.0, 191.0, 255.0, 190.0, 1.0, 1.0, 1.0]
 
         node._mavlink_cmd_rx_cb(msg)

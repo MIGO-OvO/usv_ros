@@ -169,7 +169,7 @@ class SamplingContextContractTests(unittest.TestCase):
         self.server.standalone = False
         with patch.object(self.server, '_call_control_command', return_value=(False, 'halt failed', {})) as control:
             response = self.server.app.test_client().post('/api/motor/stop').get_json()
-        control.assert_called_once_with('manual_stop_all', {})
+        control.assert_called_once_with('manual_stop_all', {'confirm_stop': True})
         self.assertFalse(response['success'])
 
     def test_rejected_duplicate_start_preserves_existing_owner(self):

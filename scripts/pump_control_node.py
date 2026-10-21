@@ -577,6 +577,8 @@ class PumpControlNode(object):
         self._cleanup_failed = False
         self._prior_cleanup_failed = False
         self._calibration = {}
+        self._calibration_preflight = None
+        self._calibration_thread = None
         self._stop_in_progress = False
         self.preflight_config = normalize_preflight({})
         self.calibration_file = os.path.expanduser(rospy.get_param(
@@ -943,6 +945,8 @@ class PumpControlNode(object):
             if self.injection_pump_worker:
                 self.injection_pump_worker.invalidate()
             self._controller_fault = self._controller_fault or 'disconnected'
+            if self._calibration.get('active'):
+                self._calibration['cleanup_failed'] = True
             self._end_calibration('failed', 'serial_disconnected')
             self._spectro_config_state = 'disconnected'
             if self._automation_is_active():
@@ -1146,6 +1150,8 @@ class PumpControlNode(object):
         """Invalidate ordinary work and issue the first halt before any join/ACK."""
         with self.serial_lock:
             if command == 'STOPALL':
+                if self._calibration.get('active'):
+                    self._calibration['stopping'] = True
                 self._end_calibration('cancelled', 'operator_stop')
             if command == 'ADSSTOP':
                 self._ads_state = 5
@@ -2234,30 +2240,36 @@ class PumpControlNode(object):
         if self._calibration.get('active'):
             self._calibration.update(active=False, outcome=outcome,
                                      reason=self._calibration.get('reason') or reason)
+            if self._calibration_preflight:
+                self._calibration_preflight.cancel()
 
     def _calibration_text(self, text):
-        calibration = self._calibration
-        if not calibration.get('active') or not calibration.get('written'):
+        if self._calibration_preflight:
+            self._calibration_preflight.notify_text(text)
+
+    def _run_calibration(self, calibration, preparation, zeros):
+        try:
+            preparation.command('PIDQUERY', 'PIDPARAM:')
+            preparation.home(calibration['axes'], zeros, preparation.PID_PRECISION_DEG)
+            with self._control_lock, self.serial_lock:
+                preparation._check()
+                calibration.update(done=calibration['axes'], complete=True, phase='complete')
+                self._end_calibration('succeeded', '')
+        except PreflightCancelled:
             return
-        if text.startswith('CAL_START:'):
-            calibration['started'] = True
-        elif not calibration.get('started'):
-            return
-        elif text.startswith('CAL_FAIL:'):
-            calibration['reason'] = calibration.get('reason') or text[:80]
-        elif text.startswith('CAL_DONE:'):
-            axis = text[9:10]
-            if axis in calibration['axes'] and axis not in calibration['done']:
-                calibration['done'] += axis
-        elif text == 'CAL_COMPLETE:ALL_DONE':
-            calibration['complete'] = True
-        elif text == 'CAL_STOPPED':
-            success = (calibration['complete'] and not calibration['reason']
-                       and set(calibration['done']) == set(calibration['axes']))
-            self._end_calibration('succeeded' if success else 'failed',
-                                  '' if success else 'calibration_incomplete')
-            if not success:
-                self._controller_fault = self._controller_fault or calibration['reason']
+        except Exception as exc:
+            with self._control_lock:
+                if self._calibration is not calibration or not calibration['active']:
+                    return
+                reason = exc.reason if isinstance(exc, PreflightError) else 'calibration_failed'
+                calibration['stopping'] = True
+                self._end_calibration('failed', reason)
+                calibration['error'] = str(exc)
+                self._controller_fault = self._controller_fault or reason
+                stopped = self._auto_stop_callback(None, confirm_stop=True)
+                calibration['cleanup_failed'] = not stopped.success
+        finally:
+            self._publish_automation_status(self._last_automation_status_text)
 
     def _check_calibration(self):
         with self.serial_lock:
@@ -2269,13 +2281,11 @@ class PumpControlNode(object):
                 reason = 'calibration_timeout'
             if not reason:
                 return
+            calibration['stopping'] = True
             self._end_calibration('failed', reason)
             self._controller_fault = self._controller_fault or reason
-        self._request_output_stop()
-        try:
-            self.send_command('CALSTOP')
-        finally:
-            self._finish_output_stop()
+        response = self._auto_stop_callback(None, confirm_stop=True)
+        calibration['cleanup_failed'] = not response.success
         self._publish_automation_status(self._last_automation_status_text)
 
     def _on_text_received(self, text):
@@ -3281,36 +3291,50 @@ class PumpControlNode(object):
         if action == 'calibration_start':
             if self._automation_is_active() or self.manual_mode_enabled:
                 return False, 'Calibration rejected: controller busy', {}
-            # Ordered read barrier drains previous CAL_START replies. No retry:
-            # an unknown start must be stopped before another motion request.
-            synced, reply = self._send_and_wait_text('CALSTATUS', ('CAL_STATUS:',), ('CAL_ERR:',))
-            if not synced:
-                return False, 'Calibration reply barrier: ' + reply, {}
             axes = str(payload.get('axes', 'XYZA'))
             if not axes or any(axis not in 'XYZA' for axis in axes):
                 return False, 'Invalid calibration axes', {}
-            mask = sum(1 << 'XYZA'.index(axis) for axis in set(axes))
+            axes = ''.join(axis for axis in 'XYZA' if axis in axes)
+            try:
+                zeros = load_zero_offsets(self.calibration_file, axes)
+                self._preflight_angles(axes)
+            except (ValueError, PreflightError) as exc:
+                return False, str(exc), {}
+            connection, cancel = self.serial_conn, self._action_cancel
+            def check_active(require_measurement=False):
+                if (self._calibration is not calibration or not calibration['active']
+                        or cancel.is_set() or self._stop_requested):
+                    raise PreflightCancelled()
+                if (self._controller_fault or rospy.is_shutdown() or self.serial_conn is not connection
+                        or not connection or not connection.is_open):
+                    raise PreflightError('controller_fault', self._controller_fault or 'Calibration serial session lost')
+            def send(command):
+                with self._control_lock, self.serial_lock:
+                    check_active()
+                    calibration.update(command=command, written=False)
+                    return self.send_command(command)
+            def publish():
+                calibration['phase'] = preparation.snapshot()['phase']
+                self._publish_automation_status(self._last_automation_status_text)
             with self.serial_lock:
-                self._calibration = {'active': True, 'started': False, 'written': False,
-                    'command': 'CAL' + axes, 'axes': ''.join(sorted(set(axes))), 'done': '',
+                calibration = {'active': True, 'started': True, 'written': False,
+                    'command': '', 'axes': axes, 'done': '', 'phase': 'checking',
                     'complete': False, 'reason': '', 'outcome': '',
-                    'attempt_id': uuid.uuid4().hex, 'deadline': time.monotonic() + 17.0,
+                    'attempt_id': uuid.uuid4().hex, 'deadline': time.monotonic() + self.pid_wait_timeout + 5.0,
                     'mavlink_request': payload.get('mavlink_request')}
-            success, reply = self._send_and_wait_text('CAL' + axes, ('CAL_START:mask=0x%X' % mask,),
-                                                      ('CAL_ERR:', 'BUSY:', 'WATCHDOG_ERR:'))
-            if success:
-                self._calibration['started'] = True
-                self._publish_status('calibrate_started')
-            if not success:
-                self._end_calibration('failed', 'calibration_start_unconfirmed')
-                self._request_output_stop()
-                try:
-                    self.send_command('CALSTOP')
-                    self._controller_fault = self._controller_fault or 'calibration_start_unconfirmed'
-                finally:
-                    self._finish_output_stop()
+                self._calibration = calibration
+                preparation = AutomationPreflight(send, check_active, self._preflight_angles, publish)
+                preparation.PID_TIMEOUT = self.pid_wait_timeout
+                self._calibration_preflight = preparation
+            self._calibration_thread = threading.Thread(target=self._run_calibration,
+                args=(calibration, preparation, zeros), name='RelativeZero', daemon=True)
+            try:
+                self._calibration_thread.start()
+            except RuntimeError as exc:
+                self._end_calibration('failed', 'calibration_worker_failed')
+                return False, str(exc), dict(calibration)
             self._publish_automation_status(self._last_automation_status_text)
-            return success, reply, dict(self._calibration)
+            return True, '正在校准', dict(calibration)
 
         if action == "manual_mode":
             success, message = self._set_manual_mode(bool(payload.get("enabled", False)))
@@ -3907,6 +3931,8 @@ class PumpControlNode(object):
         finally:
             self._stop_in_progress = self._stop_requested
         message = "Automation stopped and pumps halted" if success else "Automation stopped but pump halt failed"
+        if self._calibration.get('stopping'):
+            self._calibration.update(stopping=False, cleanup_failed=not (success and confirm_stop))
         self._log_automation_terminal()
         status = 'cleanup_failed' if confirm_stop and not success else 'stopped'
         self._publish_automation_status(status)

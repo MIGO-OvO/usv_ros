@@ -119,7 +119,7 @@ from scripts.lib.sample_recording import MIN_RAW_RECORD_HZ, SampleRecordingStora
 from scripts.lib.sample_recording.models import safe_id
 from scripts.lib.sample_recording.record import bind_web_context, freeze_position, navsat_position, position_local_age_s, finite
 from scripts.lib.gps_diagnostics import diagnose
-from scripts.lib.automation_preflight import DEFAULT_PREFLIGHT, normalize_preflight, calibrated_offsets
+from scripts.lib.automation_preflight import DEFAULT_PREFLIGHT, normalize_preflight, calibrated_offsets, relative_angles
 from scripts.lib.sample_recording.downsampling import MinMaxSeries
 
 # 配置文件路径
@@ -150,24 +150,6 @@ ANGLE_AXES = ("X", "Y", "Z", "A")
 ANGLE_STALE_AFTER_MS = 1000
 
 
-def build_calibrated_zero_command(angles, motors, precision=0.1):
-    """Build relative PID moves from calibrated angles to calibrated 0°."""
-    parts = []
-    precision = max(0.01, min(10.0, float(precision)))
-    for axis in motors:
-        if axis not in ANGLE_AXES or axis not in angles:
-            continue
-        angle = float(angles[axis]) % 360.0
-        if angle <= precision or (360.0 - angle) <= precision:
-            continue
-        if angle <= 180.0:
-            direction = "B"
-            delta = angle
-        else:
-            direction = "F"
-            delta = 360.0 - angle
-        parts.append("{}E{}R{:.3f}P{:g}".format(axis, direction, delta, precision))
-    return "".join(parts) + ("\r\n" if parts else "")
 DEFAULT_MAPPING_PROFILE = {
     "survey_min_distance_m": 5.0,
     "survey_min_speed_mps": 0.0,
@@ -1070,14 +1052,8 @@ class CalibrationManager(object):
 
     def get_corrected_angle(self, axis, raw_angle):
         """获取校准后的角度"""
-        offset = self.offsets.get(axis, 0.0)
-        corrected = raw_angle - offset
-        # Normalize to 0-360 if needed, or keep linear.
-        # Usually angle is 0-360.
-        corrected = corrected % 360.0
-        if corrected < 0:
-            corrected += 360.0
-        return corrected
+        return relative_angles({axis: raw_angle},
+            {key: self.offsets[key] for key in self.configured_axes}).get(axis)
 
 class MissionDataManager(object):
     """任务数据管理器。"""
@@ -2103,7 +2079,7 @@ class WebConfigServer(object):
         self.pump_connected = False
         self.automation_running = False
         self.automation_paused = False
-        self.current_angles = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
+        self.current_angles = dict.fromkeys(ANGLE_AXES)
         self.raw_angles = {"X": 0.0, "Y": 0.0, "Z": 0.0, "A": 0.0}
         self.latest_angle_telemetry = {
             "angles": dict(self.current_angles),
@@ -2146,6 +2122,7 @@ class WebConfigServer(object):
         self.route_source = "none"
         self.current_waypoint_seq = None
         self.latest_automation_status = {}
+        self.latest_calibration_status = {}
         self._sampling_results = OrderedDict()
         self._sampling_context = {}
         self._web_attempt_id = None
@@ -2684,6 +2661,9 @@ class WebConfigServer(object):
             return
         if not isinstance(data, dict):
             return
+        calibration = data.get('calibration')
+        self.latest_calibration_status = calibration if isinstance(calibration, dict) else {}
+        self.socketio.emit('calibration_status', self.latest_calibration_status)
         expected = self._recording_attempt_id()
         context = data.get('sampling_context')
         if expected and (not isinstance(context, dict) or context.get('attempt_id') != expected):
@@ -2833,6 +2813,11 @@ class WebConfigServer(object):
         }
         self.current_angles.update(corrected_angles)
         return corrected_angles
+
+    def _refresh_relative_angles(self):
+        self._update_angle_values(self.raw_angles)
+        self.latest_angle_telemetry = self._build_angle_telemetry(self.latest_angle_telemetry)
+        self._emit_angle_state()
 
     def _build_angle_telemetry(self, source_payload=None):
         source_payload = source_payload if isinstance(source_payload, dict) else {}
@@ -4231,7 +4216,7 @@ class WebConfigServer(object):
 
     def _stop_all_control(self):
         self._cancel_pending_web_start()
-        return self._call_control_command('manual_stop_all', {})
+        return self._call_control_command('manual_stop_all', {'confirm_stop': True})
 
     def _publish_spectrometer_command(self, payload):
         """Send a spectrometer runtime command through the synchronous control transaction service."""
@@ -5322,20 +5307,8 @@ class WebConfigServer(object):
                 self._add_log(f"[模拟] 运动到校准零点: {motors}", "info")
                 return jsonify({"success": True, "message": "运动回零已启动 (模拟模式)"})
 
-            telemetry = getattr(self, 'latest_angle_telemetry', {})
-            if not telemetry.get('valid') or telemetry.get('stale'):
-                return jsonify({"success": False, "message": "泵角度数据无效或已过期，不能运动回零"}), 409
-
-            cmd = build_calibrated_zero_command(self.current_angles, motors)
-            if not cmd:
-                return jsonify({"success": True, "message": "所选泵轴已经位于校准零点"})
-
-            if hasattr(self, 'command_pub') and self.command_pub:
-                self.command_pub.publish(cmd)
-                self._add_log(f"运动到校准零点已启动: {motors} ({cmd.strip()})", "info")
-                return jsonify({"success": True, "message": "运动到校准零点已启动"})
-
-            return jsonify({"success": False, "message": "ROS Publisher 未初始化"})
+            ok, message, result = self._call_control_command('calibration_start', {'axes': motors})
+            return jsonify(success=ok, message='正在校准' if ok else message, data=result), 200 if ok else 409
 
         # ================= WebSocket 事件 =================
         @self.socketio.on('connect')
@@ -5353,6 +5326,7 @@ class WebConfigServer(object):
                 "total_loops": automation.get("total_loops", 0),
                 "preflight": automation.get('preflight'),
             })
+            emit('calibration_status', self.latest_calibration_status)
             emit('angles', self.current_angles)
             emit('angle_telemetry', self.latest_angle_telemetry)
             emit('angle_snapshot', dict(self.latest_angle_telemetry, schema_version=1, seq=self._angle_sequence))
@@ -5835,7 +5809,9 @@ class WebConfigServer(object):
 
         @self.app.route('/api/calibration/offsets', methods=['POST'])
         def save_offsets():
-            if self.automation_running or self.automation_paused:
+            if (self.automation_running or self.automation_paused
+                    or any(self.latest_calibration_status.get(flag)
+                           for flag in ('active', 'stopping'))):
                 return jsonify(success=False, message='任务运行期间不能修改相对零点'), 409
             data = json_object()
             if data is None or not isinstance(data.get('offsets'), dict):
@@ -5844,11 +5820,15 @@ class WebConfigServer(object):
                 ok = self.calibration_manager.update_offsets(data['offsets'])
             except (TypeError, ValueError) as exc:
                 return jsonify(success=False, message=str(exc)), 400
+            if ok:
+                self._refresh_relative_angles()
             return jsonify(success=ok, message='相对零点已保存' if ok else '相对零点保存失败'), 200 if ok else 500
 
         @self.app.route('/api/calibration/zero', methods=['POST'])
         def set_zero():
-            if self.automation_running or self.automation_paused:
+            if (self.automation_running or self.automation_paused
+                    or any(self.latest_calibration_status.get(flag)
+                           for flag in ('active', 'stopping'))):
                 return jsonify(success=False, message='任务运行期间不能修改相对零点'), 409
             data = json_object()
             if data is None:
@@ -5859,18 +5839,22 @@ class WebConfigServer(object):
                 if hasattr(self, 'raw_angles'):
                     if not self.calibration_manager.update_offsets(self.raw_angles):
                         return jsonify(success=False, message='零点保存失败'), 500
+                self._refresh_relative_angles()
                 return jsonify({"success": True, "message": "所有轴零点已设置"})
 
             if hasattr(self, 'raw_angles') and axis in self.raw_angles:
                 if not self.calibration_manager.set_zero(axis, self.raw_angles[axis]):
                     return jsonify(success=False, message='零点保存失败'), 500
+                self._refresh_relative_angles()
                 return jsonify({"success": True, "message": f"{axis} 轴零点已设置"})
 
             return jsonify({"success": False, "message": "无法获取当前原始角度"}), 400
 
         @self.app.route('/api/calibration/reset', methods=['POST'])
         def reset_zero():
-            if self.automation_running or self.automation_paused:
+            if (self.automation_running or self.automation_paused
+                    or any(self.latest_calibration_status.get(flag)
+                           for flag in ('active', 'stopping'))):
                 return jsonify(success=False, message='任务运行期间不能修改相对零点'), 409
             data = json_object()
             if data is None:
@@ -5878,6 +5862,7 @@ class WebConfigServer(object):
             axis = clean_string(data.get('axis'), '', 1).upper() or None
             if not self.calibration_manager.reset(axis):
                 return jsonify(success=False, message='零点保存失败'), 500
+            self._refresh_relative_angles()
             return jsonify({"success": True, "message": "零点已重置"})
 
         # ================= 进样泵控制 API =================

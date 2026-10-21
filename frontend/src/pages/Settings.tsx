@@ -119,6 +119,8 @@ const parseOptionalMetricNumber = (value: string): number | null => {
 
 export default function Settings() {
   const pumpAngles = useAppStore((state) => state.pumpAngles)
+  const calibration = useAppStore((state) => state.calibrationStatus)
+  const stopPumps = useAppStore((state) => state.stopManualPumps)
   const rawAngles = useAppStore((state) => state.rawAngles)
   const confirm = useConfirm()
   const [config, setConfig] = useState({
@@ -289,8 +291,8 @@ export default function Settings() {
     const ok = await confirm({
       title: axis ? `${axis} 轴回到校准零点` : '全部泵回到校准零点',
       description: axis
-        ? `将驱动 ${axis} 轴自动转到校准后的 0°，不会修改零点偏移。确认继续吗？`
-        : '将驱动 X/Y/Z/A 四轴自动转到各自校准后的 0°，不会修改零点偏移。确认继续吗？',
+        ? `将 ${axis} 轴转到保存的零点，确认继续吗？`
+        : '将 X/Y/Z/A 四轴转到保存的零点，确认继续吗？',
     })
     if (!ok) return
     setHoming(target)
@@ -302,7 +304,7 @@ export default function Settings() {
       })
       const data = await res.json()
       if (!res.ok || !data.success) throw new Error(data.message || '运动回零失败')
-      toast({ title: axis ? `${axis} 轴已开始回到校准零点` : '四轴已开始回到校准零点', description: '请等待校准角度稳定到 0°。', variant: 'success' })
+      toast({ title: '正在校准' })
     } catch (e) {
       toast({ title: '运动回零失败', description: e instanceof Error ? e.message : String(e), variant: 'destructive' })
     } finally {
@@ -541,16 +543,16 @@ export default function Settings() {
                         </div>
                         <div className="min-w-0 text-center font-mono font-bold text-primary">
                             <span className="block text-[11px] font-sans font-normal text-muted-foreground sm:hidden">校准</span>
-                            {pumpAngles[axis]?.toFixed(2)}°
+                            {pumpAngles[axis] == null ? '未校准' : `${pumpAngles[axis].toFixed(2)}°`}
                         </div>
                         <div className="col-span-3 flex gap-2 sm:col-span-1 sm:justify-center">
-                            <Button size="icon" variant="outline" className="h-11 w-full sm:w-12" onClick={() => moveToZero(axis)} disabled={homing !== null} title="回到校准零点">
+                            <Button size="icon" variant="outline" className="h-11 w-full sm:w-12" onClick={() => moveToZero(axis)} disabled={homing !== null || calibration.active || calibration.stopping} title="回到校准零点">
                                 <RotateCcw className="w-4 h-4 sm:w-3 sm:h-3" />
                             </Button>
-                            <Button size="icon" variant="outline" className="h-11 w-full sm:w-12" onClick={() => setZero(axis)} title="设为零点">
+                            <Button size="icon" variant="outline" className="h-11 w-full sm:w-12" disabled={!!calibration.active || !!calibration.stopping} onClick={() => setZero(axis)} title="设为零点">
                                 <Target className="w-4 h-4 sm:w-3 sm:h-3" />
                             </Button>
-                            <Button size="icon" variant="ghost" className="h-11 w-full text-muted-foreground sm:w-12" onClick={() => resetZero(axis)} title="重置">
+                            <Button size="icon" variant="ghost" className="h-11 w-full text-muted-foreground sm:w-12" disabled={!!calibration.active || !!calibration.stopping} onClick={() => resetZero(axis)} title="重置">
                                 <RotateCcw className="w-4 h-4 sm:w-3 sm:h-3" />
                             </Button>
                         </div>
@@ -558,18 +560,21 @@ export default function Settings() {
                 ))}
 
                 <div className="flex flex-col gap-2 border-t pt-4 sm:flex-row">
-                     <Button variant="default" className="flex-1" onClick={() => moveToZero()} disabled={homing !== null}>
+                     <Button variant="default" className="flex-1" onClick={() => moveToZero()} disabled={homing !== null || calibration.active || calibration.stopping}>
                        <RotateCcw className="w-4 h-4 mr-2" />
-                       {homing === 'XYZA' ? '回到校准零点中…' : '全部回到校准零点'}
+                       {homing ? '等待响应' : calibration.active ? '正在校准' : '全部回到校准零点'}
                      </Button>
-                     <Button variant="secondary" className="flex-1" onClick={() => setZero()}>全部设为零点</Button>
-                     <Button variant="ghost" className="flex-1" onClick={() => resetZero()}>全部重置</Button>
+                     <Button variant="secondary" className="flex-1" disabled={!!calibration.active || !!calibration.stopping} onClick={() => setZero()}>全部设为零点</Button>
+                     <Button variant="ghost" className="flex-1" disabled={!!calibration.active || !!calibration.stopping} onClick={() => resetZero()}>全部重置</Button>
                 </div>
 
-                <div className="text-xs text-muted-foreground bg-muted/50 p-3 rounded">
-                    <p>校准原理：当前位置 = 原始位置 - 偏移量。</p>
-                    <p>点击“设为零点”将当前位置记录为偏移量，使读数归零。</p>
-                </div>
+                <p role="status" className="text-sm text-muted-foreground">
+                  {calibration.stopping ? '正在停止' : calibration.active ? '正在校准' : calibration.outcome === 'succeeded' ? '已完成' : calibration.reason || ''}
+                </p>
+                {(calibration.active || calibration.stopping) && <Button variant="destructive" onClick={async () => {
+                  const result = await stopPumps()
+                  toast({ title: result.success ? '已确认停止' : '停止失败', description: result.success ? undefined : result.message, variant: result.success ? 'success' : 'destructive' })
+                }}>停止校准</Button>}
             </CardContent>
         </Card>
       </div>
