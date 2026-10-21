@@ -7,7 +7,7 @@ def remote_command(node, command, param1=0, param2=0):
     """A current protocol client, with a new durable identity for each request."""
     node._mavlink_tcp_session = node._mavlink_tcp_session or 1
     node._test_request_id = getattr(node, '_test_request_id', 0) + 1
-    return SimpleNamespace(data=[command, param1, param2, 1, 191, 255, 190,
+    return SimpleNamespace(executor=node._executor_id, data=[command, param1, param2, 1, 191, 255, 190,
                                  node._test_request_id, 1, node._mavlink_tcp_session])
 
 

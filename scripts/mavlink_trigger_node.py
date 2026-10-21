@@ -37,6 +37,7 @@ import threading
 import queue
 import time
 import uuid
+from types import SimpleNamespace
 import copy
 from collections import deque
 
@@ -251,6 +252,7 @@ class MAVLinkTriggerNode(object):
         self._request_ledger_lock = threading.Lock()
         self._event_pub = rospy.Publisher('/usv/payload_event', String, queue_size=32)
         self._protocol_pub = rospy.Publisher('/usv/payload_protocol', String, queue_size=1)
+        self._executor_id = uuid.uuid4().hex
         self._mavlink_tcp_session = 0
         rospy.Subscriber('/usv/mavlink_session', Float32MultiArray, self._mavlink_session_cb)
         self._sample_record_lock = threading.Lock()
@@ -293,6 +295,7 @@ class MAVLinkTriggerNode(object):
         self.global_position_sub = rospy.Subscriber('/mavros/global_position/global', NavSatFix, self._global_position_cb, queue_size=10)
         self.imu_sub = rospy.Subscriber('/mavros/imu/data', Imu, self._imu_cb, queue_size=10)
         self.mavlink_cmd_sub = rospy.Subscriber('/usv/mavlink_cmd_rx', Float32MultiArray, self._mavlink_cmd_rx_cb, queue_size=20)
+        self.payload_command_sub = rospy.Subscriber('/usv/payload_command', String, self._payload_command_cb, queue_size=20)
         self.mavlink_sub = None
         if self._enable_mavros_command_long_fallback:
             self.mavlink_sub = rospy.Subscriber('/mavros/mavlink/from', Mavlink, self._mavlink_from_cb, queue_size=20)
@@ -853,10 +856,12 @@ class MAVLinkTriggerNode(object):
             return
         calibration = data.get('calibration')
         if isinstance(calibration, dict) and calibration.get('attempt_id'):
+            active = bool(calibration.get('active') or calibration.get('stopping'))
             self._emit_request_event(calibration.get('mavlink_request'),
-                'progress' if calibration.get('active') else 'terminal',
-                calibration.get('outcome', ''), calibration.get('reason', ''),
-                attempt_id=calibration['attempt_id'], state='calibrating')
+                'progress' if active else 'terminal',
+                '' if active else calibration.get('outcome', ''), calibration.get('reason', ''),
+                attempt_id=calibration['attempt_id'], state='calibrating',
+                preflight_phase=calibration.get('phase', ''), cleanup_failed=bool(calibration.get('cleanup_failed')))
         reported = data.get('sampling_context')
         if not isinstance(reported, dict):
             return
@@ -1183,6 +1188,13 @@ class MAVLinkTriggerNode(object):
 
         self._handle_command_long_payload(msg)
 
+    def _payload_command_cb(self, msg):
+        try:
+            data = json.loads(msg.data)
+            self._mavlink_cmd_rx_cb(SimpleNamespace(data=data['values'], executor=data['executor']))
+        except (ValueError, TypeError, KeyError):
+            rospy.logwarn('Invalid payload command envelope')
+
     def _mavlink_cmd_rx_cb(self, msg):
         """兼容旧内部总线 /usv/mavlink_cmd_rx。"""
         try:
@@ -1209,6 +1221,10 @@ class MAVLinkTriggerNode(object):
             if len(msg.data) == 10 and (msg.data[7] or msg.data[8]):
                 request = request_context(msg.data[7], msg.data[8], msg.data[9], command,
                                           sender_system, sender_component)
+                if getattr(msg, 'executor', None) != self._executor_id:
+                    self._emit_request_event(request, 'request', 'failed', 'executor_restarted')
+                    self._send_command_ack(command, MAV_RESULT_FAILED, sender_system, sender_component, received_session)
+                    return
             elif len(msg.data) not in (7, 10):
                 return
             # Legacy FCU mission triggers have source 0; legacy remote clients
@@ -2331,7 +2347,7 @@ class MAVLinkTriggerNode(object):
             capability = String()
             # Request correlation is always available in memory; the journal is
             # optional diagnostics and cannot withdraw this capability.
-            capability.data = json.dumps({'version': 1, 'source_monotonic': time.monotonic()})
+            capability.data = json.dumps({'version': 1, 'executor': self._executor_id, 'source_monotonic': time.monotonic()})
             self._protocol_pub.publish(capability)
 
             rospy.logdebug_throttle(10, "Mode: %s, Armed: %s, Sampling: %s, Connected: %s, v=%.3f, yaw=%.3f",

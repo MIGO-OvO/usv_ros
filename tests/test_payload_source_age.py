@@ -31,7 +31,7 @@ class SourceAgeTests(unittest.TestCase):
         b._field_received_at = {field: at - 4 for field, at in b._field_received_at.items()}
         b._angles_cb(SimpleNamespace(data='X:3'))
         sent = self.send()
-        self.assertEqual(sent['PUMP_X'], 3)
+        self.assertEqual(sent['PUMP_X'], -1)  # No saved zero: explicit uncalibrated display.
         self.assertNotIn('PUMP_Y', sent)
         self.assertNotIn('USV_VOLT', sent)
         self.assertEqual(sent['USV_VLD'], 0)

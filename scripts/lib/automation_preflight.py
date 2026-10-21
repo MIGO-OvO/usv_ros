@@ -77,6 +77,12 @@ def load_zero_offsets(path, axes):
     return offsets
 
 
+def relative_angles(raw, offsets):
+    """Display only; absent zero points must never look like absolute zero."""
+    return {axis: (float(value) - offsets[axis]) % 360 if axis in offsets else None
+            for axis, value in raw.items() if axis in AXES}
+
+
 class PreflightError(Exception):
     def __init__(self, reason, message):
         super().__init__(message)
@@ -259,14 +265,8 @@ class AutomationPreflight:
                 self.started.clear()
                 self.pending.clear()
 
-    def run(self, motors, zeros, policy, precision, injection):
-        # Ordered firmware text processing drains previous command replies.
-        self.command('PIDQUERY', 'PIDPARAM:')
-        if injection:
-            # Managed acquisition owns injection from this point. Confirm OFF
-            # before preparation even if a previous/manual output was left on.
-            self.command('PUMP:OFF', 'PUMP_OK:OFF')
-        self.stage('homing', motors=motors, oil_axis=policy['oil_axis'])
+    def home(self, motors, zeros, precision):
+        self.stage('homing', motors=motors)
         raw = self.angles(motors)
         moves = {}
         for axis in motors:
@@ -274,6 +274,16 @@ class AutomationPreflight:
             # Send even zero travel: require a real firmware completion for each pump.
             moves[axis] = (abs(delta), 'F' if delta >= 0 else 'B')
         self.pid_moves(moves, precision)
+
+    def run(self, motors, zeros, policy, precision, injection):
+        # Ordered firmware text processing drains previous command replies.
+        self.command('PIDQUERY', 'PIDPARAM:')
+        if injection:
+            # Managed acquisition owns injection from this point. Confirm OFF
+            # before preparation even if a previous/manual output was left on.
+            self.command('PUMP:OFF', 'PUMP_OK:OFF')
+        self.stage('checking', oil_axis=policy['oil_axis'])
+        self.home(motors, zeros, precision)
         self.stage('compensating')
         self.pid_moves({axis: (360.0, 'F') for axis in motors}, precision)
         if policy['separation_turns'] > 0:

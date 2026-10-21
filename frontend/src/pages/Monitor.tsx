@@ -785,7 +785,7 @@ export default function Monitor() {
                 {Object.entries(pumpAngles).map(([axis, angle]) => (
                     <div key={axis} className="min-w-0 text-center">
                         <div className="text-xs text-muted-foreground">{axis}</div>
-                        <div className="font-mono text-xs font-semibold sm:text-sm">{angle.toFixed(1)}°</div>
+                        <div className="font-mono text-xs font-semibold sm:text-sm">{angle == null ? '未校准' : `${angle.toFixed(1)}°`}</div>
                     </div>
                 ))}
               </div>

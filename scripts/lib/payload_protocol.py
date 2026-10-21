@@ -307,3 +307,12 @@ class RequestLedger(object):
     def close(self):
         if self.journal is not None:
             self.journal.close()
+
+    def observe(self, event):
+        """Keep the bridge's request owner until its executor reports closure."""
+        with self.lock:
+            record = self.records.get(self.key(event))
+            if record is not None and event['seq'] > (record.get('event') or {}).get('seq', 0):
+                record['event'] = dict(event)
+                record['closed'] = self._is_closed(event['phase'], event['outcome'], event['command'])
+                self._evict()

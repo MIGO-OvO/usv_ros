@@ -138,7 +138,7 @@ export default function Manual() {
         <Card className="border-amber-500/30 bg-amber-500/10">
           <CardContent className="py-4 flex items-center gap-3 text-amber-600">
             <AlertTriangle className="w-5 h-5" />
-            自动采样正在运行，手动模式会被后端拒绝。
+            正在采样，暂时无法进入手动模式。
           </CardContent>
         </Card>
       )}
@@ -153,7 +153,7 @@ export default function Manual() {
                   <CardTitle className="flex items-center justify-between text-base">
                     <span>{axis} 轴微泵</span>
                     <span className="font-mono text-sm text-muted-foreground">
-                      {(pumpAngles[axis] ?? 0).toFixed(1)} deg
+                      {pumpAngles[axis] == null ? '未校准' : `${pumpAngles[axis].toFixed(1)} deg`}
                     </span>
                   </CardTitle>
                 </CardHeader>

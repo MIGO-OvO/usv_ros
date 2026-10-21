@@ -5,8 +5,10 @@
 - 必须与匹配的 DetFirmware、ArduRover 和 QGC 成套更新。26 个显示遥测字段（含 `USV_LOOP/LTOT/ADS/PROTO`）；`USV_ADS` 为 0 未知、1 停止已确认、2 启动中、3 采集中、4 错误、5 停止未确认。旧 QGC/ROS 组合不用于自动任务验收。
 - STOP 使用独立有界通道，先取消旧工作再发送；注射泵队列在连接换代、取消、期限届满后不得重放。重连恢复需真实 STOPALL 与 ADSSTOP 确认，串口写成功不代表硬件停止。
 - 真实采样准入要求当前会话的真实新鲜帧与有效基线，GPS 仍可选。运行断流 2 秒后数据无效，在默认 10 秒有界窗口内可等待恢复；恢复前不发下一条运动命令，不用旧数据完成步骤，现有输出可能继续运行。设备错误、owner 丢失与停止不等待这个窗口。
-- 请求身份由 SQLite 持久化去重，普通动作先落盘再执行；停止先执行再持久化，不让磁盘等待阻塞首次停止。不要删除请求账本或清空 QGC 请求身份文件来“解锁”，编号冲突需停机维护。失败/取消保留首因、准备阶段和清理失败标记；Web 按 trigger 最终结果关窗，并导出 `sample_results.csv`。
-- 校准收到全部轴完成、校准完成及停止状态后才成功，17 秒期限内允许 STOP 抢占。日志工具 `scripts/rotate_runtime_logs.py` 默认仅预览，`--rotate` 才操作三类运行日志；10 MiB × 5，copytruncate 存在小窗口丢行风险，不用于故障证据归档。
+- 请求由内存 RequestLedger 去重，JSONL 仅为尽力诊断，不阻塞动作、STOP 或通道释放。bridge 固定每个请求的 trigger 执行实例；trigger 重启但 TCP 未重连时，旧身份返回 `executor_restarted`，不能续跑。不要清空 QGC 请求身份文件来“解锁”。失败/取消保留首因、准备阶段和清理失败标记；Web 按 trigger 最终结果关窗，并导出 `sample_results.csv`。
+- Web 回零和 QGC 31014 共用 `calibration_start`，读取 `calibration.json` 和新鲜原始角度，以最短相对 R/PID 运动回保存零点，全部 PID_DONE 后成功。缺失零点明确拒绝；STOP 抢占并核验 STOPALL_OK，清理失败保留标志。独立回零不执行 360°补偿或油相分隔，自动化原流程保留。Web 与 bridge 需指向同一零点文件，bridge/pump 可用 `~calibration_file` 指定；Web 修改后立即更新显示，QGC 下一遥测周期同步，未校准轴分别显示 null/-1。
+
+日志工具 `scripts/rotate_runtime_logs.py` 默认仅预览，`--rotate` 才操作三类运行日志；10 MiB × 5，copytruncate 存在小窗口丢行风险，不用于故障证据归档。
 - 离线验证：`python -B tests/run_non_map_tests.py`。地图测试按要求跳过，设备烧录、Jetson/台架/实船验收由操作者执行；ROS 等待延长不解除检测板独立 30 秒 PID 限时。
 
 ## safety1 成套升级注意
@@ -30,6 +32,8 @@ bridge 连接 router 后立即发送 component 191 心跳并接收命令；飞�
 QGC 手动点采样采用 Web 全局步骤和自动进样泵策略的 `speed`；缺少自动策略时沿用 `default_speed`。进样仍在泵组准备完成后开启。准备阶段通过现有 `USV_STAT=8` 上报，QGC 主按钮显示“停止采样准备”；进入采样步骤后才提供暂停/恢复。`31011` 在准备阶段和步骤执行期间均全局停止全部泵输出，并核对设备 `PIDQUERY → STOPALL_OK` 回应。
 
 QGC 发送层与面板响应期限一致：分光启动 40 秒（覆盖最多三次配置重试和首帧等待），停止类 `31011/31016/31019` 为 15 秒。期限是等待确认的上限，停止命令点击后即发送。更新 ROS 后重启 trigger/bridge/pump，并运行重新编译的 QGC。
+
+QGC 在总预算内以 1 秒间隔最多发送三份同 session/request/command/参数的帧，不创建新请求。RequestLedger 重放原阶段与结果，不重复执行物理动作；标准 ACK 与 USVE1 可任意先后到达，只有匹配关联事件结束收执等待。
 
 回归：`python -B -m unittest discover -s tests -p test_qgc_payload_startup.py`。台架验收：ROS 启动后立即使用 QGC 启动信号；对比 Web/QGC 相同配置的进样速度；分别在准备、运行、暂停阶段点击普通停止，确认泵组与进样泵停止且记录窗口关闭。
 
@@ -651,7 +655,8 @@ roslaunch usv_ros usv_bringup.launch \
 | `/usv/trigger_status` | `std_msgs/String` | pub | 触发状态：开始、停止、暂停、校准等 |
 | `/usv/bridge_diagnostics` | `std_msgs/String` | pub | router bridge 诊断 JSON |
 | `/usv/radio_status` | `std_msgs/String` | pub | `RADIO_STATUS` 电台链路质量 |
-| `/usv/mavlink_cmd_rx` | `std_msgs/Float32MultiArray` | pub/sub | bridge 转发的 QGC/飞控命令 |
+| `/usv/payload_command` | `std_msgs/String` | pub/sub | 关联 QGC 命令，JSON 含 executor 与原始十元 values |
+| `/usv/mavlink_cmd_rx` | `std_msgs/Float32MultiArray` | pub/sub | 飞控内部事件及无关联兼容 STOP |
 | `/usv/mavlink_cmd_ack` | `std_msgs/Float32MultiArray` | pub/sub | trigger 请求 bridge 发送 `COMMAND_ACK` |
 
 ### 主要 service
@@ -776,7 +781,7 @@ curl -X POST http://127.0.0.1:5000/api/hardware/apply \
 ### 下行命令
 
 `usv_mavlink_router_bridge.py` 从 router TCP 端点接收 `COMMAND_LONG`，筛选 `31010..31019`，转成
-`/usv/mavlink_cmd_rx`；`mavlink_trigger_node.py` 执行后发布 `/usv/mavlink_cmd_ack`，再由 bridge 封装
+带执行实例的 `/usv/payload_command`（无关联兼容 STOP 仍走 `/usv/mavlink_cmd_rx`）；`mavlink_trigger_node.py` 执行后发布 `/usv/mavlink_cmd_ack`，再由 bridge 封装
 `COMMAND_ACK`。
 
 | 命令 | 含义 |
@@ -844,7 +849,7 @@ bridge 发送：
 |---|---|
 | `USV_VOLT` | 分光电压 |
 | `USV_ABS` | 吸光度 |
-| `PUMP_X`、`PUMP_Y`、`PUMP_Z`、`PUMP_A` | 四路泵角度 |
+| `PUMP_X`、`PUMP_Y`、`PUMP_Z`、`PUMP_A` | 保存零点下的相对角度，未校准为 -1；内部控制/诊断保留原始角度 |
 | `USV_STAT` | 任务阶段编码 |
 | `USV_PKT` | 载荷包计数 |
 | `USV_STEP` | 当前自动化步骤号 |

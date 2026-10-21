@@ -404,6 +404,9 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             server = module.WebConfigServer(standalone=False)
             server.socketio = RecordingSocket()
 
+            server.calibration_manager = module.CalibrationManager(str(Path(tmpdir) / "calibration.json"))
+            self.assertTrue(server.calibration_manager.update_offsets(dict.fromkeys("XYZA", 0.0)))
+
             server._angle_telemetry_cb(string_cls(json.dumps({
                 "angles": {"X": 10.0, "Y": 20.0, "Z": 30.0, "A": 40.0},
                 "raw_angles": {"X": 10.0, "Y": 20.0, "Z": 30.0, "A": 40.0},
