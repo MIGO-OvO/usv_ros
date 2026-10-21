@@ -135,7 +135,11 @@ class AutomationPreflight:
     def _check(self):
         if self.cancelled.is_set():
             raise PreflightCancelled()
-        self.check_active()
+        # Mechanical preparation never consumes samples: the pumps have to home,
+        # compensate 360 deg and separate oil exactly once even if the detector
+        # has no fresh frame yet. The formal acquisition gate is applied at the
+        # hand-off in run(), where measurement really is required.
+        self.check_active(False)
         with self.lock:
             if self.error:
                 raise self.error
@@ -315,4 +319,8 @@ class AutomationPreflight:
                 self.changed.wait(min(0.05, max(0.0, deadline - time.monotonic())))
                 self.changed.clear()
         self._check()
+        # Last gate before formal acquisition: real data and a baseline for the
+        # current session. Nothing above this point may depend on measurement.
+        self.stage('verifying')
+        self.check_active(True)
         self.stage('complete')

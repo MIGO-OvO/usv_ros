@@ -427,12 +427,14 @@ class FieldTransactionTests(unittest.TestCase):
         self.ack_sender()
         self.assertTrue(self.node._apply_i2c_mapping())
 
-    def test_start_ack_counts_as_compatibility_success(self):
+    def test_start_ack_confirms_the_command_without_faking_a_measurement(self):
         for timestamp in (None, 123.0):
             self.node._last_valid_spectro_at = timestamp
             acknowledge(self.node, 'ADSSTART')
             self.assertEqual(self.node.spectro_state, 'starting')
-            self.assertIsNotNone(self.node._last_valid_spectro_at)
+            # Start confirmation and measurement freshness are separate facts.
+            self.assertIsNotNone(self.node._spectro_start_ack_at)
+            self.assertIsNone(self.node._last_valid_spectro_at)
         self.node._on_spectro_received({'valid': True, 'voltage': 1.2})
         self.assertEqual(self.node.spectro_state, 'acquiring')
 
@@ -444,7 +446,9 @@ class FieldTransactionTests(unittest.TestCase):
         self.assertEqual(self.node._spectro_txn_phase, 'running')
         self.assertIsNone(self.node._last_spectro_txn_error)
         self.assertNotIn('ADSSTOP', sent)
-        self.assertIsNotNone(self.node._last_valid_spectro_at)
+        self.assertIsNotNone(self.node._spectro_start_ack_at)
+        self.assertIsNone(self.node._last_valid_spectro_at)
+        self.assertFalse(self.node._real_measurement_ready(require_reference=False))
 
     def test_success_accepts_frame_in_same_reader_batch_as_start_ack(self):
         self.ack_sender()

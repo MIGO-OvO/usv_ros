@@ -76,18 +76,24 @@ class SpectroTimeoutBudgetTests(unittest.TestCase):
     setUp = field.FieldTransactionTests.setUp
 
     def test_short_gap_invalidates_data_without_aborting_then_long_gap_stops(self):
-        self.node._automation_is_active = Mock(return_value=True)
-        self.node._auto_stop_callback = Mock()
+        self.node.sampling_context = {'attempt_id': 'stale-owner'}
+        self.node.automation_engine._running.set()  # formal acquisition
+        self.node.send_command = Mock(return_value=True)
+        self.node._auto_stop_locked = Mock(
+            return_value=self.module.TriggerResponse(success=True, message='stopped'))
         self.node._last_valid_spectro_at = 100.0
         self.node.latest_spectro = {'valid': True}
         with patch.object(self.module.time, 'monotonic', return_value=103.0):
             self.node._check_spectro_freshness()
         self.assertFalse(self.node.latest_spectro['valid'])
         self.assertEqual(self.node.spectro_state, 'stale')
-        self.node._auto_stop_callback.assert_not_called()
+        self.node._auto_stop_locked.assert_not_called()
         with patch.object(self.module.time, 'monotonic', return_value=111.0):
             self.node._check_spectro_freshness()
-        self.node._auto_stop_callback.assert_called_once()
+        # The background check stops the attempt it owns, judged by its own
+        # confirmed stop evidence, rather than issuing a blind global STOP.
+        self.node._auto_stop_locked.assert_called_once()
+        self.assertTrue(self.node._auto_stop_locked.call_args.kwargs['confirm_stop'])
         self.assertEqual(self.node._terminal_reason, 'spectrometer_stale')
 
     def test_sample_wait_recovers_with_new_frame_after_old_two_second_deadline(self):

@@ -86,9 +86,11 @@ class RemainingMeasurementPathTests(unittest.TestCase):
             self.node._preflight_angles, self.node._publish_preflight_status)
         return self.node._preflight
 
-    def test_preflight_off_after_pidquery_does_not_wait_for_measurement_recovery(self):
+    def test_mechanical_preparation_and_injection_prestart_do_not_gate_on_measurement(self):
         # Deterministic production function timing: admission age 1.9s,
-        # PIDQUERY ACK after 0.4s, next real frame only 1.7s later.
+        # PIDQUERY ACK after 0.4s, and no new frame at all afterwards. Homing,
+        # the 360 deg compensation, the oil separation and the injection
+        # pre-start do not consume samples, so none of them may stall here.
         clock = [100.0]
         writes = []
         with patch.object(self.module.time, 'monotonic', side_effect=lambda: clock[0]):
@@ -105,17 +107,16 @@ class RemainingMeasurementPathTests(unittest.TestCase):
                 elif command.startswith('PUMP:SET:'):
                     self.node._on_text_received('PUMP_OK:SET=60,ON')
                 return True
-            def new_frame(_timeout):
-                clock[0] = max(clock[0], 104.0)
-                fresh_measurement(self.node)
             self.node.send_command = send
-            preflight.changed.wait = new_frame
-            preflight.run([], {}, {'oil_axis': None, 'separation_turns': 0, 'separation_rpm': 5},
-                          0.1, (60, 0))
+            # The formal hand-off still refuses to start without real data.
+            with self.assertRaises(self.module.PreflightError) as raised:
+                preflight.run([], {}, {'oil_axis': None, 'separation_turns': 0, 'separation_rpm': 5},
+                              0.1, (60, 0))
+        self.assertEqual(raised.exception.reason, 'spectrometer_not_ready')
         off_at = next(at for command, at in writes if command == 'PUMP:OFF')
         self.assertAlmostEqual(off_at, 102.3)
         on_at = next(at for command, at in writes if command == 'PUMP:SET:60')
-        self.assertGreaterEqual(on_at, 104.0, 'new motion must still wait for a real frame')
+        self.assertAlmostEqual(on_at, 102.3, msg='injection pre-start must not wait for a measurement')
 
     def test_finite_oil_stop_bypasses_stale_measurement_wait(self):
         preflight = self.make_preflight()
@@ -265,13 +266,16 @@ class RemainingMeasurementPathTests(unittest.TestCase):
         self.node.automation_engine._running.set()
         clock = [time.monotonic()]
         with patch.object(self.module.time, 'monotonic', side_effect=lambda: clock[0]):
+            # The readiness check shares serial_lock with the reader, so while
+            # the lock is held neither the check nor the write can proceed.
             with self.node.serial_lock:
                 worker.start()
-                self.assertTrue(generated.wait(1))
+                self.assertFalse(generated.wait(0.2))
                 clock[0] += 3
-            time.sleep(0.08)
+            self.assertFalse(generated.wait(0.2), 'stale frame admitted after lock contention')
             self.assertEqual(self.writes, [], 'write used a frame checked before serial-lock contention')
             fresh_measurement(self.node)
+            self.assertTrue(generated.wait(1))
             worker.join(1)
         self.assertFalse(worker.is_alive())
         self.assertEqual(result, [True])

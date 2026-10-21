@@ -276,6 +276,15 @@ class AutomationEngine(object):
             self._handle_error(message)
             self._pid_complete_event.set()
 
+    def clear_cleanup_failure(self):
+        """A confirmed physical stop supersedes an earlier cleanup failure.
+
+        The failed run stays visible through its terminal reason and the request
+        ledger; this only stops the old latch from rejecting the next stop.
+        """
+        with self._lock:
+            self._cleanup_failed = False
+
     def get_status(self):
         """
         获取当前状态。
