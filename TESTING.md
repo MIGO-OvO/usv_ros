@@ -285,6 +285,16 @@ rosservice call /usv/automation_stop
 
 通过判据：泵状态有更新或实际动作；自动化启动后日志出现 `Automation start requested` 并进入步骤执行。
 
+启动与校准回归：
+
+```bash
+PYTHONPATH=tests python3 -B -m unittest test_manual_sampling_admission test_calibration_lifecycle test_sampling_cleanup_ownership test_preflight_stop_races
+```
+
+覆盖首次就绪点采样、空/旧 owner、泵手动模式、故障、非法配置、RPC 结果未知与迟到 START/STOP。比较同一 attempt 的 QGC 事件、采样记录和 `sampling_result.reason`，清理状态单独检查。校准中分别从 Web、ROS 服务和统一控制入口停止进样泵，校准继续等待四轴 PID_DONE，迟到 PID_DONE 不改写终态。
+
+现场首次拒绝需同时保存 trigger/pump 日志、`~/usv_ws/config/sampling_config.json`、泵 `manual_mode_enabled/controller_fault` 和当前 owner。按 `Automation admission` 与 `Sampling cleanup` 中的 attempt 关联。正常点采样应在航行 Manual 下进入准备；真实拒绝按提示退出泵手动模式、停止当前任务、修正配置或恢复控制器后重试。
+
 <a id="mavlink-router-bridge"></a>
 
 ### 5.4 MAVLink 路由桥接

@@ -584,6 +584,12 @@ sudo USV_BOOT_START_NOW=true USV_STRICT_SELF_CHECK=false ./src/usv_ros/scripts/i
 
 当前 DetFirmware 的 `0xCC` 角度帧没有有效位或源时间戳；传感器失效时会重复 last_valid，`ANGLE_AGE_CH_MS=0` 也不能单独证明有效。Preflight 使用逐轴 monotonic 接收时刻（1 秒断流预算）、有限/范围校验、通道 age 和独立健康包时间戳（2.5 秒预算，重复/倒退不续约，支持 uint32 回绕）。油相运动需在 2 秒内产生超过量化/噪声的净正向进展；相同帧或在固定位置附近抖动不能续约进展计时。以上检测失败均停止输出；这些有界软件门禁仍须台架验证机械停机延迟。
 
+`automation_start` 返回本次 `attempt_id` 与 `admission`：`rejected` 表示未准入，`owned` 表示泵节点已接管该 attempt；RPC 异常或身份不匹配按 `unknown` 处理。启动失败首因保留在 QGC 关联结果、日志、`sampling_result` 与采样记录中，清理另存 `cleanup_result`。明确未准入仍登记取消，阻止迟到 START；未知结果按 attempt 核验，当前 owner 匹配才执行停止，其他 owner 不受影响。`not_admitted/not_owned` 表示已登记取消且当前无本 attempt 的输出归属；`superseded` 表示其他 owner 已接管；`stopped` 才表示本 attempt 停止确认成功。航行 Manual 与泵手动模式独立，泵手动模式、控制器故障、忙碌和非法配置分别返回具体原因。
+
+未到 `sampling_started` 就失败的 attempt，Web 按匹配的上下文和最终结果建立失败记录；支持两者任意到达顺序，重复或旧 owner 结果不重复建档。任务 JSON 与 `sample_results.csv` 保存首因、`start_admission` 和独立 JSON 格式的 `cleanup_result`，不附加有效测量。
+
+独立校准期间，Web `/api/injection-pump/off` 与 ROS `/usv/injection_pump_off` 只关闭进样泵，校准继续等待各轴 PID 完成。取消校准使用全局 STOP，沿用轴停止确认与取消终态；独立校准只回保存零点，自动化继续执行回零、360° 补偿、油相分隔、进样和正式步骤。
+
 Web 自动化页的“启动前准备”可编辑相对零点、油相轴、分隔圈数和转速；桌面并列显示零点与分隔参数，窄屏纵向排列。运行期间配置锁定，Preflight 只能停止，不能暂停/恢复。QGC 的 31012/31013 ACK 和 mission 状态仅在泵服务成功后更新；准备阶段的拒绝返回失败 ACK，不显示假暂停/恢复。阶段和待完成轴通过 `automation_status.preflight` 显示；准备期间 `running=true`、`automation_step=0`。启动 RPC 成功表示接受准备事务，终态仍由关联 attempt 的状态决定。
 
 QGC 31011 的全局停止和 trigger 内部按 attempt 的清理通过已有 `ControlCommand` 请求携带可选 `confirm_stop: true`：先执行原停止输出，再用 `PIDQUERY → PIDPARAM` 排空旧响应，随后等待最终 `STOPALL → STOPALL_OK` 确认固件已关闭电机、PID/校准/测试和进样。串口写入成功不能单独生成成功 ACK；清理/确认超时、异常或已锁存故障返回失败、mission 为 FAILED，保留原故障原因。原命令号、ACK 结构、串口指令及不带该标记的旧 ROS 调用兼容；部署须更新 pump 与 trigger。固件确认表示执行了停机逻辑，机械惯性/电气输出仍需台架测量。
@@ -790,7 +796,7 @@ curl -X POST http://127.0.0.1:5000/api/hardware/apply \
 | `31011` | 停止采样 |
 | `31012` | 暂停采样 |
 | `31013` | 恢复采样 |
-| `31014` | 校准，向检测装置发布 `CALXYZA\r\n` |
+| `31014` | 调用 `calibration_start`，按保存零点发送最短相对 R/PID 回零 |
 | `31015` | 开始走航采样 |
 | `31016` | 停止走航采样 |
 | `31017` | 设置分光 baseline，`param1=0` 使用最新有效电压 |

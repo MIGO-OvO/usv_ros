@@ -2594,13 +2594,20 @@ class WebConfigServer(object):
         return any(token in status for token in ('finish', 'done', 'stop', 'error', 'fail', 'owner_lost', 'timeout', 'cancel'))
 
     def _finish_owned_recording(self, data):
-        if not isinstance(data, dict) or self.current_sample_window is None:
+        if not isinstance(data, dict) or data.get('_recording_finished'):
             return False
         context = data.get('sampling_context')
         expected = self._recording_attempt_id()
         if (not expected or not isinstance(context, dict) or context.get('attempt_id') != expected
                 or not self._automation_terminal(data)):
             return False
+        if self.current_sample_window is None:
+            if data.get('outcome') != 'failed' or not data.get('start_admission'):
+                return False
+            self._start_data_recording_if_needed(source='survey' if context.get('source') == 'survey' else 'trigger')
+            self._start_sample_window_if_needed()
+            if self.current_sample_window is None:
+                return False
         source = self.current_sample_window.get('source')
         if source in ('manual', 'fcu', 'survey', 'lab') and not data.get('outcome'):
             # Trigger owns final cleanup for these jobs. Pump 'finished' alone
@@ -2621,12 +2628,14 @@ class WebConfigServer(object):
         elif status in ('stopped', 'cancelled') and reason in ('stopped', 'cancelled', 'operator_stop') and not cleanup_failed:
             outcome = 'cancelled'
         window.update(outcome=outcome, terminal_reason=reason, cleanup_failed=cleanup_failed)
-        for key in ('preflight_phase', 'terminal_reason_at', 'spectrometer_age_s', 'owner_age_s'):
+        for key in ('preflight_phase', 'terminal_reason_at', 'spectrometer_age_s', 'owner_age_s',
+                    'start_admission', 'cleanup_result'):
             window[key] = data.get(key, context.get(key))
         self._close_sample_window_if_open()
         if self.data_recording_source not in ('survey', 'lab'):
             self._stop_data_recording_if_active()
         self._sampling_context = {}
+        data['_recording_finished'] = True
         return True
 
     def _sampling_result_cb(self, msg):
@@ -2705,7 +2714,10 @@ class WebConfigServer(object):
         if raw_status.startswith('sampling_context:'):
             try:
                 context = json.loads(raw_status.split(':', 1)[1])
+                if isinstance(context, dict) and self._sampling_results.get(context.get('attempt_id'), {}).get('_recording_finished'):
+                    return
                 self._sampling_context = context if isinstance(context, dict) else {}
+                self._finish_owned_recording(self._sampling_results.get(self._recording_attempt_id()))
             except (TypeError, ValueError):
                 self._sampling_context = {}
             return
@@ -3799,11 +3811,13 @@ class WebConfigServer(object):
                 results = io.StringIO()
                 columns = ['sample_id', 'attempt_id', 'state', 'outcome', 'terminal_reason',
                            'preflight_phase', 'terminal_reason_at', 'cleanup_failed',
-                           'spectrometer_age_s', 'owner_age_s']
+                           'spectrometer_age_s', 'owner_age_s', 'start_admission', 'cleanup_result']
                 writer = csv.DictWriter(results, fieldnames=columns, extrasaction='ignore')
                 writer.writeheader()
                 for window in self.sample_storage.list_windows(data):
-                    writer.writerow(dict(window, outcome=window.get('outcome') or 'unknown'))
+                    row = dict(window, outcome=window.get('outcome') or 'unknown')
+                    row['cleanup_result'] = json.dumps(window['cleanup_result'], ensure_ascii=False) if window.get('cleanup_result') is not None else ''
+                    writer.writerow(row)
                 archive.writestr(root + '/sample_results.csv', results.getvalue().encode('utf-8'))
                 with archive.open(root + "/raw.csv", "w") as csv_file:
                     for chunk in self._iter_mission_raw_csv_chunks(data):

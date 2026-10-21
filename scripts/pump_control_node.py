@@ -3080,7 +3080,7 @@ class PumpControlNode(object):
 
     def _reject_if_manual_mode(self, action_name):
         if self.manual_mode_enabled:
-            message = "%s rejected: manual mode is enabled" % action_name
+            message = "%s rejected: pump manual mode is enabled" % action_name
             rospy.logwarn(message)
             return TriggerResponse(success=False, message=message)
         return None
@@ -3157,6 +3157,8 @@ class PumpControlNode(object):
         return self._control_response(success, message, result)
 
     def _execute_control_action(self, action, payload):
+        rejected = ({'admission': 'rejected', 'attempt_id': payload.get('attempt_id')}
+                    if action == 'automation_start' else {})
         # These clients run on the same Jetson, where monotonic is shared
         # across processes. Preserve the original admission time across RPC
         # waits; an old RPC arriving after STOP must not become a new action.
@@ -3164,7 +3166,7 @@ class PumpControlNode(object):
             issued = payload.get('_issued_monotonic', time.monotonic())
             if (not isinstance(issued, (int, float)) or not math.isfinite(issued)
                     or issued <= self._stop_cutoff or issued > time.monotonic()):
-                return False, 'Request predates stop/session or has invalid admission time', {}
+                return False, 'Request predates stop/session or has invalid admission time', rejected
         if action == 'automation_cleanup':
             attempt = payload.get('attempt_id')
             with self.serial_lock:
@@ -3175,7 +3177,12 @@ class PumpControlNode(object):
                     oldest = next(iter(self._cancelled_attempts))
                     self._stop_cutoff = max(self._stop_cutoff, self._cancelled_attempts.pop(oldest))
                 if attempt != self.sampling_context.get('attempt_id'):
-                    return False, 'Cleanup owner was superseded', {'cleanup': 'superseded', 'attempt_id': attempt}
+                    owner = self.sampling_context.get('attempt_id')
+                    cleanup = ('not_admitted' if payload.get('admission') == 'rejected'
+                               else 'superseded' if owner else 'not_owned')
+                    return cleanup in ('not_admitted', 'not_owned'), 'Attempt cancelled without stopping another owner', {
+                        'cleanup': cleanup, 'attempt_id': attempt, 'owner_attempt_id': owner,
+                    }
                 first_write = self._request_output_stop()
             try:
                 with self._control_lock:
@@ -3191,7 +3198,13 @@ class PumpControlNode(object):
             if self._automation_is_active():
                 response = self._auto_stop_callback(None)
                 return response.success, response.message, self._injection_status_result()
-            first_write = self._request_output_stop('PUMP:OFF')
+            with self.serial_lock:
+                if self._calibration.get('active'):
+                    success = self._send_injection_pump_command(enabled=False)
+                    if not success:
+                        self._record_cleanup_result(False)
+                    return success, 'Injection stop sent' if success else 'Injection stop failed', self._injection_status_result()
+                first_write = self._request_output_stop('PUMP:OFF')
             try:
                 success = self._send_injection_pump_command(enabled=False) and first_write
                 if not success:
@@ -3235,19 +3248,28 @@ class PumpControlNode(object):
         with self._action_scope(), self._control_lock:
             try:
                 if self._action_cancelled() or self._stop_requested:
-                    return False, 'cancelled by stop', {}
+                    return False, 'cancelled by stop', rejected
                 if self._calibration.get('active'):
-                    return False, 'Calibration is active; stop it before another action', {}
+                    return False, 'Calibration is active; stop it before another action', rejected
                 if payload.get('_issued_monotonic', time.monotonic()) <= self._stop_cutoff:
-                    return False, 'Request predates stop/session', {}
+                    return False, 'Request predates stop/session', rejected
                 return self._execute_control_action_locked(action, payload)
             finally:
                 if action in ('spectrometer_i2c_map', 'spectrometer_configure'):
                     self._publish_automation_status(self._last_automation_status_text)
 
     def _execute_control_action_locked(self, action, payload):
+        rejected = ({'admission': 'rejected', 'attempt_id': payload.get('attempt_id')}
+                    if action == 'automation_start' else {})
+        if action == 'automation_start':
+            rospy.loginfo('Automation admission: attempt_id=%s owner=%s pump_manual=%s fault=%s active=%s steps=%s',
+                          payload.get('attempt_id'), self.sampling_context.get('attempt_id'),
+                          self.manual_mode_enabled, self._controller_fault, self._automation_is_active(),
+                          len(payload['steps']) if isinstance(payload.get('steps'), list) else 'invalid')
         if self._controller_fault and action not in ('manual_stop_all', 'automation_cleanup', 'injection_off', 'injection_status', 'spectrometer_stop'):
-            return False, 'Controller fault: reconnect required', {}
+            recovery = ('confirm STOP, then restart signal' if self._controller_fault in RECOVERABLE_FAULTS
+                        else 'reconnect controller')
+            return False, 'Controller fault %s; %s' % (self._controller_fault, recovery), rejected
         if action == 'automation_cleanup':
             attempt = payload.get('attempt_id')
             if not isinstance(attempt, str) or not attempt:
@@ -3269,17 +3291,19 @@ class PumpControlNode(object):
             return False, 'Configuration/manual output rejected during automation', {}
         if action == 'automation_start':
             if payload.get('attempt_id') in self._cancelled_attempts:
-                return False, 'Automation attempt was cancelled before admission', {}
-            if self._automation_is_active() or self.manual_mode_enabled:
-                return False, 'Automation start rejected: controller busy', {}
+                return False, 'Automation attempt was cancelled before admission', rejected
+            if self.manual_mode_enabled:
+                return False, 'pump manual mode enabled: disable pump manual mode', rejected
+            if self._automation_is_active():
+                return False, 'Automation already running: stop current task first', rejected
             config = dict(payload)
             config.pop('transaction_only', None)
             msg = String()
             msg.data = json.dumps(config)
             if not self._steps_callback(msg):
-                return False, 'Invalid automation configuration', {}
+                return False, 'Invalid automation configuration: check sequence and pump settings', rejected
             response = self._auto_start_callback(None)
-            return response.success, response.message, dict(self.sampling_context)
+            return response.success, response.message, dict(self.sampling_context, admission='owned')
 
         if action in ('automation_resume', 'automation_pause'):
             if payload.get('attempt_id') != self.sampling_context.get('attempt_id'):
@@ -3736,7 +3760,7 @@ class PumpControlNode(object):
         if self._action_cancelled() or self._stop_requested:
             return TriggerResponse(success=False, message='cancelled by stop')
         if self._controller_fault:
-            return TriggerResponse(success=False, message='Controller fault: reconnect required')
+            return TriggerResponse(success=False, message='Controller fault %s; reconnect controller' % self._controller_fault)
         if self._calibration.get('active'):
             return TriggerResponse(success=False, message='Calibration is active')
         rejected = self._reject_if_manual_mode("Automation start")
@@ -3750,7 +3774,7 @@ class PumpControlNode(object):
         if step_count == 0:
             rospy.logwarn("Automation start rejected: no steps loaded")
             self._set_terminal_reason('configuration_failed')
-            return TriggerResponse(success=False, message="No automation steps loaded")
+            return TriggerResponse(success=False, message="No automation steps loaded: save sampling sequence")
 
         if (not self._configuration_ready or self._owner_last_seen is None
                 or time.monotonic() - self._owner_last_seen > 5.0):

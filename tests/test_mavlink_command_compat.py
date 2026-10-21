@@ -231,6 +231,7 @@ class FailingOnceNamedValueMav(RecordingMav):
 class MavlinkCommandCompatibilityTests(unittest.TestCase):
     def _install_injection_session_recorder(self, node, accepted=True):
         calls = []
+        node._command_context = threading.local()
         node.sampling_result_pub = RecordingPublisher()
         node._latest_global_position = gps_position()
         if not hasattr(node, 'state_lock'):
@@ -1108,6 +1109,7 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
     def _make_survey_gate_node(self, module, config):
         node = module.MAVLinkTriggerNode.__new__(module.MAVLinkTriggerNode)
+        node._command_context = threading.local()
         node.state_lock = threading.Lock()
         node.is_sampling = False
         node._survey_active = True
