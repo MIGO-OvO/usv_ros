@@ -43,6 +43,7 @@ class BridgeQMLWireTests(unittest.TestCase):
         transport = MAVLinkTCPTransport(wire, counts)
         system_id = int(os.environ.get('USV_QA_SYSTEM_ID', '1'))
         self.assertTrue(1 <= system_id <= 255)
+        bridge._transport = transport
         bridge._conn = SimpleNamespace(mav=dialect.MAVLink(transport, srcSystem=system_id, srcComponent=191))
         ledger = RequestLedger(':memory:')
         self.addCleanup(ledger.close)
@@ -54,10 +55,28 @@ class BridgeQMLWireTests(unittest.TestCase):
         for event in (accepted, progress):
             bridge._payload_event_cb(SimpleNamespace(data=json.dumps(event)))
         with patch('scripts.lib.mavlink_tcp_transport.select.select', return_value=([], [wire], [])):
+            transport.deadline = 0  # Healthy port, exhausted before the first byte.
+            bridge._send_payload_event()
+            self.assertFalse(wire.accepted)
+            self.assertIsNotNone(bridge._conn)
+            transport.begin_cycle()
             bridge._send_payload_event()
             # Model link packet loss of the earlier accepted event, rather than
             # weakening the production parser's legal progress contract.
             wire.accepted.clear()
+            original_write = transport.write
+            held = []
+            def write(frame):
+                size = original_write(frame)
+                if not held:
+                    held.append(True)
+                    transport.deadline = 0  # Defer the next complete MAVLink frame.
+                return size
+            transport.write = write
+            transport.begin_cycle()
+            bridge._send_payload_event()
+            self.assertIsNotNone(bridge._active_event_send)
+            transport.begin_cycle()
             bridge._send_payload_event()
         frames = dialect.MAVLink(None).parse_buffer(bytes(wire.accepted))
         self.assertTrue(frames)
@@ -70,6 +89,7 @@ class BridgeQMLWireTests(unittest.TestCase):
         self.assertEqual(progress['state'], 'running')
         self.assertGreater(counts['short_writes'], 0)
         self.assertGreater(counts['would_block'], 0)
+        self.assertEqual(counts['deferred_frames'], 2)
         self.assertEqual(counts['fully_written_frames'], bridge._diag_tx_total)
         fixture = os.environ.get('USV_QA_EVENT_FRAMES')
         if fixture:

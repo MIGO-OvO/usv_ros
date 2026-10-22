@@ -96,6 +96,9 @@ class EventDeliveryTests(unittest.TestCase):
             self.enqueue(request)
         self.assertLessEqual(len(self.bridge._recent_events), 32)
         self.now += 31.0
+        # Unsent transitions survive expiry; only replay history expires.
+        for _ in range(32):
+            self.send()
         self.assertEqual(self.send(), [])
         self.assertFalse(self.bridge._recent_events)
 

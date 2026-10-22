@@ -221,8 +221,9 @@ class RequestLedger(object):
                 # A record synthesised by an out-of-band event learns its
                 # signature on first admission; it never changes afterwards.
                 record['signature'] = signature
+                record['reply_tcp_session'] = context['tcp_session']
                 event = record.get('event')
-                return False, dict(event) if event else None
+                return False, dict(event, tcp_session=context['tcp_session']) if event else None
             watermark = self.watermarks.get(sender)
             if watermark and (context['session'], context['request']) <= tuple(watermark):
                 raise ValueError('Retired payload request')
@@ -230,9 +231,18 @@ class RequestLedger(object):
                 raise ValueError('Payload sender capacity reached')
             self.watermarks[sender] = (context['session'], context['request'])
             self.records[key] = {'signature': signature, 'event': None, 'closed': False,
-                                 'command': context['command'], 'attempts': []}
+                                 'command': context['command'], 'attempts': [],
+                                 'reply_tcp_session': context['tcp_session']}
             self._evict()
             return True, None
+
+    def recover(self, context, param1, param2):
+        """Bind a verified retry to a new reply session without admitting work."""
+        with self.lock:
+            record = self.records.get(self.key(context))
+            if record is None or record['signature'] != self.signature(context, param1, param2):
+                raise ValueError('Unknown or conflicting payload recovery request')
+            return self.reserve(context, param1, param2)[1]
 
     def persist(self, context, param1, param2):
         """Compatibility shim: the journal needs no separate admission step.
@@ -279,6 +289,9 @@ class RequestLedger(object):
                 self.records[key] = record
                 self._evict()
             previous = dict(record.get('event') or {})
+            context = dict(context, tcp_session=record.get('reply_tcp_session', context['tcp_session']))
+            if previous:
+                previous['tcp_session'] = context['tcp_session']
             # Once a terminal result exists, late accepted/progress cannot erase
             # it. A survey run legitimately continues into its next attempt.
             if (previous.get('phase') == 'terminal'
