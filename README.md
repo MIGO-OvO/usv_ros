@@ -8,7 +8,42 @@
 - 请求由内存 RequestLedger 去重，JSONL 仅为尽力诊断，不阻塞动作、STOP 或通道释放。bridge 固定每个请求的 trigger 执行实例；trigger 重启但 TCP 未重连时，旧身份返回 `executor_restarted`，不能续跑。不要清空 QGC 请求身份文件来“解锁”。失败/取消保留首因、准备阶段和清理失败标记；Web 按 trigger 最终结果关窗，并导出 `sample_results.csv`。
 - Web 回零和 QGC 31014 共用 `calibration_start`，读取 `calibration.json` 和新鲜原始角度，以最短相对 R/PID 运动回保存零点，全部 PID_DONE 后成功。缺失零点明确拒绝；STOP 抢占并核验 STOPALL_OK，清理失败保留标志。独立回零不执行 360°补偿或油相分隔，自动化原流程保留。Web 与 bridge 需指向同一零点文件，bridge/pump 可用 `~calibration_file` 指定；Web 修改后立即更新显示，QGC 下一遥测周期同步，未校准轴分别显示 null/-1。
 
-日志工具 `scripts/rotate_runtime_logs.py` 默认仅预览，`--rotate` 才操作三类运行日志；10 MiB × 5，copytruncate 存在小窗口丢行风险，不用于故障证据归档。
+日志入口为 `usvlogs`，支持最近日志打包、占用查询、清理预览和定时清理。安装与用法见下节。
+
+### 日志管理与下载
+
+更新后安装快捷命令，系统依赖为 Python 3、logrotate 和 cron：
+
+```bash
+sudo apt install logrotate cron
+bash ~/usv_ws/src/usv_ros/scripts/install_usv_commands.sh install
+usvlogs usage
+usvlogs pack field-1022              # 输出 field-1022.tar.gz
+usvlogs pack field-1022-more --count 5
+usvlogs clean                        # 预览轮转和删除目标
+usvlogs clean --apply                # 执行，删除后不可恢复
+usvlogs auto on                      # 当前用户 cron，每 10 分钟检查
+usvlogs auto status
+usvlogs auto off
+```
+
+`usvctl logs` 与 `usvlogs` 等价。日志包默认取最近 3 个 ROS 会话、最近 3 个 ROS 根目录日志，以及三类启动日志；包含当前文件和未压缩的 `.1` 轮转文件，不含更早的压缩轮转。每文件只取末尾 2 MiB，总计最多 64 MiB，包内 `manifest.json` 记录原始大小和截取大小。日志包保存在 `~/usv_ws/.usv_run/bundles/`，同名包不覆盖。它是排障快照，不是完整现场证据备份。
+
+清理先复用 logrotate：启动日志和 ROS `*.log` 超过 10 MiB 时轮转，保留 5 份。copytruncate 保持正在写入的文件描述符，但复制与截断之间可能丢少量日志。随后按旧到新清理 ROS UUID 会话和日志包，默认保留 3 份，ROS 会话预算 512 MiB、日志包预算 256 MiB；预算不足时可少于 3 份。`clean --keep 5 --max-mib 1024` 可调整本次手动清理参数，自动清理使用默认值。
+
+工具保留 `latest` 会话、当前用户进程打开的文件及其会话和最近一小时修改的日志；无法检查进程时跳过过期日志删除，并输出警告。ROS 根目录的 `.log` 及其编号轮转文件也按最近 3 个文件清理，与会话共用 512 MiB 预算。预算是清理目标，不是磁盘配额：活跃文件、保护期内日志和两次检查之间的增长仍可超过预算。采样数据、pcap、QGC tlog、系统 journal 和其他应用目录不在清理范围内。需要长期保存的日志包应下载到本机。
+
+自动清理不需要 sudo，以启用命令的用户运行，退出 SSH 后仍由 cron 执行。先用 `systemctl is-active cron` 确认服务已启动；运行记录可用 `journalctl -t usv-logs` 查询。自定义日志位置时，用 `usvlogs --ros-dir /path/to/log auto on`，该路径会写入定时任务；默认遵循 `ROS_LOG_DIR`、`ROS_HOME`。只以运行 USV 的普通用户启用，不要用 root 管理其他用户的 ROS 日志。
+
+Windows 更新根仓库与 ROS 仓库后，双击根目录 `download_jetson_logs.bat`，输入 Jetson IP 和日志包名称即可通过 SCP 下载。默认用户为 `jetson`，远端工作区为用户目录下的 `usv_ws`，本机保存到根目录 `.usv_run/downloads/`。首次连接需核对 SSH 指纹，使用密码认证时还需输入密码。下载失败会报错，不留下冒充成功包的文件，也不覆盖已有包。
+
+非默认用户名或工作区可运行：
+
+```powershell
+powershell -NoProfile -File .\src\usv_ros\scripts\download_jetson_logs.ps1 -User boat -RemoteWorkspace /home/boat/usv_ws
+```
+
+Windows 需要 OpenSSH Client（`scp`）。该入口下载已经由 `usvlogs pack` 生成的包，不会远程启动设备、打包或清理。
 - 离线验证：`python -B tests/run_non_map_tests.py`。地图测试按要求跳过，设备烧录、Jetson/台架/实船验收由操作者执行；ROS 等待延长不解除检测板独立 30 秒 PID 限时。
 
 ## safety1 成套升级注意

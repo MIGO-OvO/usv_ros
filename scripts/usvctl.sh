@@ -40,6 +40,7 @@ Usage:
   usvimport [bundle_path] [--build] [--restart]
   usvbuild [catkin_make args...]
   usvdeploy [roslaunch args...]
+  usvlogs pack [name] [--count 3] | usage | clean [--apply] | auto on|off|status
 
 Commands:
   start      Start roscore, mavlink-routerd, and usv_ros launch
@@ -52,6 +53,7 @@ Commands:
   import     import a git bundle created by create_hotspot_update.bat
   build      Run catkin_make in the workspace root
   deploy     Stop, update, chmod runtime scripts, build, then start
+  logs       Pack recent logs, show usage, clean old logs, configure retention
 EOF
 }
 
@@ -227,6 +229,9 @@ dispatch() {
         usvdeploy)
             cmd="deploy"
             ;;
+        usvlogs)
+            cmd="logs"
+            ;;
         usvctl)
             cmd="${1:-help}"
             if [[ $# -gt 0 ]]; then
@@ -271,6 +276,9 @@ dispatch() {
             ;;
         deploy)
             deploy_system "$@"
+            ;;
+        logs)
+            python3 "$SCRIPT_DIR/usv_logs.py" "$@"
             ;;
         help|-h|--help)
             usage
