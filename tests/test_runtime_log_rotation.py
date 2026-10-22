@@ -13,6 +13,20 @@ SPEC.loader.exec_module(rotation)
 
 @unittest.skipUnless(shutil.which('logrotate'), 'Linux logrotate required')
 class RuntimeRotationTests(unittest.TestCase):
+    def test_ros_log_rotation_keeps_append_descriptor(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            ros = root / 'ros'
+            ros.mkdir()
+            log = ros / 'node.log'
+            with log.open('ab') as stream:
+                stream.write(b'x' * (11 * 1024 * 1024))
+                stream.flush()
+                self.assertEqual(rotation.main(['--log-dir', folder, '--ros-log-dir', str(ros), '--rotate']), 0)
+                stream.write(b'after\n')
+            self.assertEqual(log.read_bytes(), b'after\n')
+            self.assertTrue((ros / 'node.log.1').exists())
+
     def test_dry_run_and_append_descriptor_survive_rotation(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
