@@ -42,8 +42,8 @@ export function AutomationPreflightCard({ motors, zeros, config, disabled, onZer
         </fieldset>
         <fieldset disabled={disabled} className="min-w-0 space-y-3">
           <legend className="text-sm font-semibold">油相分隔</legend>
-          <p id="separation-help" className="text-xs text-muted-foreground">360° 补偿完成后，油相泵按以下转速额外正转。圈数为 0 时跳过。</p>
-          <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+          <p id="separation-help" className="text-xs text-muted-foreground">360° 补偿后按配置圈数进行 PID 分隔，每段确认完成后继续。转速由设备 PID 上下限控制；圈数为 0 时跳过。</p>
+          <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
             <div className="space-y-2">
               <Label htmlFor="preflight-oil-axis">油相泵轴</Label>
               <select id="preflight-oil-axis" value={config.oil_axis ?? ''}
@@ -57,11 +57,6 @@ export function AutomationPreflightCard({ motors, zeros, config, disabled, onZer
               <Label htmlFor="preflight-turns">分隔圈数</Label>
               <NumericInput id="preflight-turns" value={config.separation_turns} min={0} max={10}
                 onValueChange={(value) => onConfig({ separation_turns: value })} aria-describedby="separation-help" />
-            </div>
-            <div className="space-y-2">
-              <Label htmlFor="preflight-rpm">转速（rpm）</Label>
-              <NumericInput id="preflight-rpm" value={config.separation_rpm} min={0.1} max={20}
-                onValueChange={(value) => onConfig({ separation_rpm: value })} aria-describedby="separation-help" />
             </div>
           </div>
         </fieldset>

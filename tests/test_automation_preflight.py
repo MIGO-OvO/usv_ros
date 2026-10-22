@@ -69,25 +69,23 @@ class PreflightWorkerTests(unittest.TestCase):
             for axis, direction, delta, precision in re.findall(r'([XYZA])E([FB])R([\d.]+)P([\d.]+)', command):
                 delta = float(delta)
                 self.node._on_text_received('PID_START:%s,delta=%.1f,dir=%s,prec=%s' % (axis, delta, direction, precision))
-                if self.block_phase == phase and phase != 'separating':
+                if self.block_phase == phase:
                     continue
                 if self.failure_phase == phase:
                     self.node._on_text_received('PID_FAIL:%s=SENSOR_ERR' % axis)
                 else:
+                    if phase == 'separating':
+                        remaining = delta
+                        while remaining > 0.00001:
+                            step = min(30.0, remaining)
+                            with preparation.lock:
+                                preparation.travel['at'] -= step / (preparation.travel['rpm'] * 6)
+                                angle = (preparation.travel['angle'] + step) % 360
+                            self.node._on_angle_received({axis: angle})
+                            remaining -= step
                     self.node._on_text_received('PID_DONE:%s,abs=360.0,err=0.01' % axis)
             if self.missing_ack != phase:
                 self.node._on_text_received('CMD_OK')
-        elif preparation and phase == 'separating' and command.startswith('AEFV'):
-            if self.missing_ack != phase:
-                self.node._on_text_received('CMD_OK')
-            if self.block_phase == phase:
-                return True
-            # Simulate 90°/0.75s at 20rpm, including wraparound and multiple turns.
-            for _ in range(8):
-                with preparation.lock:
-                    preparation.travel['at'] -= 0.75
-                    angle = (preparation.travel['angle'] + 90.0) % 360
-                self.node._on_angle_received({'A': angle})
         else:
             self.node._on_text_received('CMD_OK')
         return True
@@ -112,19 +110,84 @@ class PreflightWorkerTests(unittest.TestCase):
         deadline = time.monotonic() + 2
         while time.monotonic() < deadline:
             if (self.node._preflight.snapshot()['phase'] == phase and
-                    (phase not in ('homing', 'compensating') or self.node._preflight.pending)):
+                    (phase not in ('homing', 'compensating', 'separating') or self.node._preflight.pending)):
                 return
             time.sleep(0.005)
         self.fail('worker did not reach ' + phase)
+
+    def test_oil_separation_uses_bounded_pid_segments_for_ten_turns(self):
+        self.assertTrue(self.start(preflight={
+            'oil_axis': 'A', 'separation_turns': 10, 'separation_rpm': 0.1})[0])
+        self.join()
+        moves = [float(delta) for command in self.commands
+                 for delta in re.findall(r'AEFR([\d.]+)P', command) if float(delta) > 0]
+        self.assertAlmostEqual(sum(moves), 3600)
+        self.assertTrue(all(delta <= 120 for delta in moves))  # PIDQUERY: 1 rpm floor, 20 s travel
+        self.assertFalse(any('J' in command for command in self.commands))
+        self.node.automation_engine.start.assert_called_once()
+
+    def test_low_pid_floor_reduces_segments_without_using_legacy_j_speed(self):
+        sender = self.send
+        def send(command):
+            if command == 'PIDQUERY':
+                self.commands.append(command)
+                self.node._on_text_received('PIDPARAM:0.14,0.015,0.06,0.1,8')
+                return True
+            return sender(command)
+        self.node.send_command = send
+        self.assertTrue(self.start(preflight={
+            'oil_axis': 'A', 'separation_turns': 1, 'separation_rpm': 20})[0])
+        self.join()
+        moves = [float(delta) for command in self.commands
+                 for delta in re.findall(r'AEFR([\d.]+)P', command)]
+        self.assertEqual(len(moves), 30)
+        self.assertEqual(sum(moves), 360)
+        self.assertTrue(all(delta <= 12 for delta in moves))
+        self.node.automation_engine.start.assert_called_once()
+
+    def test_separation_ack_and_angles_cannot_replace_each_pid_done(self):
+        self.block_phase = 'separating'
+        self.assertTrue(self.start()[0])
+        self.wait_phase('separating')
+        preparation = self.node._preflight
+        for step in (30, 30, 30, 24):
+            with preparation.lock:
+                preparation.travel['at'] -= step / 48
+                angle = (preparation.travel['angle'] + step) % 360
+            self.node._on_angle_received({'A': angle})
+        self.assertEqual(self.commands.count('AEFR114.000P0.1'), 1)
+        self.node.automation_engine.start.assert_not_called()
+        self.node._on_text_received('PID_DONE:A,abs=120,err=0')
+        deadline = time.monotonic() + 1
+        while self.commands.count('AEFR114.000P0.1') < 2 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertEqual(self.commands.count('AEFR114.000P0.1'), 2)
+        self.assertTrue(self.node._auto_stop_callback(None).success)
+        self.join()
+        stopped_at = self.commands.index('STOPALL')
+        self.node._on_text_received('PID_DONE:A,abs=240,err=0')
+        self.assertFalse(any('AEFR' in cmd for cmd in self.commands[stopped_at:]))
+        self.assertFalse(self.node.inject_pump_enabled)
+        self.node.automation_engine.start.assert_not_called()
+
+    def test_separation_pid_timeout_stops_before_injection(self):
+        self.block_phase = 'separating'
+        with patch.object(self.node, 'pid_wait_timeout', 0.04):
+            self.assertTrue(self.start()[0])
+            self.join()
+        self.assertEqual(self.status()['terminal_reason'], 'pid_timeout')
+        self.assertIn('STOPALL', self.commands)
+        self.assertNotIn('PUMP:SET:60', self.commands)
+        self.node.automation_engine.start.assert_not_called()
 
     def test_full_order_relative_zero_full_turns_then_injection_then_engine(self):
         saved = Path(self.node.calibration_file).read_bytes()
         self.assertTrue(self.start()[0])
         self.join()
-        self.assertEqual(self.phases, ['homing', 'compensating', 'separating'])
+        self.assertEqual(self.phases, ['homing', 'compensating'] + ['separating'] * 7)
         self.assertIn('XEBR27.000P0.1ZEBR135.000P0.1', self.commands)
         self.assertIn('XEFR360.000P0.1ZEFR360.000P0.1', self.commands)
-        self.assertLess(self.commands.index('AEFV20J720.000'), self.commands.index('PUMP:SET:60'))
+        self.assertLess(self.commands.index('AEFR114.000P0.1'), self.commands.index('PUMP:SET:60'))
         self.assertEqual(self.node._preflight.snapshot()['travel_degrees'], 720)
         self.node.automation_engine.start.assert_called_once()
         self.assertEqual(saved, Path(self.node.calibration_file).read_bytes())
@@ -147,7 +210,7 @@ class PreflightWorkerTests(unittest.TestCase):
         self.node.automation_engine.start.assert_called_once()
 
     def test_each_pid_failure_stops_all_outputs_and_never_enters_engine(self):
-        for phase in ('homing', 'compensating'):
+        for phase in ('homing', 'compensating', 'separating'):
             with self.subTest(phase=phase):
                 self.failure_phase = phase
                 self.assertTrue(self.start()[0])
@@ -198,7 +261,7 @@ class PreflightWorkerTests(unittest.TestCase):
         self.node.automation_engine.start.assert_not_called()
 
     def test_pid_command_ack_is_required_even_after_all_done_feedback(self):
-        for phase in ('homing', 'compensating'):
+        for phase in ('homing', 'compensating', 'separating'):
             with self.subTest(phase=phase):
                 self.missing_ack = phase
                 with patch.object(self.module.AutomationPreflight, 'ACK_TIMEOUT', 0.03):
@@ -358,7 +421,7 @@ class PreflightContractTests(unittest.TestCase):
 
     def test_separation_rejects_angle_jumps_and_stale_stream(self):
         runner = AutomationPreflight(lambda command: True, lambda: None, lambda axes: {}, lambda: None)
-        runner.travel = {'axis': 'X', 'angle': 10, 'at': time.monotonic(), 'degrees': 0, 'rpm': 5,
+        runner.travel = {'axis': 'X', 'angle': 10, 'at': time.monotonic(), 'degrees': 0, 'base_degrees': 0, 'rpm': 5,
                          'progress_at': time.monotonic(), 'progress_degrees': 0}
         runner.notify_angles({'X': 100})
         self.assertIsInstance(runner.error, PreflightError)
