@@ -97,6 +97,32 @@ class CalibrationLifecycleTests(unittest.TestCase):
         self.assertFalse(self.node._calibration['cleanup_failed'])
         self.assertEqual(self.commands[-2:], ['PIDQUERY', 'STOPALL'])
 
+    def test_injection_off_preserves_calibration_monitor_through_service_and_control(self):
+        from test_preflight_web_contract import PreflightWebContractTests
+        web = PreflightWebContractTests()
+        web.setUp()
+        self.addCleanup(web.doCleanups)
+        web.server._call_control_command = self.node._execute_control_action
+        self.node._on_angle_received({'X': 150, 'Y': 5, 'Z': 345, 'A': 18})
+        self.node._on_text_received('ANGLE_AGE_CH_MS:1,1,1,1')
+        self.start()
+        token = self.node._action_cancel
+        before = len(self.commands)
+        self.assertTrue(self.node._execute_control_action('injection_off', {})[0])
+        self.assertTrue(self.node._injection_off_callback(None).success)
+        self.assertTrue(web.client.post('/api/injection-pump/off').get_json()['success'])
+        self.assertIs(self.node._action_cancel, token)
+        self.assertFalse(token.is_set())
+        self.assertTrue(self.node._calibration['active'])
+        self.assertNotIn('STOPALL', self.commands[before:])
+        for axis in 'XYZA':
+            self.node._on_text_received('PID_DONE:' + axis)
+        self.node._calibration_thread.join(2)
+        self.assertFalse(self.node._calibration_thread.is_alive())
+        self.assertEqual(self.node._calibration['outcome'], 'succeeded')
+        self.node._on_text_received('PID_DONE:X')
+        self.assertEqual(self.node._calibration['outcome'], 'succeeded')
+
     def test_timeout_and_stale_feedback_fail_closed(self):
         self.node.latest_angle_received_at = time.time() - 2
         self.assertFalse(self.node._execute_control_action('calibration_start', {})[0])

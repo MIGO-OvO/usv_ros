@@ -2,6 +2,7 @@ import csv
 import io
 import json
 import tempfile
+import time
 import unittest
 import zipfile
 from types import SimpleNamespace
@@ -12,6 +13,49 @@ from scripts.web_config_server import FLASK_AVAILABLE, MissionDataManager, WebCo
 
 @unittest.skipUnless(FLASK_AVAILABLE, 'Flask is not installed')
 class RecordingTerminalTests(unittest.TestCase):
+    def test_start_rejection_is_saved_without_sampling_started_in_either_order(self):
+        for result_first in (False, True):
+            with self.subTest(result_first=result_first), tempfile.TemporaryDirectory() as directory:
+                server = WebConfigServer(standalone=True)
+                server.data_manager = MissionDataManager(directory)
+                server.sample_storage = SampleRecordingStorage(directory)
+                attempt = 'c' * 32
+                context = dict(attempt_id=attempt, source='manual', record_id='d' * 32,
+                               timestamp_start=time.time(), gps_snapshot={'position_source': 'manual_no_gps'})
+                cleanup = dict(cleanup='not_admitted', attempt_id=attempt, owner_attempt_id=None)
+                result = dict(source='manual', attempt_id=attempt, outcome='failed',
+                              reason='Controller fault watchdog_tripped; reconnect controller',
+                              start_admission='rejected', cleanup_result=cleanup)
+                context_msg = SimpleNamespace(data='sampling_context:' + json.dumps(context))
+                result_msg = SimpleNamespace(data=json.dumps(result))
+                if result_first:
+                    server._sampling_result_cb(result_msg)
+                    server._trigger_status_cb(context_msg)
+                else:
+                    server._trigger_status_cb(context_msg)
+                    server._sampling_result_cb(result_msg)
+                missions = server.data_manager.list_missions()
+                self.assertEqual(len(missions), 1)
+                data = server.data_manager.get_mission(missions[0]['id'])
+                window = data['sample_windows'][0]
+                self.assertEqual(window['state'], 'closed')
+                self.assertEqual(window['outcome'], 'failed')
+                self.assertEqual(window['terminal_reason'], result['reason'])
+                self.assertEqual(window['start_admission'], 'rejected')
+                self.assertEqual(window['cleanup_result'], cleanup)
+                self.assertFalse(data['data_points'])
+                with server._build_mission_archive(data) as archive, zipfile.ZipFile(archive) as zipped:
+                    rows = list(csv.DictReader(io.StringIO(zipped.read(
+                        'mission_' + data['mission_id'] + '/sample_results.csv').decode('utf-8'))))
+                    self.assertEqual(rows[0]['terminal_reason'], result['reason'])
+                    self.assertEqual(json.loads(rows[0]['cleanup_result']), cleanup)
+                server._trigger_status_cb(context_msg)
+                server._sampling_result_cb(result_msg)
+                self.assertEqual(len(server.data_manager.list_missions()), 1)
+                server._sampling_context = {'attempt_id': 'new-owner', 'source': 'manual'}
+                server._sampling_result_cb(result_msg)
+                self.assertEqual(server._sampling_context['attempt_id'], 'new-owner')
+
     def test_trigger_cleanup_result_wins_over_early_pump_finished(self):
         with tempfile.TemporaryDirectory() as directory:
             server = WebConfigServer(standalone=True)

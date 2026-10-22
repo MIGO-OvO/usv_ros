@@ -680,10 +680,12 @@ class MAVLinkTriggerNode(object):
             self._prepare_automation_steps(steps_data)
             context = self.current_sampling_context
             if not self._start_prepared_automation():
-                self._cleanup_sampling_attempt(context, 'lab_real_start_failed')
-                self._emit_sample_record(context, 'failed', 'lab_real_start_failed')
+                reason = context.get('terminal_reason') or 'lab_real_start_failed'
+                self._cleanup_sampling_attempt(context, reason)
+                self._emit_sample_record(context, 'failed', reason)
+                self._publish_sampling_result(context, 'failed', reason)
                 self.is_sampling = False
-                self._set_mission_state(MissionState.FAILED, "%d:lab_real_start_failed" % seq)
+                self._set_mission_state(MissionState.FAILED, "%d:%s" % (seq, reason))
                 self._publish_status("sampling_stopped")
             return
         # 模拟数据源: 生成有限液滴事件, 详情走专用话题, 兼容通路只发一次聚合值。
@@ -748,6 +750,7 @@ class MAVLinkTriggerNode(object):
                 self._sampling_finishing = False
 
     def _finish_sampling_context(self, sampling_context, was_survey_sample, success, reason, cancelled):
+        reason = sampling_context.get('terminal_reason') or reason
         source = str(sampling_context.get('source', 'waypoint') or 'waypoint')
         is_manual_sample = source == 'manual'
         rospy.loginfo("Handling sampling completion: success=%s reason=%s", success, reason)
@@ -756,7 +759,11 @@ class MAVLinkTriggerNode(object):
             cleaned, superseded = self._cleanup_sampling_attempt(sampling_context, reason)
             if superseded:
                 # A newer owner is authoritative. Do not stop it or change mode.
-                self._publish_sampling_result(sampling_context, 'cancelled', 'cleanup_superseded')
+                if not sampling_context.get('started') and sampling_context.get('start_admission'):
+                    self._emit_sample_record(sampling_context, 'failed', reason)
+                    self._publish_sampling_result(sampling_context, 'failed', reason)
+                else:
+                    self._publish_sampling_result(sampling_context, 'cancelled', 'cleanup_superseded')
                 self._publish_status('sampling_stopped')
                 return
             if not cleaned:
@@ -1004,16 +1011,17 @@ class MAVLinkTriggerNode(object):
         self._set_mission_state(MissionState.SAMPLING, str(waypoint_seq))
         self.is_sampling = True
         if not self._start_prepared_automation():
-            cleaned, superseded = self._cleanup_sampling_attempt(context, 'automation_start_failed')
-            self._emit_sample_record(context, 'failed', 'automation_start_failed')
+            reason = context.get('terminal_reason') or 'automation_start_failed'
+            cleaned, superseded = self._cleanup_sampling_attempt(context, reason)
+            self._emit_sample_record(context, 'failed', reason)
             self.is_sampling = False
             if superseded:
                 return False
             if not cleaned:
                 context.update(on_fail='HOLD', retry_count=0)
             self._set_waypoint_state(waypoint_seq, WaypointSamplingState.FAILED)
-            self._set_mission_state(MissionState.FAILED, "{}:automation_start_failed".format(waypoint_seq))
-            self._handle_failure_action('automation_start_failed')
+            self._set_mission_state(MissionState.FAILED, "{}:{}".format(waypoint_seq, reason))
+            self._handle_failure_action(reason)
             return False
 
         return True
@@ -1625,7 +1633,15 @@ class MAVLinkTriggerNode(object):
             if not isinstance(payload, dict):
                 rospy.logerr('Automation start rejected: no prepared configuration')
                 return False
-            return self._call_control_command('automation_start', payload)
+            context = self.current_sampling_context
+            success, result = self._call_control_transaction('automation_start', payload)
+            if isinstance(context, dict) and context.get('attempt_id') == payload.get('attempt_id'):
+                context['start_admission'] = (result.get('admission', 'unknown')
+                                              if result.get('attempt_id') == payload.get('attempt_id') else 'unknown')
+                if not success:
+                    context.setdefault('terminal_reason', getattr(self._command_context, 'last_reason', '')
+                                       or 'automation_start_failed')
+            return success
         if action in ('pause', 'resume'):
             context = self.current_sampling_context or {}
             return self._call_control_command('automation_' + action, {'attempt_id': context.get('attempt_id')})
@@ -1653,20 +1669,25 @@ class MAVLinkTriggerNode(object):
                 payload_json=json.dumps(payload),
             )
             rospy.loginfo("Control command %s: %s", action, getattr(resp, "message", ""))
-            if not getattr(resp, "success", False):
+            message = str(getattr(resp, 'message', '') or '')
+            if not getattr(resp, "success", False) and action != 'automation_cleanup':
                 # Keep the backend's own wording: a flat "rejected" leaves the
                 # operator unable to tell a stale detector from a busy lane.
-                self._record_command_reason(getattr(resp, "message", ""))
+                self._record_command_reason(message)
             result = json.loads(getattr(resp, 'result_json', '') or '{}')
-            return bool(getattr(resp, "success", False)), result if isinstance(result, dict) else {}
+            result = result if isinstance(result, dict) else {}
+            if not getattr(resp, 'success', False):
+                result.setdefault('reason', message)
+            return bool(getattr(resp, "success", False)), result
         except Exception as e:
             rospy.logerr("Control command error: %s", str(e))
-            self._record_command_reason(str(e))
-            return False, {}
+            if action != 'automation_cleanup':
+                self._record_command_reason(str(e))
+            return False, {'reason': str(e)}
 
     def _record_command_reason(self, message):
         reason = str(message or '').strip()
-        if reason:
+        if reason and not getattr(self._command_context, 'last_reason', ''):
             self._command_context.last_reason = reason[:80]
 
     def _cleanup_sampling_attempt(self, context, reason):
@@ -1677,15 +1698,24 @@ class MAVLinkTriggerNode(object):
             already_finishing = getattr(self, '_sampling_finishing', False)
             self._sampling_finishing = True
         try:
-            success, result = self._call_control_transaction('automation_cleanup', {
+            payload = {
                 'attempt_id': attempt, 'reason': str(reason), 'confirm_stop': True,
-            })
+            }
+            if context.get('start_admission') == 'rejected':
+                payload['admission'] = 'rejected'
+            success, result = self._call_control_transaction('automation_cleanup', payload)
         finally:
             with self.state_lock:
                 self._sampling_finishing = already_finishing
+        context['cleanup_result'] = dict(result)
+        rospy.loginfo('Sampling cleanup: attempt_id=%s first_reason=%s result=%s',
+                      attempt, context.get('terminal_reason') or reason, result)
         if result.get('attempt_id') != attempt:
+            context['cleanup_failed'] = True
             return False, False
-        return (bool(success and result.get('cleanup') == 'stopped'),
+        if result.get('cleanup') not in ('stopped', 'not_admitted', 'not_owned', 'superseded'):
+            context['cleanup_failed'] = True
+        return (bool(success and result.get('cleanup') in ('stopped', 'not_admitted', 'not_owned')),
                 result.get('cleanup') == 'superseded')
 
     def _default_injection_speed(self, config):
@@ -1739,6 +1769,7 @@ class MAVLinkTriggerNode(object):
         self.status_pub.publish(msg)
 
     def _prepare_automation_steps(self, steps, source=None):
+        self._command_context.last_reason = ''
         context = dict(getattr(self, 'current_sampling_context', None) or {})
         context['source'] = source or context.get('source', 'unknown')
         context['attempt_id'] = context.get('attempt_id') or uuid.uuid4().hex
@@ -1778,6 +1809,8 @@ class MAVLinkTriggerNode(object):
             'preflight_phase': context.get('preflight_phase'),
             'terminal_reason_at': context.get('terminal_reason_at'),
             'cleanup_failed': context.get('cleanup_failed', False),
+            'start_admission': context.get('start_admission'),
+            'cleanup_result': context.get('cleanup_result'),
             'sample_record': (context.get('_terminal_record') or sample_record(
                               context, context.get('spectrometer'), context.get('water_quality'), time.time())
                               if context.get('record_id') else None),
@@ -1801,7 +1834,8 @@ class MAVLinkTriggerNode(object):
             return
         record = sample_record(context, context.get('spectrometer'), context.get('water_quality'), time.time())
         record.update(outcome=outcome, reason=str(reason))
-        for field in ('attempt_id', 'preflight_phase', 'terminal_reason_at', 'cleanup_failed', 'spectrometer_age_s', 'owner_age_s'):
+        for field in ('attempt_id', 'preflight_phase', 'terminal_reason_at', 'cleanup_failed',
+                      'spectrometer_age_s', 'owner_age_s', 'start_admission', 'cleanup_result'):
             if field in context:
                 record[field] = context[field]
         context['_terminal_record'] = record
@@ -1919,6 +1953,7 @@ class MAVLinkTriggerNode(object):
         """手动采样：不切模式，不判稳定，直接执行当前配置的采样序列。"""
         if self.is_sampling or getattr(self, '_sampling_finishing', False):
             rospy.logwarn("Sampling already in progress")
+            self._record_command_reason('Sampling already running: stop current task first')
             return False
 
         config = self._load_config() or self._get_default_config()
@@ -1929,14 +1964,17 @@ class MAVLinkTriggerNode(object):
         self._bind_sample_position(context)
         self.is_sampling = True
         self._set_mission_state(MissionState.SAMPLING, str(self.current_waypoint))
-        self.is_sampling = True
         self._prepare_automation_steps(steps_data)
         if not self._start_prepared_automation():
-            self._cleanup_sampling_attempt(context, 'automation_start_failed')
-            self._emit_sample_record(context, 'failed', 'automation_start_failed')
-            self.is_sampling = False
-            self.current_sampling_context = None
-            self._set_mission_state(MissionState.IDLE, "manual_start_rejected")
+            reason = context.get('terminal_reason') or getattr(self._command_context, 'last_reason', '') or 'automation_start_failed'
+            context.setdefault('terminal_reason', reason)
+            self._cleanup_sampling_attempt(context, reason)
+            self._emit_sample_record(context, 'failed', reason)
+            self._publish_sampling_result(context, 'failed', reason)
+            if self.current_sampling_context is context:
+                self.is_sampling = False
+                self.current_sampling_context = None
+                self._set_mission_state(MissionState.IDLE, "manual_start_rejected")
             if getattr(self, 'status_pub', None) is not None:
                 self._publish_status("manual_start_rejected")
             return False
@@ -2178,11 +2216,13 @@ class MAVLinkTriggerNode(object):
         if not self._survey_active or self.current_sampling_context is not context:
             return 'skipped'  # STOP already owns terminal status and cleanup.
 
-        self._cleanup_sampling_attempt(context, 'survey_sample_start_failed')
-        self._emit_sample_record(context, 'failed', 'survey_sample_start_failed')
+        reason = context.get('terminal_reason') or 'survey_sample_start_failed'
+        self._cleanup_sampling_attempt(context, reason)
+        self._emit_sample_record(context, 'failed', reason)
+        self._publish_sampling_result(context, 'failed', reason)
         self._set_survey_sampling_flags(False)
         self._survey_active = False
-        self._set_mission_state(MissionState.FAILED, "survey_sample_start_failed")
+        self._set_mission_state(MissionState.FAILED, reason)
         self._publish_status("survey_stopped")
         return "failed"
 
