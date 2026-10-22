@@ -1,4 +1,5 @@
 """Run on Linux: python3 -m unittest discover -s tests -p test_usv_logs.py."""
+import io
 import json
 import os
 from pathlib import Path
@@ -102,6 +103,7 @@ class LogTests(unittest.TestCase):
                 sessions.append(session)
             (ros / 'latest').symlink_to(sessions[0])
             (sessions[1] / 'outside').symlink_to(outside)
+            os.utime(sessions[1], (1, 1))
             (output / 'old.tar.gz').write_bytes(b'old')
             (output / 'new.tar.gz').write_bytes(b'new')
             (ros / 'roslaunch-old.log').write_bytes(b'old root log')
@@ -117,7 +119,35 @@ class LogTests(unittest.TestCase):
             self.assertEqual(outside.read_text(), 'keep')
             self.assertFalse((output / 'old.tar.gz').exists())
             self.assertTrue((output / 'new.tar.gz').exists())
-            self.assertFalse((ros / 'roslaunch-old.log').exists())
+            self.assertTrue((ros / 'roslaunch-old.log').exists())  # newest root log retained
+
+    def test_keep_count_wins_over_budget_and_reports_excess(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            ros, output = root / 'ros', root / 'bundles'
+            ros.mkdir()
+            output.mkdir()
+            retained = []
+            for index in range(4):
+                session = ros / str(uuid.uuid4())
+                session.mkdir()
+                (session / 'node.log').write_bytes(b'x' * logs.MIB)
+                os.utime(session / 'node.log', (1, 1))
+                os.utime(session, (index + 1, index + 1))
+                archive = output / ('%s.tar.gz' % index)
+                archive.touch()
+                with archive.open('wb') as handle:
+                    handle.truncate(100 * logs.MIB)
+                os.utime(archive, (index + 1, index + 1))
+                retained.append((session, archive))
+            with patch.object(logs, 'open_paths', return_value=set()), \
+                    patch('sys.stderr', new_callable=io.StringIO) as errors:
+                logs.cleanup(ros, output, 3, 1, False)
+                self.assertTrue(all(p.exists() for pair in retained for p in pair))
+                logs.cleanup(ros, output, 3, 1, True)
+            self.assertTrue(all(p.exists() for pair in retained[1:] for p in pair))
+            self.assertTrue(all(not p.exists() for p in retained[0]))
+            self.assertIn('WARNING', errors.getvalue())
 
     def test_unreadable_proc_preserves_sessions(self):
         with tempfile.TemporaryDirectory() as folder:

@@ -29,11 +29,13 @@ usvlogs auto off
 
 `usvctl logs` 与 `usvlogs` 等价。日志包默认取最近 3 个 ROS 会话、最近 3 个 ROS 根目录日志，以及三类启动日志；包含当前文件和未压缩的 `.1` 轮转文件，不含更早的压缩轮转。每文件只取末尾 2 MiB，总计最多 64 MiB，包内 `manifest.json` 记录原始大小和截取大小。日志包保存在 `~/usv_ws/.usv_run/bundles/`，同名包不覆盖。它是排障快照，不是完整现场证据备份。
 
-清理先复用 logrotate：启动日志和 ROS `*.log` 超过 10 MiB 时轮转，保留 5 份。copytruncate 保持正在写入的文件描述符，但复制与截断之间可能丢少量日志。随后按旧到新清理 ROS UUID 会话和日志包，默认保留 3 份，ROS 会话预算 512 MiB、日志包预算 256 MiB；预算不足时可少于 3 份。`clean --keep 5 --max-mib 1024` 可调整本次手动清理参数，自动清理使用默认值。
+安装遇到旧版独立命令或其他符号链接时，先迁移到 `~/.local/bin/.usv-commands-backup.XXXXXX/`，逐项打印备份路径，再建立新链接；自定义 `USV_COMMAND_DIR` 时备份位于该目录。重复安装保留已有正确链接；卸载仅移除本仓库链接，备份由用户保管。若目标是目录，安装会提示手动处理。
 
-工具保留 `latest` 会话、当前用户进程打开的文件及其会话和最近一小时修改的日志；无法检查进程时跳过过期日志删除，并输出警告。ROS 根目录的 `.log` 及其编号轮转文件也按最近 3 个文件清理，与会话共用 512 MiB 预算。预算是清理目标，不是磁盘配额：活跃文件、保护期内日志和两次检查之间的增长仍可超过预算。采样数据、pcap、QGC tlog、系统 journal 和其他应用目录不在清理范围内。需要长期保存的日志包应下载到本机。
+清理先复用 logrotate：启动日志和 ROS `*.log` 超过 10 MiB 时轮转，保留 5 份。copytruncate 保持正在写入的文件描述符，但复制与截断之间可能丢少量日志。随后按旧到新清理 ROS UUID 会话、ROS 根目录日志和日志包，每类至少保留最近 3 份。数量与活动保护优先于容量预算；ROS 共用 512 MiB、日志包 256 MiB，保留后仍超预算则输出目录、占用与预算告警，不继续删除最近份数。`clean --keep 5 --max-mib 1024` 可调整本次手动清理参数，自动清理使用默认值。
 
-自动清理不需要 sudo，以启用命令的用户运行，退出 SSH 后仍由 cron 执行。先用 `systemctl is-active cron` 确认服务已启动；运行记录可用 `journalctl -t usv-logs` 查询。自定义日志位置时，用 `usvlogs --ros-dir /path/to/log auto on`，该路径会写入定时任务；默认遵循 `ROS_LOG_DIR`、`ROS_HOME`。只以运行 USV 的普通用户启用，不要用 root 管理其他用户的 ROS 日志。
+工具保留 `latest` 会话、当前用户进程打开的文件及其会话和最近一小时修改的日志；无法检查进程时跳过过期日志删除，并输出警告。ROS 根目录的 `.log` 及其编号轮转文件也按最近 3 个文件清理，与会话共用 512 MiB 预算。预算是容量告警线，不是磁盘配额：活跃文件、保护期内日志和两次检查之间的增长仍可超过预算。采样数据、pcap、QGC tlog、系统 journal 和其他应用目录不在清理范围内。需要长期保存的日志包应下载到本机。
+
+自动清理默认关闭，须显式执行 `usvlogs auto on`。它不需要 sudo，以启用命令的用户运行，退出 SSH 后仍由 cron 执行。先用 `systemctl is-active cron` 确认服务已启动；运行记录可用 `journalctl -t usv-logs` 查询。自定义日志位置时，用 `usvlogs --ros-dir /path/to/log auto on`，该路径会写入定时任务；默认遵循 `ROS_LOG_DIR`、`ROS_HOME`。只以运行 USV 的普通用户启用，不要用 root 管理其他用户的 ROS 日志。
 
 Windows 更新根仓库与 ROS 仓库后，双击根目录 `download_jetson_logs.bat`，输入 Jetson IP 和日志包名称即可通过 SCP 下载。默认用户为 `jetson`，远端工作区为用户目录下的 `usv_ws`，本机保存到根目录 `.usv_run/downloads/`。首次连接需核对 SSH 指纹，使用密码认证时还需输入密码。下载失败会报错，不留下冒充成功包的文件，也不覆盖已有包。
 
@@ -88,7 +90,7 @@ QGC 在总预算内以 1 秒间隔最多发送三份同 session/request/command/
 
 - 正式步骤和 preflight 共用 `/automation/pid_wait_timeout`（默认 120 秒，可用节点私有 `~pid_wait_timeout` 覆盖，范围 1–600 秒）。现在配置实际生效，且等待使用单调时钟；必须收到 `PID_DONE` 才算完成。**检测板仍有独立的 30 秒 `PID_MOVE_TIMEOUT`；收到板端 `PID_TIMEOUT/PID_FAIL` 仍立即失败，本补丁不能解除该固件限制。**
 - 新分光平均样本等待默认 10 秒；冷、暖启动首帧至少等 4 秒。运行断流 2 秒仍置数据无效，不用旧值完成步骤；断流超过 `spectro_stale_stop_timeout`（默认 10 秒，launch 可覆盖，最大 60 秒）才终止整次任务。该恢复窗口内输出可能继续运行；不是对无效测量的放行。明确的控制器故障、失联、owner 丢失和停止路径不变。
-- 油相分隔无净正向进展期限由 2 秒改为 5 秒，总期限为 `理论行程时间 × 2 + 10 秒`。仍核验真实角度行程；1 秒角度反馈中断、跳变、传感器异常和持续停滞仍失败，不按时间猜测完成。
+- 油相分隔无净正向进展期限为 5 秒；PID 分段同时受 ROS 等待预算与板端单次 30 秒限时约束。仍核验真实角度行程；1 秒角度反馈中断、跳变、传感器异常和持续停滞仍失败，不按时间猜测完成。
 - 离线回归：`python -B -m unittest discover -s tests -p test_sampling_timeout_budget.py`。跳过地图测试；Jetson/台架/实船验收由操作者执行，建议先小剂量验证停止和恢复行为。停止系统后执行 `usvdeploy` 更新并重启，用现场终态区分 ROS 等待超时与板端 `PID_TIMEOUT`。
 
 [![ROS Noetic](https://img.shields.io/badge/ROS-Noetic-22314E?logo=ros&logoColor=white)](https://wiki.ros.org/noetic)
@@ -613,11 +615,11 @@ sudo USV_BOOT_START_NOW=true USV_STRICT_SELF_CHECK=false ./src/usv_ros/scripts/i
 每次任务先完成以下准备，再进入现有 `AutomationEngine`；序列内部循环不重复准备：
 
 1. 自动统计本次 steps 中 `enable: "E"` 的 X/Y/Z/A（包括连续转动步骤）。
-2. 各相关轴以最短路径回到**预先保存的相对零点**，随后全部正转 360° 补偿液体位移。使用相对 `R` 指令，分别等待匹配的 `PID_START`、`CMD_OK` 和各轴 `PID_DONE`；不会发送归绝对 0° 的 `CAL` 或改写零点。归位、360° 补偿及油相 R0 的独立定位容差固定为 0.1°，覆盖 MT6701 的 14-bit 量化步长 `360/16384 ≈ 0.022°` 及少量噪声；正式步骤仍使用用户指定的 PID 精度。
-3. 油相泵按配置额外正转分隔圈数。先以零位移 `R0` 的匹配 PID 完成确认传感器有效（也适用于不在 steps 中的油相轴），再使用指定 rpm 的有限 `J` 指令；其 `CMD_OK` 仅代表接收成功，需连续角度反馈解环累计证明圈数，再确认轴停止指令。分隔容差独立于正式 PID 精度，为 `min(0.5°, 目标角度 × 5%)`。
+2. 各相关轴以最短路径回到**预先保存的相对零点**，随后全部正转 360° 补偿液体位移。使用相对 `R` 指令，分别等待匹配的 `PID_START`、`CMD_OK` 和各轴 `PID_DONE`；不会发送归绝对 0° 的 `CAL` 或改写零点。归位、360° 补偿及油相分隔的独立定位容差固定为 0.1°，覆盖 MT6701 的 14-bit 量化步长 `360/16384 ≈ 0.022°` 及少量噪声；正式步骤仍使用用户指定的 PID 精度。
+3. 油相泵按配置额外正转分隔圈数，使用与回零、360° 补偿相同的相对角度 `R/PID`。启动时 `PIDQUERY` 读取设备实际速度上下限，按 `PIDPARAM` 的一位小数精度取保守最低速度 `max(0.1, out_min - 0.05)` rpm，每段角度不超过该速度对应的 20 秒行程且最多 360°，为板端 30 秒限时留出启动和收敛余量。每段均等待匹配的 `PID_START`、`CMD_OK`、真实 `PID_DONE`，并核验角度解环行程，之后才发送下一段。不在 steps 中的油相轴也执行同样核验。主机每段行程容差为 `min(0.5°, 段角度 × 5%)`，PID 定位容差仍为 0.1°。分隔阶段不发送开环 `J` 指令。
 4. 按进样泵任务策略预启动，确认 `PUMP_OK:SET=…,ON` 并等待 lead time；完成后才启动正式序列。受管进样在归位前先确认 OFF。Web 直接启动仍按其 automation 策略；trigger 发起的 Survey 每次采样将进样策略纳入同一准备事务，使用已配置联动速度和 lead time。Survey 启动/停止广播不会控制硬件，每次采样结束停机，间隔期间进样关闭；Survey 停止按 attempt 清理整个采样事务，不影响新 owner。
 
-当前 DetFirmware 的 `0xCC` 角度帧没有有效位或源时间戳；传感器失效时会重复 last_valid，`ANGLE_AGE_CH_MS=0` 也不能单独证明有效。Preflight 使用逐轴 monotonic 接收时刻（1 秒断流预算）、有限/范围校验、通道 age 和独立健康包时间戳（2.5 秒预算，重复/倒退不续约，支持 uint32 回绕）。油相运动需在 2 秒内产生超过量化/噪声的净正向进展；相同帧或在固定位置附近抖动不能续约进展计时。以上检测失败均停止输出；这些有界软件门禁仍须台架验证机械停机延迟。
+当前 DetFirmware 的 `0xCC` 角度帧没有有效位或源时间戳；传感器失效时会重复 last_valid，`ANGLE_AGE_CH_MS=0` 也不能单独证明有效。Preflight 使用逐轴 monotonic 接收时刻（1 秒断流预算）、有限/范围校验、通道 age 和独立健康包时间戳（2.5 秒预算，重复/倒退不续约，支持 uint32 回绕）。油相运动需在 5 秒内产生至少 0.1° 的净正向进展；相同帧或在固定位置附近抖动不能续约进展计时。以上检测失败均停止输出；这些有界软件门禁仍须台架验证机械停机延迟。
 
 `automation_start` 返回本次 `attempt_id` 与 `admission`：`rejected` 表示未准入，`owned` 表示泵节点已接管该 attempt；RPC 异常或身份不匹配按 `unknown` 处理。启动失败首因保留在 QGC 关联结果、日志、`sampling_result` 与采样记录中，清理另存 `cleanup_result`。明确未准入仍登记取消，阻止迟到 START；未知结果按 attempt 核验，当前 owner 匹配才执行停止，其他 owner 不受影响。`not_admitted/not_owned` 表示已登记取消且当前无本 attempt 的输出归属；`superseded` 表示其他 owner 已接管；`stopped` 才表示本 attempt 停止确认成功。航行 Manual 与泵手动模式独立，泵手动模式、控制器故障、忙碌和非法配置分别返回具体原因。
 
@@ -625,7 +627,7 @@ sudo USV_BOOT_START_NOW=true USV_STRICT_SELF_CHECK=false ./src/usv_ros/scripts/i
 
 独立校准期间，Web `/api/injection-pump/off` 与 ROS `/usv/injection_pump_off` 只关闭进样泵，校准继续等待各轴 PID 完成。取消校准使用全局 STOP，沿用轴停止确认与取消终态；独立校准只回保存零点，自动化继续执行回零、360° 补偿、油相分隔、进样和正式步骤。
 
-Web 自动化页的“启动前准备”可编辑相对零点、油相轴、分隔圈数和转速；桌面并列显示零点与分隔参数，窄屏纵向排列。运行期间配置锁定，Preflight 只能停止，不能暂停/恢复。QGC 的 31012/31013 ACK 和 mission 状态仅在泵服务成功后更新；准备阶段的拒绝返回失败 ACK，不显示假暂停/恢复。阶段和待完成轴通过 `automation_status.preflight` 显示；准备期间 `running=true`、`automation_step=0`。启动 RPC 成功表示接受准备事务，终态仍由关联 attempt 的状态决定。
+Web 自动化页的“启动前准备”可编辑相对零点、油相轴和分隔圈数；分隔速度使用设备 PID 上下限。桌面并列显示零点与分隔参数，窄屏纵向排列。运行期间配置锁定，Preflight 只能停止，不能暂停/恢复。QGC 的 31012/31013 ACK 和 mission 状态仅在泵服务成功后更新；准备阶段的拒绝返回失败 ACK，不显示假暂停/恢复。阶段和待完成轴通过 `automation_status.preflight` 显示；准备期间 `running=true`、`automation_step=0`。启动 RPC 成功表示接受准备事务，终态仍由关联 attempt 的状态决定。
 
 QGC 31011 的全局停止和 trigger 内部按 attempt 的清理通过已有 `ControlCommand` 请求携带可选 `confirm_stop: true`：先执行原停止输出，再用 `PIDQUERY → PIDPARAM` 排空旧响应，随后等待最终 `STOPALL → STOPALL_OK` 确认固件已关闭电机、PID/校准/测试和进样。串口写入成功不能单独生成成功 ACK；清理/确认超时、异常或已锁存故障返回失败、mission 为 FAILED，保留原故障原因。原命令号、ACK 结构、串口指令及不带该标记的旧 ROS 调用兼容；部署须更新 pump 与 trigger。固件确认表示执行了停机逻辑，机械惯性/电气输出仍需台架测量。
 
@@ -637,11 +639,11 @@ Survey 启动 RPC 与 31011/31016 停止及收尾共用独立事务锁，STOP �
 {"oil_axis": "A", "separation_turns": 2, "separation_rpm": 5}
 ```
 
-默认圈数为 0（跳过分隔，油相轴可为空）；启用分隔时圈数为 0.01–10、转速为 0.1–20 rpm，轴可独立于 steps 中的相关泵选择。零点复用 `calibration.json` 的 `offsets`，可通过 `GET/POST /api/calibration/offsets` 读取/保存原始角度，范围为 `[0, 360)`。新增 `configured_axes` 区分未设零与显式保存的 0°；无此标记的旧文件只兼容非 0° 的已保存 offset，默认 0° 无法证明曾标定，须在 Web 明确保存确认。读旧文件不会重新设零或改写文件。未保存过相关轴零点时任务失败，不回退到绝对 0°。泵节点可用私有参数 `~calibration_file` 指定同一零点文件。启动和保存请求的部分 `pump_settings` 先递归合并，再校验完整配置，未提供的 PID、进样及分隔参数保持原值；无效请求回滚且不分派启动。
+默认圈数为 0（跳过分隔，油相轴可为空）；启用分隔时圈数为 0.01–10，轴可独立于 steps 中的相关泵选择。旧 `separation_rpm` 字段继续读写以兼容已有配置，不参与运动。设备 `out_min` 范围为 0.1–5 rpm，`out_max` 为 1–20 rpm，且最低值须不大于最高值；固件默认值为 1/6 rpm，以实际 `PIDPARAM` 为准。`R` 使用 `computePIDDirect`，大误差时可达当前 `out_max`，未使用另一条平滑启动算法；ROS 不覆盖设备 PID 参数，起转能力与负载下的最低速度仍需台架确认。零点复用 `calibration.json` 的 `offsets`，可通过 `GET/POST /api/calibration/offsets` 读取/保存原始角度，范围为 `[0, 360)`。新增 `configured_axes` 区分未设零与显式保存的 0°；无此标记的旧文件只兼容非 0° 的已保存 offset，默认 0° 无法证明曾标定，须在 Web 明确保存确认。读旧文件不会重新设零或改写文件。未保存过相关轴零点时任务失败，不回退到绝对 0°。泵节点可用私有参数 `~calibration_file` 指定同一零点文件。启动和保存请求的部分 `pump_settings` 先递归合并，再校验完整配置，未提供的 PID、进样及分隔参数保持原值；无效请求回滚且不分派启动。
 
 任一步骤 ACK/PID 超时、角度无效/断流、owner 丢失、watchdog 或串口故障均走现有停泵和终态清理；清理失败继续锁存故障。PID 算法、正式步骤等待、安全租约与串口恢复协议保持原有行为；GPS 仅作为可选记录位置，详见下文。部署时成套更新并重启 pump、trigger、Web，含 `static/dist`。
 
-回归：`python -B -m pytest tests/test_preflight_stop_races.py tests/test_preflight_review_regressions.py tests/test_automation_preflight.py tests/test_preflight_web_contract.py tests/test_system_safety_contract.py tests/test_terminal_reasons.py tests/test_sampling_cleanup_ownership.py`；前端：`cd frontend && npm run test:automation-controls && npm run build`。实机仍需在 Jetson/ESP32 台架确认：非 0° 相对零点、补偿方向及液体位移、跨 0° 的多圈分隔、拔除角度传感器/冻结反馈后的有界停机、最小 rpm 和小圈数容差、两轮 Survey 进样顺序、0.1° 定位稳定性、启动/停止并发与立即重启，以及每阶段停止/拔串口后的物理输出停止、STOPALL 确认延迟和 QGC 失败 ACK/FAILED 状态。
+回归：`python -B -m pytest tests/test_preflight_stop_races.py tests/test_preflight_review_regressions.py tests/test_automation_preflight.py tests/test_preflight_web_contract.py tests/test_system_safety_contract.py tests/test_terminal_reasons.py tests/test_sampling_cleanup_ownership.py`；前端：`cd frontend && npm run test:automation-controls && npm run build`。实机仍需在 Jetson/ESP32 台架确认：非 0° 相对零点、补偿方向及液体位移、跨 0° 的多圈分隔、拔除角度传感器/冻结反馈后的有界停机、PID 速度上下限、分段衔接和小圈数容差、两轮 Survey 进样顺序、0.1° 定位稳定性、启动/停止并发与立即重启，以及每阶段停止/拔串口后的物理输出停止、STOPALL 确认延迟和 QGC 失败 ACK/FAILED 状态。
 
 ### launch 参数
 

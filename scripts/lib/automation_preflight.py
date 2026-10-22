@@ -118,6 +118,7 @@ class AutomationPreflight:
         self.pending = set()
         self.ack = None
         self.ack_received = False
+        self.ack_text = None
         self.error = None
         self.travel = None
 
@@ -181,6 +182,7 @@ class AutomationPreflight:
                 raise PreflightError('controller_fault', 'Preflight serial write failed')
             self._wait(lambda: self.ack_received, self.ACK_TIMEOUT,
                        'controller_fault', 'Preflight command ACK timeout')
+            return self.ack_text
         finally:
             with self.lock:
                 self.ack = None
@@ -192,6 +194,7 @@ class AutomationPreflight:
             if self.ack is not None and (text == self.ack or
                     (self.ack == 'PIDPARAM:' and text.startswith(self.ack))):
                 self.ack_received = True
+                self.ack_text = text
             if text.startswith(('CMD_ERR:', 'BUSY:', 'PUMP_ERR:')):
                 self.error = PreflightError('controller_fault', text)
             if text.startswith('PID_START:'):
@@ -239,15 +242,15 @@ class AutomationPreflight:
                 self.travel.update(angle=angle, at=now)
                 # Net forward progress must exceed noise/quantization. Repeated
                 # frames or oscillation around one angle cannot renew this clock.
-                threshold = max(0.1, self.travel['rpm'] * 6 * self.PROGRESS_TIMEOUT * 0.1)
+                threshold = self.PID_PRECISION_DEG
                 if self.travel['degrees'] >= self.travel['progress_degrees'] + threshold:
                     self.travel.update(progress_degrees=self.travel['degrees'], progress_at=now)
-                self.state['travel_degrees'] = round(self.travel['degrees'], 2)
+                self.state['travel_degrees'] = round(self.travel['base_degrees'] + self.travel['degrees'], 2)
             except (KeyError, TypeError, ValueError) as exc:
                 self.error = PreflightError('controller_fault', str(exc))
             self.changed.set()
 
-    def pid_moves(self, moves, precision):
+    def pid_moves(self, moves, precision, before_send=None, timeout=None):
         with self.lock:
             self.expected = dict(moves)
             self.started = set()
@@ -256,8 +259,8 @@ class AutomationPreflight:
             if moves:
                 command = ''.join('%sE%sR%.3fP%g' % (axis, direction, delta, precision)
                                   for axis, (delta, direction) in moves.items())
-                self.command(command)
-                self._wait(lambda: not self.pending, self.PID_TIMEOUT,
+                self.command(command, before_send=before_send)
+                self._wait(lambda: not self.pending, self.PID_TIMEOUT if timeout is None else timeout,
                            'pid_timeout', 'Preflight PID completion timeout')
         finally:
             with self.lock:
@@ -277,7 +280,14 @@ class AutomationPreflight:
 
     def run(self, motors, zeros, policy, precision, injection):
         # Ordered firmware text processing drains previous command replies.
-        self.command('PIDQUERY', 'PIDPARAM:')
+        pid_reply = self.command('PIDQUERY', 'PIDPARAM:')
+        if policy['separation_turns'] > 0:
+            try:
+                _, _, _, min_rpm, max_rpm = map(float, pid_reply[len('PIDPARAM:'):].split(','))
+                if not (0.1 <= min_rpm <= 5 and 1 <= max_rpm <= 20 and min_rpm <= max_rpm):
+                    raise ValueError('Invalid PID speed limits')
+            except (TypeError, ValueError) as exc:
+                raise PreflightError('configuration_failed', 'Cannot use detector PID limits: %s' % exc)
         if injection:
             # Managed acquisition owns injection from this point. Confirm OFF
             # before preparation even if a previous/manual output was left on.
@@ -289,36 +299,37 @@ class AutomationPreflight:
         if policy['separation_turns'] > 0:
             axis = policy['oil_axis']
             goal = policy['separation_turns'] * 360.0
-            rpm = policy['separation_rpm']
+            # R uses the device PID speed limits, not the legacy fixed-J rpm.
+            # At the configured minimum speed, leave 10 s of the firmware's
+            # 30 s move deadline for startup and settling. Never exceed one turn.
+            # PIDPARAM rounds to 0.1 rpm; account for its rounding interval.
+            segment_limit = min(360.0, max(0.1, min_rpm - 0.05) * 6.0 * 20.0)
             self.stage('separating', target_degrees=goal, travel_degrees=0.0)
-            # Prove sensor validity with firmware PID completion before open
-            # loop, including oil axes absent from steps. AGE_CH=0 alone is
-            # ambiguous when g_angleValid is false in the current firmware.
-            self.pid_moves({axis: (0.0, 'F')}, precision)
-            # Drain preceding angle/reply packets before taking the baseline.
-            self.command('PIDQUERY', 'PIDPARAM:')
-            def arm_travel():
-                # The sender calls this under the control lock immediately
-                # before writing. Waiting for that lock cannot count old travel.
-                raw = self.angles([axis], require_health=True)
-                with self.lock:
-                    now = time.monotonic()
-                    self.travel = {'axis': axis, 'angle': raw[axis], 'at': now,
-                                   'degrees': 0.0, 'rpm': rpm,
-                                   'progress_at': now, 'progress_degrees': 0.0}
-            try:
-                self.command('%sEFV%gJ%.3f' % (axis, rpm, goal), before_send=arm_travel)
-                def completed():
-                    # Independent of the formal PID tolerance; account for
-                    # finite-J step truncation and encoder noise, bounded to 5%.
-                    tolerance = min(self.SEPARATION_TOLERANCE_DEG, goal * 0.05)
-                    return self.travel['degrees'] >= goal - tolerance
-                self._wait(completed, goal / (rpm * 6.0) * 2.0 + 10.0,
-                           'controller_fault', 'Oil pump did not complete separation travel')
-                self.command('%sDFV0J0' % axis)
-            finally:
-                with self.lock:
-                    self.travel = None
+            remaining, completed = goal, 0.0
+            while remaining > 0.0005:
+                segment = min(remaining, segment_limit)
+                def arm_travel():
+                    # Called under the control lock at the actual serial write.
+                    raw = self.angles([axis], require_health=True)
+                    with self.lock:
+                        now = time.monotonic()
+                        self.travel = {'axis': axis, 'angle': raw[axis], 'at': now,
+                                       'degrees': 0.0, 'rpm': max_rpm, 'base_degrees': completed,
+                                       'progress_at': now, 'progress_degrees': 0.0}
+                try:
+                    self.pid_moves({axis: (segment, 'F')}, precision,
+                                   before_send=arm_travel, timeout=min(self.PID_TIMEOUT, 30.0))
+                    # PID_DONE is required above. Also allow the angle stream
+                    # up to one second to catch up with the final PID packet.
+                    tolerance = min(self.SEPARATION_TOLERANCE_DEG, segment * 0.05)
+                    self._wait(lambda: self.travel['degrees'] >= segment - tolerance,
+                               self.ANGLE_TIMEOUT, 'controller_fault',
+                               'Oil pump PID completed without verified separation travel')
+                    completed += self.travel['degrees']
+                finally:
+                    with self.lock:
+                        self.travel = None
+                remaining -= segment
         self.stage('injection')
         if injection:
             speed, lead = injection

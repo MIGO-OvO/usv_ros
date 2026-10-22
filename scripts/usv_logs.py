@@ -123,31 +123,33 @@ def open_paths():
 
 
 def cleanup(ros, output, keep, budget, apply):
+    print('保留规则: 每类最近 %d 份、使用中及最近一小时日志优先；容量预算仅告警' % keep)
     opened = open_paths()
     latest = (ros / 'latest').resolve()
     root_logs = sorted([p for p in files(ros) if p.parent == ros
                         and re.search(r'\.log(?:\.[1-5](?:\.gz)?)?$', p.name)],
                        key=lambda p: p.stat().st_mtime, reverse=True)
-    groups = [(sessions(ros), ros, budget * MIB), (root_logs, ros, budget * MIB)]
+    groups = [(sessions(ros), ros), (root_logs, ros)]
     archives = sorted([p for p in files(output) if p.parent == output
                        and p.name.endswith('.tar.gz')],
                       key=lambda p: p.stat().st_mtime, reverse=True)
-    groups.append((archives, output, 256 * MIB))
+    groups.append((archives, output))
     projected = {ros: size(ros), output: size(output)}
-    for entries, parent, limit in groups:
+    for entries, parent in groups:
         total = projected[parent]
         for index in range(len(entries) - 1, -1, -1):
             path = entries[index]
             members = files(path) if path.is_dir() else [path]
             amount = sum(p.stat().st_size for p in members)
-            if index < keep and total <= limit:
+            if index < keep:
                 continue
             if (path == latest or opened is None
                     or any(p.resolve() in (opened or set()) for p in members)
                     or any(p.stat().st_mtime > time.time() - 3600 for p in members)):
                 print('保留使用中/最近一小时日志:', path)
                 continue
-            print(('删除: ' if apply else '将删除: ') + str(path))
+            print(('删除: ' if apply else '将删除: ') + str(path) +
+                  ' (超出最近 %d 份，%.2f MiB)' % (keep, amount / MIB))
             if apply:
                 # Only direct UUID sessions, log files or bundles under the selected root.
                 if path.is_symlink() or path.resolve().parent != parent:
@@ -161,7 +163,8 @@ def cleanup(ros, output, keep, budget, apply):
     for parent, limit in ((ros, budget * MIB), (output, 256 * MIB)):
         total = projected[parent]
         if total > limit:
-            print('WARNING: 受保护日志超过预算: %.1f MiB' % (total / MIB), file=sys.stderr)
+            print('WARNING: %s 保留日志 %.1f MiB 超过预算 %.1f MiB；保留最近 %d 份及活动/一小时保护' %
+                  (parent, total / MIB, limit / MIB, keep), file=sys.stderr)
 
 
 def automatic(action, runtime, ros, output):
@@ -202,8 +205,8 @@ def main(argv=None):
     sub.add_parser('usage')
     clean = sub.add_parser('clean', help='预览过期日志；--apply 才删除')
     clean.add_argument('--apply', action='store_true')
-    clean.add_argument('--keep', type=int, default=3)
-    clean.add_argument('--max-mib', type=int, default=512)
+    clean.add_argument('--keep', type=int, default=3, help='每类至少保留最近 N 份，优先于容量预算')
+    clean.add_argument('--max-mib', type=int, default=512, help='ROS 容量告警预算；不突破保留数量或活动保护')
     auto = sub.add_parser('auto')
     auto.add_argument('action', choices=['on', 'off', 'status'])
     sub.add_parser('maintain', help='定时任务入口：轮转并清理')

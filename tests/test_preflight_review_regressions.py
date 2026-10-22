@@ -42,7 +42,7 @@ class FeedbackReviewTests(unittest.TestCase):
                 time.sleep(0.01)
             self.assertFalse(self.node._preflight_thread.is_alive(), 'frozen feedback kept oil motion alive')
         self.assertIn('STOPALL', self.commands)
-        self.assertIn('AEFV20J720.000', self.commands)
+        self.assertIn('AEFR114.000P0.1', self.commands)
         self.node.automation_engine.start.assert_not_called()
 
     def test_other_axis_frames_do_not_refresh_the_oil_axis(self):
@@ -51,20 +51,20 @@ class FeedbackReviewTests(unittest.TestCase):
             with self.assertRaises(self.module.PreflightError):
                 self.node._preflight_angles(['A'])
 
-    def test_oil_axis_outside_steps_must_prove_sensor_validity_before_open_loop(self):
+    def test_oil_axis_outside_steps_must_complete_real_pid(self):
         self.failure_phase = 'separating'
         self.assertTrue(self.start()[0])
         self.join()
         self.assertEqual(self.status()['terminal_reason'], 'pid_fail')
-        self.assertIn('AEFR0.000P0.1', self.commands)
-        self.assertNotIn('AEFV20J720.000', self.commands)
+        self.assertIn('AEFR114.000P0.1', self.commands)
+        self.assertNotIn('PUMP:SET:60', self.commands)
         self.assertIn('STOPALL', self.commands)
 
-    def test_missing_health_prevents_open_loop_even_with_fresh_angles(self):
+    def test_missing_health_prevents_separation_pid_even_with_fresh_angles(self):
         self.node._angle_health_received_at = None
         self.assertTrue(self.start()[0])
         self.join()
-        self.assertNotIn('AEFV20J720.000', self.commands)
+        self.assertNotIn('AEFR114.000P0.1', self.commands)
         self.assertEqual(self.status()['terminal_reason'], 'controller_fault')
 
     def test_duplicate_health_timestamps_and_fresh_angle_receipts_cannot_renew_health(self):
@@ -102,31 +102,25 @@ class FeedbackReviewTests(unittest.TestCase):
                 self.node.automation_engine.start.assert_not_called()
                 self.assertIn('STOPALL', self.commands)
 
-    def test_small_separation_uses_bounded_encoder_tolerance_independent_of_pid(self):
-        sender = self.node.send_command
-        def send(command):
-            if command.startswith('AEFV'):
-                self.node._on_text_received('CMD_OK')
-                with self.node._preflight.lock:
-                    self.node._preflight.travel['at'] -= 0.03
-                self.node._on_angle_received({'A': 21.45})  # 0.15° below a 3.6° target
-                return True
-            return sender(command)
-        self.node.send_command = send
+    def test_small_separation_uses_preflight_pid_precision(self):
         self.assertTrue(self.start(pid_precision=0.001, preflight={
             'oil_axis': 'A', 'separation_turns': 0.01, 'separation_rpm': 20})[0])
         self.join()
         self.node.automation_engine.start.assert_called_once()
-        self.assertIn('ADFV0J0', self.commands)
+        self.assertIn('AEFR3.600P0.1', self.commands)
+        self.assertFalse(any('J' in command for command in self.commands))
 
-    def test_tolerance_cannot_release_a_materially_short_separation(self):
+    def test_pid_done_cannot_release_a_materially_short_separation(self):
         sender = self.node.send_command
         def send(command):
-            if command.startswith('AEFV'):
+            if command.startswith('AEFR'):
+                self.commands.append(command)
+                self.node._on_text_received('PID_START:A,delta=3.6,dir=F,prec=0.1')
                 self.node._on_text_received('CMD_OK')
                 with self.node._preflight.lock:
                     self.node._preflight.travel['at'] -= 0.03
                 self.node._on_angle_received({'A': 21.25})  # More than 5% short
+                self.node._on_text_received('PID_DONE:A,abs=3.6,err=0')
                 return True
             return sender(command)
         self.node.send_command = send
@@ -148,7 +142,7 @@ class FeedbackReviewTests(unittest.TestCase):
         clock = [0.0]
         runner = self.module.AutomationPreflight(lambda command: True, lambda require_measurement=True: None,
             lambda axes, require_health=False: {'A': 0}, lambda: None)
-        runner.travel = {'axis': 'A', 'angle': 359.9, 'at': 0.0, 'degrees': 0.0,
+        runner.travel = {'axis': 'A', 'angle': 359.9, 'at': 0.0, 'degrees': 0.0, 'base_degrees': 0.0,
                          'rpm': 0.1, 'progress_at': 0.0, 'progress_degrees': 0.0}
         with patch.object(self.module.time, 'monotonic', side_effect=lambda: clock[0]):
             for index in range(1, 61):
@@ -316,7 +310,7 @@ class SurveyAndQGCChainTests(unittest.TestCase):
             self.assertEqual(terminal['status'], 'finished')
             self.trigger._automation_status_cb(self.String(json.dumps(terminal)))
             commands = self.commands[offset:]
-            self.assertLess(commands.index('AEFV20J720.000'), commands.index('PUMP:SET:38'))
+            self.assertLess(commands.index('AEFR114.000P0.1'), commands.index('PUMP:SET:38'))
             self.assertEqual(commands.count('PUMP:SET:38'), 1)
             self.assertFalse(self.node.inject_pump_enabled)
             self.assertFalse(self.trigger.is_sampling)
@@ -382,6 +376,10 @@ class SurveyAndQGCChainTests(unittest.TestCase):
         self.node.automation_status_pub = ForwardPublisher(bridge._automation_status_cb)
         self.trigger._send_command_ack = Mock()
         self.block_phase = 'compensating'
+        # The bridge import can outlast the angle/health freshness window.
+        self.node._on_angle_received(dict(self.node.current_angles))
+        self.node._on_health_received({'timestamp_ms': 1001})
+        self.node._on_text_received('ANGLE_AGE_CH_MS:1,1,1,1')
         self.assertTrue(self.trigger._do_manual_sample())
         self.wait_phase('compensating')
         for command in (31012, 31013):

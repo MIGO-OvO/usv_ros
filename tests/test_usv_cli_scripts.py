@@ -1,3 +1,7 @@
+import os
+import shutil
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -60,9 +64,37 @@ class UsvCliScriptTests(unittest.TestCase):
             self.assertIn(name, text)
 
         self.assertIn('TARGET_DIR="${USV_COMMAND_DIR:-$HOME/.local/bin}"', text)
-        self.assertIn('ln -sfn "$USVCTL_SCRIPT" "$target"', text)
+        self.assertIn('ln -s -- "$USVCTL_SCRIPT" "$target"', text)
         self.assertIn("uninstall_commands", text)
         self.assertIn("~/.bashrc", text)
+
+    @unittest.skipUnless(os.name == 'posix' and shutil.which('bash'), 'requires Linux/WSL Bash')
+    def test_installer_backs_up_legacy_files_and_broken_symlinks(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            installer = root / 'install_usv_commands.sh'
+            installer.write_text((SCRIPTS_DIR / installer.name).read_text(encoding='utf-8'))
+            (root / 'usvctl.sh').write_text('#!/usr/bin/env bash\nexit 0\n')
+            target = root / 'bin'
+            target.mkdir()
+            (target / 'usvon').write_text('user command\n')
+            (target / 'usvstatus').symlink_to('missing-old-helper')
+            env = dict(os.environ, USV_COMMAND_DIR=str(target))
+            for _ in range(2):
+                result = subprocess.run(['bash', str(installer), 'install'], env=env,
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            backups = list(target.glob('.usv-commands-backup.*'))
+            self.assertEqual(len(backups), 1)
+            self.assertEqual((backups[0] / 'usvon').read_text(), 'user command\n')
+            self.assertEqual(os.readlink(backups[0] / 'usvstatus'), 'missing-old-helper')
+            for name in ('usvon', 'usvstatus', 'usvlogs'):
+                self.assertEqual((target / name).resolve(), root / 'usvctl.sh')
+            result = subprocess.run(['bash', str(installer), 'uninstall'], env=env,
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((target / 'usvon').exists())
+            self.assertTrue((backups[0] / 'usvon').exists())
 
     def test_usvctl_dispatches_to_existing_runtime_scripts(self):
         text = self._read_script("usvctl.sh")

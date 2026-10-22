@@ -32,7 +32,7 @@ class TimeoutBudgetTests(unittest.TestCase):
 
     def test_preflight_waits_for_real_done_after_old_deadline(self):
         runner = AutomationPreflight(Mock(), Mock(), Mock(), Mock())
-        runner.command = lambda _: runner.notify_text('PID_START:X,delta=360.0,dir=F')
+        runner.command = lambda _, **kwargs: runner.notify_text('PID_START:X,delta=360.0,dir=F')
         now = [0.0]
         def tick(_timeout):
             now[0] += 30
@@ -59,17 +59,19 @@ class TimeoutBudgetTests(unittest.TestCase):
             with self.assertRaisesRegex(PreflightError, 'angle feedback timeout'):
                 runner._check()
 
-    def test_oil_total_deadline_includes_startup_and_speed_margin(self):
+    def test_oil_pid_segments_respect_the_firmware_deadline(self):
         runner = AutomationPreflight(Mock(return_value=True), Mock(),
                                      lambda axes, **kw: {'A': 0}, Mock())
-        def command(_command, ack='CMD_OK', before_send=None):
+        runner.command = Mock(return_value='PIDPARAM:0.14,0.015,0.06,1,8')
+        def finish(moves, precision, before_send=None, timeout=None):
             if before_send:
                 before_send()
-        runner.command = command
-        runner.pid_moves = Mock()
-        runner._wait = Mock()
+                runner.travel['degrees'] = moves['A'][0]
+        runner.pid_moves = Mock(side_effect=finish)
         runner.run([], {}, {'oil_axis': 'A', 'separation_turns': 1, 'separation_rpm': 5}, 0.1, None)
-        self.assertEqual(runner._wait.call_args.args[1], 34.0)
+        segments = [call for call in runner.pid_moves.call_args_list if call.kwargs.get('before_send')]
+        self.assertEqual(len(segments), 4)
+        self.assertTrue(all(call.kwargs['timeout'] == 30.0 for call in segments))
 
 
 class SpectroTimeoutBudgetTests(unittest.TestCase):

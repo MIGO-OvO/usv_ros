@@ -17,6 +17,7 @@ resolve_script_dir() {
 SCRIPT_DIR="$(resolve_script_dir)"
 USVCTL_SCRIPT="$SCRIPT_DIR/usvctl.sh"
 TARGET_DIR="${USV_COMMAND_DIR:-$HOME/.local/bin}"
+BACKUP_DIR=""
 COMMANDS=(usvctl usvon usvoff usvrestart usvstatus usvhotspot usvaddr usvupdate usvimport usvbuild usvdeploy usvlogs)
 
 log() {
@@ -46,16 +47,23 @@ install_one() {
 
     if [[ -L "$target" ]]; then
         current="$(readlink "$target")"
-        if [[ "$current" != "$USVCTL_SCRIPT" ]]; then
-            log "ERROR: $target already points to $current"
-            exit 1
+        if [[ "$current" == "$USVCTL_SCRIPT" ]]; then
+            log "already linked $target"
+            return
         fi
-    elif [[ -e "$target" ]]; then
-        log "ERROR: $target already exists and is not a symlink"
+    elif [[ -d "$target" ]]; then
+        log "ERROR: $target is a directory; move it manually before installing"
         exit 1
     fi
 
-    ln -sfn "$USVCTL_SCRIPT" "$target"
+    if [[ -e "$target" || -L "$target" ]]; then
+        if [[ -z "$BACKUP_DIR" ]]; then
+            BACKUP_DIR="$(mktemp -d "$TARGET_DIR/.usv-commands-backup.XXXXXX")"
+        fi
+        mv -- "$target" "$BACKUP_DIR/$name"
+        log "backed up $target -> $BACKUP_DIR/$name"
+    fi
+    ln -s -- "$USVCTL_SCRIPT" "$target"
     log "linked $target -> $USVCTL_SCRIPT"
 }
 
