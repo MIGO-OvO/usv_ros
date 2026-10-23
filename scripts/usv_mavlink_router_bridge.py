@@ -623,6 +623,15 @@ class USVMavlinkRouterBridge(object):
                      for key, event in self._recent_events.items() if event['pending']]
             active = self._active_event_send
             if active is not None:
+                priority = (0 if active['event']['command'] in SAFETY_COMMANDS else
+                            1 if active['item'].get('phase') == 'terminal' else 2)
+                if (now - active['started_at'] >= 1.0
+                        or any(rank < priority for rank, _ in fresh)):
+                    # Transport returns only at a complete frame boundary (or
+                    # retires the session). Keep the unsent event queued and
+                    # restart it with a new chunk id after higher-priority work.
+                    self._active_event_send = active = None
+            if active is not None:
                 selected, event, item = active['key'], active['event'], active['item']
             elif fresh:
                 selected = min(fresh, key=lambda item: item[0])[1]
@@ -641,11 +650,6 @@ class USVMavlinkRouterBridge(object):
                 self._active_event_send = active
         if active is None:
             return
-        # QGC's existing assembly window is one second. If backpressure spans
-        # that window, replay the whole event under a fresh chunk id.
-        if now - active['started_at'] >= 1.0:
-            self._event_chunk_id = self._event_chunk_id % 65535 + 1
-            active.update(id=self._event_chunk_id, offset=0, started_at=now)
         raw = item['text'].encode('ascii') + b'\x00'
         for offset in range(active['offset'], len(raw), 50):
             seq = offset // 50

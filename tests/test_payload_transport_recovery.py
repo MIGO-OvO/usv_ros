@@ -160,6 +160,103 @@ class TransportRecoveryTests(unittest.TestCase):
         self.assertEqual([chunk[3] for chunk in replay], list(range(len(replay))))
         self.assertIn(b'\0', replay[-1][1])
 
+    def test_stop_preempts_long_event_under_persistent_backpressure(self):
+        request = self.start()
+        sender = self.bridge._conn.mav.statustext_send
+        def send(*args):
+            sender(*args)
+            if self.bridge._active_event_send['event']['command'] == 31010:
+                self.bridge._transport.deadline = 0
+        self.bridge._conn.mav.statustext_send = send
+        # The old event can send one complete frame per assembly window, but
+        # the shorter STOP can finish whenever it gets a scheduling turn.
+        for _ in range(3):
+            self.bridge._transport.begin_cycle()
+            self.bridge._send_payload_event()
+            self.bridge._active_event_send['started_at'] -= 1.1
+        old_id = self.bridge._active_event_send['id']
+        stop = remote_command(self.node, 31011)
+        self.bridge._forward_payload_command(stop.data)
+        wait_commands(self.node)
+        self.frames.clear()
+        for _ in range(2):
+            self.bridge._transport.begin_cycle()
+            self.bridge._send_payload_event()
+            if not self.bridge._recent_events[(255, 190, 1, 2)]['pending']:
+                break
+            self.bridge._active_event_send['started_at'] -= 1.1
+        self.assertFalse(self.bridge._recent_events[(255, 190, 1, 2)]['pending'])
+        chunks = [args for kind, args in self.frames if kind == 'text' and len(args) == 4]
+        self.assertNotEqual(chunks[0][2], old_id)
+        self.assertEqual([chunk[3] for chunk in chunks], list(range(len(chunks))))
+        raw = b''.join(chunk[1] for chunk in chunks).split(b'\0')[0]
+        self.assertEqual(json.loads(raw[6:]), self.event(stop))
+        self.assertTrue(self.bridge._recent_events[(255, 190, 1, 1)]['pending'])
+
+    def test_stop_preempts_unexpired_event_at_a_complete_frame_boundary(self):
+        self.start()
+        sender = self.bridge._conn.mav.statustext_send
+        def send(*args):
+            sender(*args)
+            self.bridge._transport.deadline = 0
+        self.bridge._conn.mav.statustext_send = send
+        self.bridge._transport.begin_cycle()
+        self.bridge._send_payload_event()
+        old_id = self.bridge._active_event_send['id']
+        stop = remote_command(self.node, 31011)
+        self.bridge._forward_payload_command(stop.data)
+        wait_commands(self.node)
+        self.frames.clear()
+        self.bridge._conn.mav.statustext_send = sender
+        self.bridge._transport.begin_cycle()
+        self.bridge._send_payload_event()
+        chunks = [args for kind, args in self.frames if kind == 'text' and len(args) == 4]
+        self.assertEqual(chunks[0][3], 0)
+        raw = b''.join(chunk[1] for chunk in chunks).split(b'\0')[0]
+        self.assertEqual(json.loads(raw[6:]), self.event(stop))
+        self.assertNotEqual(chunks[0][2], old_id)
+
+    def test_transport_loss_before_request_binding_preserves_terminal_and_recovery(self):
+        self._check_transport_loss_before_request_binding(0)
+
+    def test_fcu_transport_loss_before_request_binding_preserves_terminal_and_recovery(self):
+        self._check_transport_loss_before_request_binding(42)
+
+    def _check_transport_loss_before_request_binding(self, sample_id):
+        entered, release, stopped = threading.Event(), threading.Event(), threading.Event()
+        def bind(context):
+            entered.set()
+            self.assertTrue(release.wait(2))
+        self.node._bind_sample_position = bind
+        self.node._cleanup_sampling_attempt = Mock(return_value=(True, False))
+        self.node.sampling_result_pub.publish = lambda msg: stopped.set()
+        request = remote_command(self.node, 31010, param2=sample_id)
+        try:
+            self.bridge._forward_payload_command(request.data)
+            self.assertTrue(entered.wait(1))
+            attempt = self.node.current_sampling_context['attempt_id']
+            self.bridge._retire_router('TCP EOF before automation preparation')
+            self.assertTrue(stopped.wait(1))
+            release.set()
+            wait_commands(self.node)
+            terminal = dict(self.node._ledger().records['255:190:1:1']['event'])
+            self.assertEqual((terminal['phase'], terminal['outcome'], terminal['reason']),
+                             ('terminal', 'cancelled', 'transport_session_lost'))
+            self.assertEqual(terminal['attempt_id'], attempt)
+            self.reconnect()
+            self.bridge._recover_payload_results()
+            recovered = self.event(request)
+            self.assertEqual((recovered['seq'], recovered['reason'], recovered['attempt_id']),
+                             (terminal['seq'], 'transport_session_lost', attempt))
+            request.data[9] = 85
+            self.bridge._forward_payload_command(request.data)
+            wait_commands(self.node)
+            self.node._call_automation_service.assert_called_once_with('stop')
+            self.assertFalse(self.node.is_sampling)
+        finally:
+            release.set()
+            wait_commands(self.node)
+
     def test_transport_loss_during_start_rpc_preserves_first_cancellation_reason(self):
         entered, release = threading.Event(), threading.Event()
         def service(action):

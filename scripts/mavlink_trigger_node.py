@@ -1980,11 +1980,13 @@ class MAVLinkTriggerNode(object):
         config = self._load_config() or self._get_default_config()
         steps_data = self._build_manual_steps_payload(config)
         context = {'waypoint_seq': int(self.current_waypoint), 'source': 'manual',
-                   'attempt_id': uuid.uuid4().hex}
-        self.current_sampling_context = context
+                   'attempt_id': uuid.uuid4().hex,
+                   'mavlink_request': getattr(self._command_context, 'request', None)}
+        with self.state_lock:
+            self.current_sampling_context = context
+            self.is_sampling = True
+            self._set_mission_state(MissionState.SAMPLING, str(self.current_waypoint))
         self._bind_sample_position(context)
-        self.is_sampling = True
-        self._set_mission_state(MissionState.SAMPLING, str(self.current_waypoint))
         self._prepare_automation_steps(steps_data)
         if not self._start_prepared_automation():
             reason = context.get('terminal_reason') or context.get('cancel_reason') or getattr(self._command_context, 'last_reason', '') or 'automation_start_failed'
@@ -2022,17 +2024,19 @@ class MAVLinkTriggerNode(object):
             'source': 'fcu', 'sample_id': int(sample_id),
             'on_fail': self.default_on_fail, 'started': False,
             'attempt_id': uuid.uuid4().hex,
+            'mavlink_request': getattr(self._command_context, 'request', None),
         }
-        self.current_sampling_context = context
+        with self.state_lock:
+            self.current_sampling_context = context
+            self.is_sampling = True
+            self._set_mission_state(MissionState.SAMPLING, str(self.current_waypoint))
         self._bind_sample_position(context)
-        self.is_sampling = True
         if self.current_sampling_context is not context:
             self._cleanup_sampling_attempt(context, 'start_cancelled')
             return False
 
         self._prepare_automation_steps(steps_data)
 
-        self._set_mission_state(MissionState.SAMPLING, str(self.current_waypoint))
         if not self._start_prepared_automation():
             self._handle_completion(False, 'fcu_sample_start_failed', expected_context=context)
             return False
