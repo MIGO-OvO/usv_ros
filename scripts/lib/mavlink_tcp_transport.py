@@ -1,9 +1,13 @@
-"""One socket writer: complete a frame or fail and retire that TCP session."""
+"""One socket writer: defer an untouched frame or complete its entire prefix."""
 import errno
 import ipaddress
 import select
 import socket
 import time
+
+
+class TCPWriteDeferred(Exception):
+    """No frame bytes were written in this cycle; retry on the same session."""
 
 
 def connect_router(mavutil, url, source_system, source_component):
@@ -45,6 +49,7 @@ class MAVLinkTCPTransport:
         self.counters = counters
         self.deadline = None
         self.last_write_at = None
+        self.last_attempt = None
 
     def begin_cycle(self, budget=0.03):
         # One budget for the entire batch, not 24 independent timeouts.
@@ -55,18 +60,24 @@ class MAVLinkTCPTransport:
         deadline = self.deadline if self.deadline is not None else time.monotonic() + 0.03
         offset = 0
         view = memoryview(frame)
+        self.last_attempt = {'frame_bytes': len(view), 'offset': 0, 'send_calls': 0, 'result': 'writing'}
         try:
             while offset < len(view):
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
+                    if offset == 0:
+                        raise TCPWriteDeferred('TCP cycle budget exhausted before frame write')
                     raise TimeoutError('TCP frame write deadline')
                 try:
+                    self.last_attempt['send_calls'] += 1
                     written = self.port.send(view[offset:])
                 except OSError as exc:
                     if exc.errno not in (errno.EAGAIN, errno.EWOULDBLOCK, errno.EINTR):
                         raise
                     self.counters['would_block'] += 1
                     if not select.select([], [self.port], [], remaining)[1]:
+                        if offset == 0:
+                            raise TCPWriteDeferred('TCP backpressure before frame write')
                         raise TimeoutError('TCP backpressure deadline')
                     continue
                 if not written:
@@ -74,14 +85,21 @@ class MAVLinkTCPTransport:
                 if written < len(view) - offset:
                     self.counters['short_writes'] += 1
                 offset += written
+                self.last_attempt['offset'] = offset
             self.counters['fully_written_frames'] += 1
             self.counters['fully_written_bytes'] += offset
             self.last_write_at = time.monotonic()
+            self.last_attempt['result'] = 'complete'
             return offset
-        except (OSError, ValueError):
-            self.counters['send_errors'] += 1
-            self.port.close()  # Never put a new frame after an incomplete prefix.
+        except TCPWriteDeferred as exc:
+            self.counters['deferred_frames'] = self.counters.get('deferred_frames', 0) + 1
+            self.last_attempt.update(result='deferred', reason=str(exc))
             raise
+        except (OSError, ValueError) as exc:
+            self.counters['send_errors'] += 1
+            self.last_attempt.update(result='failed', reason=str(exc))
+            self.port.close()  # Never put a new frame after an incomplete prefix.
+            raise OSError('TCP frame write failed offset=%d/%d: %s' % (offset, len(view), exc)) from exc
 
     def recv(self, size):
         try:
@@ -92,4 +110,5 @@ class MAVLinkTCPTransport:
             raise
         if not data:
             raise ConnectionError('TCP EOF')
+        self.counters['received_bytes'] = self.counters.get('received_bytes', 0) + len(data)
         return data

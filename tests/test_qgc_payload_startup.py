@@ -8,6 +8,7 @@ from unittest.mock import Mock, patch
 import test_preflight_review_regressions as preparation
 from test_fcu_sampling_result import ForwardPublisher
 from test_mavlink_command_compat import _load_script
+from command_fixtures import remote_command, wait_commands
 
 
 class PayloadStartupTests(unittest.TestCase):
@@ -88,6 +89,46 @@ class QGCPreparationTests(unittest.TestCase):
         self.assertTrue(self.node.inject_pump_enabled)
         self.node.automation_engine.start.assert_called_once()
         self.assertEqual(self.requests[0][1]['injection_pump_policy']['speed'], 38)
+
+    def test_tcp_loss_stops_real_preflight_and_recovery_never_restarts_pumps(self):
+        bridge = self.attach_bridge()
+        bridge._conn = SimpleNamespace(close=lambda: None)
+        bridge._tcp_session = self.trigger._mavlink_tcp_session = 84
+        bridge._executor_id = self.trigger._executor_id
+        bridge._payload_command_pub.publish = self.trigger._payload_command_cb
+        bridge._session_pub.publish = self.trigger._mavlink_session_cb
+        self.trigger._event_pub.publish = bridge._payload_event_cb
+        def status(message):
+            bridge._automation_status_cb(message)
+            self.trigger._automation_status_cb(message)
+        self.node.automation_status_pub = ForwardPublisher(status)
+        self.pubs['/usv/automation_status'] = self.node.automation_status_pub
+        self.block_phase = 'compensating'
+        request = remote_command(self.trigger, 31010)
+        bridge._forward_payload_command(request.data)
+        wait_commands(self.trigger)
+        self.wait_phase('compensating')
+        bridge._retire_router('TCP EOF')
+        wait_commands(self.trigger)
+        self.join()
+        self.assertFalse(self.node._automation_is_active())
+        self.assertFalse(self.node.inject_pump_enabled)
+        self.assertIn('STOPALL', self.commands)
+        count = len(self.commands)
+        bridge._conn = SimpleNamespace()
+        bridge._tcp_session = bridge._executor_session = 85
+        self.trigger._mavlink_session_cb(SimpleNamespace(data=[85]))
+        bridge._recover_payload_results()
+        request.data[9] = 85
+        bridge._forward_payload_command(request.data)
+        wait_commands(self.trigger)
+        event = json.loads(bridge._recent_events[(255, 190, 1, 1)]['text'][6:])
+        self.assertEqual(event['phase'], 'terminal')
+        self.assertEqual(event['reason'], 'transport_session_lost')
+        self.assertEqual(event['tcp_session'], 85)
+        self.assertEqual(len(self.commands), count)
+        self.assertEqual(sum(action == 'automation_start' for action, _ in self.requests), 1)
+        self.node.automation_engine.start.assert_not_called()
 
     def test_preparation_is_distinct_from_sampling_and_normal_stop_confirms_halt(self):
         self.config['pump_settings']['default_speed'] = 60

@@ -72,6 +72,12 @@ QGC 发送层与面板响应期限一致：分光启动 40 秒（覆盖最多三
 
 QGC 在总预算内以 1 秒间隔最多发送三份同 session/request/command/参数的帧，不创建新请求。RequestLedger 重放原阶段与结果，不重复执行物理动作；标准 ACK 与 USVE1 可任意先后到达，只有匹配关联事件结束收执等待。
 
+TCP 每轮发送预算仍为 30 ms，从收包处理结束后计时。尚未写出字节的帧延期，ACK 与事件分片完整发送后出队；部分帧发送失败或真实连接错误仍退役连接并停止任务。USVE1 保留分片发送位置，超过 QGC 的 1 秒组包期限后从头重播。
+
+断线取消保留 `transport_session_lost`。重连后 bridge 通过 `recover_only` 查询保存的原请求，trigger 核对执行实例、请求身份和参数，再向新会话重放缓存结果或后续终态。同身份重试也走该校验，不重复执行 START。bridge/trigger 必须一起更新并重启；QGC 更新后显示通信取消的中文原因。飞控与检测板本轮无协议变更。
+
+回归入口：`test_mavlink_tcp_transport.py`、`test_payload_transport_recovery.py`、`test_qgc_payload_startup.py`、`test_bridge_qml_event_chain.py`。最后一项单独运行于真实 pymavlink 环境，包含发送前预算耗尽与分片中途延期。
+
 回归：`python -B -m unittest discover -s tests -p test_qgc_payload_startup.py`。台架验收：ROS 启动后立即使用 QGC 启动信号；对比 Web/QGC 相同配置的进样速度；分别在准备、运行、暂停阶段点击普通停止，确认泵组与进样泵停止且记录窗口关闭。
 
 ### 分光冷启动与现场诊断

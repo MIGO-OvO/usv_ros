@@ -6,7 +6,7 @@ import unittest
 from collections import defaultdict
 from unittest.mock import patch
 
-from scripts.lib.mavlink_tcp_transport import MAVLinkTCPTransport
+from scripts.lib.mavlink_tcp_transport import MAVLinkTCPTransport, TCPWriteDeferred
 from test_mavlink_command_compat import _load_script, FakeConnection
 
 
@@ -28,6 +28,30 @@ class Port:
 
 
 class TCPTransportTests(unittest.TestCase):
+    def test_expired_cycle_before_first_byte_defers_without_closing(self):
+        port = Port([])
+        writer = MAVLinkTCPTransport(port, defaultdict(int))
+        writer.begin_cycle()
+        # Reproduce time spent receiving/dispatching before a healthy send.
+        time.sleep(0.04)
+        with self.assertRaises(TCPWriteDeferred):
+            writer.write(b'complete frame')
+        self.assertFalse(port.closed, 'a frame with no written prefix must be deferred')
+        self.assertEqual(port.accepted, b'')
+        writer.begin_cycle()
+        self.assertEqual(writer.write(b'complete frame'), 14)
+        self.assertEqual(port.accepted, b'complete frame')
+
+    def test_deadline_after_prefix_still_closes_with_exact_offset(self):
+        port = Port([2, BlockingIOError(errno.EAGAIN, 'full')])
+        writer = MAVLinkTCPTransport(port, defaultdict(int))
+        with patch('scripts.lib.mavlink_tcp_transport.select.select', return_value=([], [], [])):
+            with self.assertRaisesRegex(OSError, 'offset=2/6'):
+                writer.write(b'abcdef')
+        self.assertTrue(port.closed)
+        self.assertEqual(writer.last_attempt['offset'], 2)
+        self.assertEqual(writer.last_attempt['result'], 'failed')
+
     def test_short_writes_and_eagain_keep_exact_tail(self):
         port = Port([3, BlockingIOError(errno.EAGAIN, 'full'), 2])
         counts = defaultdict(int)
@@ -50,7 +74,7 @@ class TCPTransportTests(unittest.TestCase):
             self.assertTrue(port.closed)
             self.assertEqual(counts['fully_written_frames'], 0)
 
-    def test_real_backpressure_is_bounded_and_retires_session(self):
+    def test_real_backpressure_before_first_byte_defers_without_closing(self):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.addCleanup(listener.close)
         listener.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024)
@@ -75,10 +99,10 @@ class TCPTransportTests(unittest.TestCase):
         counts = defaultdict(int)
         writer = MAVLinkTCPTransport(sender, counts)
         started = time.monotonic()
-        with self.assertRaises(OSError):
+        with self.assertRaises(TCPWriteDeferred):
             writer.write(b'y' * 65536)
         self.assertLess(time.monotonic() - started, 0.25)
-        self.assertEqual(sender.fileno(), -1)
+        self.assertNotEqual(sender.fileno(), -1)
         self.assertEqual(counts['fully_written_frames'], 0)
         self.assertGreater(counts['would_block'], 0)
 

@@ -1030,20 +1030,21 @@ class MAVLinkTriggerNode(object):
         # A start RPC owns this lock until its reply. Send the physical stop
         # before joining that transaction, then finish bookkeeping without a
         # second delayed global stop which could hit a newer Web owner.
+        reason = getattr(self._command_context, 'cancel_reason', '') or 'operator_stop'
         if not self._sampling_control_lock.acquire(blocking=False):
             with self.state_lock:
                 context = self.current_sampling_context
                 if expected_context is not None and context is not expected_context:
                     return True
                 if isinstance(context, dict):
-                    context['cancel_reason'] = 'operator_stop'
+                    context.setdefault('cancel_reason', reason)
                 stopped_context = dict(context or {})
                 if self._survey_active:
                     stopped_context['source'] = 'survey'
             if expected_context is None:
                 stop_result = self._call_automation_service('stop')
             else:
-                stopped, superseded = self._cleanup_sampling_attempt(context, 'operator_stop')
+                stopped, superseded = self._cleanup_sampling_attempt(context, context.get('cancel_reason') or reason)
                 stop_result = stopped or superseded
             with self._sampling_control_lock:
                 return self._stop_sampling_sequence_locked(expected_context, request_hold, stop_result, stopped_context)
@@ -1062,6 +1063,7 @@ class MAVLinkTriggerNode(object):
             self._sampling_finishing = True
             sampling_context = dict(stopped_context if stopped_context is not None else
                                     (getattr(self, "current_sampling_context", {}) or {}))
+            sampling_context.setdefault('cancel_reason', getattr(self._command_context, 'cancel_reason', '') or 'operator_stop')
             was_survey = getattr(self, '_survey_active', False) or sampling_context.get('source') == 'survey'
             if was_survey:
                 self._survey_active = False
@@ -1199,7 +1201,8 @@ class MAVLinkTriggerNode(object):
     def _payload_command_cb(self, msg):
         try:
             data = json.loads(msg.data)
-            self._mavlink_cmd_rx_cb(SimpleNamespace(data=data['values'], executor=data['executor']))
+            self._mavlink_cmd_rx_cb(SimpleNamespace(data=data['values'], executor=data['executor'],
+                                                   recover_only=data.get('recover_only', False)))
         except (ValueError, TypeError, KeyError):
             rospy.logwarn('Invalid payload command envelope')
 
@@ -1232,6 +1235,10 @@ class MAVLinkTriggerNode(object):
                 if getattr(msg, 'executor', None) != self._executor_id:
                     self._emit_request_event(request, 'request', 'failed', 'executor_restarted')
                     self._send_command_ack(command, MAV_RESULT_FAILED, sender_system, sender_component, received_session)
+                    return
+                if getattr(msg, 'recover_only', False):
+                    previous = self._ledger().recover(request, param1, param2)
+                    self._replay_request(request, previous, command, sender_system, sender_component, received_session)
                     return
             elif len(msg.data) not in (7, 10):
                 return
@@ -1278,7 +1285,16 @@ class MAVLinkTriggerNode(object):
         if previous:
             # Retire in-flight remote work. The independent STOP lane reaches
             # pump cancellation before waiting on any old ordinary service.
-            self._enqueue_command_long(CMD_STOP_SAMPLING, 0, 0, 0, 0, 'TCP session retired')
+            with self.state_lock:
+                context = self.current_sampling_context
+                if isinstance(context, dict):
+                    context.setdefault('cancel_reason', 'transport_session_lost')
+                    context.setdefault('terminal_reason', 'transport_session_lost')
+            with self._command_dispatch_lock:
+                if self._command_lanes[False]['busy']:
+                    self._command_lanes[False]['cancel_reason'] = 'transport_session_lost'
+            self._enqueue_command_long(CMD_STOP_SAMPLING, 0, 0, 0, 0, 'TCP session retired',
+                                       cancel_reason='transport_session_lost')
 
     @staticmethod
     def _ack_for_event(event):
@@ -1295,7 +1311,7 @@ class MAVLinkTriggerNode(object):
         """Answer a repeated identity with its stored answer, never with a second action."""
         if previous is not None:
             message = String()
-            message.data = json.dumps(dict(previous, tcp_session=request['tcp_session']))
+            message.data = json.dumps(previous)
             self._event_pub.publish(message)
             self._send_command_ack(command, self._ack_for_event(previous),
                                    sender_system, sender_component, ack_session)
@@ -1305,7 +1321,8 @@ class MAVLinkTriggerNode(object):
         # arrive on this path.
         self._send_command_ack(command, MAV_RESULT_IN_PROGRESS, sender_system, sender_component, ack_session)
 
-    def _enqueue_command_long(self, command, param1, param2, sender_system, sender_component, log_prefix, request=None):
+    def _enqueue_command_long(self, command, param1, param2, sender_system, sender_component, log_prefix, request=None,
+                              cancel_reason=''):
         """Two bounded lanes: a blocked ordinary RPC cannot occupy STOP admission."""
         if not CMD_START_SAMPLING <= command <= CMD_SPECTROMETER_STOP:
             return
@@ -1337,7 +1354,7 @@ class MAVLinkTriggerNode(object):
                 generation = self._command_generation + int(cancels)
                 try:
                     lane['queue'].put_nowait((generation, time.monotonic(), request, ack_session, (
-                        command, param1, param2, sender_system, sender_component, log_prefix)))
+                        command, param1, param2, sender_system, sender_component, log_prefix, cancel_reason)))
                 except queue.Full:
                     rejected = True
                 else:
@@ -1350,8 +1367,9 @@ class MAVLinkTriggerNode(object):
             else:
                 lane['busy'] += 1
                 lane['command'] = command
+                lane['cancel_reason'] = ''
                 lane['queue'].put_nowait((self._command_generation, time.monotonic(), request, ack_session, (
-                    command, param1, param2, sender_system, sender_component, log_prefix)))
+                    command, param1, param2, sender_system, sender_component, log_prefix, cancel_reason)))
             if lane['thread'] is None and lane['busy']:
                 lane['thread'] = threading.Thread(
                     target=self._command_loop, args=(safety,), daemon=True,
@@ -1381,11 +1399,13 @@ class MAVLinkTriggerNode(object):
             self._command_context.request = request
             self._command_context.ack_session = ack_session
             self._command_context.last_reason = ''
+            self._command_context.cancel_reason = args[6]
             try:
                 if safety or generation == self._command_generation:
-                    self._dispatch_command_long(*args)
+                    self._dispatch_command_long(*args[:6])
                 else:
-                    self._emit_request_event(request, 'request', 'cancelled', 'superseded_by_stop')
+                    self._emit_request_event(request, 'request', 'cancelled',
+                                             lane.get('cancel_reason') or 'superseded_by_stop')
                     self._send_command_ack(args[0], MAV_RESULT_FAILED, args[3], args[4])
             except Exception as exc:
                 rospy.logerr('Payload command worker failed: %s', exc)
@@ -1396,6 +1416,7 @@ class MAVLinkTriggerNode(object):
                 self._command_context.issued_at = None
                 self._command_context.request = None
                 self._command_context.ack_session = None
+                self._command_context.cancel_reason = ''
                 with self._command_dispatch_lock:
                     lane['busy'] -= 1
                     if not safety:
@@ -1639,7 +1660,7 @@ class MAVLinkTriggerNode(object):
                 context['start_admission'] = (result.get('admission', 'unknown')
                                               if result.get('attempt_id') == payload.get('attempt_id') else 'unknown')
                 if not success:
-                    context.setdefault('terminal_reason', getattr(self._command_context, 'last_reason', '')
+                    context.setdefault('terminal_reason', context.get('cancel_reason') or getattr(self._command_context, 'last_reason', '')
                                        or 'automation_start_failed')
             return success
         if action in ('pause', 'resume'):
@@ -1959,18 +1980,21 @@ class MAVLinkTriggerNode(object):
         config = self._load_config() or self._get_default_config()
         steps_data = self._build_manual_steps_payload(config)
         context = {'waypoint_seq': int(self.current_waypoint), 'source': 'manual',
-                   'attempt_id': uuid.uuid4().hex}
-        self.current_sampling_context = context
+                   'attempt_id': uuid.uuid4().hex,
+                   'mavlink_request': getattr(self._command_context, 'request', None)}
+        with self.state_lock:
+            self.current_sampling_context = context
+            self.is_sampling = True
+            self._set_mission_state(MissionState.SAMPLING, str(self.current_waypoint))
         self._bind_sample_position(context)
-        self.is_sampling = True
-        self._set_mission_state(MissionState.SAMPLING, str(self.current_waypoint))
         self._prepare_automation_steps(steps_data)
         if not self._start_prepared_automation():
-            reason = context.get('terminal_reason') or getattr(self._command_context, 'last_reason', '') or 'automation_start_failed'
+            reason = context.get('terminal_reason') or context.get('cancel_reason') or getattr(self._command_context, 'last_reason', '') or 'automation_start_failed'
             context.setdefault('terminal_reason', reason)
             self._cleanup_sampling_attempt(context, reason)
-            self._emit_sample_record(context, 'failed', reason)
-            self._publish_sampling_result(context, 'failed', reason)
+            outcome = 'cancelled' if reason == context.get('cancel_reason') else 'failed'
+            self._emit_sample_record(context, outcome, reason)
+            self._publish_sampling_result(context, outcome, reason)
             if self.current_sampling_context is context:
                 self.is_sampling = False
                 self.current_sampling_context = None
@@ -2000,17 +2024,19 @@ class MAVLinkTriggerNode(object):
             'source': 'fcu', 'sample_id': int(sample_id),
             'on_fail': self.default_on_fail, 'started': False,
             'attempt_id': uuid.uuid4().hex,
+            'mavlink_request': getattr(self._command_context, 'request', None),
         }
-        self.current_sampling_context = context
+        with self.state_lock:
+            self.current_sampling_context = context
+            self.is_sampling = True
+            self._set_mission_state(MissionState.SAMPLING, str(self.current_waypoint))
         self._bind_sample_position(context)
-        self.is_sampling = True
         if self.current_sampling_context is not context:
             self._cleanup_sampling_attempt(context, 'start_cancelled')
             return False
 
         self._prepare_automation_steps(steps_data)
 
-        self._set_mission_state(MissionState.SAMPLING, str(self.current_waypoint))
         if not self._start_prepared_automation():
             self._handle_completion(False, 'fcu_sample_start_failed', expected_context=context)
             return False
@@ -2387,7 +2413,8 @@ class MAVLinkTriggerNode(object):
             capability = String()
             # Request correlation is always available in memory; the journal is
             # optional diagnostics and cannot withdraw this capability.
-            capability.data = json.dumps({'version': 1, 'executor': self._executor_id, 'source_monotonic': time.monotonic()})
+            capability.data = json.dumps({'version': 1, 'executor': self._executor_id,
+                                          'tcp_session': self._mavlink_tcp_session, 'source_monotonic': time.monotonic()})
             self._protocol_pub.publish(capability)
 
             rospy.logdebug_throttle(10, "Mode: %s, Armed: %s, Sampling: %s, Connected: %s, v=%.3f, yaw=%.3f",
