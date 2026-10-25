@@ -96,7 +96,7 @@ TCP 每轮发送预算仍为 30 ms，从收包处理结束后计时。尚未写�
 
 - 正式步骤和 preflight 共用 `/automation/pid_wait_timeout`（默认 120 秒，可用节点私有 `~pid_wait_timeout` 覆盖，范围 1–600 秒）。现在配置实际生效，且等待使用单调时钟；必须收到 `PID_DONE` 才算完成。**检测板仍有独立的 30 秒 `PID_MOVE_TIMEOUT`；收到板端 `PID_TIMEOUT/PID_FAIL` 仍立即失败，本补丁不能解除该固件限制。**
 - 新分光平均样本等待默认 10 秒；冷、暖启动首帧至少等 4 秒。运行断流 2 秒仍置数据无效，不用旧值完成步骤；断流超过 `spectro_stale_stop_timeout`（默认 10 秒，launch 可覆盖，最大 60 秒）才终止整次任务。该恢复窗口内输出可能继续运行；不是对无效测量的放行。明确的控制器故障、失联、owner 丢失和停止路径不变。
-- 油相分隔无净正向进展期限为 5 秒；PID 分段同时受 ROS 等待预算与板端单次 30 秒限时约束。仍核验真实角度行程；1 秒角度反馈中断、跳变、传感器异常和持续停滞仍失败，不按时间猜测完成。
+- 油相分隔在段目标范围外连续 5 秒无净正向进展时失败；进入段目标的 `min(0.5°, 段角度 × 5%)` 范围后，允许 PID 小幅往返收敛，仍须收到真实 `PID_DONE` 并核验角度行程。每段继续受 ROS 等待预算与板端单次 30 秒限时约束；角度反馈中断超过 1 秒、跳变或传感器异常仍立即结束准备。系统日志的 `Preflight failed` 行记录 attempt、阶段和具体原因，便于区分进展超时、反馈过期和固件故障。
 - 离线回归：`python -B -m unittest discover -s tests -p test_sampling_timeout_budget.py`。跳过地图测试；Jetson/台架/实船验收由操作者执行，建议先小剂量验证停止和恢复行为。停止系统后执行 `usvdeploy` 更新并重启，用现场终态区分 ROS 等待超时与板端 `PID_TIMEOUT`。
 
 [![ROS Noetic](https://img.shields.io/badge/ROS-Noetic-22314E?logo=ros&logoColor=white)](https://wiki.ros.org/noetic)

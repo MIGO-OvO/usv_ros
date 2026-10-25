@@ -47,6 +47,7 @@ class TimeoutBudgetTests(unittest.TestCase):
     def test_oil_startup_slack_still_rejects_stall_and_missing_angles(self):
         runner = AutomationPreflight(Mock(), Mock(), Mock(), Mock())
         runner.travel = {'axis': 'A', 'angle': 0, 'at': 3.0, 'degrees': 0,
+                         'target_degrees': 114.0, 'tolerance': 0.5,
                          'rpm': 5, 'progress_at': 0.0, 'progress_degrees': 0}
         with patch('scripts.lib.automation_preflight.time.monotonic', return_value=3.0):
             runner._check()  # Old 2-second no-progress deadline rejected this.

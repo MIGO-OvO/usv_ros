@@ -143,6 +143,7 @@ class FeedbackReviewTests(unittest.TestCase):
         runner = self.module.AutomationPreflight(lambda command: True, lambda require_measurement=True: None,
             lambda axes, require_health=False: {'A': 0}, lambda: None)
         runner.travel = {'axis': 'A', 'angle': 359.9, 'at': 0.0, 'degrees': 0.0, 'base_degrees': 0.0,
+                         'target_degrees': 12.0, 'tolerance': 0.5,
                          'rpm': 0.1, 'progress_at': 0.0, 'progress_degrees': 0.0}
         with patch.object(self.module.time, 'monotonic', side_effect=lambda: clock[0]):
             for index in range(1, 61):

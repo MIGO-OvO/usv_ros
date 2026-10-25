@@ -157,7 +157,11 @@ class AutomationPreflight:
                 now = time.monotonic()
                 if now - self.travel['at'] > self.ANGLE_TIMEOUT:
                     raise PreflightError('controller_fault', 'Oil pump angle feedback timeout')
-                if now - self.travel['progress_at'] > self.PROGRESS_TIMEOUT:
+                # PID may reverse or hold near the target while settling. The
+                # move deadline and real PID_DONE still gate completion there.
+                outside_target = (abs(self.travel['target_degrees'] - self.travel['degrees'])
+                                  > self.travel['tolerance'])
+                if outside_target and now - self.travel['progress_at'] > self.PROGRESS_TIMEOUT:
                     raise PreflightError('controller_fault', 'Oil pump has no verified forward progress')
 
     def _wait(self, ready, timeout, reason, message):
@@ -308,6 +312,7 @@ class AutomationPreflight:
             remaining, completed = goal, 0.0
             while remaining > 0.0005:
                 segment = min(remaining, segment_limit)
+                tolerance = min(self.SEPARATION_TOLERANCE_DEG, segment * 0.05)
                 def arm_travel():
                     # Called under the control lock at the actual serial write.
                     raw = self.angles([axis], require_health=True)
@@ -315,13 +320,13 @@ class AutomationPreflight:
                         now = time.monotonic()
                         self.travel = {'axis': axis, 'angle': raw[axis], 'at': now,
                                        'degrees': 0.0, 'rpm': max_rpm, 'base_degrees': completed,
+                                       'target_degrees': segment, 'tolerance': tolerance,
                                        'progress_at': now, 'progress_degrees': 0.0}
                 try:
                     self.pid_moves({axis: (segment, 'F')}, precision,
                                    before_send=arm_travel, timeout=min(self.PID_TIMEOUT, 30.0))
                     # PID_DONE is required above. Also allow the angle stream
                     # up to one second to catch up with the final PID packet.
-                    tolerance = min(self.SEPARATION_TOLERANCE_DEG, segment * 0.05)
                     self._wait(lambda: self.travel['degrees'] >= segment - tolerance,
                                self.ANGLE_TIMEOUT, 'controller_fault',
                                'Oil pump PID completed without verified separation travel')

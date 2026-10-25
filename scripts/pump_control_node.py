@@ -3901,6 +3901,9 @@ class PumpControlNode(object):
             reason = exc.reason if isinstance(exc, PreflightError) else 'configuration_failed'
             self._set_terminal_reason(reason)
             self.last_automation_failure = {'reason': str(exc), 'preflight_phase': preparation.snapshot()['phase']}
+            rospy.logerr('Preflight failed: attempt_id=%s phase=%s reason=%s detail=%s',
+                         self._preflight_attempt_id, self.last_automation_failure['preflight_phase'],
+                         reason, str(exc))
             with preparation.lock:
                 preparation.state.update(interrupted_phase=preparation.state['phase'],
                                          phase='failed', active=False, error=str(exc))

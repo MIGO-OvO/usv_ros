@@ -312,6 +312,16 @@ class PreflightWorkerTests(unittest.TestCase):
         self.assertFalse(self.start(attempt_id='next')[0])
         self.node.automation_engine.start.assert_not_called()
 
+    def test_preflight_failure_logs_the_phase_and_specific_cause(self):
+        self.failure_phase = 'separating'
+        with patch.object(self.module.rospy, 'logerr') as log_error:
+            self.assertTrue(self.start()[0])
+            self.join()
+        log_error.assert_any_call(
+            'Preflight failed: attempt_id=%s phase=%s reason=%s detail=%s',
+            'preflight-1', 'separating', 'pid_fail', 'PID_FAIL:A=SENSOR_ERR')
+        self.assertIn('STOPALL', self.commands)
+
     def test_preflight_worker_start_failure_cleans_up_before_returning(self):
         with patch.object(self.module.threading.Thread, 'start', side_effect=RuntimeError('cannot start thread')):
             self.assertFalse(self.start()[0])
@@ -392,6 +402,106 @@ class PreflightWorkerTests(unittest.TestCase):
         self.assertEqual(self.status()['terminal_reason'], 'completed')
 
 
+class SeparationPIDSettlingTests(unittest.TestCase):
+    def run_separation(self, *, done=True, turns=5.0, position=None):
+        clock = [100.0]
+        raw = {'A': 350.0}
+        move = {}
+        commands, completions = [], []
+
+        def send(command, before_send=None):
+            if before_send:
+                before_send()
+            commands.append(command)
+            if command == 'PIDQUERY':
+                runner.notify_text('PIDPARAM:0.14,0.015,0.06,1,6')
+            else:
+                match = re.fullmatch(r'AE([FB])R([\d.]+)P[\d.]+', command)
+                self.assertIsNotNone(match)
+                direction, delta = match.groups()
+                runner.notify_text('PID_START:A,delta=%.1f,dir=%s,prec=0.1' % (float(delta), direction))
+                runner.notify_text('CMD_OK')
+                if runner.snapshot()['phase'] == 'separating':
+                    move.update(at=clock[0], start=raw['A'], delta=float(delta))
+                else:
+                    runner.notify_text('PID_DONE:A,abs=360,err=0.09')
+            return True
+
+        def feedback(_timeout):
+            clock[0] += 0.05
+            elapsed = clock[0] - move['at']
+            target = move['delta']
+            # Reach the target in 8 s, then correct +/-0.2 deg before DONE.
+            # The 0.1-deg firmware stability gate has not passed during hunting.
+            if position is not None:
+                degrees = position(elapsed, target)
+            elif elapsed < 8:
+                degrees = target * elapsed / 8
+            else:
+                degrees = target + (0.2 if int(elapsed * 4) % 2 else -0.2)
+            if done and elapsed >= 14:
+                degrees = target
+            raw['A'] = (move['start'] + degrees) % 360
+            runner.notify_angles(raw)
+            if done and elapsed >= 14:
+                completions.append(target)
+                runner.notify_text('PID_DONE:A,abs=%.2f,err=0.00' % target)
+
+        runner = AutomationPreflight(send, lambda require_measurement: None,
+                                     lambda axes, require_health=False: dict(raw), lambda: None)
+        runner.changed = Mock(wait=Mock(side_effect=feedback))
+        with patch('scripts.lib.automation_preflight.time.monotonic', side_effect=lambda: clock[0]):
+            runner.run(['A'], {'A': 350.0}, normalize_preflight({
+                'oil_axis': 'A', 'separation_turns': turns, 'separation_rpm': 5.0}), 0.1, None)
+        return runner, commands, completions
+
+    def test_five_turns_wait_for_each_pid_done_while_settling(self):
+        runner, commands, completions = self.run_separation()
+        self.assertEqual(runner.snapshot()['phase'], 'complete')
+        self.assertAlmostEqual(runner.snapshot()['travel_degrees'], 1800.0)
+        self.assertAlmostEqual(sum(completions), 1800.0)
+        self.assertEqual(len(completions), 16)
+        self.assertFalse(any('J' in command for command in commands))
+
+    def test_at_target_without_done_still_reaches_pid_timeout(self):
+        with self.assertRaises(PreflightError) as caught:
+            self.run_separation(done=False)
+        self.assertEqual(caught.exception.reason, 'pid_timeout')
+
+    def test_stall_short_of_target_keeps_forward_progress_timeout(self):
+        with self.assertRaisesRegex(PreflightError, 'no verified forward progress'):
+            self.run_separation(position=lambda elapsed, target: min(target * elapsed / 8, target / 2))
+
+    def test_large_overshoot_is_not_treated_as_target_settling(self):
+        with self.assertRaisesRegex(PreflightError, 'no verified forward progress'):
+            self.run_separation(position=lambda elapsed, target: min(target * elapsed / 8, target + 1))
+
+    def test_small_segment_uses_its_existing_five_percent_travel_tolerance(self):
+        runner, _, completions = self.run_separation(
+            turns=0.01, position=lambda elapsed, target: min(target * elapsed / 8, target - 0.16))
+        self.assertEqual(runner.snapshot()['phase'], 'complete')
+        self.assertAlmostEqual(sum(completions), 3.6)
+        with self.assertRaisesRegex(PreflightError, 'no verified forward progress'):
+            self.run_separation(
+                turns=0.01, position=lambda elapsed, target: min(target * elapsed / 8, target - 0.20))
+
+    def test_target_settling_still_requires_fresh_angles_and_health(self):
+        angles = Mock(return_value={'A': 114.0})
+        runner = AutomationPreflight(Mock(), Mock(), angles, Mock())
+        runner.travel = {'axis': 'A', 'at': 13.0, 'degrees': 114.0,
+                         'target_degrees': 114.0, 'tolerance': 0.5, 'progress_at': 8.0}
+        with patch('scripts.lib.automation_preflight.time.monotonic', return_value=13.1):
+            runner._check()
+            angles.assert_called_with(['A'], require_health=True)
+            angles.side_effect = PreflightError('controller_fault', 'stale health')
+            with self.assertRaisesRegex(PreflightError, 'stale health'):
+                runner._check()
+            angles.side_effect = None
+            runner.travel['at'] = 12.0
+            with self.assertRaisesRegex(PreflightError, 'angle feedback timeout'):
+                runner._check()
+
+
 class PreflightContractTests(unittest.TestCase):
     def test_active_axes_include_continuous_and_ignore_disabled_and_legacy_pump(self):
         self.assertEqual(involved_axes([{'X': {'enable': 'E'}, 'pump': {'enable': True}},
@@ -422,6 +532,7 @@ class PreflightContractTests(unittest.TestCase):
     def test_separation_rejects_angle_jumps_and_stale_stream(self):
         runner = AutomationPreflight(lambda command: True, lambda: None, lambda axes: {}, lambda: None)
         runner.travel = {'axis': 'X', 'angle': 10, 'at': time.monotonic(), 'degrees': 0, 'base_degrees': 0, 'rpm': 5,
+                         'target_degrees': 114.0, 'tolerance': 0.5,
                          'progress_at': time.monotonic(), 'progress_degrees': 0}
         runner.notify_angles({'X': 100})
         self.assertIsInstance(runner.error, PreflightError)
