@@ -122,7 +122,7 @@ class PreflightWorkerTests(unittest.TestCase):
         moves = [float(delta) for command in self.commands
                  for delta in re.findall(r'AEFR([\d.]+)P', command) if float(delta) > 0]
         self.assertAlmostEqual(sum(moves), 3600)
-        self.assertTrue(all(delta <= 120 for delta in moves))  # PIDQUERY: 1 rpm floor, 20 s travel
+        self.assertEqual(moves, [360.0] * 10)
         self.assertFalse(any('J' in command for command in self.commands))
         self.node.automation_engine.start.assert_called_once()
 
@@ -140,9 +140,9 @@ class PreflightWorkerTests(unittest.TestCase):
         self.join()
         moves = [float(delta) for command in self.commands
                  for delta in re.findall(r'AEFR([\d.]+)P', command)]
-        self.assertEqual(len(moves), 30)
+        self.assertEqual(len(moves), 2)
         self.assertEqual(sum(moves), 360)
-        self.assertTrue(all(delta <= 12 for delta in moves))
+        self.assertEqual(moves, [216.0, 144.0])  # 360 s travel at the 0.1 rpm floor
         self.node.automation_engine.start.assert_called_once()
 
     def test_separation_ack_and_angles_cannot_replace_each_pid_done(self):
@@ -150,22 +150,22 @@ class PreflightWorkerTests(unittest.TestCase):
         self.assertTrue(self.start()[0])
         self.wait_phase('separating')
         preparation = self.node._preflight
-        for step in (30, 30, 30, 24):
+        for step in [30] * 12:
             with preparation.lock:
                 preparation.travel['at'] -= step / 48
                 angle = (preparation.travel['angle'] + step) % 360
             self.node._on_angle_received({'A': angle})
-        self.assertEqual(self.commands.count('AEFR114.000P0.1'), 1)
+        self.assertEqual(self.commands.count('AEFR360.000P0.1'), 1)
         self.node.automation_engine.start.assert_not_called()
-        self.node._on_text_received('PID_DONE:A,abs=120,err=0')
+        self.node._on_text_received('PID_DONE:A,abs=360,err=0')
         deadline = time.monotonic() + 1
-        while self.commands.count('AEFR114.000P0.1') < 2 and time.monotonic() < deadline:
+        while self.commands.count('AEFR360.000P0.1') < 2 and time.monotonic() < deadline:
             time.sleep(0.005)
-        self.assertEqual(self.commands.count('AEFR114.000P0.1'), 2)
+        self.assertEqual(self.commands.count('AEFR360.000P0.1'), 2)
         self.assertTrue(self.node._auto_stop_callback(None).success)
         self.join()
         stopped_at = self.commands.index('STOPALL')
-        self.node._on_text_received('PID_DONE:A,abs=240,err=0')
+        self.node._on_text_received('PID_DONE:A,abs=720,err=0')
         self.assertFalse(any('AEFR' in cmd for cmd in self.commands[stopped_at:]))
         self.assertFalse(self.node.inject_pump_enabled)
         self.node.automation_engine.start.assert_not_called()
@@ -180,14 +180,30 @@ class PreflightWorkerTests(unittest.TestCase):
         self.assertNotIn('PUMP:SET:60', self.commands)
         self.node.automation_engine.start.assert_not_called()
 
+    def test_extended_firmware_settling_timeout_still_stops_and_retains_reason(self):
+        self.block_phase = 'compensating'
+        self.assertTrue(self.start()[0])
+        self.wait_phase('compensating')
+        self.node._on_text_received('PID_SETTLE:X,err=9.9,elapsed_ms=100000')
+        self.assertEqual(self.node._preflight.pending, {'X', 'Z'})
+        self.node._on_text_received(
+            'PID_TIMEOUT:X,abs=359.7,err=0.3,phase=settling,elapsed_ms=280000,settle_ms=180000')
+        self.join()
+        self.node._on_text_received('PID_DONE:X,abs=360,err=0.01')
+        self.assertEqual(self.status()['terminal_reason'], 'pid_timeout')
+        self.assertIn('phase=settling', self.node.last_automation_failure['reason'])
+        self.assertIn('STOPALL', self.commands)
+        self.assertNotIn('PUMP:SET:60', self.commands)
+        self.node.automation_engine.start.assert_not_called()
+
     def test_full_order_relative_zero_full_turns_then_injection_then_engine(self):
         saved = Path(self.node.calibration_file).read_bytes()
         self.assertTrue(self.start()[0])
         self.join()
-        self.assertEqual(self.phases, ['homing', 'compensating'] + ['separating'] * 7)
+        self.assertEqual(self.phases, ['homing', 'compensating'] + ['separating'] * 2)
         self.assertIn('XEBR27.000P0.1ZEBR135.000P0.1', self.commands)
         self.assertIn('XEFR360.000P0.1ZEFR360.000P0.1', self.commands)
-        self.assertLess(self.commands.index('AEFR114.000P0.1'), self.commands.index('PUMP:SET:60'))
+        self.assertLess(self.commands.index('AEFR360.000P0.1'), self.commands.index('PUMP:SET:60'))
         self.assertEqual(self.node._preflight.snapshot()['travel_degrees'], 720)
         self.node.automation_engine.start.assert_called_once()
         self.assertEqual(saved, Path(self.node.calibration_file).read_bytes())
@@ -403,7 +419,7 @@ class PreflightWorkerTests(unittest.TestCase):
 
 
 class SeparationPIDSettlingTests(unittest.TestCase):
-    def run_separation(self, *, done=True, turns=5.0, position=None):
+    def run_separation(self, *, done=True, turns=5.0, position=None, finish_at=14):
         clock = [100.0]
         raw = {'A': 350.0}
         move = {}
@@ -439,11 +455,11 @@ class SeparationPIDSettlingTests(unittest.TestCase):
                 degrees = target * elapsed / 8
             else:
                 degrees = target + (0.2 if int(elapsed * 4) % 2 else -0.2)
-            if done and elapsed >= 14:
+            if done and elapsed >= finish_at and position is None:
                 degrees = target
             raw['A'] = (move['start'] + degrees) % 360
             runner.notify_angles(raw)
-            if done and elapsed >= 14:
+            if done and elapsed >= finish_at:
                 completions.append(target)
                 runner.notify_text('PID_DONE:A,abs=%.2f,err=0.00' % target)
 
@@ -460,7 +476,7 @@ class SeparationPIDSettlingTests(unittest.TestCase):
         self.assertEqual(runner.snapshot()['phase'], 'complete')
         self.assertAlmostEqual(runner.snapshot()['travel_degrees'], 1800.0)
         self.assertAlmostEqual(sum(completions), 1800.0)
-        self.assertEqual(len(completions), 16)
+        self.assertEqual(len(completions), 5)
         self.assertFalse(any('J' in command for command in commands))
 
     def test_at_target_without_done_still_reaches_pid_timeout(self):
@@ -470,18 +486,24 @@ class SeparationPIDSettlingTests(unittest.TestCase):
 
     def test_stall_short_of_target_keeps_forward_progress_timeout(self):
         with self.assertRaisesRegex(PreflightError, 'no verified forward progress'):
-            self.run_separation(position=lambda elapsed, target: min(target * elapsed / 8, target / 2))
+            self.run_separation(done=False, position=lambda elapsed, target: min(target * elapsed / 8, target / 2))
 
-    def test_large_overshoot_is_not_treated_as_target_settling(self):
-        with self.assertRaisesRegex(PreflightError, 'no verified forward progress'):
-            self.run_separation(position=lambda elapsed, target: min(target * elapsed / 8, target + 1))
+    def test_overshoot_can_settle_but_still_requires_real_done(self):
+        with self.assertRaises(PreflightError) as caught:
+            self.run_separation(done=False, position=lambda elapsed, target: min(target * elapsed / 8, target + 1))
+        self.assertEqual(caught.exception.reason, 'pid_timeout')
+
+    def test_real_done_after_long_settling_releases_each_segment(self):
+        runner, _, completions = self.run_separation(finish_at=150)
+        self.assertEqual(runner.snapshot()['phase'], 'complete')
+        self.assertEqual(completions, [360.0] * 5)
 
     def test_small_segment_uses_its_existing_five_percent_travel_tolerance(self):
         runner, _, completions = self.run_separation(
             turns=0.01, position=lambda elapsed, target: min(target * elapsed / 8, target - 0.16))
         self.assertEqual(runner.snapshot()['phase'], 'complete')
         self.assertAlmostEqual(sum(completions), 3.6)
-        with self.assertRaisesRegex(PreflightError, 'no verified forward progress'):
+        with self.assertRaisesRegex(PreflightError, 'without verified separation travel'):
             self.run_separation(
                 turns=0.01, position=lambda elapsed, target: min(target * elapsed / 8, target - 0.20))
 

@@ -11,14 +11,14 @@ from measurement_fixtures import prepare_measurement
 
 class TimeoutBudgetTests(unittest.TestCase):
     def test_engine_allows_delayed_done_but_still_has_absolute_deadline(self):
-        for finish_at in (90, None):
+        for finish_at in (590, None):
             with self.subTest(finish_at=finish_at):
                 engine = AutomationEngine(Mock(), Mock(return_value=True), Mock())
                 engine._running.set()
                 engine._pending_pid_motors = {'X'}
                 now = [0.0]
                 def tick(timeout):
-                    now[0] += 30
+                    now[0] += 10
                     if finish_at is not None and now[0] >= finish_at:
                         engine.notify_pid_complete('X')
                 engine._pid_complete_event = Mock()
@@ -28,7 +28,7 @@ class TimeoutBudgetTests(unittest.TestCase):
                     self.assertEqual(engine._wait_for_pid_complete(), finish_at is not None)
                 if finish_at is None:
                     self.assertTrue(engine._failed)
-                    self.assertIn('120s', engine._last_error)
+                    self.assertIn('610s', engine._last_error)
 
     def test_preflight_waits_for_real_done_after_old_deadline(self):
         runner = AutomationPreflight(Mock(), Mock(), Mock(), Mock())
@@ -36,13 +36,13 @@ class TimeoutBudgetTests(unittest.TestCase):
         now = [0.0]
         def tick(_timeout):
             now[0] += 30
-            if now[0] >= 90:
+            if now[0] >= 570:
                 runner.notify_text('PID_DONE:X')
         runner.changed = Mock()
         runner.changed.wait.side_effect = tick
         with patch('scripts.lib.automation_preflight.time.monotonic', side_effect=lambda: now[0]):
             runner.pid_moves({'X': (360.0, 'F')}, 0.1)
-        self.assertEqual(now[0], 90)
+        self.assertEqual(now[0], 570)
 
     def test_oil_startup_slack_still_rejects_stall_and_missing_angles(self):
         runner = AutomationPreflight(Mock(), Mock(), Mock(), Mock())
@@ -51,8 +51,11 @@ class TimeoutBudgetTests(unittest.TestCase):
                          'rpm': 5, 'progress_at': 0.0, 'progress_degrees': 0}
         with patch('scripts.lib.automation_preflight.time.monotonic', return_value=3.0):
             runner._check()  # Old 2-second no-progress deadline rejected this.
-        runner.travel['at'] = 5.1
-        with patch('scripts.lib.automation_preflight.time.monotonic', return_value=5.1):
+        runner.travel['at'] = 119.9
+        with patch('scripts.lib.automation_preflight.time.monotonic', return_value=119.9):
+            runner._check()
+        runner.travel['at'] = 120.1
+        with patch('scripts.lib.automation_preflight.time.monotonic', return_value=120.1):
             with self.assertRaisesRegex(PreflightError, 'forward progress'):
                 runner._check()
         runner.travel.update(at=0.0, progress_at=1.1)
@@ -71,12 +74,68 @@ class TimeoutBudgetTests(unittest.TestCase):
         runner.pid_moves = Mock(side_effect=finish)
         runner.run([], {}, {'oil_axis': 'A', 'separation_turns': 1, 'separation_rpm': 5}, 0.1, None)
         segments = [call for call in runner.pid_moves.call_args_list if call.kwargs.get('before_send')]
-        self.assertEqual(len(segments), 4)
-        self.assertTrue(all(call.kwargs['timeout'] == 30.0 for call in segments))
+        self.assertEqual(len(segments), 1)
+        self.assertTrue(all(call.kwargs['timeout'] == 610.0 for call in segments))
+
+    def test_settling_latches_at_ten_degrees_and_allows_reverse_correction(self):
+        runner = AutomationPreflight(Mock(), Mock(), Mock(), Mock())
+        runner.travel = {'axis': 'A', 'at': 100.0, 'degrees': 350.0,
+                         'target_degrees': 360.0, 'tolerance': 0.5, 'progress_at': 0.0}
+        with patch('scripts.lib.automation_preflight.time.monotonic', return_value=100.0):
+            runner._check()
+        runner.travel.update(at=250.0, degrees=348.0)
+        with patch('scripts.lib.automation_preflight.time.monotonic', return_value=250.0):
+            runner._check()  # Firmware's settling deadline now owns the decision.
+
+    def test_extremely_slow_travel_accumulates_across_quantized_repeats(self):
+        runner = AutomationPreflight(Mock(), Mock(), Mock(return_value={'A': 0}), Mock())
+        runner.travel = {'axis': 'A', 'angle': 0.0, 'at': 0.0, 'degrees': 0.0,
+                         'base_degrees': 0.0, 'target_degrees': 360.0, 'rpm': 1.0,
+                         'tolerance': 0.5, 'progress_at': 0.0, 'progress_degrees': 0.0}
+        for second in range(1, 591):
+            with patch('scripts.lib.automation_preflight.time.monotonic', return_value=float(second)):
+                # 0.002 deg/s with 14-bit encoder quantization: far below 0.1 rpm.
+                runner.notify_angles({'A': round(second * .002 / (360 / 16384)) * (360 / 16384)})
+                runner._check()
+        self.assertGreater(runner.travel['degrees'], 1.1)
+
+    def test_firmware_settle_notice_is_axis_scoped_and_never_completes_move(self):
+        runner = AutomationPreflight(Mock(), Mock(), Mock(), Mock())
+        runner.travel = {'axis': 'A', 'settling': False}
+        runner.expected = {'A': (360, 'F')}
+        runner.pending = {'A'}
+        runner.notify_text('PID_SETTLE:A,err=10.00,elapsed_ms=100000')
+        self.assertFalse(runner.travel['settling'])  # No matching start yet.
+        runner.notify_text('PID_START:A,delta=360.0,dir=F')
+        runner.notify_text('PID_SETTLE:Y,err=10.00,elapsed_ms=100000')
+        self.assertFalse(runner.travel['settling'])
+        runner.notify_text('PID_SETTLE:A,err=10.00,elapsed_ms=100000')
+        self.assertTrue(runner.travel['settling'])
+        self.assertEqual(runner.pending, {'A'})
+        runner.notify_text('PID_TIMEOUT:A,abs=359.7,err=0.3,phase=settling,elapsed_ms=280000,settle_ms=180000')
+        self.assertEqual(runner.error.reason, 'pid_timeout')
+        self.assertEqual(runner.pending, {'A'})
 
 
 class SpectroTimeoutBudgetTests(unittest.TestCase):
     setUp = field.FieldTransactionTests.setUp
+
+    def test_default_pid_budget_and_parameter_validation(self):
+        self.assertEqual(self.node.pid_wait_timeout, 610.0)
+        self.assertEqual(self.node.automation_engine.PID_WAIT_TIMEOUT, 610.0)
+        original = self.module.rospy.get_param
+        for value in (610.0, 1800.0, 1800.1, 0.0, float('nan')):
+            with self.subTest(value=value):
+                def param(name, default=None):
+                    return value if name == '/automation/pid_wait_timeout' else original(name, default)
+                with patch.object(self.module.rospy, 'get_param', side_effect=param), \
+                        patch.object(self.module, 'InjectionPumpWorker', return_value=None):
+                    if value in (610.0, 1800.0):
+                        node = self.module.PumpControlNode()
+                        self.assertEqual(node.automation_engine.PID_WAIT_TIMEOUT, value)
+                    else:
+                        with self.assertRaises(ValueError):
+                            self.module.PumpControlNode()
 
     def test_short_gap_invalidates_data_without_aborting_then_long_gap_stops(self):
         self.node.sampling_context = {'attempt_id': 'stale-owner'}

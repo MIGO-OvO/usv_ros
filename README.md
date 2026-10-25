@@ -46,7 +46,7 @@ powershell -NoProfile -File .\src\usv_ros\scripts\download_jetson_logs.ps1 -User
 ```
 
 Windows 需要 OpenSSH Client（`scp`）。该入口下载已经由 `usvlogs pack` 生成的包，不会远程启动设备、打包或清理。
-- 离线验证：`python -B tests/run_non_map_tests.py`。地图测试按要求跳过，设备烧录、Jetson/台架/实船验收由操作者执行；ROS 等待延长不解除检测板独立 30 秒 PID 限时。
+- 离线验证：`python -B tests/run_non_map_tests.py`。地图测试按要求跳过，设备烧录、Jetson/台架/实船验收由操作者执行；PID 分阶段超时需要同步更新 ROS 和检测板固件。
 
 ## safety1 成套升级注意
 
@@ -92,12 +92,13 @@ TCP 每轮发送预算仍为 30 ms，从收包处理结束后计时。尚未写�
 
 回归：`python -B -m pytest tests/test_spectrometer_cold_start.py tests/test_field_transactions.py tests/test_terminal_reasons.py`；前端：`cd frontend && node --test scripts/test-spectrometer-diagnostics.mjs`。部署时更新前端构建产物并重启 `pump_control_node`、`web_config_server`；本次没有更改串口协议或固件。实机验收：冷上电一次启动、前两次瞬时 I2C 失败的同次点击恢复、配置失败显示、串口拔插、首帧延迟/缺失、运行断流及物理输出停止。
 
-### 2026-10-19 采样超时热修复（仅 ROS）
+### PID 分阶段超时与采样等待
 
-- 正式步骤和 preflight 共用 `/automation/pid_wait_timeout`（默认 120 秒，可用节点私有 `~pid_wait_timeout` 覆盖，范围 1–600 秒）。现在配置实际生效，且等待使用单调时钟；必须收到 `PID_DONE` 才算完成。**检测板仍有独立的 30 秒 `PID_MOVE_TIMEOUT`；收到板端 `PID_TIMEOUT/PID_FAIL` 仍立即失败，本补丁不能解除该固件限制。**
+- DetFirmware `2026.10.25-pid-phases1` 每轴单次 PID 总上限为 600 秒。首次进入剩余解环误差 10° 以内后，另计 180 秒收敛时间，两项期限先到者生效。进入 1°、回摆或其他轴完成都不重置时钟；小行程从首次控制周期开始收敛计时。0.1° 预处理定位精度和真实 `PID_DONE` 要求不变。
+- 正式步骤、独立回零和 preflight 共用 `/automation/pid_wait_timeout`（默认 610 秒，节点私有 `~pid_wait_timeout` 可覆盖，范围 1～1800 秒）。主机使用单调时钟，并给固件总上限留 10 秒回传余量；`PID_TIMEOUT/PID_FAIL` 仍立即失败。已有私有参数若小于 610 秒，仍会提前结束主机等待。旧固件保留 30 秒限时，部署时必须同步更新检测板。
 - 新分光平均样本等待默认 10 秒；冷、暖启动首帧至少等 4 秒。运行断流 2 秒仍置数据无效，不用旧值完成步骤；断流超过 `spectro_stale_stop_timeout`（默认 10 秒，launch 可覆盖，最大 60 秒）才终止整次任务。该恢复窗口内输出可能继续运行；不是对无效测量的放行。明确的控制器故障、失联、owner 丢失和停止路径不变。
-- 油相分隔在段目标范围外连续 5 秒无净正向进展时失败；进入段目标的 `min(0.5°, 段角度 × 5%)` 范围后，允许 PID 小幅往返收敛，仍须收到真实 `PID_DONE` 并核验角度行程。每段继续受 ROS 等待预算与板端单次 30 秒限时约束；角度反馈中断超过 1 秒、跳变或传感器异常仍立即结束准备。系统日志的 `Preflight failed` 行记录 attempt、阶段和具体原因，便于区分进展超时、反馈过期和固件故障。
-- 离线回归：`python -B -m unittest discover -s tests -p test_sampling_timeout_budget.py`。跳过地图测试；Jetson/台架/实船验收由操作者执行，建议先小剂量验证停止和恢复行为。停止系统后执行 `usvdeploy` 更新并重启，用现场终态区分 ROS 等待超时与板端 `PID_TIMEOUT`。
+- 油相行程阶段允许 120 秒无净正向进展，累计前进至少 0.1° 才更新进展时钟。首次进入剩余 10° 或收到本轴匹配运动的 `PID_SETTLE` 后，不再要求持续正向运动，由固件收敛期限和主机总等待兜底；真实 `PID_DONE` 与最终行程核验仍为必需。角度反馈中断超过 1 秒、跳变或传感器异常仍结束准备。日志保留 `PID_START`、`PID_SETTLE`；板端超时带 `phase=total|settling`、总耗时和收敛耗时，`Preflight failed` 记录 attempt 与任务阶段。
+- 离线回归：`python -B -m unittest discover -s tests -p test_sampling_timeout_budget.py`。台架先验证 STOP、断线与低负载慢速运行，再检查进入 10° 后的实际收敛耗时。停止系统后更新 ROS 并烧录匹配固件，重启后核对板端版本与 PID 等待参数；Agent 离线测试不包含烧录或实机运行。
 
 [![ROS Noetic](https://img.shields.io/badge/ROS-Noetic-22314E?logo=ros&logoColor=white)](https://wiki.ros.org/noetic)
 [![Python](https://img.shields.io/badge/Python-3.8-3776AB?logo=python&logoColor=white)](https://www.python.org/)
@@ -622,10 +623,10 @@ sudo USV_BOOT_START_NOW=true USV_STRICT_SELF_CHECK=false ./src/usv_ros/scripts/i
 
 1. 自动统计本次 steps 中 `enable: "E"` 的 X/Y/Z/A（包括连续转动步骤）。
 2. 各相关轴以最短路径回到**预先保存的相对零点**，随后全部正转 360° 补偿液体位移。使用相对 `R` 指令，分别等待匹配的 `PID_START`、`CMD_OK` 和各轴 `PID_DONE`；不会发送归绝对 0° 的 `CAL` 或改写零点。归位、360° 补偿及油相分隔的独立定位容差固定为 0.1°，覆盖 MT6701 的 14-bit 量化步长 `360/16384 ≈ 0.022°` 及少量噪声；正式步骤仍使用用户指定的 PID 精度。
-3. 油相泵按配置额外正转分隔圈数，使用与回零、360° 补偿相同的相对角度 `R/PID`。启动时 `PIDQUERY` 读取设备实际速度上下限，按 `PIDPARAM` 的一位小数精度取保守最低速度 `max(0.1, out_min - 0.05)` rpm，每段角度不超过该速度对应的 20 秒行程且最多 360°，为板端 30 秒限时留出启动和收敛余量。每段均等待匹配的 `PID_START`、`CMD_OK`、真实 `PID_DONE`，并核验角度解环行程，之后才发送下一段。不在 steps 中的油相轴也执行同样核验。主机每段行程容差为 `min(0.5°, 段角度 × 5%)`，PID 定位容差仍为 0.1°。分隔阶段不发送开环 `J` 指令。
+3. 油相泵按配置额外正转分隔圈数，使用与回零、360° 补偿相同的相对角度 `R/PID`。启动时 `PIDQUERY` 读取设备实际速度上下限，按 `PIDPARAM` 的一位小数精度取保守最低速度 `max(0.1, out_min - 0.05)` rpm，每段角度不超过该速度对应的 360 秒行程且最多 360°，在板端 600 秒总上限内预留 180 秒收敛与 60 秒启动余量。最低速度为 1 rpm 时五圈分为五段；0.1 rpm 时每段最多 216°。每段均等待匹配的 `PID_START`、`CMD_OK`、真实 `PID_DONE`，并核验角度解环行程，之后才发送下一段。不在 steps 中的油相轴也执行同样核验。主机每段行程容差为 `min(0.5°, 段角度 × 5%)`，PID 定位容差仍为 0.1°。分隔阶段不发送开环 `J` 指令。
 4. 按进样泵任务策略预启动，确认 `PUMP_OK:SET=…,ON` 并等待 lead time；完成后才启动正式序列。受管进样在归位前先确认 OFF。Web 直接启动仍按其 automation 策略；trigger 发起的 Survey 每次采样将进样策略纳入同一准备事务，使用已配置联动速度和 lead time。Survey 启动/停止广播不会控制硬件，每次采样结束停机，间隔期间进样关闭；Survey 停止按 attempt 清理整个采样事务，不影响新 owner。
 
-当前 DetFirmware 的 `0xCC` 角度帧没有有效位或源时间戳；传感器失效时会重复 last_valid，`ANGLE_AGE_CH_MS=0` 也不能单独证明有效。Preflight 使用逐轴 monotonic 接收时刻（1 秒断流预算）、有限/范围校验、通道 age 和独立健康包时间戳（2.5 秒预算，重复/倒退不续约，支持 uint32 回绕）。油相运动需在 5 秒内产生至少 0.1° 的净正向进展；相同帧或在固定位置附近抖动不能续约进展计时。以上检测失败均停止输出；这些有界软件门禁仍须台架验证机械停机延迟。
+当前 DetFirmware 的 `0xCC` 角度帧没有有效位或源时间戳；传感器失效时会重复 last_valid，`ANGLE_AGE_CH_MS=0` 也不能单独证明有效。Preflight 使用逐轴 monotonic 接收时刻（1 秒断流预算）、有限/范围校验、通道 age 和独立健康包时间戳（2.5 秒预算，重复/倒退不续约，支持 uint32 回绕）。油相行程阶段需在 120 秒内累计至少 0.1° 的净正向进展；相同帧或固定位置附近的小抖动不能续约计时。进入收敛后允许反向纠偏，角度与健康新鲜度检查继续生效。以上检测失败均停止输出；机械停机延迟需台架测量。
 
 `automation_start` 返回本次 `attempt_id` 与 `admission`：`rejected` 表示未准入，`owned` 表示泵节点已接管该 attempt；RPC 异常或身份不匹配按 `unknown` 处理。启动失败首因保留在 QGC 关联结果、日志、`sampling_result` 与采样记录中，清理另存 `cleanup_result`。明确未准入仍登记取消，阻止迟到 START；未知结果按 attempt 核验，当前 owner 匹配才执行停止，其他 owner 不受影响。`not_admitted/not_owned` 表示已登记取消且当前无本 attempt 的输出归属；`superseded` 表示其他 owner 已接管；`stopped` 才表示本 attempt 停止确认成功。航行 Manual 与泵手动模式独立，泵手动模式、控制器故障、忙碌和非法配置分别返回具体原因。
 
@@ -647,7 +648,7 @@ Survey 启动 RPC 与 31011/31016 停止及收尾共用独立事务锁，STOP �
 
 默认圈数为 0（跳过分隔，油相轴可为空）；启用分隔时圈数为 0.01–10，轴可独立于 steps 中的相关泵选择。旧 `separation_rpm` 字段继续读写以兼容已有配置，不参与运动。设备 `out_min` 范围为 0.1–5 rpm，`out_max` 为 1–20 rpm，且最低值须不大于最高值；固件默认值为 1/6 rpm，以实际 `PIDPARAM` 为准。`R` 使用 `computePIDDirect`，大误差时可达当前 `out_max`，未使用另一条平滑启动算法；ROS 不覆盖设备 PID 参数，起转能力与负载下的最低速度仍需台架确认。零点复用 `calibration.json` 的 `offsets`，可通过 `GET/POST /api/calibration/offsets` 读取/保存原始角度，范围为 `[0, 360)`。新增 `configured_axes` 区分未设零与显式保存的 0°；无此标记的旧文件只兼容非 0° 的已保存 offset，默认 0° 无法证明曾标定，须在 Web 明确保存确认。读旧文件不会重新设零或改写文件。未保存过相关轴零点时任务失败，不回退到绝对 0°。泵节点可用私有参数 `~calibration_file` 指定同一零点文件。启动和保存请求的部分 `pump_settings` 先递归合并，再校验完整配置，未提供的 PID、进样及分隔参数保持原值；无效请求回滚且不分派启动。
 
-任一步骤 ACK/PID 超时、角度无效/断流、owner 丢失、watchdog 或串口故障均走现有停泵和终态清理；清理失败继续锁存故障。PID 算法、正式步骤等待、安全租约与串口恢复协议保持原有行为；GPS 仅作为可选记录位置，详见下文。部署时成套更新并重启 pump、trigger、Web，含 `static/dist`。
+任一步骤 ACK/PID 超时、角度无效/断流、owner 丢失、watchdog 或串口故障均走现有停泵和终态清理；清理失败继续锁存故障。PID 控制算法、安全租约与串口恢复协议保持原有行为；GPS 仅作为可选记录位置，详见下文。分阶段限时需要同步更新 ROS 与 DetFirmware；前端无需为此重建。
 
 回归：`python -B -m pytest tests/test_preflight_stop_races.py tests/test_preflight_review_regressions.py tests/test_automation_preflight.py tests/test_preflight_web_contract.py tests/test_system_safety_contract.py tests/test_terminal_reasons.py tests/test_sampling_cleanup_ownership.py`；前端：`cd frontend && npm run test:automation-controls && npm run build`。实机仍需在 Jetson/ESP32 台架确认：非 0° 相对零点、补偿方向及液体位移、跨 0° 的多圈分隔、拔除角度传感器/冻结反馈后的有界停机、PID 速度上下限、分段衔接和小圈数容差、两轮 Survey 进样顺序、0.1° 定位稳定性、启动/停止并发与立即重启，以及每阶段停止/拔串口后的物理输出停止、STOPALL 确认延迟和 QGC 失败 ACK/FAILED 状态。
 

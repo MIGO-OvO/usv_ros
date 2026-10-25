@@ -51,7 +51,11 @@ class CalibrationLifecycleTests(unittest.TestCase):
             time.sleep(0.001)
 
     def test_saved_nonzero_shortest_moves_and_all_axes_must_complete(self):
+        before = time.monotonic()
         self.start()
+        self.assertEqual(self.node._calibration_preflight.PID_TIMEOUT, 610.0)
+        self.assertGreaterEqual(self.node._calibration['deadline'], before + 615.0)
+        self.assertLessEqual(self.node._calibration['deadline'], time.monotonic() + 615.0)
         self.assertIn('XEBR27.000P0.1YEFR40.000P0.1ZEBR135.000P0.1AEFR0.000P0.1', self.commands)
         self.assertFalse(any(cmd.startswith('CAL') or 'R360' in cmd or cmd.startswith('PUMP:SET') for cmd in self.commands))
         for axis in 'XYZ':

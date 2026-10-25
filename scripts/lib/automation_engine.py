@@ -37,7 +37,7 @@ class AutomationEngine(object):
     """
 
     # PID 等待超时时间 (秒)
-    PID_WAIT_TIMEOUT = 120.0
+    PID_WAIT_TIMEOUT = 610.0
 
     def __init__(self, command_generator, send_command_func, log_func=None):
         """

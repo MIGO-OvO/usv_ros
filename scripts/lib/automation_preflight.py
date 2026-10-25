@@ -98,9 +98,10 @@ class AutomationPreflight:
     # for quantization/noise, independent of the formal step PID setting.
     PID_PRECISION_DEG = 0.1
     ACK_TIMEOUT = 2.0
-    PID_TIMEOUT = 120.0
+    PID_TIMEOUT = 610.0  # Firmware 600 s ceiling plus serial/result delivery margin.
     ANGLE_TIMEOUT = 1.0
-    PROGRESS_TIMEOUT = 5.0
+    PROGRESS_TIMEOUT = 120.0
+    PID_SETTLE_ZONE_DEG = 10.0
     SEPARATION_TOLERANCE_DEG = 0.5
 
     def __init__(self, send, check_active, angles, publish):
@@ -159,9 +160,9 @@ class AutomationPreflight:
                     raise PreflightError('controller_fault', 'Oil pump angle feedback timeout')
                 # PID may reverse or hold near the target while settling. The
                 # move deadline and real PID_DONE still gate completion there.
-                outside_target = (abs(self.travel['target_degrees'] - self.travel['degrees'])
-                                  > self.travel['tolerance'])
-                if outside_target and now - self.travel['progress_at'] > self.PROGRESS_TIMEOUT:
+                if abs(self.travel['target_degrees'] - self.travel['degrees']) <= self.PID_SETTLE_ZONE_DEG:
+                    self.travel['settling'] = True
+                if not self.travel.get('settling', False) and now - self.travel['progress_at'] > self.PROGRESS_TIMEOUT:
                     raise PreflightError('controller_fault', 'Oil pump has no verified forward progress')
 
     def _wait(self, ready, timeout, reason, message):
@@ -216,6 +217,10 @@ class AutomationPreflight:
                         self.started.add(axis)
                     else:
                         self.error = PreflightError('controller_fault', 'Unexpected PID_START: ' + text)
+            if text.startswith('PID_SETTLE:') and self.travel:
+                axis = text[len('PID_SETTLE:'):].split(',')[0]
+                if axis == self.travel['axis'] and axis in self.pending and axis in self.started:
+                    self.travel['settling'] = True
             for prefix, reason in (('PID_DONE:', None), ('PID_TIMEOUT:', 'pid_timeout'),
                                    ('PID_FAIL:', 'pid_fail')):
                 if text.startswith(prefix):
@@ -244,6 +249,8 @@ class AutomationPreflight:
                     raise ValueError('Oil pump angle feedback jumped')
                 self.travel['degrees'] += delta
                 self.travel.update(angle=angle, at=now)
+                if abs(self.travel['target_degrees'] - self.travel['degrees']) <= self.PID_SETTLE_ZONE_DEG:
+                    self.travel['settling'] = True
                 # Net forward progress must exceed noise/quantization. Repeated
                 # frames or oscillation around one angle cannot renew this clock.
                 threshold = self.PID_PRECISION_DEG
@@ -304,10 +311,10 @@ class AutomationPreflight:
             axis = policy['oil_axis']
             goal = policy['separation_turns'] * 360.0
             # R uses the device PID speed limits, not the legacy fixed-J rpm.
-            # At the configured minimum speed, leave 10 s of the firmware's
-            # 30 s move deadline for startup and settling. Never exceed one turn.
+            # Reserve 180 s settling plus 60 s startup/slack under the device's
+            # 600 s ceiling. Limit each segment to 360 s travel and one turn.
             # PIDPARAM rounds to 0.1 rpm; account for its rounding interval.
-            segment_limit = min(360.0, max(0.1, min_rpm - 0.05) * 6.0 * 20.0)
+            segment_limit = min(360.0, max(0.1, min_rpm - 0.05) * 6.0 * 360.0)
             self.stage('separating', target_degrees=goal, travel_degrees=0.0)
             remaining, completed = goal, 0.0
             while remaining > 0.0005:
@@ -321,10 +328,11 @@ class AutomationPreflight:
                         self.travel = {'axis': axis, 'angle': raw[axis], 'at': now,
                                        'degrees': 0.0, 'rpm': max_rpm, 'base_degrees': completed,
                                        'target_degrees': segment, 'tolerance': tolerance,
+                                       'settling': segment <= self.PID_SETTLE_ZONE_DEG,
                                        'progress_at': now, 'progress_degrees': 0.0}
                 try:
                     self.pid_moves({axis: (segment, 'F')}, precision,
-                                   before_send=arm_travel, timeout=min(self.PID_TIMEOUT, 30.0))
+                                   before_send=arm_travel, timeout=self.PID_TIMEOUT)
                     # PID_DONE is required above. Also allow the angle stream
                     # up to one second to catch up with the final PID packet.
                     self._wait(lambda: self.travel['degrees'] >= segment - tolerance,

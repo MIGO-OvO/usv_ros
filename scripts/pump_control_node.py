@@ -538,9 +538,9 @@ class PumpControlNode(object):
         self.auto_injection_retry_delay = float(rospy.get_param('~auto_injection_retry_delay', 0.2))
         self.spectro_sample_wait_timeout = float(rospy.get_param('~spectro_sample_wait_timeout', 10.0))
         self.pid_wait_timeout = float(rospy.get_param(
-            '~pid_wait_timeout', rospy.get_param('/automation/pid_wait_timeout', 120.0)))
-        if not math.isfinite(self.pid_wait_timeout) or not 1.0 <= self.pid_wait_timeout <= 600.0:
-            raise ValueError('pid_wait_timeout must be finite and in [1, 600] seconds')
+            '~pid_wait_timeout', rospy.get_param('/automation/pid_wait_timeout', 610.0)))
+        if not math.isfinite(self.pid_wait_timeout) or not 1.0 <= self.pid_wait_timeout <= 1800.0:
+            raise ValueError('pid_wait_timeout must be finite and in [1, 1800] seconds')
 
         self.i2c_mapping = rospy.get_param('~i2c_mapping', rospy.get_param('/i2c_mapping', DEFAULT_I2C_MAPPING))
         self.spectro_config = rospy.get_param('~spectrometer', rospy.get_param('/spectrometer', DEFAULT_SPECTRO_CONFIG))
@@ -2334,7 +2334,7 @@ class PumpControlNode(object):
                 self._auto_stop_callback(None)
             return
         # 自动化运行时提升日志级别，便于排查 PID_DONE 等固件消息
-        if self.automation_engine.is_running():
+        if self.automation_engine.is_running() or text.startswith(('PID_START:', 'PID_SETTLE:')):
             rospy.loginfo("MCU text: %s", text)
         else:
             rospy.logdebug("MCU: %s", text)
