@@ -69,6 +69,7 @@ from automation_engine import AutomationEngine
 from injection_pump_worker import InjectionPumpWorker
 from automation_preflight import (AutomationPreflight, PreflightError, PreflightCancelled,
                                  normalize_preflight, involved_axes, load_zero_offsets)
+from runtime_hardware import CONFIG_FILE, hardware_to_pump_runtime_params
 
 # 串口协议常量
 HEADER1 = 0x55
@@ -101,6 +102,7 @@ SPECTRO_SERIAL_SETTLE_S = 0.5
 SPECTRO_INIT_ATTEMPTS = 3
 SPECTRO_RETRY_BACKOFF_S = 0.15
 SPECTRO_COLD_FIRST_FRAME_S = 4.0
+SERIAL_RECOVERY_INTERVAL_S = 5.0
 
 # 统一 terminal reason 枚举：自动化任务结束的唯一权威原因来源。
 # completed 仅由引擎正常跑完触发；其余终止路径都必须给出对应 reason。
@@ -545,12 +547,19 @@ class PumpControlNode(object):
         self.i2c_mapping = rospy.get_param('~i2c_mapping', rospy.get_param('/i2c_mapping', DEFAULT_I2C_MAPPING))
         self.spectro_config = rospy.get_param('~spectrometer', rospy.get_param('/spectrometer', DEFAULT_SPECTRO_CONFIG))
         self.angle_stream = rospy.get_param('~angle_stream', rospy.get_param('/angle_stream', DEFAULT_ANGLE_STREAM))
+        self._load_saved_hardware_config()
 
         # 串口连接
         self.serial_conn = None
         self.serial_reader = None
         self._serial_fault_connection = None
         self._last_control_keepalive = 0.0
+        self._watchdog_armed = False
+        self._watchdog_arming = False
+        self._serial_recovering = False
+        self._serial_recovery_error = None
+        self._next_serial_recovery_at = 0.0
+        self._recovery_requires_spectro_stop = False
         self.serial_lock = threading.RLock()
         self._control_lock = threading.RLock()
         self._action_cancel = threading.Event()
@@ -745,7 +754,13 @@ class PumpControlNode(object):
             return self._connect_locked(require_spectro_stop)
 
     def _connect_locked(self, require_spectro_stop=None):
+        prior_fault = bool(self._controller_fault or self._cleanup_failed)
+        recovery = prior_fault or self._serial_recovering or self.serial_conn is not None
+        self._recovery_requires_spectro_stop = bool(prior_fault or require_spectro_stop
+            or self.spectro_state in ('starting', 'acquiring', 'stale', 'stopping'))
         self.disconnect()
+        self._serial_recovering = True
+        self._controller_fault = self._controller_fault or 'reconnecting'
         connection = None
         try:
             connection = serial.Serial()
@@ -768,8 +783,6 @@ class PumpControlNode(object):
                 raise serial.SerialException('detector firmware lacks WATCHDOG1; update the matched firmware')
             with self.serial_lock:
                 self.serial_conn = connection
-                if self.serial_conn.write(b'WATCHDOG:ARM\r\n') != len(b'WATCHDOG:ARM\r\n'):
-                    raise serial.SerialException('incomplete watchdog ARM write')
                 self._serial_fault_connection = None
             self._last_control_keepalive = time.monotonic()
             self._start_keepalive_worker()
@@ -784,26 +797,62 @@ class PumpControlNode(object):
                 on_test=self._on_test_result_received,
                 on_spectro=lambda data: self._on_spectro_received(data, reader_connection),
                 on_health=self._on_health_received,
-                on_text=self._on_text_received,
+                on_text=lambda text: self._on_serial_text(text, reader_connection),
                 on_error=lambda error: self._on_serial_reader_error(error, reader_connection)
             )
+            return self._finish_serial_recovery(recovery)
 
-            recovery = bool(self._controller_fault or self._cleanup_failed)
-            if recovery:
-                # Transport recovery is not proof of output shutdown. Reuse the
-                # ordered STOP confirmation before allowing a new action owner.
-                if not self._confirm_all_outputs_stopped():
-                    raise serial.SerialException('recovery stop not confirmed')
-            # A fault recovery always verifies the ADS stop. A healthy
-            # maintenance reconnect only does so when an acquisition was
-            # active, so an idle/unconfigured ADS cannot block reconnecting.
-            if recovery or require_spectro_stop:
-                if not self._spectro_stop()[0]:
-                    raise serial.SerialException('spectrometer stop not confirmed')
-            self._controller_fault = None
+        except Exception as e:
+            if connection is not None and connection is not self.serial_conn:
+                connection.close()
+            self.disconnect()
+            self._controller_fault = self._controller_fault if self._controller_fault not in (None, 'reconnecting') else 'disconnected'
+            self._serial_recovery_error = str(e)
+            rospy.logerr("Failed to connect: %s", str(e))
+            self._publish_status("error: " + str(e))
+            return False
 
-            # Transport identity and configuration readiness are independent.
-            # Keepalive is already running throughout settling/ACK waits.
+    def _on_serial_text(self, text, connection):
+        if connection is self.serial_conn:
+            self._on_text_received(text)
+
+    def _finish_serial_recovery(self, recovery=True):
+        """Restore an idle session; a failed STOP leaves the UART available."""
+        self._serial_recovering = True
+        self._next_serial_recovery_at = time.monotonic() + SERIAL_RECOVERY_INTERVAL_S
+        try:
+            if not self._watchdog_armed:
+                self._watchdog_arming = True
+                try:
+                    # Drain any previous ARM reply before registering this ARM.
+                    ok, reply = self._send_and_wait_text('PIDQUERY', ('PIDPARAM:',), ('CMD_ERR:',))
+                    if not ok:
+                        raise RuntimeError('Watchdog reply barrier: ' + reply)
+                    ok, reply = self._send_and_wait_text('WATCHDOG:ARM', ('WATCHDOG_OK:ARM',), ('CMD_ERR:',))
+                    if not ok:
+                        raise RuntimeError('Watchdog ARM: ' + reply)
+                finally:
+                    self._watchdog_arming = False
+            if recovery and not self._confirm_all_outputs_stopped():
+                raise RuntimeError('STOPALL not confirmed')
+            if self._recovery_requires_spectro_stop:
+                for attempt in range(3):
+                    ok, reply = self._spectro_stop()
+                    if ok:
+                        break
+                    rospy.logwarn('Recovery ADSSTOP %d/3: %s', attempt + 1, reply)
+                    if attempt < 2:
+                        time.sleep(0.2)
+                if not ok:
+                    raise RuntimeError('ADSSTOP not confirmed: ' + reply)
+            with self.serial_lock:
+                if not self._watchdog_armed or self.serial_conn is self._serial_fault_connection:
+                    raise RuntimeError('Controller session lost during recovery')
+                self._controller_fault = None
+            self._release_confirmed_stop_latches()
+            self._serial_recovery_error = None
+            self._serial_recovering = False
+            self._recovery_requires_spectro_stop = False
             self._spectro_ready_after = time.monotonic() + SPECTRO_SERIAL_SETTLE_S
             self._spectro_cold_start_pending = True
             self._spectro_config_state = 'unconfigured'
@@ -813,23 +862,47 @@ class PumpControlNode(object):
             self.spectro_state = 'idle'
             self._ads_state = 0
             self._publish_status('serial_connected')
-            self._publish_automation_status(self._last_automation_status_text)
-            configured = self._apply_runtime_configuration()
-
-            rospy.loginfo("Serial connected: %s; spectrometer configuration: %s",
+            configured = (self._apply_runtime_configuration(allow_auto_start=False) if recovery
+                          else self._apply_runtime_configuration())
+            rospy.loginfo('Serial connected: %s; spectrometer configuration: %s',
                           self.serial_port, self._spectro_config_state)
             if not configured:
                 rospy.logwarn('Runtime initialization failed: %s', self._last_spectro_txn_error)
-            self._publish_automation_status(self._last_automation_status_text)
             return True
-
-        except Exception as e:
-            if connection is not None and connection is not self.serial_conn:
-                connection.close()
-            self.disconnect()
-            rospy.logerr("Failed to connect: %s", str(e))
-            self._publish_status("error: " + str(e))
+        except RuntimeError as exc:
+            self._serial_recovering = True
+            self._controller_fault = self._controller_fault or 'recovery_failed'
+            self._serial_recovery_error = str(exc)
+            self._publish_status('error: recovery pending: ' + str(exc))
+            rospy.logwarn('Serial recovery pending: %s; retry in %.0fs', exc, SERIAL_RECOVERY_INTERVAL_S)
             return False
+        finally:
+            self._publish_automation_status(self._last_automation_status_text)
+
+    def _retry_serial_connection(self):
+        if time.monotonic() < self._next_serial_recovery_at:
+            return
+        if not self._control_lock.acquire(blocking=False):
+            return
+        try:
+            disconnected = not self.serial_conn or not self.serial_conn.is_open
+            recover = disconnected or self._serial_recovering or self._controller_fault in (
+                'disconnected', 'reconnecting', 'watchdog_tripped', 'recovery_failed')
+            if recover:
+                self._next_serial_recovery_at = time.monotonic() + SERIAL_RECOVERY_INTERVAL_S
+                if not disconnected and self._serial_recovering and self.serial_conn is not self._serial_fault_connection:
+                    self._finish_serial_recovery()
+                else:
+                    self._reconnect_locked(None)
+            elif (not self._controller_fault and self._spectro_config_state == 'failed'
+                    and not self._automation_is_active() and not self._calibration.get('active')):
+                self._next_serial_recovery_at = time.monotonic() + SERIAL_RECOVERY_INTERVAL_S
+                if self._spectro_reply_sync_failed:
+                    self._reconnect_locked(None)
+                else:
+                    self._apply_runtime_configuration(allow_auto_start=False)
+        finally:
+            self._control_lock.release()
 
     def disconnect(self):
         """断开连接。"""
@@ -838,6 +911,7 @@ class PumpControlNode(object):
 
     def _disconnect_locked(self):
         with self.serial_lock:
+            self._watchdog_armed = False
             self._action_cancel.set()
             self._action_cancel = threading.Event()
             self._stop_cutoff = time.monotonic()
@@ -903,7 +977,7 @@ class PumpControlNode(object):
                     return
                 if not connection.is_open:
                     raise serial.SerialException('serial port closed')
-                if self._controller_fault:
+                if not self._watchdog_armed or (self._controller_fault and not self._serial_recovering):
                     continue
                 if connection.write(b'WATCHDOG:KEEPALIVE\r\n') != len(b'WATCHDOG:KEEPALIVE\r\n'):
                     raise serial.SerialException('incomplete watchdog keepalive write')
@@ -967,7 +1041,7 @@ class PumpControlNode(object):
             self.disconnect()
             if not rospy.is_shutdown() and self.connect():
                 rospy.loginfo("Recovered pump serial connection")
-            else:
+            elif self.serial_conn is None:
                 self._publish_status("disconnected")
 
     def _reconnect_callback(self, req):
@@ -1008,6 +1082,7 @@ class PumpControlNode(object):
             else:
                 self._controller_fault = None
 
+            self._serial_recovering = True
             if self.connect(require_spectro_stop=spectro_was_active):
                 msg = "Serial reconnected to %s @ %d; spectrometer configuration: %s" % (
                     self.serial_port, self.baudrate, self._spectro_config_state)
@@ -1016,9 +1091,9 @@ class PumpControlNode(object):
                 rospy.loginfo(msg)
                 return TriggerResponse(success=True, message=msg)
             else:
-                msg = "Failed to connect to %s" % self.serial_port
+                msg = "Controller recovery pending on %s: %s" % (self.serial_port, self._serial_recovery_error)
                 rospy.logerr(msg)
-                self._publish_status("disconnected")
+                self._publish_status('recovery_pending' if self.serial_conn else 'disconnected')
                 return TriggerResponse(success=False, message=msg)
 
         except Exception as e:
@@ -1026,6 +1101,31 @@ class PumpControlNode(object):
             rospy.logerr(msg)
             self._publish_status("error: " + str(e))
             return TriggerResponse(success=False, message=msg)
+
+    def _load_saved_hardware_config(self):
+        try:
+            with open(CONFIG_FILE, encoding='utf-8') as stream:
+                hw = json.load(stream).get('hardware', {})
+            if not hw:
+                return
+            mapping, spectrometer, angle_stream = hardware_to_pump_runtime_params(hw)
+            # An explicit launch port wins; the default uses the saved device.
+            if self.serial_port == '/dev/ttyUSB0':
+                self.serial_port = hw.get('pump_serial_port') or self.serial_port
+                self.baudrate = int(hw.get('pump_baudrate', self.baudrate))
+                self.timeout = float(hw.get('pump_timeout', self.timeout))
+            self.i2c_mapping = mapping
+            self.spectro_config = spectrometer
+            self.angle_stream = angle_stream
+            for name, value in (('serial_port', self.serial_port), ('baudrate', self.baudrate),
+                                ('timeout', self.timeout), ('i2c_mapping', mapping),
+                                ('spectrometer', spectrometer), ('angle_stream', angle_stream)):
+                rospy.set_param('~' + name, value)
+            rospy.loginfo('Loaded saved hardware before serial open: %s', self.serial_port)
+        except FileNotFoundError:
+            pass
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            rospy.logwarn('Saved hardware configuration not loaded: %s', exc)
 
     def _resolve_lower_device_settings_file(self):
         candidates = []
@@ -1234,17 +1334,17 @@ class PumpControlNode(object):
                 self._on_serial_reader_error('serial write failed: %s' % e, connection)
             return False
 
-    def _apply_runtime_configuration(self):
+    def _apply_runtime_configuration(self, allow_auto_start=True):
         """连接后同步 I2C 映射和 ADS 采样配置。"""
         with self._action_scope(), self._control_lock:
             try:
-                return self._apply_runtime_configuration_locked()
+                return self._apply_runtime_configuration_locked(allow_auto_start)
             finally:
                 self._publish_automation_status(self._last_automation_status_text)
 
-    def _apply_runtime_configuration_locked(self):
+    def _apply_runtime_configuration_locked(self, allow_auto_start=True):
         self._refresh_runtime_settings()
-        if self.spectro_config.get('enabled', True) and self.spectro_config.get('auto_start', False):
+        if allow_auto_start and self.spectro_config.get('enabled', True) and self.spectro_config.get('auto_start', False):
             ok, _ = self.prepare_and_start_spectrometer()
             if not ok:
                 return False
@@ -1312,8 +1412,10 @@ class PumpControlNode(object):
             synced, error = self._ensure_spectro_reply_sync()
             if not synced:
                 return False, error
-        stop_confirmation = command in ('STOPALL', 'PIDQUERY', 'ADSSTOP')
-        if self._controller_fault and not stop_confirmation and command not in ('ADSSTOP', 'I2CMAP?', 'ADSSTATUS?'):
+        stop_confirmation = command in ('STOPALL', 'PIDQUERY', 'ADSSTOP') or (
+            command == 'WATCHDOG:ARM' and self._watchdog_arming)
+        fault_allowed = stop_confirmation or command in ('ADSSTATUS?', 'I2CMAP?')
+        if self._controller_fault and not fault_allowed:
             return False, self._controller_fault
         success = tuple(success_prefixes or ())
         errors = tuple(error_prefixes or ())
@@ -1332,7 +1434,7 @@ class PumpControlNode(object):
                 if self._action_cancelled():
                     self._spectro_reply_sync_required = True
                     return False, 'cancelled'
-                if self._controller_fault and not stop_confirmation:
+                if self._controller_fault and not fault_allowed:
                     return False, self._controller_fault
                 if time.monotonic() >= deadline:
                     if not stop_confirmation:
@@ -1349,7 +1451,7 @@ class PumpControlNode(object):
                 if command == 'ADSSTATUS?':
                     self._spectro_reply_sync_failed = True
                 return False, 'timeout'
-            if self._controller_fault and not stop_confirmation and command not in ('ADSSTOP', 'I2CMAP?', 'ADSSTATUS?'):
+            if self._controller_fault and not fault_allowed:
                 return False, self._controller_fault
             if any(line.startswith(prefix) for prefix in errors):
                 return False, line
@@ -2300,7 +2402,10 @@ class PumpControlNode(object):
                 or any(text.startswith(prefix) for prefix in txn['error']))
                 and not (txn.get('cancel') and txn['cancel'].is_set()))
             if matched:
-                if text == 'ADS_OK:START':
+                if text == 'WATCHDOG_OK:ARM' and self._watchdog_arming:
+                    self._watchdog_armed = True
+                    self._watchdog_arming = False
+                elif text == 'ADS_OK:START':
                     # The ACK proves the start command was accepted, nothing
                     # more. Never stamp it as a valid measurement: the first
                     # real frame decides acquisition, so a start with no data
@@ -2327,7 +2432,13 @@ class PumpControlNode(object):
         if matched and text in ('ADS_OK:START', 'ADS_OK:STOP'):
             self._publish_spectro_status(self.spectro_state)
         if text == 'WATCHDOG_TRIPPED' or text.startswith('WATCHDOG_ERR:'):
-            self._controller_fault = 'watchdog_tripped'
+            if self._watchdog_arming:
+                rospy.loginfo('Pre-ARM detector status: %s', text)
+                return
+            with self.serial_lock:
+                self._watchdog_armed = False
+                self._controller_fault = 'watchdog_tripped'
+            rospy.logwarn('Detector watchdog: %s', text)
             self._invalidate_spectro('watchdog_tripped')
             if self._automation_is_active():
                 self._set_terminal_reason('watchdog_tripped')
@@ -4260,6 +4371,8 @@ class PumpControlNode(object):
             "sample_id": self.sampling_context.get('sample_id'),
             "source": self.sampling_context.get('source', 'unknown'),
             "controller_fault": self._controller_fault,
+            "serial_recovering": self._serial_recovering,
+            "serial_recovery_error": self._serial_recovery_error,
             "running": running,
             "paused": paused,
             "automation_step": automation_step,
@@ -4328,13 +4441,13 @@ class PumpControlNode(object):
 
     def _run_connected(self):
         if not self.connect():
-            rospy.logerr("Failed to connect, exiting")
-            return
+            rospy.logwarn('Controller unavailable; keeping services online for recovery')
 
         rate = rospy.Rate(10)
         last_status_at = 0.0
 
         while not rospy.is_shutdown():
+            self._retry_serial_connection()
             self._check_calibration()
             self._check_spectro_freshness()
             self._check_sampling_owner()

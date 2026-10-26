@@ -84,13 +84,18 @@ TCP 每轮发送预算仍为 30 ms，从收包处理结束后计时。尚未写�
 
 `connect()` 的成功仅表示串口已打开、设备身份与会话握手通过；发布 `serial_connected`，不会以 `connected` 暗示 I2C/ADS 配置成功。Web 的 Automation 和监控页常驻显示串口、I2C/ADS 运行配置、采集状态、事务阶段、最近错误及重试记录。`ready` 只表示 I2CMAP 和 ADSCFG 回显已验证；只有 ADSSTART ACK 后收到有效真实帧才表示启动成功。
 
-- 新串口会话握手后等待 0.5 秒稳定期，独立 watchdog keepalive 持续运行。
+- 泵控节点在首次打开串口前读取 `~/usv_ws/config/sampling_config.json` 的硬件配置；默认 `/dev/ttyUSB0` 使用保存的串口，显式指定的其他 launch 串口优先。Web 启动不再重复发起重连，手动应用硬件配置仍会重连。
+- 新串口会话先用 `PIDQUERY` 排空旧回复，再等待 `WATCHDOG_OK:ARM`，确认后独立发送 keepalive；配置前等待 0.5 秒稳定期。ARM 前的旧 watchdog 消息不锁死新会话，ARM 后的真实故障仍触发停机。
+- 首次打开失败时节点保留服务，后台按 5 秒间隔重试。恢复时确认 STOPALL；需要确认 ADSSTOP 时每轮最多尝试 3 次，间隔 0.2 秒。停止确认失败保留可用串口和具体错误，下轮继续恢复；真正的串口读写故障会重建连接。
+- 恢复仅回到空闲，不重放旧任务，也不按 `auto_start` 自动采集。串口故障、恢复中或配置失败通过现有 `USV_STAT=3` 上报 QGC；`serial_recovering`、`serial_recovery_error` 见 `/usv/automation_status`。
 - 一次点击执行 `I2CMAP → ADSCFG → ADSSTART → 首个有效帧`。瞬时 I2C 错误或 ACK 超时最多尝试 3 次，退避 0.15 / 0.30 秒；每次重新发送并校验配置回显。参数错误、回显不匹配、控制器故障直接失败。
-- 重试前消费独立 `ADS_STATUS:` 响应，排空前次迟到 ACK；ADSSTART 失败先确认 ADSSTOP。清理失败不重试；响应同步失败要求重连，避免后续点击误用旧 ACK。固件文本命令按顺序处理是该屏障的协议依据。
+- 重试前消费独立 `ADS_STATUS:` 响应，排空前次迟到 ACK；ADSSTART 失败先确认 ADSSTOP。清理失败不重试 START；空闲时后台重试失败配置，响应同步失败则自动重连。固件文本命令按顺序处理是该屏障的协议依据。
 - ACK 预算仍为 2 秒。冷、暖启动首帧预算均至少为 4 秒（从 START ACK 计时）；运行数据 freshness 使用 `measurement_timeout`（默认 2 秒）。无效、模拟、过期或截止后到达的帧不算成功。4 秒是有界启动容错预算，仍须在 Jetson/ESP32 上验证实际延迟分布。
 - 失败阶段分别见 `serial_failed`、`i2c_map_failed`、`ads_config_failed`、`start_failed`、`frame_timeout`；`spectrometer_last_txn_error` 保留主要原因，重试恢复后该字段清空，但本次重试记录仍可展开查看。自动化 `terminal_reason` 保持独立。
 
 回归：`python -B -m pytest tests/test_spectrometer_cold_start.py tests/test_field_transactions.py tests/test_terminal_reasons.py`；前端：`cd frontend && node --test scripts/test-spectrometer-diagnostics.mjs`。部署时更新前端构建产物并重启 `pump_control_node`、`web_config_server`；本次没有更改串口协议或固件。实机验收：冷上电一次启动、前两次瞬时 I2C 失败的同次点击恢复、配置失败显示、串口拔插、首帧延迟/缺失、运行断流及物理输出停止。
+
+串口恢复回归：`python -B -m pytest tests/test_serial_startup_recovery.py tests/test_stop_recovery_contract.py tests/test_system_safety_contract.py`。部署需同步更新并重启 pump、Web、bridge，无需重新编译 QGC 或检测板固件。台架验证：检测板晚于 ROS 上电、采集中拔插串口、恢复期间点击停止；确认输出停止、QGC 显示故障、恢复后不自行采集，再手动启动成功。
 
 ### PID 分阶段超时与采样等待
 

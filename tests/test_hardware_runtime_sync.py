@@ -239,6 +239,9 @@ def _load_script(module_name, relative_path):
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
     spec.loader.exec_module(module)
+    if relative_path == 'scripts/pump_control_node.py':
+        # Unit tests must not load the operator's saved hardware configuration.
+        module.CONFIG_FILE = str(REPO_ROOT / 'tests' / '_no_saved_hardware.json')
     return module, publishers, string_cls
 
 

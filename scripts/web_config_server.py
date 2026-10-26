@@ -121,6 +121,7 @@ from scripts.lib.sample_recording.record import bind_web_context, freeze_positio
 from scripts.lib.gps_diagnostics import diagnose
 from scripts.lib.automation_preflight import DEFAULT_PREFLIGHT, normalize_preflight, calibrated_offsets, relative_angles
 from scripts.lib.sample_recording.downsampling import MinMaxSeries
+from scripts.lib.runtime_hardware import hardware_to_pump_runtime_params
 
 # 配置文件路径
 CONFIG_DIR = os.path.expanduser("~/usv_ws/config")
@@ -4249,28 +4250,7 @@ class WebConfigServer(object):
         return ok, message
 
 
-    @staticmethod
-    def _hardware_to_pump_runtime_params(hw):
-        mapping = {
-            "angles": dict(hw.get("i2c_mapping", {})),
-            "spectro_channel": int(hw.get("spectro_channel", 2)),
-        }
-        spectrometer = {
-            "enabled": True,
-            "auto_start": bool(hw.get("auto_start", False)),
-            "ads_address": hw.get("ads_address", "0x40"),
-            "mux": hw.get("mux", "AIN0"),
-            "gain": int(hw.get("gain", 1)),
-            "vref_mode": hw.get("vref_mode", "AVDD"),
-            "adc_rate": max(MIN_RAW_RECORD_HZ, int(hw.get("adc_rate", 90))),
-            "publish_rate": max(MIN_RAW_RECORD_HZ, int(hw.get("publish_rate", 90))),
-            "spectro_output_hz": int(hw.get("spectro_output_hz", 10)),
-            "continuous_mode": bool(hw.get("continuous_mode", True)),
-            "reference_voltage": float(hw.get("reference_voltage", 0.0)),
-            "baseline_voltage": float(hw.get("baseline_voltage", 0.0)),
-        }
-        angle_stream = {"enabled": True, "auto_start": True}
-        return mapping, spectrometer, angle_stream
+    _hardware_to_pump_runtime_params = staticmethod(hardware_to_pump_runtime_params)
 
     def _set_pump_runtime_params(self, hw):
         mapping, spectrometer, angle_stream = self._hardware_to_pump_runtime_params(hw)
@@ -6576,27 +6556,6 @@ class WebConfigServer(object):
                 rospy.logwarn("Realtime Socket.IO flush failed: %s", str(exc))
             threading.Event().wait(min(SOCKET_VOLTAGE_EMIT_INTERVAL_S, SOCKET_ANGLE_EMIT_INTERVAL_S))
 
-    def _apply_saved_hardware_on_startup(self):
-        """启动后延迟推送已保存的硬件配置到 pump_control_node ROS 参数并调用 reconnect。"""
-        try:
-            rospy.sleep(5.0)  # 等待 pump_control_node 服务注册
-            hw = self.config_manager.get().get('hardware', {})
-            saved_port = hw.get('pump_serial_port', '')
-            if not saved_port or saved_port == '/dev/ttyUSB0':
-                return  # 默认值无需覆盖
-            rospy.loginfo("[HW-AutoApply] 推送已保存硬件配置: port=%s baud=%s",
-                          saved_port, hw.get('pump_baudrate', 115200))
-            self._set_pump_runtime_params(hw)
-            svc = rospy.ServiceProxy('/usv/pump_reconnect', Trigger)
-            svc.wait_for_service(timeout=5.0)
-            resp = svc()
-            if resp.success:
-                rospy.loginfo("[HW-AutoApply] 泵控重连成功: %s", resp.message)
-            else:
-                rospy.logwarn("[HW-AutoApply] 泵控重连失败: %s", resp.message)
-        except Exception as e:
-            rospy.logwarn("[HW-AutoApply] 自动应用硬件配置跳过: %s", str(e))
-
     def run(self):
         """运行服务器。"""
         if not FLASK_AVAILABLE:
@@ -6625,12 +6584,6 @@ class WebConfigServer(object):
         mission_recording_thread = threading.Thread(target=self._mission_recording_loop)
         mission_recording_thread.daemon = True
         mission_recording_thread.start()
-
-        # 启动后自动推送已保存的硬件配置 (延迟执行)
-        if not self.standalone:
-            hw_apply_thread = threading.Thread(target=self._apply_saved_hardware_on_startup)
-            hw_apply_thread.daemon = True
-            hw_apply_thread.start()
 
         # 启动 SocketIO 服务器
         try:

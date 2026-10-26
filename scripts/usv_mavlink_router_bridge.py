@@ -350,6 +350,9 @@ class USVMavlinkRouterBridge(object):
             return
 
         self._mark_source_locked('automation', data_dict)
+        self._controller_unavailable = bool(data_dict.get('controller_fault')
+            or data_dict.get('serial_connected') is False or data_dict.get('serial_recovering')
+            or data_dict.get('spectrometer_config_state') == 'failed')
         ads = data_dict.get('ads_state')
         self._ads_state = ads if type(ads) is int and 0 <= ads <= 5 else 0
         calibration = data_dict.get('calibration', {})
@@ -391,7 +394,10 @@ class USVMavlinkRouterBridge(object):
         if ("error" in status_text or "fail" in status_text or self._automation_preflight_active
                 or self._automation_paused or last_state in ("IDLE", "HOLD_NO_MISSION", "SAMPLING", "SAMPLING_DONE", "PAUSED")):
             self._field_received_at['USV_STAT'] = automation_at
-        if self._calibration_active:
+        if self._controller_unavailable:
+            self._status_code = self._MISSION_STATE_CODES['FAILED']
+            self._field_received_at['USV_STAT'] = automation_at
+        elif self._calibration_active:
             self._status_code = self._MISSION_STATE_CODES["CALIBRATING"]
             self._field_received_at['USV_STAT'] = automation_at
         elif "error" in status_text or "fail" in status_text:
@@ -485,7 +491,10 @@ class USVMavlinkRouterBridge(object):
                 automation_at = self._field_received_at.get('USV_STEP', float('-inf'))
                 automation_fresh = time.monotonic() - automation_at <= 3.0
                 state_at = time.monotonic()
-                if automation_fresh and getattr(self, '_calibration_active', False):
+                if getattr(self, '_controller_unavailable', False):
+                    code = self._MISSION_STATE_CODES['FAILED']
+                    state_at = automation_at
+                elif automation_fresh and getattr(self, '_calibration_active', False):
                     code = self._MISSION_STATE_CODES["CALIBRATING"]
                     state_at = automation_at
                 elif (automation_fresh and getattr(self, '_automation_preflight_active', False)

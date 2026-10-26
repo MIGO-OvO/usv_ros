@@ -78,7 +78,7 @@ class FieldTransactionTests(unittest.TestCase):
         def reader_started(**callbacks):
             def reply(data):
                 responses = {b'PIDQUERY\r\n': 'PIDPARAM:X,Kp=1', b'STOPALL\r\n': 'STOPALL_OK',
-                             b'ADSSTOP\r\n': 'ADS_OK:STOP'}
+                             b'ADSSTOP\r\n': 'ADS_OK:STOP', b'WATCHDOG:ARM\r\n': 'WATCHDOG_OK:ARM'}
                 if data in responses:
                     callbacks['on_text'](responses[data])
             ports[-1].on_write = reply
@@ -102,7 +102,8 @@ class FieldTransactionTests(unittest.TestCase):
         self.node._record_cleanup_result(False)
         with patch.object(self.node, '_spectro_stop', return_value=(False, 'ADS_ERR:STOP_I2C')):
             self.assertFalse(self.node.connect())
-        self.assertIsNone(self.node.serial_conn)
+        self.assertIsNotNone(self.node.serial_conn)
+        self.assertTrue(self.node._serial_recovering)
         self.assertEqual(self.node._controller_fault, 'cleanup_failed')
 
     def ack_sender(self, *, mapping=MAP_ACK, config=CFG_ACK, start='ADS_OK:START',
@@ -114,7 +115,9 @@ class FieldTransactionTests(unittest.TestCase):
             reply = (mapping if command.startswith('I2CMAP:') else
                      config if command.startswith('ADSCFG:') else
                      start if command == 'ADSSTART' else
-                     stop if command == 'ADSSTOP' else None)
+                     stop if command == 'ADSSTOP' else
+                     'PIDPARAM:X,Kp=1' if command == 'PIDQUERY' else
+                     'WATCHDOG_OK:ARM' if command == 'WATCHDOG:ARM' else None)
             if reply:
                 self.node._on_text_received(reply)
             if frame and command == 'ADSSTART' and reply == 'ADS_OK:START':
@@ -151,6 +154,7 @@ class FieldTransactionTests(unittest.TestCase):
         port = FakeSerial()
         port.open()
         self.node.serial_conn = port
+        self.node._watchdog_armed = True
         stopped = threading.Event()
         self.node._reconnect_after_reader_error = Mock()
         def stop(connection):
@@ -321,7 +325,7 @@ class FieldTransactionTests(unittest.TestCase):
         self.node._spectro_stop = Mock(return_value=(False, 'ADS_ERR:STOP_I2C'))
         result = self.node._reconnect_callback(None)
         self.assertFalse(result.success)
-        self.node._spectro_stop.assert_called_once()
+        self.assertEqual(self.node._spectro_stop.call_count, 3)
 
     def test_fault_reconnect_still_requires_recovery_ads_stop(self):
         self.serial_environment()
@@ -331,7 +335,7 @@ class FieldTransactionTests(unittest.TestCase):
         self.node._controller_fault = 'disconnected'
         result = self.node._reconnect_callback(None)
         self.assertFalse(result.success)
-        self.node._spectro_stop.assert_called_once()
+        self.assertEqual(self.node._spectro_stop.call_count, 3)
 
     def test_reconnect_stops_old_worker_and_disconnect_stops_new_worker(self):
         ports = self.serial_environment()
