@@ -115,18 +115,18 @@ class PreflightWorkerTests(unittest.TestCase):
             time.sleep(0.005)
         self.fail('worker did not reach ' + phase)
 
-    def test_oil_separation_uses_bounded_pid_segments_for_ten_turns(self):
+    def test_oil_separation_uses_one_pid_move_for_ten_turns(self):
         self.assertTrue(self.start(preflight={
             'oil_axis': 'A', 'separation_turns': 10, 'separation_rpm': 0.1})[0])
         self.join()
         moves = [float(delta) for command in self.commands
                  for delta in re.findall(r'AEFR([\d.]+)P', command) if float(delta) > 0]
         self.assertAlmostEqual(sum(moves), 3600)
-        self.assertEqual(moves, [360.0] * 10)
+        self.assertEqual(moves, [3600.0])
         self.assertFalse(any('J' in command for command in self.commands))
         self.node.automation_engine.start.assert_called_once()
 
-    def test_low_pid_floor_reduces_segments_without_using_legacy_j_speed(self):
+    def test_low_pid_floor_keeps_fractional_turns_in_one_pid_move(self):
         sender = self.send
         def send(command):
             if command == 'PIDQUERY':
@@ -136,32 +136,36 @@ class PreflightWorkerTests(unittest.TestCase):
             return sender(command)
         self.node.send_command = send
         self.assertTrue(self.start(preflight={
-            'oil_axis': 'A', 'separation_turns': 1, 'separation_rpm': 20})[0])
+            'oil_axis': 'A', 'separation_turns': 1.25, 'separation_rpm': 20})[0])
         self.join()
         moves = [float(delta) for command in self.commands
                  for delta in re.findall(r'AEFR([\d.]+)P', command)]
-        self.assertEqual(len(moves), 2)
-        self.assertEqual(sum(moves), 360)
-        self.assertEqual(moves, [216.0, 144.0])  # 360 s travel at the 0.1 rpm floor
+        self.assertEqual(moves, [450.0])
         self.node.automation_engine.start.assert_called_once()
 
-    def test_separation_ack_and_angles_cannot_replace_each_pid_done(self):
+    def test_separation_ack_and_full_travel_cannot_replace_pid_done(self):
         self.block_phase = 'separating'
         self.assertTrue(self.start()[0])
         self.wait_phase('separating')
         preparation = self.node._preflight
-        for step in [30] * 12:
+        for step in [30] * 24:
             with preparation.lock:
                 preparation.travel['at'] -= step / 48
                 angle = (preparation.travel['angle'] + step) % 360
             self.node._on_angle_received({'A': angle})
-        self.assertEqual(self.commands.count('AEFR360.000P0.1'), 1)
+        self.assertEqual(self.commands.count('AEFR720.000P0.1'), 1)
         self.node.automation_engine.start.assert_not_called()
-        self.node._on_text_received('PID_DONE:A,abs=360,err=0')
-        deadline = time.monotonic() + 1
-        while self.commands.count('AEFR360.000P0.1') < 2 and time.monotonic() < deadline:
-            time.sleep(0.005)
-        self.assertEqual(self.commands.count('AEFR360.000P0.1'), 2)
+        self.assertNotIn('PUMP:SET:60', self.commands)
+        self.node._on_text_received('PID_DONE:A,abs=720,err=0')
+        self.join()
+        self.assertEqual(self.commands.count('AEFR720.000P0.1'), 1)
+        self.node.automation_engine.start.assert_called_once()
+
+    def test_stop_during_multi_turn_separation_prevents_late_restart(self):
+        self.block_phase = 'separating'
+        self.assertTrue(self.start()[0])
+        self.wait_phase('separating')
+        self.assertIn('AEFR720.000P0.1', self.commands)
         self.assertTrue(self.node._auto_stop_callback(None).success)
         self.join()
         stopped_at = self.commands.index('STOPALL')
@@ -200,10 +204,10 @@ class PreflightWorkerTests(unittest.TestCase):
         saved = Path(self.node.calibration_file).read_bytes()
         self.assertTrue(self.start()[0])
         self.join()
-        self.assertEqual(self.phases, ['homing', 'compensating'] + ['separating'] * 2)
+        self.assertEqual(self.phases, ['homing', 'compensating', 'separating'])
         self.assertIn('XEBR27.000P0.1ZEBR135.000P0.1', self.commands)
         self.assertIn('XEFR360.000P0.1ZEFR360.000P0.1', self.commands)
-        self.assertLess(self.commands.index('AEFR360.000P0.1'), self.commands.index('PUMP:SET:60'))
+        self.assertLess(self.commands.index('AEFR720.000P0.1'), self.commands.index('PUMP:SET:60'))
         self.assertEqual(self.node._preflight.snapshot()['travel_degrees'], 720)
         self.node.automation_engine.start.assert_called_once()
         self.assertEqual(saved, Path(self.node.calibration_file).read_bytes())
@@ -447,19 +451,21 @@ class SeparationPIDSettlingTests(unittest.TestCase):
             clock[0] += 0.05
             elapsed = clock[0] - move['at']
             target = move['delta']
-            # Reach the target in 8 s, then correct +/-0.2 deg before DONE.
+            travel_time = max(8.0, target / 30.0)
+            finished = done and elapsed >= max(finish_at, travel_time + 6)
+            # Travel within the PID speed limit, then correct +/-0.2 deg before DONE.
             # The 0.1-deg firmware stability gate has not passed during hunting.
             if position is not None:
                 degrees = position(elapsed, target)
-            elif elapsed < 8:
-                degrees = target * elapsed / 8
+            elif elapsed < travel_time:
+                degrees = target * elapsed / travel_time
             else:
                 degrees = target + (0.2 if int(elapsed * 4) % 2 else -0.2)
-            if done and elapsed >= finish_at and position is None:
+            if finished and position is None:
                 degrees = target
             raw['A'] = (move['start'] + degrees) % 360
             runner.notify_angles(raw)
-            if done and elapsed >= finish_at:
+            if finished:
                 completions.append(target)
                 runner.notify_text('PID_DONE:A,abs=%.2f,err=0.00' % target)
 
@@ -471,12 +477,12 @@ class SeparationPIDSettlingTests(unittest.TestCase):
                 'oil_axis': 'A', 'separation_turns': turns, 'separation_rpm': 5.0}), 0.1, None)
         return runner, commands, completions
 
-    def test_five_turns_wait_for_each_pid_done_while_settling(self):
+    def test_five_turns_use_one_1800_degree_pid_move_and_wait_for_done(self):
         runner, commands, completions = self.run_separation()
         self.assertEqual(runner.snapshot()['phase'], 'complete')
         self.assertAlmostEqual(runner.snapshot()['travel_degrees'], 1800.0)
-        self.assertAlmostEqual(sum(completions), 1800.0)
-        self.assertEqual(len(completions), 5)
+        self.assertEqual(completions, [1800.0])
+        self.assertEqual(commands.count('AEFR1800.000P0.1'), 1)
         self.assertFalse(any('J' in command for command in commands))
 
     def test_at_target_without_done_still_reaches_pid_timeout(self):
@@ -486,19 +492,19 @@ class SeparationPIDSettlingTests(unittest.TestCase):
 
     def test_stall_short_of_target_keeps_forward_progress_timeout(self):
         with self.assertRaisesRegex(PreflightError, 'no verified forward progress'):
-            self.run_separation(done=False, position=lambda elapsed, target: min(target * elapsed / 8, target / 2))
+            self.run_separation(done=False, position=lambda elapsed, target: min(30 * elapsed, target / 2))
 
     def test_overshoot_can_settle_but_still_requires_real_done(self):
         with self.assertRaises(PreflightError) as caught:
-            self.run_separation(done=False, position=lambda elapsed, target: min(target * elapsed / 8, target + 1))
+            self.run_separation(done=False, position=lambda elapsed, target: min(30 * elapsed, target + 1))
         self.assertEqual(caught.exception.reason, 'pid_timeout')
 
-    def test_real_done_after_long_settling_releases_each_segment(self):
+    def test_real_done_after_long_settling_completes_multi_turn_move(self):
         runner, _, completions = self.run_separation(finish_at=150)
         self.assertEqual(runner.snapshot()['phase'], 'complete')
-        self.assertEqual(completions, [360.0] * 5)
+        self.assertEqual(completions, [1800.0])
 
-    def test_small_segment_uses_its_existing_five_percent_travel_tolerance(self):
+    def test_small_separation_uses_its_existing_five_percent_travel_tolerance(self):
         runner, _, completions = self.run_separation(
             turns=0.01, position=lambda elapsed, target: min(target * elapsed / 8, target - 0.16))
         self.assertEqual(runner.snapshot()['phase'], 'complete')

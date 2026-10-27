@@ -42,7 +42,7 @@ class FeedbackReviewTests(unittest.TestCase):
                 time.sleep(0.01)
             self.assertFalse(self.node._preflight_thread.is_alive(), 'frozen feedback kept oil motion alive')
         self.assertIn('STOPALL', self.commands)
-        self.assertIn('AEFR360.000P0.1', self.commands)
+        self.assertIn('AEFR720.000P0.1', self.commands)
         self.node.automation_engine.start.assert_not_called()
 
     def test_other_axis_frames_do_not_refresh_the_oil_axis(self):
@@ -56,7 +56,7 @@ class FeedbackReviewTests(unittest.TestCase):
         self.assertTrue(self.start()[0])
         self.join()
         self.assertEqual(self.status()['terminal_reason'], 'pid_fail')
-        self.assertIn('AEFR360.000P0.1', self.commands)
+        self.assertIn('AEFR720.000P0.1', self.commands)
         self.assertNotIn('PUMP:SET:60', self.commands)
         self.assertIn('STOPALL', self.commands)
 
@@ -64,7 +64,7 @@ class FeedbackReviewTests(unittest.TestCase):
         self.node._angle_health_received_at = None
         self.assertTrue(self.start()[0])
         self.join()
-        self.assertNotIn('AEFR360.000P0.1', self.commands)
+        self.assertNotIn('AEFR720.000P0.1', self.commands)
         self.assertEqual(self.status()['terminal_reason'], 'controller_fault')
 
     def test_duplicate_health_timestamps_and_fresh_angle_receipts_cannot_renew_health(self):
@@ -311,7 +311,7 @@ class SurveyAndQGCChainTests(unittest.TestCase):
             self.assertEqual(terminal['status'], 'finished')
             self.trigger._automation_status_cb(self.String(json.dumps(terminal)))
             commands = self.commands[offset:]
-            self.assertLess(commands.index('AEFR360.000P0.1'), commands.index('PUMP:SET:38'))
+            self.assertLess(commands.index('AEFR720.000P0.1'), commands.index('PUMP:SET:38'))
             self.assertEqual(commands.count('PUMP:SET:38'), 1)
             self.assertFalse(self.node.inject_pump_enabled)
             self.assertFalse(self.trigger.is_sampling)

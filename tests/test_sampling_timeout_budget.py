@@ -63,7 +63,7 @@ class TimeoutBudgetTests(unittest.TestCase):
             with self.assertRaisesRegex(PreflightError, 'angle feedback timeout'):
                 runner._check()
 
-    def test_oil_pid_segments_respect_the_firmware_deadline(self):
+    def test_multi_turn_oil_pid_move_keeps_the_firmware_deadline(self):
         runner = AutomationPreflight(Mock(return_value=True), Mock(),
                                      lambda axes, **kw: {'A': 0}, Mock())
         runner.command = Mock(return_value='PIDPARAM:0.14,0.015,0.06,1,8')
@@ -72,10 +72,11 @@ class TimeoutBudgetTests(unittest.TestCase):
                 before_send()
                 runner.travel['degrees'] = moves['A'][0]
         runner.pid_moves = Mock(side_effect=finish)
-        runner.run([], {}, {'oil_axis': 'A', 'separation_turns': 1, 'separation_rpm': 5}, 0.1, None)
-        segments = [call for call in runner.pid_moves.call_args_list if call.kwargs.get('before_send')]
-        self.assertEqual(len(segments), 1)
-        self.assertTrue(all(call.kwargs['timeout'] == 610.0 for call in segments))
+        runner.run([], {}, {'oil_axis': 'A', 'separation_turns': 5, 'separation_rpm': 5}, 0.1, None)
+        oil_moves = [call for call in runner.pid_moves.call_args_list if call.kwargs.get('before_send')]
+        self.assertEqual(len(oil_moves), 1)
+        self.assertEqual(oil_moves[0].args[0], {'A': (1800.0, 'F')})
+        self.assertEqual(oil_moves[0].kwargs['timeout'], 610.0)
 
     def test_settling_latches_at_ten_degrees_and_allows_reverse_correction(self):
         runner = AutomationPreflight(Mock(), Mock(), Mock(), Mock())

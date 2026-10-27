@@ -628,7 +628,7 @@ sudo USV_BOOT_START_NOW=true USV_STRICT_SELF_CHECK=false ./src/usv_ros/scripts/i
 
 1. 自动统计本次 steps 中 `enable: "E"` 的 X/Y/Z/A（包括连续转动步骤）。
 2. 各相关轴以最短路径回到**预先保存的相对零点**，随后全部正转 360° 补偿液体位移。使用相对 `R` 指令，分别等待匹配的 `PID_START`、`CMD_OK` 和各轴 `PID_DONE`；不会发送归绝对 0° 的 `CAL` 或改写零点。归位、360° 补偿及油相分隔的独立定位容差固定为 0.1°，覆盖 MT6701 的 14-bit 量化步长 `360/16384 ≈ 0.022°` 及少量噪声；正式步骤仍使用用户指定的 PID 精度。
-3. 油相泵按配置额外正转分隔圈数，使用与回零、360° 补偿相同的相对角度 `R/PID`。启动时 `PIDQUERY` 读取设备实际速度上下限，按 `PIDPARAM` 的一位小数精度取保守最低速度 `max(0.1, out_min - 0.05)` rpm，每段角度不超过该速度对应的 360 秒行程且最多 360°，在板端 600 秒总上限内预留 180 秒收敛与 60 秒启动余量。最低速度为 1 rpm 时五圈分为五段；0.1 rpm 时每段最多 216°。每段均等待匹配的 `PID_START`、`CMD_OK`、真实 `PID_DONE`，并核验角度解环行程，之后才发送下一段。不在 steps 中的油相轴也执行同样核验。主机每段行程容差为 `min(0.5°, 段角度 × 5%)`，PID 定位容差仍为 0.1°。分隔阶段不发送开环 `J` 指令。
+3. 油相泵按配置额外正转分隔圈数，使用与回零、360° 补偿相同的相对角度 `R/PID`。ROS 将圈数乘以 360°，一次发送完整行程；例如五圈只发送一次 `AEFR1800.000P0.1`（油相轴为 A），十圈发送一次 3600°，小数圈数同样按总角度执行。启动时 `PIDQUERY` 读取设备实际 PID 速度上下限。整个行程等待匹配的 `PID_START`、`CMD_OK`、真实 `PID_DONE`，并核验角度解环累计行程，完成后才开启进样。不在 steps 中的油相轴也执行同样核验。主机行程容差为 `min(0.5°, 总角度 × 5%)`，PID 定位容差仍为 0.1°。固件保留 600 秒总上限和 180 秒收敛上限，主机沿用现有 PID 等待期限；分隔阶段不发送开环 `J` 指令。
 4. 按进样泵任务策略预启动，确认 `PUMP_OK:SET=…,ON` 并等待 lead time；完成后才启动正式序列。受管进样在归位前先确认 OFF。Web 直接启动仍按其 automation 策略；trigger 发起的 Survey 每次采样将进样策略纳入同一准备事务，使用已配置联动速度和 lead time。Survey 启动/停止广播不会控制硬件，每次采样结束停机，间隔期间进样关闭；Survey 停止按 attempt 清理整个采样事务，不影响新 owner。
 
 当前 DetFirmware 的 `0xCC` 角度帧没有有效位或源时间戳；传感器失效时会重复 last_valid，`ANGLE_AGE_CH_MS=0` 也不能单独证明有效。Preflight 使用逐轴 monotonic 接收时刻（1 秒断流预算）、有限/范围校验、通道 age 和独立健康包时间戳（2.5 秒预算，重复/倒退不续约，支持 uint32 回绕）。油相行程阶段需在 120 秒内累计至少 0.1° 的净正向进展；相同帧或固定位置附近的小抖动不能续约计时。进入收敛后允许反向纠偏，角度与健康新鲜度检查继续生效。以上检测失败均停止输出；机械停机延迟需台架测量。
@@ -655,7 +655,7 @@ Survey 启动 RPC 与 31011/31016 停止及收尾共用独立事务锁，STOP �
 
 任一步骤 ACK/PID 超时、角度无效/断流、owner 丢失、watchdog 或串口故障均走现有停泵和终态清理；清理失败继续锁存故障。PID 控制算法、安全租约与串口恢复协议保持原有行为；GPS 仅作为可选记录位置，详见下文。分阶段限时需要同步更新 ROS 与 DetFirmware；前端无需为此重建。
 
-回归：`python -B -m pytest tests/test_preflight_stop_races.py tests/test_preflight_review_regressions.py tests/test_automation_preflight.py tests/test_preflight_web_contract.py tests/test_system_safety_contract.py tests/test_terminal_reasons.py tests/test_sampling_cleanup_ownership.py`；前端：`cd frontend && npm run test:automation-controls && npm run build`。实机仍需在 Jetson/ESP32 台架确认：非 0° 相对零点、补偿方向及液体位移、跨 0° 的多圈分隔、拔除角度传感器/冻结反馈后的有界停机、PID 速度上下限、分段衔接和小圈数容差、两轮 Survey 进样顺序、0.1° 定位稳定性、启动/停止并发与立即重启，以及每阶段停止/拔串口后的物理输出停止、STOPALL 确认延迟和 QGC 失败 ACK/FAILED 状态。
+回归：`python -B -m pytest tests/test_preflight_stop_races.py tests/test_preflight_review_regressions.py tests/test_automation_preflight.py tests/test_preflight_web_contract.py tests/test_system_safety_contract.py tests/test_terminal_reasons.py tests/test_sampling_cleanup_ownership.py`；前端：`cd frontend && npm run test:automation-controls && npm run build`。实机仍需在 Jetson/ESP32 台架确认：非 0° 相对零点、补偿方向及液体位移、跨 0° 的多圈分隔、拔除角度传感器/冻结反馈后的有界停机、PID 速度上下限、单次多圈行程完成和小圈数容差、两轮 Survey 进样顺序、0.1° 定位稳定性、启动/停止并发与立即重启，以及每阶段停止/拔串口后的物理输出停止、STOPALL 确认延迟和 QGC 失败 ACK/FAILED 状态。
 
 ### launch 参数
 
