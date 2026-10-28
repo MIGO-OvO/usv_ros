@@ -9,6 +9,7 @@ import { Archive, Download, Trash2, RefreshCw, FileText, Calendar, Save } from '
 import { LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Legend } from 'recharts'
 import { cn } from "@/lib/utils"
 import { useConfirm } from '@/hooks/use-confirm'
+import { useAppStore } from '@/store'
 
 type MissionMeta = {
   readonly id: string
@@ -152,6 +153,7 @@ function gpsText(gps: SampleWindow['gps_start']): string {
 
 export default function Data() {
   const confirm = useConfirm()
+  const automationRunning = useAppStore(state => state.automationRunning)
   const [missions, setMissions] = useState<readonly MissionMeta[]>([])
   const [selectedId, setSelectedId] = useState<string | null>(null)
   const [chartData, setChartData] = useState<readonly MissionPoint[]>([])
@@ -185,7 +187,7 @@ export default function Data() {
 
   useEffect(() => {
     void fetchMissions()
-  }, [])
+  }, [automationRunning])
 
   useEffect(() => {
     const controller = new AbortController()

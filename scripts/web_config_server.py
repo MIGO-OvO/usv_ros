@@ -2126,6 +2126,7 @@ class WebConfigServer(object):
         self.latest_calibration_status = {}
         self._sampling_results = OrderedDict()
         self._sampling_context = {}
+        self._trigger_attempt_id = None
         self._web_attempt_id = None
         self._web_start_lock = threading.Lock()
         self._web_state_lock = threading.Lock()
@@ -2676,12 +2677,29 @@ class WebConfigServer(object):
         self.socketio.emit('calibration_status', self.latest_calibration_status)
         expected = self._recording_attempt_id()
         context = data.get('sampling_context')
+        attempt_id = context.get('attempt_id') if isinstance(context, dict) else None
+        if self._sampling_results.get(attempt_id, {}).get('_recording_finished'):
+            return
+        # Pump status is latched and repeated; it also opens recordings when
+        # the one-shot trigger start notification was not received.
+        if (self.current_sample_window is None and isinstance(context, dict)
+                and (not expected or attempt_id == expected)
+                and context.get('source') in ('manual', 'fcu', 'survey', 'lab')
+                and attempt_id and context.get('record_id')
+                and (data.get('running') or data.get('paused'))):
+            self._sampling_context = copy.deepcopy(context)
+            source = context['source'] if context['source'] in ('survey', 'lab') else 'trigger'
+            self._start_data_recording_if_needed(source=source)
+            self._start_sample_window_if_needed()
+            expected = self._recording_attempt_id()
         if expected and (not isinstance(context, dict) or context.get('attempt_id') != expected):
             return
         self.latest_automation_status = data
         if 'running' in data or 'paused' in data:
             self.automation_paused = bool(data.get('paused', False))
             self.automation_running = bool(data.get('running', False)) and not self.automation_paused
+        if self._finish_owned_recording(self._sampling_results.get(expected)):
+            return
         terminal_status = self._automation_terminal(data)
         if terminal_status:
             self.automation_running = False
@@ -2715,6 +2733,7 @@ class WebConfigServer(object):
         if raw_status.startswith('sampling_context:'):
             try:
                 context = json.loads(raw_status.split(':', 1)[1])
+                self._trigger_attempt_id = context.get('attempt_id') if isinstance(context, dict) else None
                 if isinstance(context, dict) and self._sampling_results.get(context.get('attempt_id'), {}).get('_recording_finished'):
                     return
                 self._sampling_context = context if isinstance(context, dict) else {}
@@ -2742,6 +2761,8 @@ class WebConfigServer(object):
         if 'survey_started' in status:
             self._start_data_recording_if_needed(source="survey")
         if 'sampling_started' in status:
+            if self._sampling_results.get(self._trigger_attempt_id, {}).get('_recording_finished'):
+                return
             self.automation_running = True
             source = "lab" if self._lab_mission_recording_active() else "trigger"
             self._start_data_recording_if_needed(source=source)
