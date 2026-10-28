@@ -32,6 +32,7 @@ Services:
 
 from __future__ import print_function
 
+import copy
 import json
 import math
 import os
@@ -3849,6 +3850,9 @@ class PumpControlNode(object):
                     'attempt_id': data.get('attempt_id'),
                     'mavlink_request': data.get('mavlink_request'),
                 }
+                for key in ('record_id', 'timestamp_start', 'gps_snapshot', 'simulated'):
+                    if key in data:
+                        self.sampling_context[key] = copy.deepcopy(data[key])
             self._owner_last_seen = time.monotonic()
             self._configuration_ready = bool(attempt_id)
             return True

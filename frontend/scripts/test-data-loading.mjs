@@ -14,6 +14,7 @@ const compiled = ts.transpileModule(source, {
 
 function harness() {
   const hooks = [], effects = [], requests = []
+  const state = { automationRunning: false }
   let cursor = 0, dirty = true, tree
   const react = {
     useState(initial) {
@@ -49,6 +50,7 @@ function harness() {
     },
     require(name) {
       if (name === 'react') return react
+      if (name === '@/store') return { useAppStore: selector => selector(state) }
       if (name === 'react/jsx-runtime') return { jsx: (type, props) => ({ type, props }), jsxs: (type, props) => ({ type, props }) }
       if (name.includes('use-confirm')) return { useConfirm: () => async () => true }
       if (name.includes('utils')) return { cn: (...args) => args.join(' ') }
@@ -57,6 +59,7 @@ function harness() {
   })
   const api = {
     requests,
+    setAutomationRunning(value) { state.automationRunning = value; dirty = true },
     async flush() {
       for (let i = 0; i < 20; i++) {
         await new Promise(resolve => setImmediate(resolve))
@@ -161,4 +164,24 @@ test('late overview cannot replace newly selected task', async () => {
   await app.flush()
   assert.doesNotMatch(app.text(), /STALE_WINDOW/)
   assert.match(app.text(), /该任务暂无数据点/)
+})
+
+test('QGC sampling refreshes the mission list without replacing the selected history', async () => {
+  const app = await openTask()
+  app.requests[1].respond(overview)
+  await app.flush()
+  for (const running of [true, false]) {
+    const before = app.requests.length
+    app.setAutomationRunning(running)
+    await app.flush()
+    assert.equal(app.requests.length, before + 1)
+    assert.equal(app.requests[before].url, '/api/data/missions')
+    app.requests[before].respond([
+      { id: 'qgc', name: 'QGC sample', start_time: '2026-10-29', point_count: 2 },
+      { id: 'history', name: 'History', start_time: '2026-01-01', point_count: 3 },
+    ])
+    await app.flush()
+    assert.match(app.text(), /QGC sample/)
+    assert.equal(app.requests.length, before + 1)
+  }
 })
