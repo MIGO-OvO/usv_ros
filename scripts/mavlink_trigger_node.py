@@ -1268,11 +1268,17 @@ class MAVLinkTriggerNode(object):
     def _emit_request_event(self, context, phase, outcome='', reason='', **details):
         if not isinstance(context, dict):
             return
-        event = self._ledger().event(context, phase, outcome, reason, **details)
-        if event is not None:
-            message = String()
-            message.data = json.dumps(event)
-            self._event_pub.publish(message)
+        ledger = self._ledger()
+        with ledger.lock:
+            record = ledger.records.get(ledger.key(context), {})
+            previous_seq = (record.get('event') or {}).get('seq', 0)
+            event = ledger.event(context, phase, outcome, reason, **details)
+            # Publish transitions once; explicit retries use _replay_request.
+            if event is None or event['seq'] <= previous_seq:
+                return
+        message = String()
+        message.data = json.dumps(event)
+        self._event_pub.publish(message)
 
     def _mavlink_session_cb(self, msg):
         if len(msg.data) != 1:

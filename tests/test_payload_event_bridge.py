@@ -2,7 +2,7 @@
 import json
 from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from command_fixtures import remote_command, wait_commands
 from test_mavlink_command_compat import _load_script
@@ -91,6 +91,91 @@ class EventBridgeTests(unittest.TestCase):
         restarted._payload_command_cb(delivered[-1])
         wait_commands(restarted)
         self.assertEqual(actions, [31014, 31014])
+
+
+class EventReplayExpiryTests(unittest.TestCase):
+    def setUp(self):
+        self.trigger = _load_script('expiry_trigger', 'scripts/mavlink_trigger_node.py')
+        module = _load_script('expiry_bridge', 'scripts/usv_mavlink_router_bridge.py')
+        self.node = self.trigger.MAVLinkTriggerNode()
+        self.addCleanup(lambda: self.node._ledger().close())
+        with patch.object(module.USVMavlinkRouterBridge, '_connect_router'):
+            self.bridge = module.USVMavlinkRouterBridge()
+        self.bridge._tcp_session = self.node._mavlink_tcp_session = 1
+        self.bridge._executor_id = self.node._executor_id
+        self.chunks, self.sent = [], []
+        self.bridge._conn = SimpleNamespace(mav=SimpleNamespace(
+            statustext_send=lambda *args: self.chunks.append(args)))
+        self.bridge._payload_command_pub.publish = self.node._payload_command_cb
+        self.node._event_pub.publish = self.bridge._payload_event_cb
+        self.node.handle_mavlink_command = Mock(return_value=True)
+        self.now = 100.0
+        clock = patch.object(module, 'time', SimpleNamespace(monotonic=lambda: self.now))
+        clock.start()
+        self.addCleanup(clock.stop)
+
+    def start(self, command=31010):
+        request = remote_command(self.node, command)
+        self.bridge._forward_payload_command(request.data)
+        wait_commands(self.node)
+        context = self.trigger.request_context(1, 1, 1, command, 255, 190)
+        return request, context
+
+    def send(self):
+        self.chunks.clear()
+        self.bridge._send_payload_event()
+        if self.chunks:
+            raw = b''.join(chunk[1] for chunk in self.chunks).split(b'\0')[0]
+            event = json.loads(raw[6:])
+            self.sent.append((self.now, event))
+            return event
+
+    def periodic_status(self, status):
+        message = SimpleNamespace(data=json.dumps(status))
+        # Pump status at 1 Hz and the production bridge at 2 Hz for 3 minutes.
+        for tick in range(361):
+            self.now = 100.0 + tick * 0.5
+            if tick % 2 == 0:
+                self.node._automation_status_cb(message)
+            self.send()
+        self.assertTrue(self.sent)
+        self.assertLess(self.sent[-1][0], 130.0, 'periodic status reopened the expired replay window')
+        self.assertFalse(self.bridge._recent_events)
+
+    def test_periodic_completed_sampling_expires_and_explicit_retry_keeps_original_result(self):
+        request, context = self.start()
+        self.node._emit_request_event(context, 'terminal', 'succeeded', 'completed',
+                                     attempt_id='a' * 32, preflight_phase='complete')
+        terminal = dict(self.node._ledger().records['255:190:1:1']['event'])
+        self.periodic_status(dict(
+            status='stopped', terminal_reason='completed', preflight_phase='complete',
+            sampling_context=dict(mavlink_request=context, attempt_id='a' * 32)))
+        self.now += 0.5
+        self.bridge._forward_payload_command(request.data)
+        wait_commands(self.node)
+        self.assertEqual(self.send(), terminal)
+        self.node.handle_mavlink_command.assert_called_once()
+
+    def test_unchanged_progress_expires_and_changed_progress_is_sent(self):
+        _, context = self.start()
+        status = dict(status='waiting', preflight_phase='settling',
+                      sampling_context=dict(mavlink_request=context, attempt_id='a' * 32))
+        self.periodic_status(status)
+        previous = self.sent[-1][1]
+        self.now += 0.5
+        status['status'] = 'running'
+        self.node._automation_status_cb(SimpleNamespace(data=json.dumps(status)))
+        event = self.send()
+        self.assertEqual(event['state'], 'running')
+        self.assertGreater(event['seq'], previous['seq'])
+
+    def test_periodic_calibration_terminal_does_not_reopen_expired_replay(self):
+        _, context = self.start(31014)
+        self.periodic_status(dict(calibration=dict(
+            mavlink_request=context, attempt_id='a' * 32, active=False,
+            outcome='succeeded', reason='completed', phase='complete')))
+        self.assertEqual(self.sent[-1][1]['phase'], 'terminal')
+        self.assertEqual(self.sent[-1][1]['outcome'], 'succeeded')
 
 
 if __name__ == '__main__':
