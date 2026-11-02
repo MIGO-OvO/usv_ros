@@ -68,6 +68,10 @@ bridge 连接 router 后立即发送 component 191 心跳并接收命令；飞�
 
 QGC 手动点采样采用 Web 全局步骤和自动进样泵策略的 `speed`；缺少自动策略时沿用 `default_speed`。进样仍在泵组准备完成后开启。准备阶段通过现有 `USV_STAT=8` 上报，QGC 主按钮显示“停止采样准备”；进入采样步骤后才提供暂停/恢复。`31011` 在准备阶段和步骤执行期间均全局停止全部泵输出，并核对设备 `PIDQUERY → STOPALL_OK` 回应。
 
+任务节点每秒重发的 `HOLD_NO_MISSION` 表示无任务保持。bridge 收到 3 秒内的控制器空闲或停止状态，且没有等待结果的 FCU 采样时，两路回调统一上报 `USV_STAT=0`，使地面站状态和采样按钮保持一致。控制器的暂停、准备、校准、故障和清理失败状态优先；空闲判断沿用控制器原始时间戳。取消结果仍由对应请求的终态事件记录。
+
+这项状态合并修复部署到 ROS bridge。当前采样、走航和校准结束后，更新并重启 bridge，观察 `USV_STAT` 和采样按钮。回归入口：`python -m unittest discover -s tests -p test_payload_status_arbitration.py`。
+
 QGC 点采样和航点采样由 Web 服务归档。Web 从 trigger 开始通知或泵控持续发布的运行/暂停状态打开同一采样窗口，使用原始记录 ID、开始时间和开始位置，收到匹配 `attempt_id` 的 trigger 最终结果后关窗。数据中心在采样开始、结束时刷新任务列表，可下载原始帧和任务归档。部署此归档修复时一起更新并重启 pump/Web；Web 服务需在采样期间运行，此前未落盘的原始帧无法补回。回归入口为 `tests/test_qgc_web_recording.py` 和 `frontend/scripts/test-data-loading.mjs`。
 
 QGC 发送层与面板响应期限一致：分光启动 40 秒（覆盖最多三次配置重试和首帧等待），停止类 `31011/31016/31019` 为 15 秒。期限是等待确认的上限，停止命令点击后即发送。更新 ROS 后重启 trigger/bridge/pump，并运行重新编译的 QGC。

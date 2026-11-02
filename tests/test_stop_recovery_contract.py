@@ -488,10 +488,10 @@ class PayloadStatusAfterStopTests(unittest.TestCase):
         self.assertEqual(self.feed({
             'status': 'failed', 'running': False, 'preflight': {'active': False},
             'terminal_reason': 'spectrometer_not_ready'}), codes['FAILED'])
-        # Mission status left the cursor on a preparation phase; that stale
-        # phase used to keep FAILED latched after the stop was confirmed.
+        # A mission heartbeat can leave the cursor on a preparation phase,
+        # but cannot clear the current controller failure.
         self.bridge._mission_status_cb(SimpleNamespace(data='WAITING_STABLE'))
-        self.assertEqual(self.bridge._status_code, codes['WAITING_STABLE'])
+        self.assertEqual(self.bridge._status_code, codes['FAILED'])
         self.assertEqual(self.feed({
             'status': 'stopped', 'running': False, 'preflight': {'active': False},
             'terminal_reason': 'spectrometer_not_ready'}), codes['IDLE'])

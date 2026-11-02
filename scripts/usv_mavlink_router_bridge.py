@@ -93,6 +93,8 @@ class USVMavlinkRouterBridge(object):
         self._automation_running = False
         self._automation_paused = False
         self._automation_preflight_active = False
+        self._automation_failed = False
+        self._automation_terminal_status = False
         self._mavros_connected = False
         self._pkt_count = 0
         self._automation_step = 0.0
@@ -376,7 +378,7 @@ class USVMavlinkRouterBridge(object):
             return
 
         self._mark_source_locked('automation', data_dict)
-        self._controller_unavailable = bool(data_dict.get('controller_fault')
+        self._controller_unavailable = bool(data_dict.get('controller_fault') or data_dict.get('cleanup_failed')
             or data_dict.get('serial_connected') is False or data_dict.get('serial_recovering')
             or data_dict.get('spectrometer_config_state') == 'failed')
         ads = data_dict.get('ads_state')
@@ -390,15 +392,16 @@ class USVMavlinkRouterBridge(object):
         self._total_loops = float(data_dict.get("total_loops", 0.0) or 0.0)
         status_text = str(data_dict.get("status", "") or "").lower()
         reported_running = bool(data_dict.get("running", False))
+        self._automation_failed = "error" in status_text or "fail" in status_text
         terminal_status = (
             "finish" in status_text
             or "done" in status_text
             or "stop" in status_text
-            or "error" in status_text
-            or "fail" in status_text
+            or self._automation_failed
             or status_text == "idle"
             or (status_text == "" and not reported_running)
         )
+        self._automation_terminal_status = terminal_status
         self._automation_running = reported_running and not terminal_status
         self._automation_paused = bool(data_dict.get("paused", False)) and not terminal_status
         preflight = data_dict.get('preflight', {})
@@ -417,7 +420,7 @@ class USVMavlinkRouterBridge(object):
 
         last_state = getattr(self, "_last_mission_state", "IDLE")
         automation_at = self._field_received_at.get('USV_STEP', float('-inf'))
-        if ("error" in status_text or "fail" in status_text or self._automation_preflight_active
+        if (self._automation_failed or self._automation_preflight_active
                 or self._automation_paused or last_state in ("IDLE", "HOLD_NO_MISSION", "SAMPLING", "SAMPLING_DONE", "PAUSED")):
             self._field_received_at['USV_STAT'] = automation_at
         if self._controller_unavailable:
@@ -426,7 +429,7 @@ class USVMavlinkRouterBridge(object):
         elif self._calibration_active:
             self._status_code = self._MISSION_STATE_CODES["CALIBRATING"]
             self._field_received_at['USV_STAT'] = automation_at
-        elif "error" in status_text or "fail" in status_text:
+        elif self._automation_failed:
             self._status_code = self._MISSION_STATE_CODES["FAILED"]
         elif self._automation_preflight_active:
             # Preparation cannot be paused. Reuse the existing preparation/wait
@@ -523,12 +526,26 @@ class USVMavlinkRouterBridge(object):
                 elif automation_fresh and getattr(self, '_calibration_active', False):
                     code = self._MISSION_STATE_CODES["CALIBRATING"]
                     state_at = automation_at
+                elif automation_fresh and self._automation_failed:
+                    code = self._MISSION_STATE_CODES['FAILED']
+                    state_at = automation_at
                 elif (automation_fresh and getattr(self, '_automation_preflight_active', False)
                         and state in ("IDLE", "HOLD_NO_MISSION", "SAMPLING", "PAUSED")):
                     code = self._MISSION_STATE_CODES["WAITING_STABLE"]
                     state_at = automation_at
+                elif (automation_fresh and self._automation_paused
+                        and state in ("IDLE", "HOLD_NO_MISSION", "SAMPLING", "PAUSED")):
+                    code = self._MISSION_STATE_CODES["PAUSED"]
+                    state_at = automation_at
                 elif automation_fresh and self._automation_running and state in ("IDLE", "HOLD_NO_MISSION"):
                     code = self._MISSION_STATE_CODES["SAMPLING"]
+                    state_at = automation_at
+                elif (automation_fresh and self._automation_terminal_status
+                        and state in ("IDLE", "HOLD_NO_MISSION") and self._fcu_sample_id <= 0):
+                    # HOLD without a mission describes navigation, not a new
+                    # cancellation. Use the same fresh controller idle/stop as
+                    # the automation callback, including its original age.
+                    code = self._MISSION_STATE_CODES["IDLE"]
                     state_at = automation_at
                 self._status_code = code
                 self._field_received_at['USV_STAT'] = state_at
