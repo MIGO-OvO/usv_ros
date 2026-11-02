@@ -3,6 +3,7 @@ import json
 import time
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from test_mavlink_command_compat import _load_script, RecordingMav
 
@@ -54,6 +55,31 @@ class SourceAgeTests(unittest.TestCase):
             'source_monotonic': time.monotonic() - 10, 'running': True, 'status': 'running'})))
         b._mission_status_cb(SimpleNamespace(data='IDLE'))
         self.assertEqual(self.send()['USV_STAT'], 0)
+
+    def test_delayed_status_cannot_turn_fresh_idle_into_missing_or_running(self):
+        b = self.bridge
+        with patch.object(self.module.time, 'monotonic', return_value=100.0):
+            b._automation_status_cb(SimpleNamespace(data=json.dumps({
+                'source_monotonic': 100.0, 'status': 'idle', 'ads_state': 1})))
+            b._mission_status_cb(SimpleNamespace(data='IDLE'))
+        with patch.object(self.module.time, 'monotonic', return_value=101.0):
+            for issued in (90.0, 99.0, 102.0):
+                b._automation_status_cb(SimpleNamespace(data=json.dumps({
+                    'source_monotonic': issued, 'status': 'running', 'running': True,
+                    'ads_state': 3})))
+                sent = self.send()
+                self.assertEqual(sent.get('USV_STAT'), 0)
+                self.assertEqual(sent['USV_ADS'], 1)
+
+    def test_delayed_controller_fault_cannot_hide_current_mission(self):
+        b = self.bridge
+        with patch.object(self.module.time, 'monotonic', return_value=100.0):
+            b._automation_status_cb(SimpleNamespace(data=json.dumps({
+                'source_monotonic': 100.0, 'status': 'idle', 'serial_connected': True})))
+            b._automation_status_cb(SimpleNamespace(data=json.dumps({
+                'source_monotonic': 90.0, 'status': 'idle', 'serial_connected': False})))
+            b._mission_status_cb(SimpleNamespace(data='IDLE'))
+            self.assertEqual(self.send().get('USV_STAT'), 0)
 
 
 if __name__ == '__main__':

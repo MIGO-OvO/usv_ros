@@ -35,6 +35,7 @@ ROUTER_URL = "tcp:127.0.0.1:5760"
 WAIT_HEARTBEAT_TIMEOUT = 10.0
 MAX_PENDING_SENDS = 50
 RECONNECT_BACKOFF_SEC = 2.0
+FCU_TELEMETRY_TIMEOUT_SEC = 10.0
 
 DEFAULT_HEALTH_FIELDS = {
     "USV_JTMP": -1.0,
@@ -107,6 +108,9 @@ class USVMavlinkRouterBridge(object):
         self._boot_monotonic = time.monotonic()
         self._last_heartbeat = 0.0
         self._last_reconnect_attempt = 0.0
+        self._router_connected_at = self._boot_monotonic
+        self._fcu_seen = False
+        self._state_read_count = 0
         self._diag_last_report = time.monotonic()
         self._transport = None
         self._last_full_write_at = None
@@ -174,6 +178,7 @@ class USVMavlinkRouterBridge(object):
 
     def _connect_router(self, wait_heartbeat=False):
         self._conn = connect_router(mavutil, self._router_url, self._sys_id, self._comp_id)
+        self._router_connected_at = time.monotonic()
         # Keep pymavlink framing/parsing; replace its swallowed TCP errors and
         # single-send write at the actual byte boundary. The loop owns recovery.
         if getattr(self._conn, 'port', None) is not None:
@@ -249,6 +254,20 @@ class USVMavlinkRouterBridge(object):
                 pending.clear()
             self._recent_events.clear()
             self._active_event_send = None
+
+    def _check_router_liveness(self):
+        if self._conn is None:
+            return
+        latest = max((record['received_monotonic'] for record in self._gps_cache.records.values()),
+                     default=None)
+        if latest is not None and latest >= self._router_connected_at:
+            self._fcu_seen = True
+        if not self._fcu_seen:
+            return  # A standalone Web/lab session may never have an FCU.
+        last_rx = max(self._router_connected_at, latest if latest is not None else self._router_connected_at)
+        age = time.monotonic() - last_rx
+        if age > FCU_TELEMETRY_TIMEOUT_SEC:
+            self._retire_router('FCU heartbeat and telemetry timeout (%.1fs)' % age)
 
     def _mav_send_with_retry(self, send_fn, label):
         # Historical method name retained for callers; no cross-session replay.
@@ -347,6 +366,13 @@ class USVMavlinkRouterBridge(object):
 
     def _apply_automation_status_locked(self, data_dict):
         if not isinstance(data_dict, dict) or not data_dict:
+            return
+
+        now = time.monotonic()
+        issued = data_dict.get('source_monotonic', now)
+        if (not isinstance(issued, (int, float)) or not math.isfinite(issued)
+                or not 0 <= now - issued <= 3.0
+                or issued < self._field_received_at.get('USV_STEP', float('-inf'))):
             return
 
         self._mark_source_locked('automation', data_dict)
@@ -848,6 +874,29 @@ class USVMavlinkRouterBridge(object):
 
             try:
                 command = int(msg.command)
+                if (command == 512 and int(getattr(msg, 'target_system', 0)) == self._sys_id
+                        and int(getattr(msg, 'target_component', 0)) == self._comp_id):
+                    # REQUEST_MESSAGE is read-only. Routine telemetry supplies
+                    # the fresh snapshot this cycle; recover_only supplies any
+                    # lost result owned by this GCS without admitting an action.
+                    message_id = float(getattr(msg, 'param1', -1))
+                    sender = (msg.get_srcSystem(), msg.get_srcComponent())
+                    supported = message_id in (0, 251)
+                    if supported:
+                        self._state_read_count += 1
+                        self._last_heartbeat = 0.0
+                        if message_id == 251:
+                            selection = (getattr(msg, 'param2', 0), getattr(msg, 'param3', 0),
+                                         getattr(msg, 'param4', 0))
+                            with self._lock:
+                                for record in self._request_routes.records.values():
+                                    values = record.get('values')
+                                    if (values and tuple(values[5:7]) == sender
+                                            and (values[8], values[7], values[0]) == selection
+                                            and record.get('executor') == self._executor_id):
+                                        record['recover'] = True
+                    self._pending_acks.append((512, 0 if supported else 3, *sender))
+                    continue
                 if command < CMD_START_SAMPLING or command > CMD_SPECTROMETER_STOP:
                     continue
 
@@ -952,6 +1001,7 @@ class USVMavlinkRouterBridge(object):
                 "tcp_session": self._tcp_session,
                 "tcp_connected": self._conn is not None,
                 "reconnect_reason": self._reconnect_reason,
+                "state_read_count": self._state_read_count,
                 "transport": dict(self._transport_counts),
                 "bad_data": dict(self._bad_data_counts),
                 "bad_data_last_reason": self._bad_data_last_reason,
@@ -1132,6 +1182,7 @@ class USVMavlinkRouterBridge(object):
                 self._reconnect_router()
             # 命令接收始终运行，不依赖 MAVROS 连接状态
             self._receive_mavlink_messages()
+            self._check_router_liveness()
             self._recover_payload_results()
             if self._transport:
                 self._transport.begin_cycle()
