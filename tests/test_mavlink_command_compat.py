@@ -207,6 +207,10 @@ class RecordingMav:
     def __init__(self):
         self.named_values = []
         self.command_acks = []
+        self.timesync_messages = []
+
+    def timesync_send(self, tc1, ts1):
+        self.timesync_messages.append((tc1, ts1))
 
     def named_value_float_send(self, timestamp, name, value):
         clean_name = name.decode("ascii").rstrip("\x00")

@@ -49,6 +49,16 @@ class RealMAVLinkTCPTests(unittest.TestCase):
         self.assertEqual(len(messages), 1)
         self.assertEqual((messages[0].id, messages[0].chunk_seq), (41, 2))
         self.assertEqual(transport.counters['fully_written_frames'], 1)
+        token = time.monotonic_ns()
+        transport.begin_cycle()
+        connection.mav.timesync_send(0, token)
+        probe = parser.parse_buffer(peer.recv(512))[0]
+        self.assertEqual((probe.tc1, probe.ts1), (0, token))
+        fcu = dialect.MAVLink(None, srcSystem=1, srcComponent=1)
+        peer.sendall(fcu.timesync_encode(123, token).pack(fcu))
+        echo = connection.recv_match(blocking=True, timeout=1)
+        self.assertEqual((echo.get_srcSystem(), echo.get_srcComponent(), echo.tc1, echo.ts1),
+                         (1, 1, 123, token))
         # A broken incoming prefix belongs only to this parser/session.
         peer.sendall(raw[:8])
         connection.recv_match(blocking=False)

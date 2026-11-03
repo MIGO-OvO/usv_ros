@@ -80,6 +80,12 @@ QGC 在总预算内以 1 秒间隔最多发送三份同 session/request/command/
 
 TCP 每轮发送预算仍为 30 ms，从收包处理结束后计时。尚未写出字节的帧延期，ACK 与事件分片完整发送后出队；部分帧发送失败或真实连接错误仍退役连接并停止任务。USVE1 保留分片发送位置，超过 QGC 的 1 秒组包期限后从头重播。
 
+长时间空闲仍维持 1 Hz 心跳和 2 Hz 遥测。bridge 发送过数据后，连续 10 秒没有完成任何帧写入会退役 TCP；收到过飞控证据后，每 5 秒用标准 TIMESYNC 探测一次往返，只接受选定飞控回显的当前单调时间戳，15 秒没有匹配回包也会重连。飞控普通心跳不能替代往返确认。TCP 重建沿用原停止保护和请求身份，不重放 START。
+
+独立地面站通过 COMMAND_LONG 512、param1=251 读取状态；191 定向读取后关键字段仍缺失时，下次改发同 sysid/component 0 的只读广播。bridge 接受这两种地址，仍按原 sender/session/request/command/executor 恢复结果。查询 ACK 不代表任务完成，过期源字段不续期。bridge 通信循环按单调时钟调度；节点退出后 roslaunch 间隔 2 秒重启该节点。部署时更新 ROS 后重启现有 launch，并使用同步更新的地面站。
+
+`usvstatus` 的 `bridge_diag` 增加 `fcu_roundtrip_age_s`、`fcu_probe_pending_age_s`、`state_read_count`。正常运行时往返确认年龄应周期性回落；进程 RUNNING 只说明进程存在，需同时检查这些诊断及地面站的新鲜字段。
+
 断线取消保留 `transport_session_lost`。重连后 bridge 通过 `recover_only` 查询保存的原请求，trigger 核对执行实例、请求身份和参数，再向新会话重放缓存结果或后续终态。同身份重试也走该校验，不重复执行 START。bridge/trigger 必须一起更新并重启；QGC 更新后显示通信取消的中文原因。飞控与检测板本轮无协议变更。
 
 回归入口：`test_mavlink_tcp_transport.py`、`test_payload_transport_recovery.py`、`test_qgc_payload_startup.py`、`test_bridge_qml_event_chain.py`。最后一项单独运行于真实 pymavlink 环境，包含发送前预算耗尽与分片中途延期。

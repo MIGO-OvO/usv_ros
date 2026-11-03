@@ -36,6 +36,7 @@ def parse_echo(text):
 def summary(value):
     return 'bridge_diag: ' + ' '.join('{}={}'.format(key, value.get(key, '?')) for key in (
         'tcp_connected', 'tcp_session', 'fcu_heartbeat_age_s', 'last_complete_write_age_s',
+        'fcu_roundtrip_age_s', 'fcu_probe_pending_age_s', 'state_read_count',
         'reconnect_reason', 'transport', 'mavros_connected', 'tx_total', 'pkt_count'))
 
 

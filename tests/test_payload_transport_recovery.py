@@ -41,6 +41,7 @@ class TransportRecoveryTests(unittest.TestCase):
             self.frames.append((kind, args))
         self.bridge._conn = SimpleNamespace(close=port.close, mav=SimpleNamespace(
             command_ack_send=lambda *args: send('ack', *args),
+            timesync_send=lambda *args: send('timesync', *args),
             statustext_send=lambda *args: send('text', *args),
             named_value_float_send=lambda *args: send('nvf', *args)))
 
@@ -70,13 +71,15 @@ class TransportRecoveryTests(unittest.TestCase):
                                      attempt_id=self.node.current_sampling_context['attempt_id'])
         original = self.event(request)
         self.bridge._recent_events.clear()
-        for sender, command, recovered in ((253, 31010, False), (255, 31014, False), (255, 31010, True)):
-            query = FakeCommandLong(512, 251, request.data[8], 1, 191, sender, 190)
-            query.param3, query.param4 = request.data[7], command
-            self.bridge._conn.recv_match = FakeConnection([query]).recv_match
-            self.bridge._receive_mavlink_messages()
-            self.bridge._recover_payload_results()
-            self.assertEqual(bool(self.bridge._recent_events), recovered)
+        for component in (191, 0):
+            for sender, command, recovered in ((253, 31010, False), (255, 31014, False), (255, 31010, True)):
+                self.bridge._recent_events.clear()
+                query = FakeCommandLong(512, 251, request.data[8], 1, component, sender, 190)
+                query.param3, query.param4 = request.data[7], command
+                self.bridge._conn.recv_match = FakeConnection([query]).recv_match
+                self.bridge._receive_mavlink_messages()
+                self.bridge._recover_payload_results()
+                self.assertEqual(bool(self.bridge._recent_events), recovered)
         self.assertEqual(self.event(request), original)
         self.node._call_automation_service.assert_called_once_with('start')
         self.assertIn((512, 0, 255, 190), self.bridge._pending_acks)
@@ -112,6 +115,90 @@ class TransportRecoveryTests(unittest.TestCase):
             self.assertFalse(self.port.closed)
             self.assertIsNotNone(self.bridge._conn)
         self.node._call_automation_service.assert_not_called()
+
+    def test_long_idle_receive_only_socket_cannot_keep_blocked_writes_alive(self):
+        self.bridge._router_connected_at = 100.0
+        self.bridge._transport.last_write_at = 100.0
+        self.port.send = Mock(side_effect=BlockingIOError(errno.EWOULDBLOCK, 'full'))
+        self.bridge._conn.mav.heartbeat_send = lambda *args: self.bridge._transport.write(b'heartbeat')
+        now = 100.0 + 16 * 60 * 60
+        self.bridge._gps_cache.records['HEARTBEAT'] = {'received_monotonic': now}
+        with patch.object(self.module.time, 'monotonic', return_value=now), \
+                patch('scripts.lib.mavlink_tcp_transport.select.select', return_value=([], [], [])):
+            self.bridge._transport.begin_cycle()
+            self.assertFalse(self.bridge._send_heartbeat())
+            self.bridge._check_router_liveness()
+        self.assertTrue(self.port.closed, 'fresh FCU input must not hide a stuck payload writer')
+        self.assertIsNone(self.bridge._conn)
+        wait_commands(self.node)
+        self.node._call_automation_service.assert_called_once_with('stop')
+
+    def test_live_fcu_and_successful_socket_writes_do_not_hide_a_lost_roundtrip(self):
+        request = self.start()
+        self.bridge._router_connected_at = 100.0
+        self.bridge._fcu_seen = True
+        with patch.object(self.module.time, 'monotonic', return_value=100.0):
+            self.bridge._transport.begin_cycle()
+            self.bridge._send_router_probe()
+        self.assertEqual(self.frames[-1][0], 'timesync')
+        for now in (105.0, 110.0):
+            with patch.object(self.module.time, 'monotonic', return_value=now):
+                self.bridge._transport.begin_cycle()
+                self.bridge._send_router_probe()
+        self.assertEqual(len({args[1] for kind, args in self.frames if kind == 'timesync'}), 1)
+        self.bridge._gps_cache.records['HEARTBEAT'] = {'received_monotonic': 116.0}
+        self.bridge._transport.last_write_at = 116.0
+        with patch.object(self.module.time, 'monotonic', return_value=116.0):
+            self.bridge._check_router_liveness()
+        wait_commands(self.node)
+        self.assertTrue(self.port.closed)
+        self.assertIn('roundtrip', self.bridge._reconnect_reason)
+        self.assertFalse(self.node.is_sampling)
+        self.reconnect()
+        self.bridge._recover_payload_results()
+        self.assertEqual(self.event(request)['reason'], 'transport_session_lost')
+        self.assertEqual(sum(call.args == ('start',) for call in self.node._call_automation_service.call_args_list), 1)
+
+    def test_long_uptime_probe_accepts_only_current_selected_fcu_echo(self):
+        self.bridge._fcu_seen = True
+        now = 100.0 + 16 * 60 * 60
+        self.bridge._router_connected_at = 100.0
+        def receive(system, component, tc1, token):
+            message = SimpleNamespace(get_type=lambda: 'TIMESYNC', get_srcSystem=lambda: system,
+                                      get_srcComponent=lambda: component, tc1=tc1, ts1=token)
+            self.bridge._conn.recv_match = FakeConnection([message]).recv_match
+            self.bridge._receive_mavlink_messages()
+        for _ in range(8):
+            self.bridge._gps_cache.records['HEARTBEAT'] = {'received_monotonic': now}
+            with patch.object(self.module.time, 'monotonic', return_value=now):
+                self.bridge._transport.begin_cycle()
+                self.bridge._send_router_probe()
+                token = self.frames[-1][1][1]
+                for system, component, tc1, response in (
+                        (1, 240, 123, token), (2, 1, 123, token),
+                        (1, 1, 0, token), (1, 1, 123, token - 1)):
+                    receive(system, component, tc1, response)
+                    self.assertIsNotNone(self.bridge._fcu_probe)
+                receive(1, 1, 123, token)
+                self.assertIsNone(self.bridge._fcu_probe)
+                self.bridge._check_router_liveness()
+                self.assertIsNotNone(self.bridge._conn)
+            now += 5.0
+        self.assertEqual(len(self.frames), 8)
+        self.node._call_automation_service.assert_not_called()
+
+    def test_bridge_pacing_survives_ros_wall_clock_correction(self):
+        self.bridge._conn.recv_match = FakeConnection([]).recv_match
+        rate = Mock()
+        rate.sleep.side_effect = RuntimeError('ROS time moved backwards')
+        with patch.object(self.module.rospy, 'Rate', return_value=rate), \
+                patch.object(self.module.rospy, 'is_shutdown', side_effect=[False, False, True]), \
+                patch.object(self.module.time, 'sleep'), \
+                patch.object(self.bridge, '_send_heartbeat', return_value=True), \
+                patch.object(self.bridge, '_send_payload') as send_payload, \
+                patch.object(self.bridge, '_publish_gps_evidence'):
+            self.bridge.run()
+        self.assertEqual(send_payload.call_count, 2)
 
     def test_delayed_healthy_send_keeps_queues_session_and_task(self):
         request = self.start()

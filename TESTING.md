@@ -315,6 +315,15 @@ rostopic echo /usv/trigger_status
 | 航线采样 | QGC Plan 使用 `MAV_CMD_NAV_SCRIPT_TIME(param1=1)`；执行时 bridge 收到 `USV_SMPL`，完成后发 `USV_DONE` |
 | 数据记录 | `sampling_started` 后 Web 数据中心出现任务记录；有效分光数据到达时数据点数量增长 |
 
+长时空闲与自动恢复：
+
+- 保持空闲至少 24 小时，记录 `/usv/bridge_diagnostics` 和数传日志。飞控与载荷均持续在线，`fcu_roundtrip_age_s` 周期性回落；再次读取时收到新的源状态。
+- 在台架模拟 TCP 发送阻塞、飞控心跳继续进入：10 秒无完整帧写入后会话退役；模拟完整写入但 TIMESYNC 回包丢失：15 秒后会话退役。观察会话更新、只读状态恢复和原任务的停止结果，确认 START 次数没有增加。
+- 模拟 191 定向路由丢失、同 sysid/component 0 广播仍可达：独立地面站第一次定向读取失败后，至少间隔 2 秒发出只读广播，收到新状态后恢复定向读取。其他船号及错误 sender/request 的结果不能解锁旧任务。
+- 检查 `usv_mavlink_bridge` 节点退出后由 roslaunch 重建，校时不影响通信循环。新会话保留停止保护；普通遥测和查询 ACK 不结束未确认的物理任务。
+
+离线回归入口：`tests/test_payload_transport_recovery.py`、`tests/test_mavlink_tcp_transport.py`；地面站为 `cargo test --locked -p usv-core --test network --test protocol`。虚拟时钟覆盖 16 小时 uptime，现场 24 小时静默验收需另行执行。
+
 ### 5.4.1 Web 航线上传合同
 
 Web 地图页的航线规划只写入飞控 mission，不解锁、不切 `AUTO`。后端接口必须走 MAVROS mission 服务并做回读比对：

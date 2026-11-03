@@ -36,6 +36,9 @@ WAIT_HEARTBEAT_TIMEOUT = 10.0
 MAX_PENDING_SENDS = 50
 RECONNECT_BACKOFF_SEC = 2.0
 FCU_TELEMETRY_TIMEOUT_SEC = 10.0
+ROUTER_WRITE_TIMEOUT_SEC = 10.0
+FCU_PROBE_INTERVAL_SEC = 5.0
+FCU_PROBE_TIMEOUT_SEC = 15.0
 
 DEFAULT_HEALTH_FIELDS = {
     "USV_JTMP": -1.0,
@@ -112,6 +115,8 @@ class USVMavlinkRouterBridge(object):
         self._last_reconnect_attempt = 0.0
         self._router_connected_at = self._boot_monotonic
         self._fcu_seen = False
+        self._fcu_probe = None
+        self._last_fcu_roundtrip_at = None
         self._state_read_count = 0
         self._diag_last_report = time.monotonic()
         self._transport = None
@@ -181,6 +186,9 @@ class USVMavlinkRouterBridge(object):
     def _connect_router(self, wait_heartbeat=False):
         self._conn = connect_router(mavutil, self._router_url, self._sys_id, self._comp_id)
         self._router_connected_at = time.monotonic()
+        self._fcu_probe = None
+        self._last_fcu_roundtrip_at = None
+        self._last_heartbeat = 0.0
         # Keep pymavlink framing/parsing; replace its swallowed TCP errors and
         # single-send write at the actual byte boundary. The loop owns recovery.
         if getattr(self._conn, 'port', None) is not None:
@@ -236,6 +244,7 @@ class USVMavlinkRouterBridge(object):
         if self._transport:
             self._last_send_attempt = self._transport.last_attempt
         self._transport = None
+        self._fcu_probe = None
         message = Float32MultiArray()
         message.data = [0.0]
         self._session_pub.publish(message)
@@ -260,6 +269,14 @@ class USVMavlinkRouterBridge(object):
     def _check_router_liveness(self):
         if self._conn is None:
             return
+        now = time.monotonic()
+        if self._transport and self._transport.last_attempt is not None:
+            last_write = self._transport.last_write_at
+            age = now - max(self._router_connected_at,
+                            last_write if last_write is not None else self._router_connected_at)
+            if age > ROUTER_WRITE_TIMEOUT_SEC:
+                self._retire_router('TCP send stalled (%.1fs without a complete frame)' % age)
+                return
         latest = max((record['received_monotonic'] for record in self._gps_cache.records.values()),
                      default=None)
         if latest is not None and latest >= self._router_connected_at:
@@ -267,9 +284,25 @@ class USVMavlinkRouterBridge(object):
         if not self._fcu_seen:
             return  # A standalone Web/lab session may never have an FCU.
         last_rx = max(self._router_connected_at, latest if latest is not None else self._router_connected_at)
-        age = time.monotonic() - last_rx
+        age = now - last_rx
         if age > FCU_TELEMETRY_TIMEOUT_SEC:
             self._retire_router('FCU heartbeat and telemetry timeout (%.1fs)' % age)
+        elif self._fcu_probe is not None and now - self._fcu_probe[1] > FCU_PROBE_TIMEOUT_SEC:
+            self._retire_router('FCU roundtrip timeout (%.1fs)' % (now - self._fcu_probe[1]))
+
+    def _send_router_probe(self):
+        if self._conn is None or not self._fcu_seen:
+            return
+        now = time.monotonic()
+        probe = self._fcu_probe
+        last_sent = probe[2] if probe is not None else self._last_fcu_roundtrip_at
+        if last_sent is not None and now - last_sent < FCU_PROBE_INTERVAL_SEC:
+            return
+        token = probe[0] if probe is not None else time.monotonic_ns()
+        # ArduPilot echoes ts1 in TIMESYNC replies. No clock or parameter is set.
+        if self._mav_send_with_retry(
+                lambda: self._conn.mav.timesync_send(0, token), 'FCU roundtrip probe'):
+            self._fcu_probe = (token, probe[1] if probe is not None else now, now)
 
     def _mav_send_with_retry(self, send_fn, label):
         # Historical method name retained for callers; no cross-session replay.
@@ -827,6 +860,16 @@ class USVMavlinkRouterBridge(object):
                 except (ValueError, TypeError, AttributeError, OverflowError) as exc:
                     rospy.logwarn_throttle(10.0, 'GPS evidence rejected: %s', str(exc))
 
+            if msg_type == 'TIMESYNC':
+                probe = self._fcu_probe
+                if (probe is not None
+                        and (msg.get_srcSystem(), msg.get_srcComponent()) == (
+                            self._gps_cache.system_id, self._gps_cache.component_id)
+                        and msg.tc1 > 0 and msg.ts1 == probe[0]):
+                    self._last_fcu_roundtrip_at = time.monotonic()
+                    self._fcu_probe = None
+                continue
+
             # RADIO_STATUS: 电台链路质量数据
             if msg_type == "RADIO_STATUS":
                 try:
@@ -892,7 +935,7 @@ class USVMavlinkRouterBridge(object):
             try:
                 command = int(msg.command)
                 if (command == 512 and int(getattr(msg, 'target_system', 0)) == self._sys_id
-                        and int(getattr(msg, 'target_component', 0)) == self._comp_id):
+                        and int(getattr(msg, 'target_component', 0)) in (0, self._comp_id)):
                     # REQUEST_MESSAGE is read-only. Routine telemetry supplies
                     # the fresh snapshot this cycle; recover_only supplies any
                     # lost result owned by this GCS without admitting an action.
@@ -1019,6 +1062,10 @@ class USVMavlinkRouterBridge(object):
                 "tcp_connected": self._conn is not None,
                 "reconnect_reason": self._reconnect_reason,
                 "state_read_count": self._state_read_count,
+                "fcu_roundtrip_age_s": (time.monotonic() - self._last_fcu_roundtrip_at
+                    if self._last_fcu_roundtrip_at is not None else None),
+                "fcu_probe_pending_age_s": (time.monotonic() - self._fcu_probe[1]
+                    if self._fcu_probe is not None else None),
                 "transport": dict(self._transport_counts),
                 "bad_data": dict(self._bad_data_counts),
                 "bad_data_last_reason": self._bad_data_last_reason,
@@ -1193,8 +1240,8 @@ class USVMavlinkRouterBridge(object):
             self._pkt_count = (self._pkt_count + 1) % 65536
 
     def run(self):
-        rate = rospy.Rate(TELEMETRY_RATE_HZ)
         while not rospy.is_shutdown():
+            cycle_started = time.monotonic()
             if self._conn is None:
                 self._reconnect_router()
             # 命令接收始终运行，不依赖 MAVROS 连接状态
@@ -1237,6 +1284,7 @@ class USVMavlinkRouterBridge(object):
             # Safety outcomes precede routine ACKs, logs and bulk telemetry.
             self._flush_pending_sends()
             self._send_payload_event()
+            self._send_router_probe()
 
             self._send_payload(voltage, absorbance, angles, status, automation_step, automation_total, current_loop, total_loops, sample_count, pid_error, pid_mode, baseline_set, reference_voltage, baseline_voltage, spectrometer_valid, health_fields)
 
@@ -1249,7 +1297,9 @@ class USVMavlinkRouterBridge(object):
             if now - self._diag_last_report >= DIAG_REPORT_INTERVAL:
                 self._publish_diagnostics()
                 self._diag_last_report = now
-            rate.sleep()
+            # ROS time follows wall/sim time; NTP corrections must not stall
+            # the socket owner or its monotonic recovery deadlines.
+            time.sleep(max(0.0, 1.0 / TELEMETRY_RATE_HZ - (time.monotonic() - cycle_started)))
 
 
 def main():
