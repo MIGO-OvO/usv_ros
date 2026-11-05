@@ -20,6 +20,7 @@ from scripts.lib.gps_diagnostics import GPSDiagnosticsCache, PARAMETERS
 from scripts.lib.mavlink_tcp_transport import MAVLinkTCPTransport, TCPWriteDeferred, connect_router
 from scripts.lib.payload_protocol import encode_event, next_transport_session, SAFETY_COMMANDS, RequestLedger, request_context
 from scripts.lib.automation_preflight import calibrated_offsets, relative_angles
+from scripts.lib.ros_radio import RosRadioServer, LocalWebAPI, MESSAGE_TYPE as ROS_RADIO_TYPE
 
 import rospy
 from std_msgs.msg import String, Float32MultiArray
@@ -80,6 +81,8 @@ class USVMavlinkRouterBridge(object):
         self._gps_request_index = 0
         self._wait_heartbeat_timeout = float(rospy.get_param("~wait_heartbeat_timeout", WAIT_HEARTBEAT_TIMEOUT))
         self._lock = threading.Lock()
+        self._ros_radio = None
+        self._ros_web_port = int(rospy.get_param('~ros_web_port', 5000))
         self._field_received_at = {}
         self._ads_state = 0
         self._voltage = 0.0
@@ -238,6 +241,8 @@ class USVMavlinkRouterBridge(object):
             return False
 
     def _retire_router(self, reason):
+        if self._ros_radio is not None:
+            self._ros_radio.reset()
         self._reconnect_reason = str(reason)
         connection, self._conn = self._conn, None
         if self._transport and self._transport.last_write_at is not None:
@@ -848,6 +853,14 @@ class USVMavlinkRouterBridge(object):
                 break
 
             msg_type = msg.get_type()
+            if msg_type == 'V2_EXTENSION':
+                if (int(msg.message_type) == ROS_RADIO_TYPE
+                        and int(msg.target_system) == self._sys_id
+                        and int(msg.target_component) == self._comp_id):
+                    if self._ros_radio is None:
+                        self._ros_radio = RosRadioServer(LocalWebAPI(self._ros_web_port))
+                    self._ros_radio.receive((msg.get_srcSystem(), msg.get_srcComponent()), msg.payload)
+                continue
             if msg_type == "BAD_DATA":
                 # A rejected frame is a diagnosable event, not a disconnect and
                 # not a command. Classify it so the field can tell a corrupt
@@ -966,9 +979,12 @@ class USVMavlinkRouterBridge(object):
                     continue
                 if command < CMD_START_SAMPLING or command > CMD_SPECTROMETER_STOP:
                     continue
-
                 target_system = int(getattr(msg, "target_system", 0) or 0)
                 target_component = int(getattr(msg, "target_component", 0) or 0)
+                if (command in SAFETY_COMMANDS and self._ros_radio is not None
+                        and target_system in (0, self._sys_id)
+                        and target_component in (0, self._comp_id)):
+                    self._ros_radio.cancel_pending()
                 ack_target_system = int(getattr(msg, "get_srcSystem", lambda: 0)())
                 ack_target_component = int(getattr(msg, "get_srcComponent", lambda: 0)())
                 identity = dict(command=command, request=getattr(msg, 'param3', 0), session=getattr(msg, 'param4', 0),
@@ -1246,7 +1262,19 @@ class USVMavlinkRouterBridge(object):
         if sent_all:
             self._pkt_count = (self._pkt_count + 1) % 65536
 
+    def _send_ros_radio(self):
+        if self._ros_radio is None or self._conn is None:
+            return
+        item = self._ros_radio.peek()
+        if item is not None:
+            target, payload = item
+            data = list(payload.ljust(249, b'\0'))
+            if self._mav_send_with_retry(lambda: self._conn.mav.v2_extension_send(
+                    0, target[0], target[1], ROS_RADIO_TYPE, data), 'ROS radio reply'):
+                self._ros_radio.sent(item)
+
     def run(self):
+        last_payload = 0.0
         while not rospy.is_shutdown():
             cycle_started = time.monotonic()
             if self._conn is None:
@@ -1293,10 +1321,16 @@ class USVMavlinkRouterBridge(object):
             self._send_payload_event()
             self._send_router_probe()
 
-            self._send_payload(voltage, absorbance, angles, status, automation_step, automation_total, current_loop, total_loops, sample_count, pid_error, pid_mode, baseline_set, reference_voltage, baseline_voltage, spectrometer_valid, health_fields)
+            payload_due = now - last_payload >= 1.0 / TELEMETRY_RATE_HZ
+            if payload_due:
+                self._send_payload(voltage, absorbance, angles, status, automation_step, automation_total, current_loop, total_loops, sample_count, pid_error, pid_mode, baseline_set, reference_voltage, baseline_voltage, spectrometer_valid, health_fields)
+                last_payload = now
+            # Configuration fragments follow control outcomes and telemetry.
+            self._send_ros_radio()
 
             try:
-                self._publish_gps_evidence()
+                if payload_due:
+                    self._publish_gps_evidence()
             except Exception as exc:
                 # Diagnostics must never interrupt control, ACK or sampling outcomes.
                 rospy.logwarn_throttle(10.0, 'GPS diagnostics unavailable: %s', str(exc))
@@ -1306,7 +1340,7 @@ class USVMavlinkRouterBridge(object):
                 self._diag_last_report = now
             # ROS time follows wall/sim time; NTP corrections must not stall
             # the socket owner or its monotonic recovery deadlines.
-            time.sleep(max(0.0, 1.0 / TELEMETRY_RATE_HZ - (time.monotonic() - cycle_started)))
+            time.sleep(max(0.0, 0.05 - (time.monotonic() - cycle_started)))
 
 
 def main():

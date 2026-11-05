@@ -244,14 +244,20 @@ class TransportRecoveryTests(unittest.TestCase):
         self.bridge._conn.recv_match = FakeConnection([]).recv_match
         rate = Mock()
         rate.sleep.side_effect = RuntimeError('ROS time moved backwards')
+        clock = [10.0]
+        def advance(seconds):
+            clock[0] += seconds
         with patch.object(self.module.rospy, 'Rate', return_value=rate), \
-                patch.object(self.module.rospy, 'is_shutdown', side_effect=[False, False, True]), \
-                patch.object(self.module.time, 'sleep'), \
+                patch.object(self.module.rospy, 'is_shutdown', side_effect=[False] * 12 + [True]), \
+                patch.object(self.module.time, 'monotonic', side_effect=lambda: clock[0]), \
+                patch.object(self.module.time, 'sleep', side_effect=advance), \
                 patch.object(self.bridge, '_send_heartbeat', return_value=True), \
                 patch.object(self.bridge, '_send_payload') as send_payload, \
-                patch.object(self.bridge, '_publish_gps_evidence'):
+                patch.object(self.bridge, '_publish_gps_evidence') as gps:
             self.bridge.run()
         self.assertEqual(send_payload.call_count, 2)
+        self.assertEqual(gps.call_count, 2)
+        rate.sleep.assert_not_called()
 
     def test_delayed_healthy_send_keeps_queues_session_and_task(self):
         request = self.start()

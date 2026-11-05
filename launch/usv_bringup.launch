@@ -122,6 +122,7 @@
     <!-- ==================== MAVLink Telemetry Bridge ==================== -->
     <node name="usv_mavlink_bridge" pkg="usv_ros" type="usv_mavlink_router_bridge.py"
           output="screen" respawn="true" respawn_delay="2" if="$(arg enable_mavlink_bridge)">
+        <param name="ros_web_port" value="$(arg web_port)" />
         <param name="source_system_id" value="$(arg mavlink_source_system)" />
         <param name="source_component_id" value="$(arg mavlink_source_component)" />
         <param name="router_url" value="$(arg mavlink_router_url)" />

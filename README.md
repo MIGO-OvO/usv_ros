@@ -1,5 +1,15 @@
 # usv_ros
 
+## 地面站 ROS 数传访问
+
+独立 USV GroundStation 可在设置中选择数传 MAVLink，访问采样配置、PID 参数、零点与运动回零、预设、航点采样配置、Jetson/bridge/MAVROS 诊断、四轴手动泵控、注射泵和硬件设置。地面站通过电台和飞控路由到 Jetson component 191，无需连接船端热点。原 HTTP 网页、数据、地图与下载接口继续可用；PIDTEST 调试保留 HTTP 入口。
+
+部署需同时更新 ROS 与地面站并重启。Web 配置服务仍在 Jetson 上运行，bridge 通过 loopback 调用原 API；`usv_bringup.launch` 将 `web_port` 传给 bridge 的 `ros_web_port`，默认 5000。已有 Web 控制认证继续生效，启用认证时在地面站填入同一令牌。
+
+数传使用标准 `V2_EXTENSION`，`message_type=31020`，载荷帧头 `<4sBQQIHHH>`（`USR1`、类型、session、boot、request、index、count、size），每片最多 218 字节 zlib JSON。原文上限 128 KiB、压缩上限 64 KiB、请求期限 120 秒；诊断返回完整最新状态及最近 20 条事件/历史。bridge 保留 32 个请求记录和每 session 的 request 高水位，旧请求只读取结果；重连更换 boot 后拒绝旧动作。STOP 独立处理，延迟请求沿用最初单调时间以遵守泵控停止截止点。无需更改飞控或检测板固件。
+
+回归：`python -B -m unittest discover -s tests -p 'test_ros_radio*.py'`。完整 Rust/真实 MAVLink 2/Flask 本机互通工具位于地面站仓库 `tools/verify-ros-radio.py`。Jetson 验收需关闭热点，仅用电台逐项读写并回读，验证运行中停止、链路中断与重启后不重放动作，再验证 HTTP 网页和归档下载。
+
 ## MAVROS 断线恢复
 
 `mavros_link: DISCONNECTED` 表示 MAVROS 未收到有效飞控心跳。MAVROS 经 router 的本机 UDP 14550 通信，载荷 bridge 经 TCP 5760 通信；地面站的飞控在线状态与这两条船内链路分别判断。

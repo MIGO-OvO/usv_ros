@@ -4250,7 +4250,19 @@ class WebConfigServer(object):
 
     def _call_control_command(self, action, payload=None, source="web"):
         payload = dict(payload or {})
-        payload['_issued_monotonic'] = time.monotonic()
+        issued = time.monotonic()
+        from flask import has_request_context
+        if has_request_context() and request.remote_addr in ('127.0.0.1', '::1'):
+            radio_issued = request.headers.get('X-USV-Radio-Issued')
+            if radio_issued is not None:
+                try:
+                    radio_issued = float(radio_issued)
+                except (TypeError, ValueError):
+                    return False, '数传控制时间无效', {}
+                if not math.isfinite(radio_issued) or not 0 <= issued - radio_issued <= 10.0:
+                    return False, '数传控制请求已过期，未执行', {}
+                issued = radio_issued
+        payload['_issued_monotonic'] = issued
         try:
             rospy.wait_for_service('/usv/control_command', timeout=2.0)
             service = rospy.ServiceProxy('/usv/control_command', ControlCommand)
