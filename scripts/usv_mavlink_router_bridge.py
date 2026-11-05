@@ -161,6 +161,7 @@ class USVMavlinkRouterBridge(object):
         self._cmd_rx_pub = rospy.Publisher("/usv/mavlink_cmd_rx", Float32MultiArray, queue_size=5)
         self._payload_command_pub = rospy.Publisher('/usv/payload_command', String, queue_size=20)
         self._radio_status_pub = rospy.Publisher("/usv/radio_status", String, queue_size=5)
+        self._link_recovery_pub = rospy.Publisher('/usv/link_recovery/request', String, queue_size=1)
         rospy.Subscriber("/usv/mavlink_cmd_ack", Float32MultiArray, self._cmd_ack_cb)
         rospy.Subscriber('/usv/payload_protocol', String, self._protocol_cb)
         rospy.Subscriber('/usv/payload_event', String, self._payload_event_cb)
@@ -936,7 +937,7 @@ class USVMavlinkRouterBridge(object):
                 command = int(msg.command)
                 if (command == 512 and int(getattr(msg, 'target_system', 0)) == self._sys_id
                         and int(getattr(msg, 'target_component', 0)) in (0, self._comp_id)):
-                    # REQUEST_MESSAGE is read-only. Routine telemetry supplies
+                    # Routine REQUEST_MESSAGE reads only. Telemetry supplies
                     # the fresh snapshot this cycle; recover_only supplies any
                     # lost result owned by this GCS without admitting an action.
                     message_id = float(getattr(msg, 'param1', -1))
@@ -946,6 +947,12 @@ class USVMavlinkRouterBridge(object):
                         self._state_read_count += 1
                         self._last_heartbeat = 0.0
                         if message_id == 251:
+                            # Only an explicit operator reread asks the separate
+                            # watchdog to recover MAVROS. Periodic reads stay passive.
+                            if float(getattr(msg, 'param5', 0)) == 1.0:
+                                recovery = String()
+                                recovery.data = 'ground_station'
+                                self._link_recovery_pub.publish(recovery)
                             selection = (getattr(msg, 'param2', 0), getattr(msg, 'param3', 0),
                                          getattr(msg, 'param4', 0))
                             with self._lock:

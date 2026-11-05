@@ -34,7 +34,7 @@ start_mavlink_router() {
     fi
     cleanup_port_process "$ROUTER_TCP_PORT"
     log "启动 mavlink-router: uart=$FCU_UART_DEVICE:$FCU_UART_BAUD tcp=$ROUTER_TCP_PORT udp=$ROUTER_MAVROS_UDP,$ROUTER_BRIDGE_UDP"
-    start_background_process "$ROUTER_PID_FILE" "$ROUTER_LOG_FILE" "$MAVLINK_ROUTERD_BIN" -e "$ROUTER_MAVROS_UDP" -e "$ROUTER_BRIDGE_UDP" "$FCU_UART_DEVICE:$FCU_UART_BAUD"
+    start_background_process "$ROUTER_PID_FILE" "$ROUTER_LOG_FILE" bash "$SCRIPT_DIR/mavlink-router-supervisor.sh" "$MAVLINK_ROUTERD_BIN" -e "$ROUTER_MAVROS_UDP" -e "$ROUTER_BRIDGE_UDP" "$FCU_UART_DEVICE:$FCU_UART_BAUD"
 }
 
 

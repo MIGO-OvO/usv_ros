@@ -24,6 +24,7 @@ EXPECTED_NODES = [
     "/mavlink_trigger_node",
     "/usv_mavlink_bridge",
     "/mavros",
+    "/link_recovery_node",
 ]
 
 

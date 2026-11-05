@@ -357,7 +357,7 @@ print_full_status() {
 
 # ── ROS 节点级健康检查 ──────────────────────────────────────────────
 # 仅在 roscore 运行时执行；使用 timeout 避免 hang；失败不中断脚本
-EXPECTED_NODES="/pump_control_node /web_config_server /mavlink_trigger_node /usv_mavlink_bridge /mavros"
+EXPECTED_NODES="/pump_control_node /web_config_server /mavlink_trigger_node /usv_mavlink_bridge /mavros /link_recovery_node"
 ROS_CHECK_TIMEOUT=3   # rosnode/mavros 检查超时秒数
 DIAG_CHECK_TIMEOUT=12 # bridge 诊断发布间隔为 10s，等 12s 确保能收到
 

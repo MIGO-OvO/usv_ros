@@ -1,14 +1,19 @@
 import { useState, useEffect } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import { Button } from '@/components/ui/button'
 import { useAppStore } from '@/store'
 import { cn } from '@/lib/utils'
-import { Radio, ChevronDown, ChevronRight, Download } from 'lucide-react'
+import { Radio, ChevronDown, ChevronRight, Download, RefreshCw } from 'lucide-react'
 
 interface LinkDiagData {
   mavros: { connected: boolean; armed: boolean; mode: string }
   bridge: Record<string, unknown>
   nodes: { name: string; alive: boolean }[]
   link_events_recent: { ts: string; type: string; detail: string }[]
+  recovery?: {
+    available: boolean; enabled: boolean; connected: boolean; state: string
+    message: string; attempts: number; retry_in_s: number; last_error: string
+  }
 }
 
 export function LinkDiagnosticsCard() {
@@ -18,14 +23,16 @@ export function LinkDiagnosticsCard() {
   const connected = useAppStore((state) => state.connected)
   const [expanded, setExpanded] = useState(true)
   const [fullDiag, setFullDiag] = useState<LinkDiagData | null>(null)
+  const [reconnecting, setReconnecting] = useState(false)
+  const [feedback, setFeedback] = useState('')
 
   useEffect(() => {
     if (!connected) return
     const load = () => {
       fetch('/api/diagnostics/link')
         .then(r => r.json())
-        .then(r => { if (r.success) setFullDiag(r.data) })
-        .catch(() => {})
+        .then(r => { setFullDiag(r.success ? r.data : null) })
+        .catch(() => { setFullDiag(null) })
     }
     load()
     const t = setInterval(load, 5000)
@@ -33,7 +40,29 @@ export function LinkDiagnosticsCard() {
   }, [connected])
 
   const bridge = bridgeDiag
-  const mavConnected = mavrosState?.connected ?? false
+  const mavConnected = connected && (fullDiag?.mavros.connected ?? false)
+  const recovery = fullDiag?.recovery
+  const reconnect = async () => {
+    setReconnecting(true)
+    setFeedback('')
+    try {
+      const response = await fetch('/api/diagnostics/link/reconnect', {
+        method: 'POST', signal: AbortSignal.timeout(7000),
+      })
+      const result = await response.json()
+      if (result.success) {
+        setFullDiag(previous => previous?.recovery ? {
+          ...previous, recovery: { ...previous.recovery, message: result.message || '已请求重连，等待飞控心跳' },
+        } : previous)
+      } else {
+        setFeedback(result.message || '重连请求失败')
+      }
+    } catch {
+      setFeedback('重连请求未确认，请检查 Web 连接和链路状态')
+    } finally {
+      setReconnecting(false)
+    }
+  }
   const routerAlive = fullDiag?.nodes?.find(n => n.name === 'mavlink-routerd')?.alive
   const linkStatus = routerAlive === undefined
     ? { color: 'bg-muted-foreground', label: '检测中' }
@@ -48,6 +77,15 @@ export function LinkDiagnosticsCard() {
       <CardHeader
         className="flex flex-col items-start justify-between gap-2 space-y-0 pb-2 cursor-pointer select-none sm:flex-row sm:items-center"
         onClick={() => setExpanded(v => !v)}
+        role="button"
+        tabIndex={0}
+        aria-expanded={expanded}
+        onKeyDown={e => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault()
+            setExpanded(v => !v)
+          }
+        }}
       >
         <CardTitle className="text-sm font-medium flex items-center gap-2">
           <Radio className="h-4 w-4" />
@@ -67,6 +105,22 @@ export function LinkDiagnosticsCard() {
 
       {expanded && (
         <CardContent className="space-y-3 text-sm">
+          <div className="flex flex-wrap items-center gap-2">
+            <Button variant="outline" size="sm" onClick={reconnect}
+              disabled={!connected || !recovery?.available || !recovery.enabled || mavConnected || reconnecting}>
+              <RefreshCw className={cn('mr-1.5 h-3.5 w-3.5', reconnecting && 'animate-spin motion-reduce:animate-none')} />
+              {reconnecting ? '请求中' : '重连 MAVROS'}
+            </Button>
+            <span className="text-xs text-muted-foreground" role="status">
+              {recovery?.available ? recovery.message : '重连服务未就绪'}
+              {recovery?.available && !mavConnected && recovery.retry_in_s > 0
+                ? ` · ${Math.ceil(recovery.retry_in_s)} 秒后重试` : ''}
+            </span>
+          </div>
+          {feedback && <p className="text-xs text-destructive" role="alert">{feedback}</p>}
+          {recovery?.available && recovery.last_error && (
+            <p className="break-words text-xs text-destructive" role="alert">{recovery.last_error}</p>
+          )}
           {/* MAVROS 状态 */}
           <div className="grid grid-cols-1 gap-2 sm:grid-cols-3">
             <KV label="模式" value={mavrosState?.mode || '--'} />

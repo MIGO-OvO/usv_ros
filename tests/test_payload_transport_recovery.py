@@ -84,6 +84,18 @@ class TransportRecoveryTests(unittest.TestCase):
         self.node._call_automation_service.assert_called_once_with('start')
         self.assertIn((512, 0, 255, 190), self.bridge._pending_acks)
 
+    def test_operator_state_read_requests_link_recovery_without_starting_payload(self):
+        self.bridge._link_recovery_pub = Mock()
+        for target, flag, expected in ((191, 0, 0), (191, 1, 1), (0, 1, 1), (1, 1, 0)):
+            with self.subTest(target=target, flag=flag):
+                self.bridge._link_recovery_pub.reset_mock()
+                query = FakeCommandLong(512, 251, 0, 1, target, 255, 190)
+                query.param5 = flag
+                self.bridge._conn.recv_match = FakeConnection([query]).recv_match
+                self.bridge._receive_mavlink_messages()
+                self.assertEqual(self.bridge._link_recovery_pub.publish.call_count, expected)
+        self.node._call_automation_service.assert_not_called()
+
     def test_silent_router_session_is_retired_without_replaying_start(self):
         request = self.start()
         self.bridge._router_connected_at = 100.0

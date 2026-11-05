@@ -57,7 +57,7 @@
     <arg name="mavros_tgt_system" default="1" />
     <arg name="mavros_tgt_component" default="1" />
     <arg name="mavros_fcu_protocol" default="v2.0" />
-    <arg name="mavros_respawn" default="false" />
+    <arg name="mavros_respawn" default="true" />
     <arg name="mavlink_source_system" default="1" />
     <arg name="mavlink_source_component" default="191" />
     <arg name="mavlink_router_url" default="tcp:127.0.0.1:5760" />
@@ -82,6 +82,11 @@
         <arg name="fcu_protocol" value="$(arg mavros_fcu_protocol)" />
         <arg name="respawn_mavros" value="$(arg mavros_respawn)" />
     </include>
+
+    <node name="link_recovery_node" pkg="usv_ros" type="link_recovery_node.py"
+          output="screen" respawn="true" respawn_delay="2" if="$(arg enable_mavros)">
+        <param name="restart_enabled" value="$(arg mavros_respawn)" />
+    </node>
 
     <!-- ==================== Pump Control Node ==================== -->
     <node name="pump_control_node" pkg="usv_ros" type="pump_control_node.py"

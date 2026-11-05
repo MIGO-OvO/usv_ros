@@ -2265,6 +2265,9 @@ class WebConfigServer(object):
 
         # ========== 通信诊断状态 ==========
         self._mavros_state = {"connected": False, "armed": False, "mode": ""}
+        self._mavros_state_received_at = None
+        self._link_recovery = {}
+        self._link_recovery_received_at = None
         self._bridge_diag = {}           # 最新的桥接诊断数据
         self._radio_status = {}          # 最新的电台链路状态
         self._diag_history = []          # 诊断历史 (最近 200 条)
@@ -2285,6 +2288,8 @@ class WebConfigServer(object):
                 '/usv/bridge_diagnostics', String, self._bridge_diag_cb)
             self._radio_status_sub = rospy.Subscriber(
                 '/usv/radio_status', String, self._radio_status_cb)
+            self._link_recovery_sub = rospy.Subscriber(
+                '/usv/link_recovery', String, self._link_recovery_cb)
         else:
             self._mavros_state_sub = None
             self._bridge_diag_sub = None
@@ -4148,6 +4153,7 @@ class WebConfigServer(object):
 
     def _web_mavros_state_cb(self, msg):
         """MAVROS State 回调 - 用于通信诊断"""
+        self._mavros_state_received_at = time.monotonic()
         self._gps_mavros = {'connected': bool(msg.connected), 'received_monotonic': time.monotonic()}
         prev_connected = self._mavros_state.get("connected", False)
         self._mavros_state = {
@@ -4161,6 +4167,20 @@ class WebConfigServer(object):
             self._add_link_event("mavros_connect", "MAVROS 已连接飞控 mode=%s" % msg.mode)
         if self.socketio:
             self.socketio.emit('mavros_state', self._mavros_state)
+
+    def _link_recovery_cb(self, msg):
+        try:
+            data = json.loads(msg.data)
+            if not isinstance(data, dict):
+                return
+        except (TypeError, ValueError):
+            return
+        previous = self._link_recovery
+        self._link_recovery = data
+        self._link_recovery_received_at = time.monotonic()
+        if (data.get('state'), data.get('attempts')) != (previous.get('state'), previous.get('attempts')):
+            self._add_link_event('link_recovery', data.get('message', '') +
+                                 ('：' + data['last_error'] if data.get('last_error') else ''))
 
     def _bridge_diag_cb(self, msg):
         """桥接节点诊断数据回调"""
@@ -6183,7 +6203,7 @@ class WebConfigServer(object):
                     import rosnode
                     node_list = rosnode.get_node_names()
                     for n in ['/mavros', '/usv_mavlink_bridge', '/mavlink_trigger_node',
-                              '/pump_control_node', '/web_config_server']:
+                              '/pump_control_node', '/web_config_server', '/link_recovery_node']:
                         nodes.append({"name": n, "alive": n in node_list})
                 except Exception:
                     nodes = [{"name": "unknown", "alive": False, "error": "rosnode API unavailable"}]
@@ -6193,22 +6213,43 @@ class WebConfigServer(object):
             try:
                 import subprocess
                 # Check using pgrep since process might not be started from the exact pid file or pid file could be stale
-                result = subprocess.run(["pgrep", "-f", "mavlink-routerd"], capture_output=True, text=True)
+                result = subprocess.run(["pgrep", "-x", "mavlink-routerd"], capture_output=True, text=True, timeout=2.0)
                 if result.returncode == 0 and result.stdout.strip():
                     router_alive = True
             except Exception:
                 pass
             nodes.append({"name": "mavlink-routerd", "alive": router_alive})
 
+            now = time.monotonic()
+            state_age = now - self._mavros_state_received_at if self._mavros_state_received_at is not None else None
+            mavros = dict(self._mavros_state, state_age_s=state_age,
+                          stale=state_age is None or state_age > 5.0)
+            mavros['connected'] = bool(mavros['connected'] and not mavros['stale'])
+            recovery = dict(self._link_recovery, available=self._link_recovery_received_at is not None and
+                            now - self._link_recovery_received_at <= 6.0)
+
             return jsonify({
                 "success": True,
                 "data": {
-                    "mavros": self._mavros_state,
+                    "mavros": mavros,
+                    "recovery": recovery,
                     "bridge": self._bridge_diag,
                     "nodes": nodes,
                     "link_events_recent": self._link_events[-20:],
                 }
             })
+
+        @self.app.route('/api/diagnostics/link/reconnect', methods=['POST'])
+        def reconnect_link():
+            if self.standalone or not ROS_AVAILABLE:
+                return jsonify(success=False, message='ROS 重连服务不可用'), 503
+            try:
+                rospy.wait_for_service('/usv/link_reconnect', timeout=2.0)
+                response = rospy.ServiceProxy('/usv/link_reconnect', Trigger)()
+                self._add_link_event('link_reconnect_requested', response.message)
+                return jsonify(success=response.success, message=response.message), 200 if response.success else 409
+            except Exception as exc:
+                return jsonify(success=False, message='重连请求失败：%s' % exc), 503
 
         @self.app.route('/api/diagnostics/history', methods=['GET'])
         def get_diag_history():
@@ -6239,6 +6280,7 @@ class WebConfigServer(object):
             report = {
                 "exported_at": datetime.now().isoformat(),
                 "mavros_state": self._mavros_state,
+                "link_recovery": self._link_recovery,
                 "bridge_latest": self._bridge_diag,
                 "system_health_latest": self.latest_system_health,
                 "automation_latest": self.latest_automation_status,

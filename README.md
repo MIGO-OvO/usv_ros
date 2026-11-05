@@ -1,5 +1,18 @@
 # usv_ros
 
+## MAVROS 断线恢复
+
+`mavros_link: DISCONNECTED` 表示 MAVROS 未收到有效飞控心跳。MAVROS 经 router 的本机 UDP 14550 通信，载荷 bridge 经 TCP 5760 通信；地面站的飞控在线状态与这两条船内链路分别判断。
+
+- 默认启用 MAVROS 的 roslaunch respawn。`link_recovery_node` 在持续断连 30 秒，或连接状态停止更新 5 秒后再持续异常 30 秒时，只请求重启 `/mavros`；后续间隔为 30、60、120 秒，最多间隔 120 秒继续尝试。重新收到新鲜的 connected 状态才报告恢复。显式 `mavros_respawn:=false` 同时关闭恢复节点的重启操作。
+- `start_usv_all.sh` 启动的 router 由独立脚本守护，进程退出后按 2、4、8、16、30 秒退避拉起；稳定运行 60 秒后复位退避。`stop_usv_all.sh` 停止守护进程和当前子进程，停止后不会再拉起 router。存活但卡死的 router 仍需结合日志排查。
+- Web 监控页的“通信链路诊断”提供“重连 MAVROS”。API 为 `POST /api/diagnostics/link/reconnect`，复用现有控制鉴权；ROS 服务为 `/usv/link_reconnect`（`std_srvs/Trigger`）。响应表示请求已提交，连接结果见 `/usv/link_recovery`、诊断卡片和导出报告。
+- 独立地面站的“重读状态”通过数传电台发送 `COMMAND_LONG 512`、`param1=251`、`param5=1`，在读取状态的同时请求恢复断开的 MAVROS。周期读取的 `param5=0`；`param7` 保持标准 Response Target 默认值 0。恢复请求合并并遵守退避，不重复执行旧采样或泵控命令。飞控链路已断开、请求无法送达 Jetson 时，由船端自动恢复继续处理。
+
+部署时停止现有系统，更新 ROS 与地面站，运行 `catkin_make` 后重新启动 `start_usv_all.sh`，使 router 守护与新 launch 一起生效。前端产物位于 `static/dist/`；地面站需重新构建后使用。无需更改飞控或检测板固件。
+
+回归：`test_link_recovery.py`、`test_router_supervisor.py`、`test_payload_transport_recovery.py`；地面站：`cargo test -p usv-core --test link_recovery`。Jetson 验收：观察持续断连的自动重启、router 异常退出后的恢复、Web/电台手动请求；分别在空闲和采样中断开链路，确认停止保护、结果身份保留及恢复后不自行重启旧任务，再做 24 小时运行观察。
+
 ## 2026-10 跨端采样安全修复
 
 - 必须与匹配的 DetFirmware、ArduRover 和 QGC 成套更新。26 个显示遥测字段（含 `USV_LOOP/LTOT/ADS/PROTO`）；`USV_ADS` 为 0 未知、1 停止已确认、2 启动中、3 采集中、4 错误、5 停止未确认。旧 QGC/ROS 组合不用于自动任务验收。
