@@ -254,6 +254,7 @@ class MAVLinkTriggerNode(object):
         self._protocol_pub = rospy.Publisher('/usv/payload_protocol', String, queue_size=1)
         self._executor_id = uuid.uuid4().hex
         self._mavlink_tcp_session = 0
+        self._mavlink_calibration_active = False
         rospy.Subscriber('/usv/mavlink_session', Float32MultiArray, self._mavlink_session_cb)
         self._sample_record_lock = threading.Lock()
 
@@ -862,6 +863,10 @@ class MAVLinkTriggerNode(object):
         if not isinstance(data, dict):
             return
         calibration = data.get('calibration')
+        with self.state_lock:
+            self._mavlink_calibration_active = bool(
+                isinstance(calibration, dict) and calibration.get('mavlink_request')
+                and (calibration.get('active') or calibration.get('stopping')))
         if isinstance(calibration, dict) and calibration.get('attempt_id'):
             active = bool(calibration.get('active') or calibration.get('stopping'))
             self._emit_request_event(calibration.get('mavlink_request'),
@@ -1293,14 +1298,19 @@ class MAVLinkTriggerNode(object):
             # pump cancellation before waiting on any old ordinary service.
             with self.state_lock:
                 context = self.current_sampling_context
-                if isinstance(context, dict):
+                active = self.is_sampling or self._survey_active or self._mavlink_calibration_active
+                if active and isinstance(context, dict):
                     context.setdefault('cancel_reason', 'transport_session_lost')
                     context.setdefault('terminal_reason', 'transport_session_lost')
             with self._command_dispatch_lock:
                 if self._command_lanes[False]['busy']:
                     self._command_lanes[False]['cancel_reason'] = 'transport_session_lost'
-            self._enqueue_command_long(CMD_STOP_SAMPLING, 0, 0, 0, 0, 'TCP session retired',
-                                       cancel_reason='transport_session_lost')
+                    active = True
+            # A Web manual pump or Web automation has no trigger-owned work.
+            # Retiring an idle radio/router session must not issue a global STOP.
+            if active:
+                self._enqueue_command_long(CMD_STOP_SAMPLING, 0, 0, 0, 0, 'TCP session retired',
+                                           cancel_reason='transport_session_lost')
 
     @staticmethod
     def _ack_for_event(event):

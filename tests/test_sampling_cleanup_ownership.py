@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import test_fcu_sampling_result as fcu_results
+from command_fixtures import wait_commands
 from test_hardware_runtime_sync import _load_script
 from gps_fixtures import gps_position
 from measurement_fixtures import prepare_measurement
@@ -105,6 +106,57 @@ class SamplingCleanupOwnershipTests(unittest.TestCase):
         self.assertTrue(self.node.handle_mavlink_command(31011))
         self.assertFalse(self.engine.is_running())
         self.assertFalse(self.pump.inject_pump_enabled)
+
+    def attach_transport(self):
+        self.node.is_sampling = False
+        self.node.current_sampling_context = None
+        self.node._call_automation_service = self.node.__class__._call_automation_service.__get__(self.node)
+        def transaction(action, payload=None):
+            ok, _, result = self.pump._execute_control_action(action, payload or {})
+            return ok, result
+        self.node._call_control_transaction = transaction
+        bridge = self.case.bridge
+        bridge._conn = SimpleNamespace(close=lambda: None)
+        bridge._tcp_session = self.node._mavlink_tcp_session = 84
+        bridge._session_pub.publish = self.node._mavlink_session_cb
+        return bridge
+
+    def test_router_timeout_and_reconnect_do_not_stop_web_manual_injection(self):
+        from test_preflight_web_contract import PreflightWebContractTests
+        web = PreflightWebContractTests()
+        web.setUp()
+        self.addCleanup(web.doCleanups)
+        web.server._call_control_command = self.pump._execute_control_action
+        bridge = self.attach_transport()
+        self.assertTrue(web.client.post('/api/manual/mode', json={'enabled': True}).get_json()['success'])
+        self.assertTrue(web.client.post('/api/injection-pump/on', json={'speed': 60}).get_json()['success'])
+        before = list(self.sent)
+        bridge._router_connected_at = 100.0
+        bridge._fcu_seen = True
+        bridge._fcu_probe = (123, 100.0, 100.0)
+        bridge._gps_cache.records['HEARTBEAT'] = {'received_monotonic': 116.0}
+        with patch.object(self.case.bridge_module.time, 'monotonic', return_value=116.0):
+            bridge._check_router_liveness()
+        wait_commands(self.node)
+        self.assertIsNone(bridge._conn)
+        self.assertIn('roundtrip', bridge._reconnect_reason)
+        self.node._mavlink_session_cb(SimpleNamespace(data=[85]))
+        wait_commands(self.node)
+        self.assertTrue(self.pump.inject_pump_enabled)
+        self.assertTrue(self.pump.manual_mode_enabled)
+        self.assertEqual(self.sent, before)
+        self.assertEqual(self.node.sampling_result_pub.messages, [])
+
+    def test_idle_router_retirement_does_not_stop_web_automation(self):
+        bridge = self.attach_transport()
+        self.start_web_b()
+        before = list(self.sent)
+        bridge._retire_router('TCP EOF while only Web owns the pumps')
+        wait_commands(self.node)
+        self.assertTrue(self.engine.is_running())
+        self.assertTrue(self.pump.inject_pump_enabled)
+        self.assertEqual(self.sent, before)
+        self.assertIsNone(self.pump._controller_fault)
 
     def test_same_trigger_start_is_busy_until_old_cleanup_returns(self):
         accepted = []

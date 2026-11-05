@@ -131,7 +131,48 @@ class TransportRecoveryTests(unittest.TestCase):
         self.assertTrue(self.port.closed, 'fresh FCU input must not hide a stuck payload writer')
         self.assertIsNone(self.bridge._conn)
         wait_commands(self.node)
+        self.node._call_automation_service.assert_not_called()
+
+    def test_router_retirement_still_stops_remote_calibration_after_its_rpc_returns(self):
+        calibration = {'attempt_id': 'remote-zero', 'active': True,
+                       'mavlink_request': request_context(1, 1, 84, 31014, 255, 190)}
+        self.node._automation_status_cb(SimpleNamespace(data=json.dumps({'calibration': calibration})))
+        self.bridge._retire_router('TCP EOF during remote calibration')
+        wait_commands(self.node)
         self.node._call_automation_service.assert_called_once_with('stop')
+
+    def test_web_or_finished_calibration_does_not_turn_router_retirement_into_global_stop(self):
+        for calibration in (
+                {'attempt_id': 'web-zero', 'active': True},
+                {'attempt_id': 'remote-zero', 'active': False,
+                 'mavlink_request': request_context(1, 1, 84, 31014, 255, 190)}):
+            with self.subTest(calibration=calibration):
+                self.node._mavlink_tcp_session = 84
+                self.node._automation_status_cb(SimpleNamespace(data=json.dumps({'calibration': calibration})))
+                self.bridge._retire_router('TCP EOF without active remote calibration')
+                wait_commands(self.node)
+                self.node._call_automation_service.assert_not_called()
+
+    def test_router_retirement_still_preempts_a_remote_start_rpc_without_sampling_context(self):
+        entered, release = threading.Event(), threading.Event()
+        def transaction(action, payload=None):
+            self.assertEqual(action, 'spectrometer_start')
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return False, {}
+        self.node._call_control_transaction = transaction
+        self.node._call_automation_service.side_effect = lambda action: release.set() or True
+        request = remote_command(self.node, 31018)
+        try:
+            self.bridge._forward_payload_command(request.data)
+            self.assertTrue(entered.wait(1))
+            self.assertIsNone(self.node.current_sampling_context)
+            self.bridge._retire_router('TCP EOF during spectrometer startup')
+            wait_commands(self.node)
+            self.node._call_automation_service.assert_called_once_with('stop')
+        finally:
+            release.set()
+            wait_commands(self.node)
 
     def test_live_fcu_and_successful_socket_writes_do_not_hide_a_lost_roundtrip(self):
         request = self.start()
