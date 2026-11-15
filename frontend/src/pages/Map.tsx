@@ -1129,7 +1129,6 @@ export default function MapPage() {
                 <Navigation className="w-4 h-4 mr-1" />跳转到坐标
               </Button>
               {gotoMsg && <div className="rounded-md bg-muted p-2 text-xs">{gotoMsg}</div>}
-              <p className="text-xs text-muted-foreground">无 GPS 信号时手动跳转到作业区；此处只接收图面 GCJ-02 坐标。</p>
             </CardContent>
           </Card>
 
@@ -1242,7 +1241,6 @@ export default function MapPage() {
                 </div>
               )}
               {cacheMsg && <div className="rounded-md bg-muted p-2 text-xs">{cacheMsg}</div>}
-              <p className="text-xs text-muted-foreground">联网时底图按缓存优先自动落盘; 无网络时可导入离线包(由联网设备 map_pack_export 导出)。</p>
             </CardContent>
           </Card>
         </aside>
@@ -1254,7 +1252,6 @@ export default function MapPage() {
               <div className="max-w-sm text-center space-y-3">
                 {loadingMap ? <Loader2 className="mx-auto h-8 w-8 animate-spin text-primary" /> : mapConfig?.enabled ? <AlertTriangle className="mx-auto h-8 w-8 text-amber-500" /> : <MapPinned className="mx-auto h-8 w-8 text-muted-foreground" />}
                 <div className="font-medium">{loadingMap ? '地图加载中' : mapError || '地图不可用'}</div>
-                <p className="text-sm text-muted-foreground">底图使用本地缓存瓦片, 离线时仅显示已预热区域。</p>
                 <Button variant="outline" size="sm" onClick={loadConfig}>重新读取配置</Button>
               </div>
             </div>

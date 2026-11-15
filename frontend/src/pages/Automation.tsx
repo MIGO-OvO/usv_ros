@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-explicit-any */
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
@@ -11,9 +11,11 @@ import { useAppStore } from '@/store'
 import { InjectionPumpCard } from '@/components/injection-pump-card'
 import { SpectrometerDiagnosticsCard } from '@/components/spectrometer-diagnostics-card'
 import { AutomationPreflightCard } from '@/components/automation-preflight-card'
-import { DEFAULT_PREFLIGHT, PUMP_AXES, PREFLIGHT_PHASES, getInvolvedAxes, getPreflightLabel,
-  type PumpAxis, type PreflightConfig } from '@/lib/automation-preflight'
+import { DEFAULT_PREFLIGHT, PREFLIGHT_PHASES, getInvolvedAxes, getPreflightLabel,
+  type PreflightConfig } from '@/lib/automation-preflight'
 import { WaypointSamplingCard } from '@/components/waypoint-sampling-card'
+import { AutoSaveStatus } from '@/components/auto-save-status'
+import { useAutoSave } from '@/hooks/use-auto-save'
 import { toast } from '@/hooks/use-toast'
 import {
   getAutomationControlAvailability,
@@ -107,10 +109,15 @@ export default function Automation() {
   const [loopCount, setLoopCount] = useState(1)
   const [pumpSettings, setPumpSettings] = useState<PumpSettings>({ ...DEFAULT_PUMP_SETTINGS })
   const [presetName, setPresetName] = useState('')
-  const [relativeZeros, setRelativeZeros] = useState<Partial<Record<PumpAxis, string>>>({})
-  const [dirtyZeros, setDirtyZeros] = useState<Partial<Record<PumpAxis, string>>>({})
+  const [configLoaded, setConfigLoaded] = useState(false)
+  const [waypointRevision, setWaypointRevision] = useState(0)
+  const waypointSave = useRef<(() => Promise<void>) | null>(null)
+  const actionGeneration = useRef(0)
   const [pendingAction, setPendingAction] = useState(false)
   const involvedMotors = getInvolvedAxes(steps)
+  const autoSave = useAutoSave('/api/config', configLoaded ? {
+    sampling_sequence: { steps, loop_count: loopCount }, pump_settings: pumpSettings,
+  } : null)
 
   useEffect(() => {
     void fetchConfig()
@@ -118,15 +125,9 @@ export default function Automation() {
 
   const fetchConfig = async () => {
     try {
-      const [res, zerosResponse] = await Promise.all([fetch('/api/config'), fetch('/api/calibration/offsets')])
+      const res = await fetch('/api/config')
+      if (!res.ok) throw new Error('配置读取失败')
       const data = await res.json()
-      const zeroData = await zerosResponse.json()
-      if (zerosResponse.ok && zeroData.success) {
-        const configured = zeroData.configured_axes ?? Object.keys(zeroData.data ?? {})
-        setRelativeZeros(Object.fromEntries(PUMP_AXES.filter((axis) => configured.includes(axis))
-          .map((axis) => [axis, String(zeroData.data[axis])])))
-        setDirtyZeros({})
-      }
       if (data.sampling_sequence) {
         setSteps(normalizeSteps(data.sampling_sequence.steps))
         setLoopCount(data.sampling_sequence.loop_count ?? 1)
@@ -148,29 +149,10 @@ export default function Automation() {
           },
         })
       }
+      setConfigLoaded(true)
     } catch (error) {
-      console.error(error)
+      toast({ title: '配置读取失败', description: String(error), variant: 'destructive' })
     }
-  }
-
-  const saveRelativeZeros = async () => {
-    if (!Object.keys(dirtyZeros).length) return
-    const offsets: Partial<Record<PumpAxis, number>> = {}
-    for (const axis of PUMP_AXES) {
-      const raw = dirtyZeros[axis]
-      if (raw === undefined) continue
-      const value = Number(raw)
-      if (raw.trim() === '' || !Number.isFinite(value) || value < 0 || value >= 360) {
-        throw new Error(`${axis} 轴相对零点应为 0–360°（不含 360°）`)
-      }
-      offsets[axis] = value
-    }
-    const response = await fetch('/api/calibration/offsets', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ offsets }),
-    })
-    const result = await response.json()
-    if (!response.ok || !result.success) throw new Error(result.message || '相对零点保存失败')
-    setDirtyZeros({})
   }
 
   const validatePreparation = () => {
@@ -179,62 +161,41 @@ export default function Automation() {
     }
   }
 
-  const saveConfig = async () => {
-    try {
-      validatePreparation()
-      await saveRelativeZeros()
-      const response = await fetch('/api/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          sampling_sequence: {
-            steps,
-            loop_count: loopCount,
-          },
-          pump_settings: pumpSettings,
-        }),
-      })
-      const result = await response.json()
-      if (!response.ok || !result.success) throw new Error(result.message || '配置保存失败')
-      toast({ title: '启动配置已保存', variant: 'success' })
-    } catch (error) {
-      toast({ title: '配置保存失败', description: String(error), variant: 'destructive' })
-    }
+  const flushConfig = async () => {
+    await autoSave.flush()
+    await waypointSave.current?.()
   }
 
   const handleAction = async (requestedAction: AutomationAction) => {
+    if (requestedAction !== 'stop' && pendingAction) return
     const action = resolveAutomationAction(requestedAction, automationState)
+    if (action === 'stop') actionGeneration.current += 1
+    const generation = actionGeneration.current
     const options: RequestInit = { method: 'POST' }
-
-    if (action === 'start') {
-      try {
-        validatePreparation()
-        await saveRelativeZeros()
-      } catch (error) {
-        toast({ title: '启动配置未就绪', description: String(error), variant: 'destructive' })
-        return
-      }
-      let wpSampling: Record<string, unknown> | null = null
-      try {
-        const wpRes = await fetch('/api/waypoint-sampling')
-        const wpJson = await wpRes.json()
-        if (wpJson.success && wpJson.data) wpSampling = wpJson.data
-      } catch {
-        wpSampling = null
-      }
-
-      const body: Record<string, unknown> = {
-        sampling_sequence: { steps, loop_count: loopCount },
-        pump_settings: pumpSettings,
-      }
-      if (wpSampling !== null) body.waypoint_sampling = wpSampling
-
-      options.headers = { 'Content-Type': 'application/json' }
-      options.body = JSON.stringify(body)
-    }
-
+    setPendingAction(true)
     try {
-      setPendingAction(true)
+      if (action === 'start') {
+        validatePreparation()
+        await flushConfig()
+        let wpSampling: Record<string, unknown> | null = null
+        try {
+          const wpRes = await fetch('/api/waypoint-sampling')
+          const wpJson = await wpRes.json()
+          if (wpJson.success && wpJson.data) wpSampling = wpJson.data
+        } catch {
+          wpSampling = null
+        }
+
+        const body: Record<string, unknown> = {
+          sampling_sequence: { steps, loop_count: loopCount },
+          pump_settings: pumpSettings,
+        }
+        if (wpSampling !== null) body.waypoint_sampling = wpSampling
+
+        options.headers = { 'Content-Type': 'application/json' }
+        options.body = JSON.stringify(body)
+      }
+      if (action === 'start' && generation !== actionGeneration.current) return
       const response = await fetch(`/api/mission/${action}`, options)
       const result = await response.json()
       if (!response.ok || !result.success) {
@@ -247,12 +208,11 @@ export default function Automation() {
         resume: '任务已恢复',
         stop: '任务已停止',
       }
-      toast({ title: successTitles[action], description: result.message || undefined, variant: 'success' })
+      toast({ title: successTitles[action], variant: 'success' })
     } catch (error) {
-      console.error(error)
-      toast({ title: '请求失败', description: `任务${action}请求异常`, variant: 'destructive' })
+      toast({ title: '操作失败', description: String(error), variant: 'destructive' })
     } finally {
-      setPendingAction(false)
+      if (generation === actionGeneration.current) setPendingAction(false)
     }
   }
 
@@ -284,14 +244,20 @@ export default function Automation() {
     }
   }
 
-  const handleExport = () => {
-    window.open('/api/mission-config/export', '_blank')
+  const handleExport = async () => {
+    try {
+      await flushConfig()
+      window.location.assign('/api/mission-config/export')
+    } catch (error) {
+      toast({ title: '导出失败', description: String(error), variant: 'destructive' })
+    }
   }
 
   const handleImport = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0]
     if (!file) return
     try {
+      await flushConfig()
       const text = await file.text()
       const data = JSON.parse(text)
       const res = await fetch('/api/mission-config/import', {
@@ -302,7 +268,8 @@ export default function Automation() {
       const result = await res.json()
       if (result.success) {
         toast({ title: '任务配置已导入', description: `已导入 ${(result.fields || []).join(', ')}` })
-        void fetchConfig()
+        await fetchConfig()
+        setWaypointRevision((current) => current + 1)
       } else {
         toast({ title: '导入失败', description: result.message, variant: 'destructive' })
       }
@@ -386,7 +353,6 @@ export default function Automation() {
       <header className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold tracking-tight">自动化控制</h1>
-          <p className="text-muted-foreground">配置并执行采样序列任务。</p>
         </div>
         <div className="flex w-full flex-wrap items-center gap-2 md:w-auto">
           {(automationRunning || automationPaused || preparing) && automationTotal > 0 && (
@@ -402,7 +368,7 @@ export default function Automation() {
               )}
             </div>
           )}
-          <Button variant="outline" onClick={() => handleAction('start')} disabled={!controls.start || pendingAction}>
+          <Button variant="outline" onClick={() => handleAction('start')} disabled={!configLoaded || !controls.start || pendingAction}>
             <Play className="w-4 h-4 mr-2 text-emerald-500" /> 启动
           </Button>
           <Button variant="outline" onClick={() => handleAction('pause')} disabled={!controls.pause}>
@@ -420,7 +386,7 @@ export default function Automation() {
       {automationPreflight && automationPreflight.phase !== 'idle' && (
         <section aria-label="启动前准备进度" aria-live="polite" className="space-y-3 rounded-lg border p-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
-            <h2 className="text-sm font-semibold">Preflight · {getPreflightLabel(automationPreflight)}</h2>
+            <h2 className="text-sm font-semibold">{getPreflightLabel(automationPreflight)}</h2>
             <p className="text-xs text-muted-foreground">
               相关泵：{automationPreflight.motors?.join(' / ') || '无'}
               {automationPreflight.pending_motors?.length ? ` · 等待 ${automationPreflight.pending_motors.join(' / ')}` : ''}
@@ -438,12 +404,8 @@ export default function Automation() {
         </section>
       )}
 
-      <AutomationPreflightCard motors={involvedMotors} zeros={relativeZeros} config={pumpSettings.preflight}
-        disabled={!idle || pendingAction}
-        onZero={(axis, value) => {
-          setRelativeZeros((current) => ({ ...current, [axis]: value }))
-          setDirtyZeros((current) => ({ ...current, [axis]: value }))
-        }}
+      <AutomationPreflightCard motors={involvedMotors} config={pumpSettings.preflight}
+        disabled={!configLoaded || !idle || pendingAction}
         onConfig={(patch) => setPumpSettings((current) => ({ ...current, preflight: { ...current.preflight, ...patch } }))} />
 
       <SpectrometerDiagnosticsCard />
@@ -491,10 +453,11 @@ export default function Automation() {
       <div className="grid grid-cols-1 gap-6 xl:grid-cols-[minmax(18rem,22rem)_minmax(0,1fr)] xl:items-start">
         <div className="space-y-6">
           <Card className="h-fit">
-            <CardHeader>
+            <CardHeader className="flex flex-row items-center justify-between gap-2">
               <CardTitle>全局配置</CardTitle>
+              {configLoaded ? <AutoSaveStatus {...autoSave} /> : <Button size="sm" variant="ghost" onClick={fetchConfig}>重新读取</Button>}
             </CardHeader>
-            <CardContent className="space-y-4">
+            <CardContent><fieldset disabled={!configLoaded || pendingAction} className="min-w-0 space-y-4">
               <div className="space-y-2">
                 <Label>循环次数 (0 = 无限循环)</Label>
                 <NumericInput value={loopCount} onValueChange={(v) => setLoopCount(Math.max(0, v))} integer min={0} className="h-9" />
@@ -573,7 +536,6 @@ export default function Automation() {
                   </Button>
                 </div>
               </div>
-              <Button className="w-full" onClick={saveConfig} disabled={!idle || pendingAction}>保存启动配置</Button>
               <div className="flex gap-2 pt-2">
                 <Button variant="outline" size="sm" className="flex-1" onClick={handleExport}>
                   <Download className="w-4 h-4 mr-1" />导出
@@ -585,21 +547,21 @@ export default function Automation() {
                   </label>
                 </Button>
               </div>
-            </CardContent>
+            </fieldset></CardContent>
           </Card>
           <InjectionPumpCard />
         </div>
 
         <div className="min-w-0">
-          <WaypointSamplingCard />
+          <WaypointSamplingCard key={waypointRevision} saveRef={waypointSave} disabled={pendingAction} />
         </div>
 
         <Card className="min-w-0 xl:col-span-2">
           <CardHeader className="flex flex-row items-center justify-between">
             <CardTitle>序列步骤</CardTitle>
-            <Button size="sm" onClick={addStep}><Plus className="w-4 h-4 mr-2" /> 添加步骤</Button>
+            <Button size="sm" onClick={addStep} disabled={!configLoaded || pendingAction}><Plus className="w-4 h-4 mr-2" /> 添加步骤</Button>
           </CardHeader>
-          <CardContent className="space-y-4">
+          <CardContent><fieldset disabled={!configLoaded || pendingAction} className="min-w-0 space-y-4">
             {steps.map((step, index) => (
               <div key={index} className="p-4 border rounded-lg bg-card/50 space-y-4">
                 <div className="flex flex-wrap items-center gap-3">
@@ -645,7 +607,7 @@ export default function Automation() {
                 </div>
               </div>
             ))}
-          </CardContent>
+          </fieldset></CardContent>
         </Card>
       </div>
     </div>

@@ -366,7 +366,6 @@ export default function Lab() {
       <header className="flex flex-col md:flex-row md:items-center justify-between gap-3 shrink-0">
         <div>
           <h1 className="text-2xl font-semibold tracking-tight">实验室测试</h1>
-          <p className="text-sm text-muted-foreground">半实物采样、模拟走航与虚拟差速输出</p>
         </div>
         <div className="flex flex-wrap items-center gap-2">
           <Button variant="outline" disabled={!!pending} onClick={() => run('save', saveConfig)}>
@@ -434,7 +433,6 @@ export default function Lab() {
                     </Button>
                   ))}
                 </div>
-                <p className="text-xs text-muted-foreground">waypoint 到点等待液滴完成；survey 用覆盖航线连续走航采样。</p>
               </div>
               <label className="flex items-center justify-between gap-3 rounded-md border p-3">
                 <span>限制水域范围 (剔除界外)</span>

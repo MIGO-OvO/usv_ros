@@ -10,7 +10,6 @@ import {
 import { buildVoltageHistoryCsv, voltageHistoryFilename } from '../src/lib/voltage-history-csv.ts'
 import {
   BASELINE_AVERAGING_MS,
-  BASELINE_STABILIZATION_MS,
   calculateAbsorbance,
   createBaselineAcquisitionSession,
   getAbsorbanceEmptyState,
@@ -285,29 +284,33 @@ test('spike test summary CSV uses cross-platform columns', () => {
   assert.match(csv, /ads_transient_drop_delta/)
 })
 
-test('baseline acquisition waits five minutes and averages only the following minute', () => {
+test('baseline acquisition immediately averages exactly twenty seconds of valid samples', () => {
   const session = createBaselineAcquisitionSession(1_000)
-  assert.equal(session.averagingStartedAtMs, 1_000 + BASELINE_STABILIZATION_MS)
-  assert.equal(session.endsAtMs, 1_000 + BASELINE_STABILIZATION_MS + BASELINE_AVERAGING_MS)
+  assert.equal(BASELINE_AVERAGING_MS, 20_000)
+  assert.equal(session.endsAtMs, 21_000)
 
   const points = [
-    { receivedAtMs: session.averagingStartedAtMs - 1, voltage: 99, valid: true },
-    { receivedAtMs: session.averagingStartedAtMs, voltage: 1, valid: true },
-    { receivedAtMs: session.averagingStartedAtMs + 10_000, voltage: 100, valid: false },
-    { receivedAtMs: session.averagingStartedAtMs + 30_000, voltage: 3, valid: true },
+    { receivedAtMs: session.startedAtMs - 1, voltage: 99, valid: true },
+    { receivedAtMs: session.startedAtMs, voltage: 1, valid: true },
+    { receivedAtMs: session.startedAtMs + 5_000, voltage: 100, valid: false },
+    { receivedAtMs: session.startedAtMs + 5_000, voltage: NaN, valid: true },
+    { receivedAtMs: session.startedAtMs + 5_000, voltage: 0, valid: true },
+    { receivedAtMs: session.startedAtMs + 10_000, voltage: 3, valid: true },
     { receivedAtMs: session.endsAtMs, voltage: 5, valid: true },
     { receivedAtMs: session.endsAtMs + 1, voltage: 101, valid: true },
   ]
 
-  const stabilizing = summarizeBaselineAcquisition(points, session, session.averagingStartedAtMs - 1)
-  assert.equal(stabilizing.phase, 'stabilizing')
-  assert.equal(stabilizing.validSampleCount, 0)
-  assert.equal(stabilizing.averageVoltage, null)
+  const initial = summarizeBaselineAcquisition(points, session, session.startedAtMs)
+  assert.equal(initial.phase, 'averaging')
+  assert.equal(initial.validSampleCount, 1)
+  assert.equal(initial.averageVoltage, 1)
+  assert.equal(initial.remainingMs, 20_000)
 
-  const averaging = summarizeBaselineAcquisition(points, session, session.averagingStartedAtMs + 30_000)
+  const averaging = summarizeBaselineAcquisition(points, session, session.startedAtMs + 10_000)
   assert.equal(averaging.phase, 'averaging')
   assert.equal(averaging.validSampleCount, 2)
   assert.equal(averaging.averageVoltage, 2)
+  assert.equal(averaging.progressPercent, 50)
 
   const complete = summarizeBaselineAcquisition(points, session, session.endsAtMs + 1_000)
   assert.equal(complete.phase, 'complete')
@@ -317,18 +320,12 @@ test('baseline acquisition waits five minutes and averages only the following mi
   assert.equal(complete.progressPercent, 100)
 })
 
-test('baseline acquisition honors custom stabilization and averaging durations', () => {
-  const session = createBaselineAcquisitionSession(1_000, 2 * 60_000, 30_000)
-  assert.equal(session.averagingStartedAtMs, 1_000 + 120_000)
-  assert.equal(session.endsAtMs, 1_000 + 150_000)
-
-  const averaging = summarizeBaselineAcquisition([
-    { receivedAtMs: 121_000, voltage: 1, valid: true },
-    { receivedAtMs: 129_999, voltage: 3, valid: true },
-  ], session, 130_000)
-  assert.equal(averaging.phase, 'averaging')
-  assert.equal(averaging.validSampleCount, 2)
-  assert.equal(averaging.averageVoltage, 2)
+test('an empty baseline window cannot produce a reference voltage', () => {
+  const session = createBaselineAcquisitionSession(1_000)
+  const complete = summarizeBaselineAcquisition([], session, session.endsAtMs)
+  assert.equal(complete.phase, 'complete')
+  assert.equal(complete.validSampleCount, 0)
+  assert.equal(complete.averageVoltage, null)
 })
 
 test('CSV recalculates absorbance from the active reference and baseline offset', () => {

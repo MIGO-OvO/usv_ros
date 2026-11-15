@@ -376,7 +376,6 @@ export default function Data() {
       <header className="flex shrink-0 flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-3xl font-bold tracking-tight">数据中心</h1>
-          <p className="text-muted-foreground">历史任务、采样窗口与分光原始信号。</p>
         </div>
         <div className="flex flex-col items-start gap-2 sm:items-end">
           {selectedMission && (
@@ -392,7 +391,6 @@ export default function Data() {
               </Button>
             </div>
           )}
-          {selectedMission && <p className="max-w-md text-xs text-muted-foreground sm:text-right">原始 CSV 是目标至少 20 Hz 的逐帧数据；任务摘要 CSV 仅用于地图和趋势展示。</p>}
           <Button className="self-start sm:self-auto" variant="outline" onClick={fetchMissions} disabled={listLoading}><RefreshCw className="w-4 h-4 mr-2" />刷新列表</Button>
         </div>
       </header>
@@ -576,7 +574,7 @@ export default function Data() {
               </div>
             ) : chartData.length > 0 ? (
               <div className="space-y-2">
-                <p className="text-xs text-muted-foreground">任务摘要趋势：显示 {chartStats?.count ?? 0}/{pointCount} 个摘要点（保留峰值）。点击采样窗口后加载原始曲线；CSV 包含全部原始帧。</p>
+                <p className="text-xs text-muted-foreground">摘要点 {chartStats?.count ?? 0} / {pointCount}</p>
                 <div className="h-[clamp(320px,48vh,520px)] min-h-80">
                   <ResponsiveContainer width="100%" height="100%">
                     <LineChart data={chartData}>

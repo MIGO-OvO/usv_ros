@@ -1,146 +1,53 @@
 import { Play, Square, Target } from 'lucide-react'
-
 import { Button } from '@/components/ui/button'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
-import { NumericInput } from '@/components/ui/numeric-input'
-import { formatBaselineDuration, type BaselineAcquisitionSummary } from '@/lib/spectrometer-baseline'
+import { type BaselineAcquisitionSummary } from '@/lib/spectrometer-baseline'
 import { cn } from '@/lib/utils'
 
-function formatRemaining(milliseconds: number): string {
-  const seconds = Math.max(0, Math.ceil(milliseconds / 1000))
-  const minutes = Math.floor(seconds / 60)
-  return `${String(minutes).padStart(2, '0')}:${String(seconds % 60).padStart(2, '0')}`
-}
-
-function Metric({ label, value }: { readonly label: string; readonly value: string }) {
-  return (
-    <div className="min-w-0 px-2 py-1">
-      <div className="truncate text-[11px] text-muted-foreground">{label}</div>
-      <div className="mt-0.5 font-mono text-sm font-semibold tabular-nums">{value}</div>
-    </div>
-  )
-}
-
 export function SpectrometerBaselineCard({
-  summary,
-  saving,
-  canStart,
-  baselineSet,
-  referenceVoltage,
-  stabilizationMin,
-  averagingMin,
-  onStabilizationChange,
-  onAveragingChange,
-  onStart,
-  onCancel,
+  summary, saving, canStart, baselineSet, referenceVoltage, onStart, onCancel,
 }: {
   readonly summary: BaselineAcquisitionSummary | null
   readonly saving: boolean
   readonly canStart: boolean
   readonly baselineSet: boolean
   readonly referenceVoltage: number | null
-  readonly stabilizationMin: number
-  readonly averagingMin: number
-  readonly onStabilizationChange: (minutes: number) => void
-  readonly onAveragingChange: (minutes: number) => void
   readonly onStart: () => void
   readonly onCancel: () => void
 }) {
   const active = summary !== null
-  const phaseLabel = saving
-    ? '正在写入基线'
-    : summary?.phase === 'stabilizing'
-      ? '稳定等待'
-      : summary?.phase === 'averaging'
-        ? '平均采集'
-        : active
-          ? '采集完成'
-          : baselineSet
-            ? '已有基线'
-            : '未获取'
-  const phaseClass = active || saving
-    ? 'text-blue-700 dark:text-blue-400'
-    : baselineSet
-      ? 'text-emerald-700 dark:text-emerald-400'
-      : 'text-muted-foreground'
-  const remainingLabel = summary?.phase === 'stabilizing' ? '距平均开始' : '距流程完成'
+  const phaseLabel = saving ? '正在写入' : active ? '平均采集' : baselineSet ? '已有基线' : '未获取'
 
   return (
     <Card className="min-w-0 overflow-hidden shadow-none">
-      <CardHeader className="grid min-w-0 gap-3 pb-3 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center">
-        <div className="min-w-0">
-          <CardTitle className="flex items-center gap-2 text-sm font-medium">
-            <Target className="h-4 w-4" />
-            参考基线获取
-          </CardTitle>
-          <p className="mt-1 text-xs text-muted-foreground">
-            油相完全通入流通池后开始；自动启动分光，先稳定 {formatBaselineDuration(Math.round(stabilizationMin * 60_000))}，再对随后 {formatBaselineDuration(Math.round(averagingMin * 60_000))} 的有效电压求平均。
-          </p>
-        </div>
-        <div className="flex min-w-0 flex-wrap items-center gap-2 lg:justify-end">
-          <label className="flex h-9 items-center gap-1.5 rounded-md border border-input bg-background px-2.5 text-xs">
-            <span className="whitespace-nowrap text-muted-foreground">稳定</span>
-            <NumericInput
-              aria-label="稳定等待时长（分钟）"
-              className="h-8 min-h-0 w-14 border-0 bg-transparent px-1 text-right font-medium shadow-none focus-visible:ring-0"
-              value={stabilizationMin}
-              onValueChange={onStabilizationChange}
-              disabled={active || saving}
-              min={0}
-              step={0.5}
-            />
-            <span className="whitespace-nowrap text-muted-foreground">分钟</span>
-          </label>
-          <label className="flex h-9 items-center gap-1.5 rounded-md border border-input bg-background px-2.5 text-xs">
-            <span className="whitespace-nowrap text-muted-foreground">平均</span>
-            <NumericInput
-              aria-label="平均采集时长（分钟）"
-              className="h-8 min-h-0 w-14 border-0 bg-transparent px-1 text-right font-medium shadow-none focus-visible:ring-0"
-              value={averagingMin}
-              onValueChange={onAveragingChange}
-              disabled={active || saving}
-              min={0}
-              step={0.5}
-            />
-            <span className="whitespace-nowrap text-muted-foreground">分钟</span>
-          </label>
-          <span className={cn('mr-1 text-xs font-medium', phaseClass)}>{phaseLabel}</span>
+      <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+        <CardTitle className="flex items-center gap-2 text-sm font-medium">
+          <Target className="h-4 w-4" />参考基线 · 20 秒平均
+        </CardTitle>
+        <div className="flex flex-wrap items-center gap-2">
+          {baselineSet && referenceVoltage !== null && !active && (
+            <span className="font-mono text-sm tabular-nums">{referenceVoltage.toFixed(6)} V</span>
+          )}
+          <span role="status" className={cn('text-xs font-medium', baselineSet && !active ? 'text-emerald-700 dark:text-emerald-400' : 'text-muted-foreground')}>{phaseLabel}</span>
           <Button size="sm" variant="outline" onClick={onStart} disabled={!canStart || active || saving}>
-            <Play className="mr-2 h-4 w-4" />
-            开始获取
+            <Play className="mr-2 h-4 w-4" />开始获取
           </Button>
-          <Button size="sm" variant="secondary" onClick={onCancel} disabled={!active || saving}>
-            <Square className="mr-2 h-4 w-4" />
-            取消
-          </Button>
+          {active && <Button size="sm" variant="secondary" onClick={onCancel} disabled={saving}>
+            <Square className="mr-2 h-4 w-4" />取消
+          </Button>}
         </div>
       </CardHeader>
-      <CardContent className="space-y-3">
-        <div
-          className="h-2 overflow-hidden rounded-full bg-muted"
-          role="progressbar"
-          aria-label="参考基线获取进度"
-          aria-valuemin={0}
-          aria-valuemax={100}
-          aria-valuenow={Math.round(summary?.progressPercent ?? (baselineSet ? 100 : 0))}
-        >
-          <div
-            className={cn('h-full rounded-full', active || saving ? 'bg-blue-600' : baselineSet ? 'bg-emerald-600' : 'bg-muted')}
-            style={{ width: `${summary?.progressPercent ?? (baselineSet ? 100 : 0)}%` }}
-          />
+      {summary && <CardContent className="space-y-3">
+        <div className="h-2 overflow-hidden rounded-full bg-muted" role="progressbar"
+          aria-label="参考基线获取进度" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(summary.progressPercent)}>
+          <div className="h-full rounded-full bg-primary" style={{ width: `${summary.progressPercent}%` }} />
         </div>
-        <div className="grid grid-cols-2 gap-2 border-t pt-2 sm:grid-cols-4">
-          <Metric label="当前阶段" value={phaseLabel} />
-          <Metric label={remainingLabel} value={active ? formatRemaining(summary?.remainingMs ?? 0) : '--:--'} />
-          <Metric label="平均窗口有效样本" value={String(summary?.validSampleCount ?? 0)} />
-          <Metric
-            label={active ? '窗口实时均值' : '当前参考电压'}
-            value={active
-              ? summary?.averageVoltage === null ? '--' : `${summary.averageVoltage.toFixed(6)} V`
-              : baselineSet && referenceVoltage !== null ? `${referenceVoltage.toFixed(6)} V` : '--'}
-          />
-        </div>
-      </CardContent>
+        <dl className="grid grid-cols-3 gap-3 text-sm">
+          <div><dt className="text-xs text-muted-foreground">剩余</dt><dd className="tabular-nums">{Math.ceil(summary.remainingMs / 1000)} 秒</dd></div>
+          <div><dt className="text-xs text-muted-foreground">有效样本</dt><dd className="tabular-nums">{summary.validSampleCount}</dd></div>
+          <div><dt className="text-xs text-muted-foreground">平均电压</dt><dd className="font-mono tabular-nums">{summary.averageVoltage === null ? '--' : `${summary.averageVoltage.toFixed(6)} V`}</dd></div>
+        </dl>
+      </CardContent>}
     </Card>
   )
 }

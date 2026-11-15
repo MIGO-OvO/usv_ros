@@ -1,5 +1,4 @@
-/* eslint-disable react-hooks/set-state-in-effect */
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, type RefObject } from 'react'
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
@@ -7,8 +6,10 @@ import { Label } from "@/components/ui/label"
 import { Switch } from "@/components/ui/switch"
 import { NumericInput } from "@/components/ui/numeric-input"
 import { ScrollArea } from "@/components/ui/scroll-area"
-import { Plus, Trash2, Save, RefreshCw, Download } from 'lucide-react'
+import { Plus, Trash2, RefreshCw, Download } from 'lucide-react'
 import { toast } from '@/hooks/use-toast'
+import { useAutoSave } from '@/hooks/use-auto-save'
+import { AutoSaveStatus } from '@/components/auto-save-status'
 
 interface WaypointSamplingItem {
   enabled: boolean
@@ -28,41 +29,35 @@ const DEFAULT_ITEM: WaypointSamplingItem = {
   on_fail: 'HOLD',
 }
 
-export function WaypointSamplingCard() {
+export function WaypointSamplingCard({ saveRef, disabled = false }: {
+  saveRef: RefObject<(() => Promise<void>) | null>
+  disabled?: boolean
+}) {
   const [data, setData] = useState<WaypointSamplingMap>({})
+  const [loaded, setLoaded] = useState(false)
   const [newSeq, setNewSeq] = useState('')
+  const autoSave = useAutoSave('/api/waypoint-sampling', loaded ? data : null)
+
+  useEffect(() => {
+    saveRef.current = autoSave.flush
+    return () => { saveRef.current = null }
+  }, [autoSave.flush, saveRef])
 
   const fetchData = useCallback(async () => {
     try {
       const res = await fetch('/api/waypoint-sampling')
       const json = await res.json()
-      if (json.success) setData(json.data || {})
-    } catch (e) { console.error(e) }
+      if (!res.ok || !json.success) throw new Error(json.message || '航点配置读取失败')
+      setData(json.data || {})
+      setLoaded(true)
+    } catch (error) { toast({ title: '航点配置读取失败', description: String(error), variant: 'destructive' }) }
   }, [])
 
   useEffect(() => { fetchData() }, [fetchData])
 
-  const saveAll = async () => {
-    try {
-      const res = await fetch('/api/waypoint-sampling', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(data),
-      })
-      const json = await res.json()
-      if (json.success) {
-        toast({ title: '航点采样配置已保存' })
-        if (json.data) setData(json.data)
-      } else {
-        toast({ title: '保存失败', description: json.message, variant: 'destructive' })
-      }
-    } catch {
-      toast({ title: '请求失败', variant: 'destructive' })
-    }
-  }
-
   const syncFromMavros = async () => {
     try {
+      await autoSave.flush()
       const res = await fetch('/api/waypoint-sampling/sync', { method: 'POST' })
       const json = await res.json()
       if (json.success) {
@@ -102,12 +97,14 @@ export function WaypointSamplingCard() {
       <CardHeader className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <CardTitle className="text-base">航点采样配置</CardTitle>
         <div className="flex w-full flex-wrap gap-2 sm:w-auto">
-          <Button size="sm" variant="outline" onClick={syncFromMavros} title="从飞控同步航点"><Download className="w-4 h-4 mr-1" />同步飞控</Button>
-          <Button size="sm" variant="ghost" onClick={fetchData} aria-label="刷新航点配置"><RefreshCw className="w-4 h-4" /></Button>
-          <Button size="sm" onClick={saveAll}><Save className="w-4 h-4 mr-1" />保存</Button>
+          <Button size="sm" variant="outline" onClick={syncFromMavros} disabled={!loaded || disabled} title="从飞控同步航点"><Download className="w-4 h-4 mr-1" />同步飞控</Button>
+          <Button size="sm" variant="ghost" onClick={async () => {
+            try { await autoSave.flush(); await fetchData() } catch { /* 保存状态显示失败原因。 */ }
+          }} disabled={disabled} aria-label="刷新航点配置"><RefreshCw className="w-4 h-4" /></Button>
+          {loaded && <AutoSaveStatus {...autoSave} />}
         </div>
       </CardHeader>
-      <CardContent className="space-y-4">
+      <CardContent><fieldset disabled={!loaded || disabled} className="min-w-0 space-y-4">
         <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
           <div className="min-w-0 flex-1 space-y-1">
             <Label className="text-xs">新增航点编号</Label>
@@ -117,7 +114,7 @@ export function WaypointSamplingCard() {
         </div>
 
         {sortedKeys.length === 0 && (
-          <p className="text-sm text-muted-foreground text-center py-4">未配置任何航点采样规则，将对所有航点使用全局默认值。</p>
+          <p className="text-sm text-muted-foreground text-center py-4">使用全局配置</p>
         )}
 
         {sortedKeys.length > 0 && (
@@ -182,7 +179,7 @@ export function WaypointSamplingCard() {
             </div>
           </ScrollArea>
         )}
-      </CardContent>
+      </fieldset></CardContent>
     </Card>
   )
 }

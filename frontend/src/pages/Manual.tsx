@@ -102,7 +102,6 @@ export default function Manual() {
       <header className="flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
           <h1 className="text-3xl font-bold tracking-tight">手动控制</h1>
-          <p className="text-muted-foreground">试剂预载入与微泵角度微调</p>
         </div>
         <div className="flex items-center gap-3">
           <span className={cn(

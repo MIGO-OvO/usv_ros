@@ -35,6 +35,7 @@ import {
 } from '@/lib/spectro-spike-test'
 import {
   createBaselineAcquisitionSession,
+  BASELINE_AVERAGING_MS,
   formatBaselineDuration,
   getAbsorbanceEmptyState,
   summarizeBaselineAcquisition,
@@ -221,8 +222,6 @@ export default function Monitor() {
   const [spikeTestDurationS, setSpikeTestDurationS] = useState(DEFAULT_SPIKE_TEST_DURATION_S)
   const [baselineSession, setBaselineSession] = useState<BaselineAcquisitionSession | null>(null)
   const [baselineSaving, setBaselineSaving] = useState(false)
-  const [baselineStabilizationMin, setBaselineStabilizationMin] = useState(5)
-  const [baselineAveragingMin, setBaselineAveragingMin] = useState(1)
   const baselineFinalizingRef = useRef(false)
 
   useEffect(() => {
@@ -283,27 +282,16 @@ export default function Monitor() {
 
   const handleStartBaselineAcquisition = useCallback(async () => {
     if (baselineActive || spikeTestActive) return
-    const stabilizationMs = Math.round(baselineStabilizationMin * 60_000)
-    const averagingMs = Math.round(baselineAveragingMin * 60_000)
-    if (stabilizationMs < 0 || averagingMs < 1000) {
-      toast({
-        title: '参考基线时长无效',
-        description: '稳定时长不能为负，平均采集时长至少 1 秒。',
-        variant: 'destructive',
-      })
-      return
-    }
     setSpectroSubmitting('baseline')
     try {
       await postSpectrometerCommand('/api/spectrometer/start')
       const startedAtMs = Date.now()
       baselineFinalizingRef.current = false
       setClock(startedAtMs)
-      setBaselineSession(createBaselineAcquisitionSession(startedAtMs, stabilizationMs, averagingMs))
+      setBaselineSession(createBaselineAcquisitionSession(startedAtMs))
       setTimeWindowMs(600_000)
       toast({
         title: '参考基线获取已开始',
-        description: `正在进行 ${formatBaselineDuration(stabilizationMs)} 稳定等待，之后将自动采集 ${formatBaselineDuration(averagingMs)} 平均值。`,
         variant: 'success',
       })
     } catch (error) {
@@ -315,14 +303,13 @@ export default function Monitor() {
     } finally {
       setSpectroSubmitting(null)
     }
-  }, [baselineActive, baselineAveragingMin, baselineStabilizationMin, spikeTestActive])
+  }, [baselineActive, spikeTestActive])
 
   const handleCancelBaselineAcquisition = useCallback(() => {
     baselineFinalizingRef.current = false
     setBaselineSession(null)
     toast({
       title: '参考基线获取已取消',
-      description: '分光采集保持运行，可在确认油相状态后重新开始。',
     })
   }, [])
 
@@ -339,11 +326,10 @@ export default function Monitor() {
     setBaselineSaving(true)
     void (async () => {
       const averageVoltage = baselineSummary.averageVoltage
-      const averagingMs = baselineSession.endsAtMs - baselineSession.averagingStartedAtMs
       if (averageVoltage === null) {
         toast({
           title: '参考基线获取失败',
-          description: `在 ${formatBaselineDuration(averagingMs)} 的平均窗口内没有有效电压样本，请检查分光链路后重试。`,
+          description: `${formatBaselineDuration(BASELINE_AVERAGING_MS)} 内没有有效电压，请检查分光链路后重试。`,
           variant: 'destructive',
         })
         return
@@ -547,7 +533,6 @@ export default function Monitor() {
       <header className="sticky top-0 z-30 flex flex-wrap items-center justify-between gap-2 border-b bg-background py-3">
         <div>
             <h1 className="text-xl font-semibold tracking-tight">系统监控</h1>
-            <p className="text-xs text-muted-foreground">USV / 当前设备</p>
         </div>
         <div className="flex w-full min-w-0 flex-wrap items-center gap-2 sm:gap-3 md:w-auto md:justify-end">
              <Button
@@ -644,7 +629,6 @@ export default function Monitor() {
         </Card>
       </div>
 
-      <GpsStatusCard gps={gps} failed={gpsFailed} />
 
 
       <section className="min-w-0 rounded-xl border bg-card" aria-labelledby="realtime-title">
@@ -731,7 +715,6 @@ export default function Monitor() {
 
             ) : <AbsorbanceHistoryTable points={displayedHistory} baselineSet={spectrometerBaselineSet} />}
         </div>
-        <p className="border-t px-4 py-2 text-xs text-muted-foreground">完整历史数据请到“数据中心”下载 Jetson 本地任务包</p>
       </section>
 
       <SpectrometerDiagnosticsCard />
@@ -742,10 +725,6 @@ export default function Monitor() {
         canStart={connected && spectroSubmitting === null && !spikeTestActive}
         baselineSet={spectrometerBaselineSet}
         referenceVoltage={currentReferenceVoltage}
-        stabilizationMin={baselineStabilizationMin}
-        averagingMin={baselineAveragingMin}
-        onStabilizationChange={setBaselineStabilizationMin}
-        onAveragingChange={setBaselineAveragingMin}
         onStart={handleStartBaselineAcquisition}
         onCancel={handleCancelBaselineAcquisition}
       />

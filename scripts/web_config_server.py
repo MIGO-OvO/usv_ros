@@ -1815,6 +1815,7 @@ class ConfigManager(object):
 
     def __init__(self, config_file=CONFIG_FILE):
         self.config_file = config_file
+        self._lock = threading.RLock()
         self.config = copy.deepcopy(DEFAULT_CONFIG)
         self._ensure_dir()
 
@@ -1826,6 +1827,10 @@ class ConfigManager(object):
 
     def load(self):
         """加载配置文件。"""
+        with self._lock:
+            return self._load_locked()
+
+    def _load_locked(self):
         try:
             if os.path.exists(self.config_file):
                 with open(self.config_file, 'r', encoding='utf-8') as f:
@@ -1840,6 +1845,11 @@ class ConfigManager(object):
 
     def save(self):
         """保存配置文件。"""
+        with self._lock:
+            return self._save_locked()
+
+    def _save_locked(self):
+        temporary = None
         try:
             self.config['sampling_sequence'] = self._normalize_sampling_sequence(
                 self.config.get('sampling_sequence', {})
@@ -1867,12 +1877,18 @@ class ConfigManager(object):
             )
             self._migrate_legacy_hardware_defaults()
             self.config['updated_at'] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            with open(self.config_file, 'w', encoding='utf-8') as f:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8',
+                    dir=os.path.dirname(self.config_file), delete=False) as f:
+                temporary = f.name
                 json.dump(self.config, f, ensure_ascii=False, indent=2)
+            os.replace(temporary, self.config_file)
             return True
         except (OSError, TypeError, ValueError, ModelParseError, CoordinateError) as e:
             rospy.logerr("Failed to save config: %s", str(e))
             return False
+        finally:
+            if temporary and os.path.exists(temporary):
+                os.unlink(temporary)
 
     def _merge_config(self, loaded):
         """合并加载的配置到默认配置。"""
@@ -1888,6 +1904,8 @@ class ConfigManager(object):
                 else:
                     base[key] = value
         merge(self.config, loaded)
+        if 'waypoint_sampling' in loaded:
+            self.config['waypoint_sampling'] = copy.deepcopy(loaded['waypoint_sampling'])
         self._migrate_legacy_hardware_defaults()
         pump_settings = self.config.setdefault('pump_settings', {})
         try:
@@ -1946,6 +1964,10 @@ class ConfigManager(object):
 
     def update(self, data):
         """更新配置。"""
+        with self._lock:
+            return self._update_locked(data)
+
+    def _update_locked(self, data):
         if 'pump_settings' in data:
             settings = data['pump_settings']
             if not isinstance(settings, dict):
@@ -1970,6 +1992,10 @@ class ConfigManager(object):
 
     def reset(self):
         """重置为默认配置。"""
+        with self._lock:
+            return self._reset_locked()
+
+    def _reset_locked(self):
         self.config = copy.deepcopy(DEFAULT_CONFIG)
         self.config['sampling_sequence'] = self._normalize_sampling_sequence(
             self.config.get('sampling_sequence', {})
@@ -1999,6 +2025,10 @@ class ConfigManager(object):
 
     def get(self):
         """获取当前配置。"""
+        with self._lock:
+            return self._get_locked()
+
+    def _get_locked(self):
         self._migrate_legacy_hardware_defaults()
         config = self.config.copy()
         config['sampling_sequence'] = self._normalize_sampling_sequence(

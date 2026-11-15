@@ -3404,7 +3404,7 @@ class PumpControlNode(object):
         if action == 'automation_start':
             if payload.get('attempt_id') in self._cancelled_attempts:
                 return False, 'Automation attempt was cancelled before admission', rejected
-            if self.manual_mode_enabled:
+            if self.manual_mode_enabled and payload.get('source') != 'web':
                 return False, 'pump manual mode enabled: disable pump manual mode', rejected
             if self._automation_is_active():
                 return False, 'Automation already running: stop current task first', rejected
@@ -3878,7 +3878,8 @@ class PumpControlNode(object):
             return TriggerResponse(success=False, message='Controller fault %s; reconnect controller' % self._controller_fault)
         if self._calibration.get('active'):
             return TriggerResponse(success=False, message='Calibration is active')
-        rejected = self._reject_if_manual_mode("Automation start")
+        rejected = (self._reject_if_manual_mode("Automation start")
+                    if self.sampling_context.get('source') != 'web' else None)
         if rejected:
             return rejected
         step_count = len(self.automation_engine.steps)
@@ -3903,6 +3904,18 @@ class PumpControlNode(object):
             self._set_terminal_reason('spectrometer_not_ready')
             self._publish_automation_status('rejected')
             return TriggerResponse(success=False, message='spectrometer_not_ready: prepare real acquisition and baseline before sampling')
+
+        if self.manual_mode_enabled:
+            # The same control lock excludes manual moves throughout hand-off.
+            confirmed = self._confirm_all_outputs_stopped()
+            if self._action_cancelled() or self._stop_requested:
+                return TriggerResponse(success=False, message='cancelled by stop')
+            if not confirmed:
+                self._record_cleanup_result(False)
+                self._publish_automation_status('cleanup_failed')
+                return TriggerResponse(success=False, message='Manual pump stop could not be confirmed')
+            self._update_injection_pump_state(enabled=False, response='STOPALL_OK')
+            self._set_manual_mode(False)
 
         rospy.loginfo("Automation start requested: %d steps, loop_count=%s, pid_mode=%s, pid_precision=%.3f",
                       step_count,

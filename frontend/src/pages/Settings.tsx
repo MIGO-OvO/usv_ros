@@ -345,7 +345,6 @@ export default function Settings() {
     <div className="settings-page px-3 pb-28 pt-4 sm:px-4 md:px-6 lg:px-8 lg:pb-8 space-y-5 sm:space-y-6 max-w-7xl mx-auto">
       <header>
           <h1 className="text-2xl font-bold tracking-tight sm:text-3xl">系统设置</h1>
-          <p className="text-sm text-muted-foreground sm:text-base">底层控制参数与校准。</p>
       </header>
 
       <div className="grid w-full min-w-0 grid-cols-1 gap-4 sm:gap-6">
@@ -401,7 +400,6 @@ export default function Settings() {
                 <label className="flex items-center justify-between gap-3 rounded-md border bg-background/60 p-3 text-sm sm:border-0 sm:bg-transparent sm:p-0">
                     <span>
                       <span className="font-medium block">启用浓度工作曲线</span>
-                      <span className="text-xs text-muted-foreground">未启用时地图自动使用吸光度。</span>
                     </span>
                     <Switch checked={pollutionMetric.enabled} onCheckedChange={v => setPollutionMetric(p => ({ ...p, enabled: v }))} />
                 </label>
@@ -461,7 +459,6 @@ export default function Settings() {
                     <label className="flex items-center justify-between gap-3 rounded-md border bg-background/60 p-3 text-sm sm:col-span-2 sm:border-0 sm:bg-transparent sm:p-0">
                         <span>
                           <span className="font-medium block">负浓度钳制为 0</span>
-                          <span className="text-xs text-muted-foreground">仅在线性公式计算出负值时生效。</span>
                         </span>
                         <Switch checked={pollutionMetric.clamp_negative} onCheckedChange={v => setPollutionMetric(p => ({ ...p, clamp_negative: v }))} />
                     </label>
@@ -504,13 +501,9 @@ export default function Settings() {
                     <label className="flex items-center justify-between gap-3 rounded-md border bg-background/60 p-3 text-sm sm:border-0 sm:bg-transparent sm:p-0">
                         <span>
                           <span className="font-medium block">需要有效分光</span>
-                          <span className="text-xs text-muted-foreground">分光状态无效时只记录跳过原因。</span>
                         </span>
                         <Switch checked={mappingProfile.survey_require_valid_spectrometer} onCheckedChange={v => setMappingProfile(p => ({ ...p, survey_require_valid_spectrometer: v }))} />
                     </label>
-                </div>
-                <div className="rounded-md bg-muted/50 p-3 text-xs text-muted-foreground">
-                  有有效定位时检查最小距离；无定位时按时间间隔采样。速度和分光门控仍在启动前检查。
                 </div>
                 <div className="flex flex-col gap-2 sm:flex-row">
                     <Button className="flex-1" onClick={saveMappingProfile}><Save className="w-4 h-4 mr-2" /> 保存门控</Button>
@@ -631,7 +624,6 @@ export default function Settings() {
               <div className="space-y-2"><Label>基线参考电压</Label><Input type="number" step="0.001" value={hw.reference_voltage} readOnly /></div>
               <div className="space-y-2"><Label>基线电压</Label><Input type="number" step="0.001" value={hw.baseline_voltage} onChange={e => setHw(p => ({ ...p, baseline_voltage: parseFloat(e.target.value) || 0 }))} /></div>
             </div>
-            <p className="text-xs text-muted-foreground">原始帧会按至少 20 Hz 保存到后端；聚合输出频率只影响实时展示和任务摘要的负载。</p>
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 sm:gap-4">
               <label className="flex items-center justify-between gap-3 rounded-md border bg-background/60 p-3 text-sm"><span>连续采样模式</span><Switch checked={hw.continuous_mode} onCheckedChange={v => setHw(p => ({ ...p, continuous_mode: v }))} /></label>
               <label className="flex items-center justify-between gap-3 rounded-md border bg-background/60 p-3 text-sm"><span>启动后自动开启分光</span><Switch checked={hw.auto_start} onCheckedChange={v => setHw(p => ({ ...p, auto_start: v }))} /></label>
@@ -665,17 +657,12 @@ export default function Settings() {
 
           <div className="flex flex-col gap-2 sm:flex-row">
             <Button onClick={saveHardwareOnly} variant="outline" className="w-full sm:w-auto"><Save className="w-4 h-4 mr-1" />仅保存</Button>
-            <Button onClick={saveAndApplyHardware} disabled={hwLoading} className="w-full sm:w-auto">
+            <Button onClick={saveAndApplyHardware} disabled={hwLoading} className="w-full sm:w-auto" title="保存配置并重连检测装置">
               {hwLoading ? <RefreshCw className="w-4 h-4 mr-1 animate-spin" /> : <Zap className="w-4 h-4 mr-1" />}
               保存并应用
             </Button>
           </div>
 
-          <div className="text-xs text-muted-foreground bg-muted/50 p-3 rounded">
-            <p>支持在 Web 端直接修改 ADS 参数、分光通道以及四个角度采样通道映射。</p>
-            <p>“仅保存”写入配置文件；“保存并应用”会同时重连泵控并下发分光/I2C 映射。</p>
-            <p>串口建议优先选择 /dev/serial/by-id/... 路径，避免 USB 口漂移。</p>
-          </div>
         </CardContent>
       </Card>
 

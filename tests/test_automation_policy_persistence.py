@@ -1,9 +1,11 @@
 """Legacy require_gps flags are removed on load, update and server restart."""
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest.mock import Mock
+from unittest.mock import patch
 
 from test_hardware_runtime_sync import _load_script
 
@@ -70,6 +72,64 @@ class AutomationPolicyPersistenceTests(unittest.TestCase):
         manager.save = Mock(return_value=False)
         self.assertFalse(manager.update({'automation_policy': {'legacy_extension': 'changed'}}))
         self.assertEqual(manager.get()['automation_policy'], {})
+
+    def test_failed_file_replace_preserves_saved_config_and_rolls_back_memory(self):
+        manager = self.make_manager()
+        self.assertTrue(manager.save())
+        saved = Path(self.config_file).read_bytes()
+        with patch.object(self.module.os, 'replace', side_effect=OSError('disk error')):
+            self.assertFalse(manager.update({'sampling_sequence': {'loop_count': 8}}))
+        self.assertEqual(Path(self.config_file).read_bytes(), saved)
+        self.assertEqual(manager.get()['sampling_sequence']['loop_count'], 1)
+
+    def test_overlapping_autosaves_keep_both_sections_and_rollback_only_failed_write(self):
+        manager = self.make_manager()
+        entered, release = threading.Event(), threading.Event()
+        save = manager.save
+
+        def delayed_save():
+            if threading.current_thread().name == 'failed-config-write':
+                entered.set()
+                release.wait(2)
+                return False
+            return save()
+
+        manager.save = delayed_save
+        results = []
+        second_entered, second_finished = threading.Event(), threading.Event()
+
+        def save_waypoints():
+            second_entered.set()
+            results.append(manager.update({'waypoint_sampling': {'3': {'enabled': True, 'loop_count': 4}}}))
+            second_finished.set()
+
+        failed = threading.Thread(name='failed-config-write', target=lambda: results.append(
+            manager.update({'sampling_sequence': {'loop_count': 7}})))
+        succeeded = threading.Thread(target=save_waypoints)
+        failed.start()
+        self.assertTrue(entered.wait(1))
+        succeeded.start()
+        try:
+            self.assertTrue(second_entered.wait(1))
+            self.assertFalse(second_finished.wait(0.1), 'second write bypassed the in-flight transaction')
+        finally:
+            release.set()
+        failed.join(3)
+        succeeded.join(3)
+        self.assertFalse(failed.is_alive())
+        self.assertFalse(succeeded.is_alive())
+        self.assertCountEqual(results, [False, True])
+        self.assertEqual(manager.get()['sampling_sequence']['loop_count'], 1)
+        self.assertEqual(manager.get()['waypoint_sampling']['3']['loop_count'], 4)
+        self.assertEqual(self.make_manager().get()['waypoint_sampling']['3']['loop_count'], 4)
+
+    def test_waypoint_map_replacement_persists_deletion_including_last_item(self):
+        manager = self.make_manager()
+        self.assertTrue(manager.update({'waypoint_sampling': {'1': {}, '2': {}}}))
+        self.assertTrue(manager.update({'waypoint_sampling': {'2': {}}}))
+        self.assertEqual(set(self.make_manager().get()['waypoint_sampling']), {'2'})
+        self.assertTrue(manager.update({'waypoint_sampling': {}}))
+        self.assertEqual(self.make_manager().get()['waypoint_sampling'], {})
 
     def test_api_config_roundtrip(self):
         class TempConfigManager(self.module.ConfigManager):

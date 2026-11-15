@@ -668,7 +668,7 @@ sudo USV_BOOT_START_NOW=true USV_STRICT_SELF_CHECK=false ./src/usv_ros/scripts/i
 
 当前 DetFirmware 的 `0xCC` 角度帧没有有效位或源时间戳；传感器失效时会重复 last_valid，`ANGLE_AGE_CH_MS=0` 也不能单独证明有效。Preflight 使用逐轴 monotonic 接收时刻（1 秒断流预算）、有限/范围校验、通道 age 和独立健康包时间戳（2.5 秒预算，重复/倒退不续约，支持 uint32 回绕）。油相行程阶段需在 120 秒内累计至少 0.1° 的净正向进展；相同帧或固定位置附近的小抖动不能续约计时。进入收敛后允许反向纠偏，角度与健康新鲜度检查继续生效。以上检测失败均停止输出；机械停机延迟需台架测量。
 
-`automation_start` 返回本次 `attempt_id` 与 `admission`：`rejected` 表示未准入，`owned` 表示泵节点已接管该 attempt；RPC 异常或身份不匹配按 `unknown` 处理。启动失败首因保留在 QGC 关联结果、日志、`sampling_result` 与采样记录中，清理另存 `cleanup_result`。明确未准入仍登记取消，阻止迟到 START；未知结果按 attempt 核验，当前 owner 匹配才执行停止，其他 owner 不受影响。`not_admitted/not_owned` 表示已登记取消且当前无本 attempt 的输出归属；`superseded` 表示其他 owner 已接管；`stopped` 才表示本 attempt 停止确认成功。航行 Manual 与泵手动模式独立，泵手动模式、控制器故障、忙碌和非法配置分别返回具体原因。
+`automation_start` 返回本次 `attempt_id` 与 `admission`：`rejected` 表示未准入，`owned` 表示泵节点已接管该 attempt；RPC 异常或身份不匹配按 `unknown` 处理。启动失败首因保留在 QGC 关联结果、日志、`sampling_result` 与采样记录中，清理另存 `cleanup_result`。明确未准入仍登记取消，阻止迟到 START；未知结果按 attempt 核验，当前 owner 匹配才执行停止，其他 owner 不受影响。`not_admitted/not_owned` 表示已登记取消且当前无本 attempt 的输出归属；`superseded` 表示其他 owner 已接管；`stopped` 才表示本 attempt 停止确认成功。航行 Manual 与泵手动模式独立。网页启动可以停止并接管泵手动输出；其他来源在泵手动模式下仍返回互锁原因。控制器故障、忙碌和非法配置分别返回具体原因。
 
 未到 `sampling_started` 就失败的 attempt，Web 按匹配的上下文和最终结果建立失败记录；支持两者任意到达顺序，重复或旧 owner 结果不重复建档。任务 JSON 与 `sample_results.csv` 保存首因、`start_admission` 和独立 JSON 格式的 `cleanup_result`，不附加有效测量。
 
@@ -782,6 +782,10 @@ rosservice call /usv/pump_stop
 Web 后端是 `scripts/web_config_server.py`，默认监听 `0.0.0.0:5000`。它既提供前端静态文件，也提供
 REST API 和 Socket.IO 实时事件。
 
+自动化页面在修改全局配置、启动前准备、序列步骤或航点采样规则后自动保存；连续输入合并为一次写入，失败时显示重试入口。启动与导出前会等待保存完成。泵手动模式下点击网页启动，控制器先确认全部泵停止，再退出手动模式并进入准备流程。相对零点在设置页校准，自动化页显示泵组实时角度。
+
+监控页的参考基线固定取启动分光后 20 秒内的有效电压平均值，窗口结束后写入参考电压。
+
 ### 常用 REST API
 
 | API | 说明 |
@@ -794,7 +798,7 @@ REST API 和 Socket.IO 实时事件。
 | `GET/POST /api/pid/config`、`POST /api/pid/test` | PID 参数与测试 |
 | `GET/POST /api/calibration/offsets`、`POST /api/calibration/zero|reset|start` | 相对零点与角度校准 |
 | `GET /api/data/voltage`、`POST /api/data/voltage/clear` | 当前内存电压历史 |
-| `POST /api/spectrometer/start`、`POST /api/spectrometer/stop`、`POST /api/spectrometer/baseline` | 分光采集启停；baseline 无请求体时沿用当前有效电压，也可通过 `reference_voltage` 写入稳定窗口的平均参考电压 |
+| `POST /api/spectrometer/start`、`POST /api/spectrometer/stop`、`POST /api/spectrometer/baseline` | 分光采集启停；baseline 无请求体时使用当前有效电压，也可通过 `reference_voltage` 写入平均参考电压；网页基线窗口固定为 20 秒 |
 | `GET /api/data/missions` | 历史任务文件列表 |
 | `GET /api/data/mission/<id>` | 历史任务 JSON |
 | `GET /api/data/mission/<id>/samples` | 任务下采样窗口列表，不返回 raw frames |
