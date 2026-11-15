@@ -17,6 +17,7 @@ import { WaypointSamplingCard } from '@/components/waypoint-sampling-card'
 import { AutoSaveStatus } from '@/components/auto-save-status'
 import { useAutoSave } from '@/hooks/use-auto-save'
 import { toast } from '@/hooks/use-toast'
+import { RecordingNameDialog } from '@/components/recording-name-dialog'
 import {
   getAutomationControlAvailability,
   resolveAutomationAction,
@@ -114,6 +115,7 @@ export default function Automation() {
   const waypointSave = useRef<(() => Promise<void>) | null>(null)
   const actionGeneration = useRef(0)
   const [pendingAction, setPendingAction] = useState(false)
+  const [namingSample, setNamingSample] = useState(false)
   const involvedMotors = getInvolvedAxes(steps)
   const autoSave = useAutoSave('/api/config', configLoaded ? {
     sampling_sequence: { steps, loop_count: loopCount }, pump_settings: pumpSettings,
@@ -166,7 +168,7 @@ export default function Automation() {
     await waypointSave.current?.()
   }
 
-  const handleAction = async (requestedAction: AutomationAction) => {
+  const handleAction = async (requestedAction: AutomationAction, sampleName?: string) => {
     if (requestedAction !== 'stop' && pendingAction) return
     const action = resolveAutomationAction(requestedAction, automationState)
     if (action === 'stop') actionGeneration.current += 1
@@ -187,6 +189,7 @@ export default function Automation() {
         }
 
         const body: Record<string, unknown> = {
+          sample_name: sampleName,
           sampling_sequence: { steps, loop_count: loopCount },
           pump_settings: pumpSettings,
         }
@@ -368,7 +371,10 @@ export default function Automation() {
               )}
             </div>
           )}
-          <Button variant="outline" onClick={() => handleAction('start')} disabled={!configLoaded || !controls.start || pendingAction}>
+          <Button variant="outline" onClick={() => {
+            if (resolveAutomationAction('start', automationState) === 'start') setNamingSample(true)
+            else void handleAction('start')
+          }} disabled={!configLoaded || !controls.start || pendingAction}>
             <Play className="w-4 h-4 mr-2 text-emerald-500" /> 启动
           </Button>
           <Button variant="outline" onClick={() => handleAction('pause')} disabled={!controls.pause}>
@@ -610,6 +616,11 @@ export default function Automation() {
           </fieldset></CardContent>
         </Card>
       </div>
+      {namingSample && <RecordingNameDialog title="开始点采样" label="采样名称" confirmLabel="开始采样"
+        onCancel={() => setNamingSample(false)} onConfirm={(name) => {
+          setNamingSample(false)
+          if (!automationRunning && !automationPaused && !preparing) void handleAction('start', name)
+        }} />}
     </div>
   )
 }

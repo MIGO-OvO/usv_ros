@@ -50,6 +50,34 @@ class ManualSamplingAdmissionTests(unittest.TestCase):
         self.assertEqual(len(self.requests), 1)
         self.assertNotIn('PUMP:SET:60', self.commands)
 
+    def test_name_token_is_frozen_through_trigger_and_pump_context(self):
+        self.config['recording'] = {'sample_names': {'123456': '湖心'}}
+        self.trigger._mavlink_cmd_rx_cb(remote_command(self.trigger, 31010, param1=123456))
+        wait_commands(self.trigger)
+        self.wait_phase('homing')
+        self.assertEqual(self.trigger.current_sampling_context['sample_name'], '湖心')
+        self.assertEqual(self.node.sampling_context['sample_name'], '湖心')
+        self.config['recording']['sample_names'] = {'654321': '岸边'}
+        self.assertEqual(self.node.sampling_context['sample_name'], '湖心')
+
+    def test_unknown_name_token_rejects_start_without_any_hardware_action(self):
+        self.trigger._mavlink_cmd_rx_cb(remote_command(self.trigger, 31010, param1=123456))
+        wait_commands(self.trigger)
+        self.assertFalse(self.trigger.is_sampling)
+        self.assertFalse(self.commands)
+        self.assertFalse(self.requests)
+
+    def test_fcu_waypoint_uses_the_task_name_without_changing_sample_identity(self):
+        self.config['recording'] = {'mission_name': '环湖任务'}
+        self.trigger.current_waypoint = 7
+        self.trigger._mavlink_cmd_rx_cb(remote_command(self.trigger, 31010, param2=42))
+        wait_commands(self.trigger)
+        self.wait_phase('homing')
+        for context in (self.trigger.current_sampling_context, self.node.sampling_context):
+            self.assertEqual(context['mission_name'], '环湖任务')
+            self.assertEqual(context['sample_id'], 42)
+            self.assertEqual(context['waypoint_seq'], 7)
+
     def test_pre_admission_rejections_keep_first_reason_with_empty_or_old_owner(self):
         for owner, fault, manual, invalid, expected in (
                 (None, 'watchdog_tripped', False, False, 'watchdog_tripped'),

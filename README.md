@@ -97,6 +97,10 @@ QGC 手动点采样采用 Web 全局步骤和自动进样泵策略的 `speed`；
 
 QGC 点采样和航点采样由 Web 服务归档。Web 从 trigger 开始通知或泵控持续发布的运行/暂停状态打开同一采样窗口，使用原始记录 ID、开始时间和开始位置，收到匹配 `attempt_id` 的 trigger 最终结果后关窗。数据中心在采样开始、结束时刷新任务列表，可下载原始帧和任务归档。部署此归档修复时一起更新并重启 pump/Web；Web 服务需在采样期间运行，此前未落盘的原始帧无法补回。回归入口为 `tests/test_qgc_web_recording.py` 和 `frontend/scripts/test-data-loading.mjs`。
 
+ROS Web 和独立 USV GroundStation 在点采样启动前输入采样名称，文件使用 `名称-时间戳`；上传航点任务时输入整个任务名称，各点文件使用 `任务名称-航点序号-时间戳`。序号沿用飞控任务的 `waypoint_seq`，时间戳取采样开始时间，采用 UTC+8 的 `YYYYMMDD_HHMMSS_ffffff`。JSON、原始 JSONL、CSV 和 ZIP 均保留名称，原记录 UUID 和旧归档仍可读取。
+
+地面站先通过所选 HTTP/数传链路调用 `POST /api/recording/name`（`{"name":"湖心"}`），再将返回的 `data.token` 放入原 `31010.param1`，`param2=0`；token 为 float32 可精确表示的正整数。`POST /api/recording/mission` 保存航点任务名称。名称保存失败、取消或断线时不发送后续启动；`param1=0` 兼容旧客户端。两端需一起更新 ROS trigger、pump、Web 和地面站。命名回归：`python -m unittest discover -s tests -p 'test_recording_names.py'`。
+
 QGC 发送层与面板响应期限一致：分光启动 40 秒（覆盖最多三次配置重试和首帧等待），停止类 `31011/31016/31019` 为 15 秒。期限是等待确认的上限，停止命令点击后即发送。更新 ROS 后重启 trigger/bridge/pump，并运行重新编译的 QGC。
 
 QGC 在总预算内以 1 秒间隔最多发送三份同 session/request/command/参数的帧，不创建新请求。RequestLedger 重放原阶段与结果，不重复执行物理动作；标准 ACK 与 USVE1 可任意先后到达，只有匹配关联事件结束收执等待。

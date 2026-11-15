@@ -59,6 +59,17 @@ class SampleRecordingStorage(object):
             raise ValueError("raw path escapes missions raw directory")
         return path
 
+    def _raw_read_path(self, mission_id, sample_id):
+        path = self._raw_abspath(self._raw_relpath(mission_id, sample_id))
+        if os.path.isfile(path):
+            return path
+        directory = path[:-len('.jsonl')]
+        if os.path.isdir(directory):
+            files = [name for name in os.listdir(directory) if name.endswith('.jsonl')]
+            if len(files) == 1:
+                return os.path.join(directory, files[0])
+        return path
+
     @staticmethod
     def _sample_windows(mission_data: dict[str, object]) -> list[dict[str, object]]:
         mission_data["sample_windows_schema_version"] = 1
@@ -90,6 +101,8 @@ class SampleRecordingStorage(object):
                     return existing
                 raise ValueError('sample record already closed')
             raw_file = self._raw_relpath(window["mission_id"], window["sample_id"])
+            if window.get('file_stem'):
+                raw_file = raw_file[:-len('.jsonl')] + '/' + window['file_stem'] + '.jsonl'
             window["spectrometer"] = SpectrometerSummaryBuilder().to_dict(raw_file)
             self._sample_windows(mission_data).append(window)
             self._builders[window["sample_id"]] = SpectrometerSummaryBuilder()
@@ -215,7 +228,7 @@ class SampleRecordingStorage(object):
         return frames
 
     def iter_raw_frames(self, mission_id: object, sample_id: object):
-        path = self._raw_abspath(self._raw_relpath(mission_id, sample_id))
+        path = self._raw_read_path(mission_id, sample_id)
         if not os.path.exists(path):
             return
         with open(path, "r", encoding="utf-8") as file_obj:
@@ -242,7 +255,7 @@ class SampleRecordingStorage(object):
         to_ms: Optional[float] = None,
         max_points: int = 2000,
     ) -> dict[str, object]:
-        path = self._raw_abspath(self._raw_relpath(mission_id, sample_id))
+        path = self._raw_read_path(mission_id, sample_id)
         max_points = max(4, min(int(max_points), 200000))
         if not os.path.exists(path):
             return {"raw_count": 0, "returned_count": 0, "from_ms": from_ms, "to_ms": to_ms, "covered": True, "samples": []}

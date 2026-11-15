@@ -102,6 +102,8 @@ def sample_record(context, spectrometer=None, water_quality=None, timestamp_end=
     return {
         'record_schema_version': 1,
         'sample_id': context['record_id'],
+        'sample_name': context.get('sample_name'),
+        'mission_name': context.get('mission_name'),
         'timestamp_start': context['timestamp_start'],
         'timestamp_end': timestamp_end,
         'latitude': gps.get('lat'), 'longitude': gps.get('lon', gps.get('lng')),

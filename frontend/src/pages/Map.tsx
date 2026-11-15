@@ -9,6 +9,7 @@ import { wgs84Input } from '@/lib/lab-coordinate-adapter'
 import { createOverscaledAmapTileLayer } from '@/lib/map-tiles'
 import { cn } from '@/lib/utils'
 import { useAppStore } from '@/store'
+import { RecordingNameDialog } from '@/components/recording-name-dialog'
 
 type MapMode = 'live' | 'history'
 type MetricMode = 'auto' | 'concentration' | 'absorbance' | 'voltage'
@@ -314,6 +315,8 @@ export default function MapPage() {
   const [draftWaypoints, setDraftWaypoints] = useState<MissionDraftWaypoint[]>([])
   const [missionUploading, setMissionUploading] = useState(false)
   const [missionPlanMsg, setMissionPlanMsg] = useState('')
+  const [namingMission, setNamingMission] = useState(false)
+  const [missionName, setMissionName] = useState('')
 
   const activeSamples = useMemo(
     () => geojson?.features.filter((f) => f.properties?.layer === 'sample') || [],
@@ -658,7 +661,7 @@ export default function MapPage() {
     setMissionPlanMsg('')
   }, [])
 
-  const uploadDraftMission = useCallback(async () => {
+  const uploadDraftMission = useCallback(async (name: string) => {
     if (draftWaypoints.length === 0) {
       setMissionPlanMsg('请先在地图上添加航点')
       return
@@ -671,6 +674,7 @@ export default function MapPage() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           replace: true,
+          mission_name: name,
           sample_timeout_s: sampleTimeoutS,
           waypoints: draftWaypoints.map((wp, index) => ({
             ...wgs84Input(wp.gcj02),
@@ -922,7 +926,7 @@ export default function MapPage() {
                   />
                 </div>
                 <div className="grid grid-cols-2 gap-2">
-                  <Button size="sm" onClick={uploadDraftMission} disabled={missionUploading || draftWaypoints.length === 0}>
+                  <Button size="sm" onClick={() => setNamingMission(true)} disabled={missionUploading || draftWaypoints.length === 0}>
                     {missionUploading ? <Loader2 className="w-4 h-4 mr-1 animate-spin" /> : <Upload className="w-4 h-4 mr-1" />}
                     上传航线
                   </Button>
@@ -1264,6 +1268,12 @@ export default function MapPage() {
           )}
         </section>
       </div>
+      {namingMission && <RecordingNameDialog title="上传航点任务" label="任务名称" confirmLabel="上传任务"
+        initialName={missionName} onCancel={() => setNamingMission(false)} onConfirm={(name) => {
+          setNamingMission(false)
+          setMissionName(name)
+          void uploadDraftMission(name)
+        }} />}
     </div>
   )
 }

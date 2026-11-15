@@ -106,7 +106,7 @@ test('task first paint is loading; overview alone does not request raw; click re
   app.requests[1].respond(overview)
   await app.flush()
   assert.equal(app.requests.length, 2)
-  assert.match(app.text(), /点击采样窗口后加载原始曲线/)
+  assert.equal(app.nodes().find(node => node.type === 'button' && node.props.children?.[1]?.props?.children === 'sample').props['aria-pressed'], false)
   app.clickSample()
   await app.flush()
   assert.equal(app.requests.length, 4)

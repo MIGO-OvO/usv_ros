@@ -74,6 +74,16 @@ class RosRadioTests(unittest.TestCase):
         self.assertTrue(radio.allowed('POST', '/api/preset/auto/五圈'))
         self.assertFalse(radio.allowed('POST', '/api/preset/auto/../other'))
 
+    def test_recording_name_metadata_roundtrips_and_duplicate_request_reuses_response(self):
+        for request, path in enumerate(('/api/recording/name', '/api/recording/mission'), 1):
+            operation = {'method': 'POST', 'path': path, 'body': {'name': '环湖任务'}}
+            parts = self.submit(operation, request)
+            result = self.result(request)
+            self.assertEqual(result['body']['data']['name'], '环湖任务')
+            self.send(radio.REQUEST, request, 0, len(parts), parts[0])
+            self.assertEqual(self.result(request), result)
+        self.assertEqual(len(self.calls), 2)
+
     def test_stop_has_independent_worker_and_cancels_queued_actions(self):
         entered, release = threading.Event(), threading.Event()
         def api(op):

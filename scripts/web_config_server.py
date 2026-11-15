@@ -37,6 +37,7 @@ import threading
 import time
 import zipfile
 import uuid
+import secrets
 from collections import OrderedDict
 from datetime import datetime
 
@@ -117,6 +118,9 @@ from scripts.lib.lab_sim.models import CoordinatePairRef, ModelParseError, Sampl
 from scripts.lib.lab_sim.route_planner import RoutePlannerError, plan_coverage_route
 from scripts.lib.sample_recording import MIN_RAW_RECORD_HZ, SampleRecordingStorage, normalize_raw_frame
 from scripts.lib.sample_recording.models import safe_id
+from scripts.lib.sample_recording.naming import (
+    recording_name, recording_stem, mission_file_id, attachment_header, recording_config,
+)
 from scripts.lib.sample_recording.record import bind_web_context, freeze_position, navsat_position, position_local_age_s, finite
 from scripts.lib.gps_diagnostics import diagnose
 from scripts.lib.automation_preflight import DEFAULT_PREFLIGHT, normalize_preflight, calibrated_offsets, relative_angles
@@ -1066,6 +1070,7 @@ class MissionDataManager(object):
         self._write_lock = threading.RLock()
         self._mission_list_cache = None
         self._mission_cache = OrderedDict()
+        self._mission_files = {}
         self._cache_capacity = max(1, int(cache_capacity))
         # File bytes are a proxy, not the decoded Python heap size.
         self._cache_max_bytes = max(0, int(cache_max_bytes))
@@ -1107,7 +1112,7 @@ class MissionDataManager(object):
     def _recover_incomplete_missions(self):
         recovered_at = datetime.now().isoformat()
         for filename in os.listdir(self.data_dir):
-            if not filename.startswith("mission_") or not filename.endswith(".json"):
+            if mission_file_id(filename) is None:
                 continue
             path = os.path.join(self.data_dir, filename)
             try:
@@ -1126,14 +1131,24 @@ class MissionDataManager(object):
             except (OSError, ValueError, TypeError):
                 continue
 
-    def start_mission(self, mission_name=""):
+    def start_mission(self, mission_name="", file_stem=None):
         """开始新任务记录。"""
         with self._write_lock:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            filename = f"mission_{timestamp}.json"
+            if file_stem:
+                if '/' in file_stem or '\\' in file_stem or os.path.basename(file_stem) != file_stem:
+                    raise ValueError('采样文件名称无效')
+                timestamp = mission_file_id(file_stem + '.json')
+                if not timestamp:
+                    raise ValueError('采样文件名称无效')
+            filename = file_stem + '.json' if file_stem else f"mission_{timestamp}.json"
+            if os.path.exists(os.path.join(self.data_dir, filename)):
+                raise FileExistsError('采样文件已存在，请重新启动采样')
             self.current_mission_file = os.path.join(self.data_dir, filename)
+            self._mission_files[timestamp] = filename
             self.current_mission_data = {
                 "mission_id": timestamp,
+                "file_stem": file_stem,
                 "name": mission_name or f"Mission {timestamp}",
                 "state": "running",
                 "start_time": datetime.now().isoformat(),
@@ -1365,11 +1380,15 @@ class MissionDataManager(object):
             return None
         try:
             entries = []
+            files = {}
             for name in os.listdir(self.data_dir):
-                if not (name.endswith(".json") and name.startswith("mission_")):
+                mission_id = mission_file_id(name)
+                if mission_id is None:
                     continue
+                files[mission_id] = name
                 stat = os.stat(os.path.join(self.data_dir, name))
                 entries.append((name, stat.st_mtime_ns, stat.st_size))
+            self._mission_files = files
             return tuple(sorted(entries))
         except OSError:
             return None
@@ -1391,15 +1410,16 @@ class MissionDataManager(object):
 
         # Load newest last so likely first-page selections remain in the LRU.
         for f in sorted(os.listdir(self.data_dir)):
-            if f.endswith(".json") and f.startswith("mission_"):
+            if mission_file_id(f) is not None:
                 try:
-                    data = self.get_mission(f[len("mission_"):-len(".json")])
+                    data = self.get_mission(mission_file_id(f))
                     if not isinstance(data, dict):
                         continue
                     summary = data["summary"]
                     mission = {
                         "id": data.get("mission_id", f),
                         "name": data.get("name", f),
+                        "file_stem": data.get('file_stem'),
                         "state": data.get("state"),
                         "start_time": data.get("start_time"),
                         "end_time": data.get("end_time"),
@@ -1433,8 +1453,7 @@ class MissionDataManager(object):
             and str(self.current_mission_data.get("mission_id")) == str(mission_id)
         ):
             return self._with_summary(self.current_mission_data)
-        filename = f"mission_{mission_id}.json"
-        path = os.path.join(self.data_dir, filename)
+        path = self._mission_path(mission_id)
         try:
             stat = os.stat(path)
         except FileNotFoundError:
@@ -1504,7 +1523,7 @@ class MissionDataManager(object):
             self.current_mission_data = data
             self._save_current()
             return True
-        path = os.path.join(self.data_dir, f"mission_{mission_id}.json")
+        path = self._mission_path(mission_id)
         if not os.path.exists(path):
             return False
         self._atomic_write_json(path, data)
@@ -1518,15 +1537,25 @@ class MissionDataManager(object):
             return self._delete_mission_locked(mission_id)
 
     def _delete_mission_locked(self, mission_id):
-        filename = f"mission_{mission_id}.json"
-        path = os.path.join(self.data_dir, filename)
+        path = self._mission_path(mission_id)
         if os.path.exists(path):
             os.remove(path)
             return True
         return False
 
+    def _mission_path(self, mission_id):
+        mission_id = str(mission_id)
+        if safe_id(mission_id) != mission_id:
+            raise ValueError('unsafe mission_id')
+        filename = self._mission_files.get(mission_id)
+        if filename is None or not os.path.isfile(os.path.join(self.data_dir, filename)):
+            self._mission_list_fingerprint()
+            filename = self._mission_files.get(mission_id, 'mission_' + mission_id + '.json')
+        return os.path.join(self.data_dir, filename)
+
 # 默认配置
 DEFAULT_CONFIG = {
+    "recording": {"mission_name": "", "sample_names": {}},
     "version": "1.0",
     "updated_at": "",
     "mission": {
@@ -1904,6 +1933,9 @@ class ConfigManager(object):
                 else:
                     base[key] = value
         merge(self.config, loaded)
+        if isinstance(loaded.get('recording'), dict) and 'sample_names' in loaded['recording']:
+            self.config['recording']['sample_names'] = copy.deepcopy(loaded['recording']['sample_names'])
+        self.config['recording'] = recording_config(self.config.get('recording', {}))
         if 'waypoint_sampling' in loaded:
             self.config['waypoint_sampling'] = copy.deepcopy(loaded['waypoint_sampling'])
         self._migrate_legacy_hardware_defaults()
@@ -2361,8 +2393,14 @@ class WebConfigServer(object):
             if not self.data_recording_source:
                 self.data_recording_source = source
             return
-        mission_name = self.config_manager.get().get('mission', {}).get('name', '')
-        self.data_manager.start_mission(mission_name)
+        context = self._current_sample_context()
+        name = context.get('sample_name') or context.get('mission_name')
+        stem = recording_stem(name, context['timestamp_start'], context.get('waypoint_seq'))
+        mission_name = name or self.config_manager.get().get('mission', {}).get('name', '')
+        if stem:
+            self.data_manager.start_mission(mission_name, file_stem=stem)
+        else:
+            self.data_manager.start_mission(mission_name)
         self._last_mission_data_point_at = 0.0
         with self._mission_sample_lock:
             self._latest_mission_sample = None
@@ -2488,6 +2526,8 @@ class WebConfigServer(object):
         mavlink_sample_id = context.get('sample_id') if source == 'fcu' else None
         return {
             "record_id": context.get('record_id'),
+            "sample_name": context.get('sample_name'),
+            "mission_name": context.get('mission_name'),
             "timestamp_start": context.get('timestamp_start', time.time()),
             "gps_snapshot": copy.deepcopy(context.get('gps_snapshot')),
             "simulated": bool(context.get('simulated', False)),
@@ -3639,7 +3679,7 @@ class WebConfigServer(object):
         return Response(
             json.dumps(payload, ensure_ascii=False, indent=2),
             mimetype="application/json",
-            headers={"Content-Disposition": f"attachment; filename={filename}"},
+            headers={"Content-Disposition": attachment_header(filename)},
         )
 
     @staticmethod
@@ -3855,7 +3895,7 @@ class WebConfigServer(object):
 
     def _build_mission_archive(self, data):
         mission_id = safe_id(data.get("mission_id"), "mission")
-        root = "mission_%s" % mission_id
+        root = data.get('file_stem') or "mission_%s" % mission_id
         archive_file = tempfile.SpooledTemporaryFile(max_size=16 * 1024 * 1024, mode="w+b")
         try:
             with zipfile.ZipFile(archive_file, "w", compression=zipfile.ZIP_DEFLATED) as archive:
@@ -3866,7 +3906,7 @@ class WebConfigServer(object):
                 archive.writestr(root + "/summary.csv", self._mission_csv_text(data).encode("utf-8"))
                 # Window closure is a storage lifecycle, never a success result.
                 results = io.StringIO()
-                columns = ['sample_id', 'attempt_id', 'state', 'outcome', 'terminal_reason',
+                columns = ['sample_id', 'sample_name', 'mission_name', 'file_stem', 'attempt_id', 'state', 'outcome', 'terminal_reason',
                            'preflight_phase', 'terminal_reason_at', 'cleanup_failed',
                            'spectrometer_age_s', 'owner_age_s', 'start_admission', 'cleanup_result']
                 writer = csv.DictWriter(results, fieldnames=columns, extrasaction='ignore')
@@ -3881,13 +3921,14 @@ class WebConfigServer(object):
                         csv_file.write(chunk.encode("utf-8"))
                 for window in self.sample_storage.list_windows(data):
                     sample_id = safe_id(window.get("sample_id"), "sample")
+                    stem = window.get('file_stem') or sample_id
                     spectrometer = window.get("spectrometer")
                     raw_file = spectrometer.get("raw_file") if isinstance(spectrometer, dict) else None
                     if raw_file:
                         raw_path = self.sample_storage._raw_abspath(str(raw_file))
                         if os.path.isfile(raw_path):
-                            archive.write(raw_path, root + "/raw/%s.jsonl" % sample_id)
-                    with archive.open(root + "/raw_csv/%s.csv" % sample_id, "w") as csv_file:
+                            archive.write(raw_path, root + "/raw/%s.jsonl" % stem)
+                    with archive.open(root + "/raw_csv/%s.csv" % stem, "w") as csv_file:
                         for chunk in self._iter_raw_csv_chunks(mission_id, sample_id):
                             csv_file.write(chunk.encode("utf-8"))
             archive_file.seek(0)
@@ -4592,6 +4633,35 @@ class WebConfigServer(object):
         def get_config():
             return jsonify(self.config_manager.get())
 
+        @self.app.route('/api/recording/name', methods=['POST'])
+        def prepare_recording_name():
+            data = json_object()
+            try:
+                name = recording_name((data or {}).get('name'), required=True)
+            except ValueError as exc:
+                return jsonify(success=False, message=str(exc)), 400
+            with self.config_manager._lock:
+                names = self.config_manager.get().get('recording', {}).get('sample_names', {})
+                names = dict(list(names.items())[-63:])
+                token = secrets.randbelow(2 ** 24 - 1) + 1
+                while str(token) in names:
+                    token = secrets.randbelow(2 ** 24 - 1) + 1
+                names[str(token)] = name
+                if not self.config_manager.update({'recording': {'sample_names': names}}):
+                    return jsonify(success=False, message='采样名称保存失败'), 500
+            return jsonify(success=True, data={'token': token, 'name': name})
+
+        @self.app.route('/api/recording/mission', methods=['POST'])
+        def name_recording_mission():
+            data = json_object()
+            try:
+                name = recording_name((data or {}).get('name'), required=True)
+            except ValueError as exc:
+                return jsonify(success=False, message=str(exc)), 400
+            if not self.config_manager.update({'recording': {'mission_name': name}}):
+                return jsonify(success=False, message='任务名称保存失败'), 500
+            return jsonify(success=True, data={'name': name})
+
         @self.app.route('/api/config', methods=['POST'])
         def save_config():
             data = json_object()
@@ -4985,10 +5055,17 @@ class WebConfigServer(object):
             data = json_object()
             if data is None:
                 return jsonify({"success": False, "message": "request body must be a JSON object"}), 400
+            try:
+                mission_name = recording_name(data.get('mission_name'))
+            except ValueError as exc:
+                return jsonify(success=False, message=str(exc)), 400
+            if mission_name and not self.config_manager.update({'recording': {'mission_name': mission_name}}):
+                return jsonify(success=False, message='任务名称保存失败'), 500
             if "sample_timeout_s" in data:
                 self.config_manager.update({"sampling": {"sample_timeout_s": data.get("sample_timeout_s")}})
             config = self.config_manager.get()
             plan_payload = dict(data)
+            plan_payload.pop('mission_name', None)
             plan_payload.pop("sample_timeout_s", None)
             result = upload_mission_plan(plan_payload, sampling_config=config.get('waypoint_sampling', {}))
             if result.get("success"):
@@ -5704,13 +5781,14 @@ class WebConfigServer(object):
             data = self.data_manager.get_mission(mission_id)
             if not data:
                 return jsonify({"success": False, "error": "任务不存在"}), 404
-            if not any(str(window.get("sample_id")) == str(sample_id) for window in self.sample_storage.list_windows(data)):
+            window = next((w for w in self.sample_storage.list_windows(data) if str(w.get('sample_id')) == str(sample_id)), None)
+            if window is None:
                 return jsonify({"success": False, "error": "采样窗口不存在"}), 404
 
             return Response(
                 self._iter_raw_csv_chunks(mission_id, sample_id),
                 mimetype="text/csv",
-                headers={"Content-Disposition": 'attachment; filename="%s.csv"' % sample_id},
+                headers={"Content-Disposition": attachment_header((window.get('file_stem') or sample_id) + '.csv')},
             )
 
         @self.app.route('/api/data/mission/<mission_id>/raw.csv', methods=['GET'])
@@ -5719,11 +5797,11 @@ class WebConfigServer(object):
             data = self.data_manager.get_mission(mission_id)
             if not data:
                 return jsonify({"success": False, "error": "任务不存在"}), 404
-            filename = "mission_%s_raw.csv" % safe_id(mission_id, "mission")
+            filename = (data['file_stem'] + '.csv') if data.get('file_stem') else "mission_%s_raw.csv" % safe_id(mission_id, "mission")
             return Response(
                 self._iter_mission_raw_csv_chunks(data),
                 mimetype="text/csv",
-                headers={"Content-Disposition": 'attachment; filename="%s"' % filename},
+                headers={"Content-Disposition": attachment_header(filename)},
             )
 
         @self.app.route('/api/data/mission/<mission_id>/sample/<sample_id>/manual-result', methods=['POST'])
@@ -5767,7 +5845,7 @@ class WebConfigServer(object):
                 "data": self._build_mission_geojson(data, metric, include_lab=include_lab),
             }
             if self._is_download_request():
-                return self._json_download_response(payload, f"mission_{mission_id}.geojson")
+                return self._json_download_response(payload, (data.get('file_stem') or f"mission_{mission_id}") + '.geojson')
             return jsonify(payload)
 
         @self.app.route('/api/data/mission/<mission_id>/surface', methods=['GET'])
@@ -5784,7 +5862,7 @@ class WebConfigServer(object):
                 "data": self._build_idw_surface(data, metric, size=size, power=power, include_lab=include_lab),
             }
             if self._is_download_request():
-                return self._json_download_response(payload, f"mission_{mission_id}_surface.json")
+                return self._json_download_response(payload, (data.get('file_stem') or f"mission_{mission_id}") + '_surface.json')
             return jsonify(payload)
 
         @self.app.route('/api/data/mission/<mission_id>/archive', methods=['GET'])
@@ -5793,7 +5871,7 @@ class WebConfigServer(object):
             if not data:
                 return jsonify({"success": False, "message": "mission not found"}), 404
             archive_file = self._build_mission_archive(data)
-            filename = "mission_%s.zip" % safe_id(mission_id, "mission")
+            filename = (data.get('file_stem') or "mission_%s" % safe_id(mission_id, "mission")) + '.zip'
             try:
                 try:
                     response = send_file(
@@ -5812,6 +5890,7 @@ class WebConfigServer(object):
             except Exception:
                 archive_file.close()
                 raise
+            response.headers['Content-Disposition'] = attachment_header(filename)
             response.call_on_close(archive_file.close)
             return response
 
@@ -5830,7 +5909,7 @@ class WebConfigServer(object):
             return Response(
                 self._mission_csv_text(data),
                 mimetype="text/csv",
-                headers={"Content-Disposition": f"attachment; filename=mission_{mission_id}.csv"}
+                headers={"Content-Disposition": attachment_header((data.get('file_stem') or f"mission_{mission_id}") + '.csv')}
             )
 
         # ================= 系统日志 API =================
@@ -6391,7 +6470,11 @@ class WebConfigServer(object):
                     if self.automation_running or self.automation_paused or self.current_sample_window is not None:
                         return jsonify(success=False, message='Sampling already active'), 409
                     previous_context = dict(self._sampling_context)
-                    acquisition = {'source': 'web'}
+                    try:
+                        name = recording_name(request_data.get('sample_name'))
+                    except ValueError as exc:
+                        return jsonify(success=False, message=str(exc)), 400
+                    acquisition = {'source': 'web', 'sample_name': name or None}
                     bind_web_context(acquisition, self._latest_real_gps,
                                      rospy.get_param('/mavlink_trigger_node/sampling_max_position_age_s', 2.0))
                     sampling_sequence = request_data.get('sampling_sequence')

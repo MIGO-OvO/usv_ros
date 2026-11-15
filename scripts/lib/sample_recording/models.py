@@ -7,6 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Mapping, Optional
 from .record import sample_record
+from .naming import recording_stem
 
 _SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_.-]+")
 
@@ -178,6 +179,9 @@ def make_window(
     record['waypoint_id'] = context.get('waypoint_id', waypoint_seq)
     record['mavlink_sample_id'] = window['mavlink_sample_id']
     window.update(record)
+    window['file_stem'] = recording_stem(
+        context.get('sample_name') or context.get('mission_name'), record['timestamp_start'],
+        waypoint_seq if mode == 'waypoint' else None)
     window['start_time'] = datetime.fromtimestamp(record['timestamp_start'], timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z')
     return window
 

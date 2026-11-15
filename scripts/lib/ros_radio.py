@@ -34,6 +34,7 @@ GET_PATHS = frozenset((
     '/api/diagnostics/events', '/api/diagnostics/history',
 ))
 POST_PATHS = frozenset((
+    '/api/recording/name', '/api/recording/mission',
     '/api/config', '/api/pid/config',
     '/api/calibration/offsets', '/api/calibration/zero',
     '/api/calibration/reset', '/api/calibration/start',

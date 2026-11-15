@@ -57,6 +57,7 @@ from scripts.lib.lab_sim.coordinates import Coordinate
 from scripts.lib.sample_recording.record import (
     bind_context, freeze_position, navsat_position, sample_record,
 )
+from scripts.lib.sample_recording.naming import recording_name, sample_name_from_token
 from scripts.lib.payload_protocol import RequestLedger, SAFETY_COMMANDS, request_context
 from scripts.lib.lab_sim.model_config import (
     Analyte,
@@ -1915,7 +1916,7 @@ class MAVLinkTriggerNode(object):
                 return self._do_fcu_sample(int(param2))
             else:
                 # QGC 手动按钮或 Web 触发
-                return self._do_manual_sample()
+                return self._do_manual_sample(param1)
         elif cmd_id == CMD_STOP_SAMPLING:
             return self._stop_sampling_sequence()
         elif cmd_id == CMD_PAUSE_SAMPLING:
@@ -1986,7 +1987,7 @@ class MAVLinkTriggerNode(object):
 
         return self._call_control_command('spectrometer_baseline', {'reference_voltage': voltage})
 
-    def _do_manual_sample(self):
+    def _do_manual_sample(self, name_token=0):
         """手动采样：不切模式，不判稳定，直接执行当前配置的采样序列。"""
         if self.is_sampling or getattr(self, '_sampling_finishing', False):
             rospy.logwarn("Sampling already in progress")
@@ -1994,8 +1995,14 @@ class MAVLinkTriggerNode(object):
             return False
 
         config = self._load_config() or self._get_default_config()
+        try:
+            name = sample_name_from_token(config, name_token)
+        except (TypeError, ValueError) as exc:
+            self._record_command_reason(str(exc))
+            return False
         steps_data = self._build_manual_steps_payload(config)
         context = {'waypoint_seq': int(self.current_waypoint), 'source': 'manual',
+                   'sample_name': name or None,
                    'attempt_id': uuid.uuid4().hex,
                    'mavlink_request': getattr(self._command_context, 'request', None)}
         with self.state_lock:
@@ -2034,10 +2041,17 @@ class MAVLinkTriggerNode(object):
             return False
 
         config = self._load_config() or self._get_default_config()
+        try:
+            name = recording_name(config.get('recording', {}).get('mission_name'))
+        except (TypeError, ValueError) as exc:
+            self._record_command_reason(str(exc))
+            self._publish_sampling_result({'source': 'fcu', 'sample_id': sample_id}, 'failed', str(exc))
+            return False
         steps_data = self._build_steps_payload(config, self.current_waypoint)
         context = {
             'waypoint_seq': int(self.current_waypoint),
             'source': 'fcu', 'sample_id': int(sample_id),
+            'mission_name': name or None,
             'on_fail': self.default_on_fail, 'started': False,
             'attempt_id': uuid.uuid4().hex,
             'mavlink_request': getattr(self._command_context, 'request', None),
