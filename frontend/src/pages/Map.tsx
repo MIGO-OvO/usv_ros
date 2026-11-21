@@ -915,11 +915,11 @@ export default function MapPage() {
                   />
                 </label>
                 <div className="space-y-2">
-                  <span className="text-muted-foreground block text-xs">采样超时(秒，0代表禁用)</span>
+                  <span className="text-muted-foreground block text-xs">采样总时限（秒，0 使用默认 1800 秒）</span>
                   <input
                     type="number"
                     min={0}
-                    max={3600}
+                    max={2048}
                     className="w-full h-9 rounded-md border border-input bg-background px-3 py-1 text-sm font-medium"
                     value={sampleTimeoutS}
                     onChange={(event) => setSampleTimeoutS(Number(event.target.value) || 0)}

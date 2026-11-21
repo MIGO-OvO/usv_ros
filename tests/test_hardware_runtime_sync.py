@@ -1501,18 +1501,35 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
             server = module.WebConfigServer(standalone=False)
             client = server.app.test_client()
 
-            response = client.post("/api/mission/plan/upload", json={
+            draft = {
                 "replace": True,
-                "sample_timeout_s": "7200",
+                "sample_timeout_s": "90",
                 "waypoints": [
                     {"lat": 30.0, "lng": 120.0, "sample": True},
                     {"lat": 30.001, "lng": 120.002, "sample": False},
                 ],
-            })
+            }
+            validated = client.post("/api/mission/plan/validate", json=draft)
+            response = client.post("/api/mission/plan/upload", json=draft)
             saved_config = client.get("/api/config").get_json()
+            invalid = client.post("/api/mission/plan/upload", json=dict(draft, sample_timeout_s=2049))
 
+            server.config_manager.update({'waypoint_sampling': {
+                '0': {'on_fail': 'HOLD'}, '2': {'on_fail': 'ABORT'},
+            }})
+            sync = client.post("/api/waypoint-sampling/sync")
+
+        self.assertEqual(validated.status_code, 200)
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(saved_config["sampling"]["sample_timeout_s"], 3600.0)
+        self.assertEqual(validated.get_json()["data"]["items"], response.get_json()["data"]["items"])
+        self.assertEqual(saved_config["sampling"]["sample_timeout_s"], 90)
+        self.assertEqual(module.rospy._mavros_state.pushed[0][2].param2, 90.0)
+        self.assertEqual(invalid.status_code, 400)
+        self.assertEqual(len(module.rospy._mavros_state.pushed), 1)
+        self.assertEqual(sync.status_code, 200)
+        self.assertEqual(list(sync.get_json()["data"]), ['0', '1'])
+        self.assertEqual(sync.get_json()["data"]["0"]["on_fail"], "HOLD")
+        self.assertEqual(sync.get_json()["data"]["1"]["on_fail"], "LOITER")
 
     def test_web_lab_config_round_trips_bounds_dwell_and_water_area(self):
         module, _, _ = _load_script(

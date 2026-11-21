@@ -10,8 +10,8 @@ import math
 MAV_FRAME_GLOBAL_RELATIVE_ALT = 3
 MAV_CMD_NAV_WAYPOINT = 16
 MAV_CMD_NAV_SCRIPT_TIME = 42702
-DEFAULT_SAMPLE_TIMEOUT_S = 255.0
-MAX_SAMPLE_TIMEOUT_S = 255.0
+DEFAULT_SAMPLE_TIMEOUT_S = 1800
+MAX_SAMPLE_TIMEOUT_S = 2048
 MAX_WAYPOINTS = 200
 
 
@@ -67,11 +67,13 @@ def _sample_timeout(raw, default_timeout):
     if isinstance(raw, dict):
         source = raw.get("sample_timeout_s", raw.get("timeout_s"))
     value = _finite_float(source)
-    if value is None:
-        value = default_timeout
-    if value < 1.0 or value > MAX_SAMPLE_TIMEOUT_S:
+    if source is not None and value is None:
         return None
-    return float(int(round(value)))
+    if value in (None, 0):
+        value = default_timeout
+    if not 1 <= value <= MAX_SAMPLE_TIMEOUT_S or value != int(value):
+        return None
+    return int(value)
 
 
 def build_mission_plan(payload, sampling_config=None):
@@ -87,7 +89,7 @@ def build_mission_plan(payload, sampling_config=None):
         DEFAULT_SAMPLE_TIMEOUT_S,
     )
     if default_timeout is None:
-        errors.append("sample_timeout_s must be within 1..255")
+        errors.append("sample_timeout_s must be 0 (default) or a whole number in 1..2048")
         default_timeout = DEFAULT_SAMPLE_TIMEOUT_S
 
     if not isinstance(raw_waypoints, list) or not raw_waypoints:
@@ -129,7 +131,7 @@ def build_mission_plan(payload, sampling_config=None):
         if _sample_enabled(raw, seq, sampling_config):
             timeout = _sample_timeout(raw, default_timeout)
             if timeout is None:
-                errors.append("waypoints[%d].sample_timeout_s must be within 1..255" % seq)
+                errors.append("waypoints[%d].sample_timeout_s must be 0 (default) or a whole number in 1..2048" % seq)
                 continue
             script_count += 1
             items.append({
@@ -140,8 +142,8 @@ def build_mission_plan(payload, sampling_config=None):
                 "is_current": False,
                 "autocontinue": True,
                 "param1": 1.0,
-                "param2": timeout,
-                "param3": 0.0,
+                "param2": min(timeout, 255),
+                "param3": timeout if timeout > 255 else 0,
                 "param4": 0.0,
                 "x_lat": 0.0,
                 "y_long": 0.0,
@@ -216,10 +218,9 @@ def compare_mission_readback(expected_items, readback_waypoints):
             if not _close_enough(item["y_long"], getattr(waypoint, "y_long", None)):
                 return False
         if int(item["command"]) == MAV_CMD_NAV_SCRIPT_TIME:
-            if not _close_enough(item["param1"], getattr(waypoint, "param1", None)):
-                return False
-            if not _close_enough(item["param2"], getattr(waypoint, "param2", None)):
-                return False
+            for param in ('param1', 'param2', 'param3'):
+                if not _close_enough(item[param], getattr(waypoint, param, None)):
+                    return False
     return True
 
 

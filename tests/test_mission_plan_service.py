@@ -35,7 +35,20 @@ class MissionPlanServiceTests(unittest.TestCase):
         script = result["items"][1]
         self.assertEqual(script["param1"], 1.0)
         self.assertEqual(script["param2"], 255.0)
+        self.assertEqual(script["param3"], 1800.0)
         self.assertFalse(result["start_auto"])
+
+    def test_extended_time_limit_must_match_fcu_readback(self):
+        module = _load_module()
+        plan = module.build_mission_plan({
+            "waypoints": [{"lat": 30.0, "lng": 120.0, "sample": True, "sample_timeout_s": 2048}],
+        })
+        self.assertTrue(plan["valid"])
+        items = plan["items"]
+        readback = [types.SimpleNamespace(**item) for item in items]
+        self.assertTrue(module.compare_mission_readback(items, readback))
+        readback[-1].param3 = 0.0
+        self.assertFalse(module.compare_mission_readback(items, readback))
 
     def test_rejects_invalid_coordinates_before_mavros_upload(self):
         module = _load_module()

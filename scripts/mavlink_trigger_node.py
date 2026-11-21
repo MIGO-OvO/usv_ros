@@ -10,7 +10,7 @@ MAVLink Trigger Node (MAVLink 指令触发节点)
   - 监听 MAVROS 的 COMMAND_LONG 消息
   - 接收自定义指令 (如 MAV_CMD 31010) 触发采样
   - 监听航点到达事件自动触发
-  - 控制飞行模式 (HOLD/AUTO)
+  - 控制航行模式 (LOITER/AUTO/HOLD)
 
 Target: Jetson Nano
 ROS: Noetic
@@ -255,6 +255,7 @@ class MAVLinkTriggerNode(object):
         self._protocol_pub = rospy.Publisher('/usv/payload_protocol', String, queue_size=1)
         self._executor_id = uuid.uuid4().hex
         self._mavlink_tcp_session = 0
+        self._fcu_request = None
         self._mavlink_calibration_active = False
         rospy.Subscriber('/usv/mavlink_session', Float32MultiArray, self._mavlink_session_cb)
         self._sample_record_lock = threading.Lock()
@@ -298,6 +299,7 @@ class MAVLinkTriggerNode(object):
         self.imu_sub = rospy.Subscriber('/mavros/imu/data', Imu, self._imu_cb, queue_size=10)
         self.mavlink_cmd_sub = rospy.Subscriber('/usv/mavlink_cmd_rx', Float32MultiArray, self._mavlink_cmd_rx_cb, queue_size=20)
         self.payload_command_sub = rospy.Subscriber('/usv/payload_command', String, self._payload_command_cb, queue_size=20)
+        self.fcu_sampling_sub = rospy.Subscriber('/usv/fcu_sampling', String, self._fcu_sampling_cb, queue_size=10)
         self.mavlink_sub = None
         if self._enable_mavros_command_long_fallback:
             self.mavlink_sub = rospy.Subscriber('/mavros/mavlink/from', Mavlink, self._mavlink_from_cb, queue_size=20)
@@ -319,10 +321,12 @@ class MAVLinkTriggerNode(object):
             self._state_received_at = time.monotonic()
             context = self.current_sampling_context
             cancel = (self.is_sampling and (context or {}).get('source') == 'fcu'
+                      and not context.get('cancel_reason')
                       and (not msg.connected or msg.mode != 'AUTO'))
             if cancel:
                 # Claim cancellation before a queued terminal callback can win.
                 context['cancel_reason'] = 'fcu_disconnected' if not msg.connected else 'fcu_mode_changed'
+                context.setdefault('terminal_reason', context['cancel_reason'])
         if cancel:
             # A cancelled/failed FCU script must not leave the detector running.
             threading.Thread(target=self._stop_sampling_sequence, kwargs={
@@ -411,10 +415,11 @@ class MAVLinkTriggerNode(object):
         seq_key = str(int(waypoint_seq))
         waypoint_config = dict(wp_cfg.get(seq_key, {}) or {})
 
+        global_loops = config.get('sampling_sequence', {}).get('loop_count', 1)
         try:
-            loop_count = int(waypoint_config.get('loop_count', config.get('sampling_sequence', {}).get('loop_count', 1)) or 1)
+            loop_count = int(waypoint_config.get('loop_count', global_loops))
         except (TypeError, ValueError):
-            loop_count = int(config.get('sampling_sequence', {}).get('loop_count', 1) or 1)
+            loop_count = int(global_loops if global_loops not in (None, '') else 1)
 
         try:
             retry_count = int(waypoint_config.get('retry_count', self.default_retry_count) or 0)
@@ -422,7 +427,7 @@ class MAVLinkTriggerNode(object):
             retry_count = self.default_retry_count
 
         try:
-            settle_time = float(waypoint_config.get('hold_before_sampling_s', self.hold_settle_time) or self.hold_settle_time)
+            settle_time = float(waypoint_config.get('hold_before_sampling_s', self.hold_settle_time))
         except (TypeError, ValueError):
             settle_time = self.hold_settle_time
 
@@ -433,7 +438,7 @@ class MAVLinkTriggerNode(object):
             'loop_count': max(0, loop_count),
             'retry_count': max(0, retry_count),
             'hold_before_sampling_s': max(0.0, settle_time),
-            'on_fail': on_fail if on_fail in ('HOLD', 'SKIP', 'ABORT') else 'HOLD',
+            'on_fail': on_fail if on_fail in ('LOITER', 'HOLD', 'SKIP', 'ABORT') else 'HOLD',
         }
 
     def _steps_without_legacy_pump(self, steps):
@@ -444,9 +449,10 @@ class MAVLinkTriggerNode(object):
             cleaned.append(step)
         return cleaned
 
-    def _build_steps_payload(self, config, waypoint_seq):
+    def _build_steps_payload(self, config, waypoint_seq, waypoint_index=None):
         sampling_sequence = dict((config or {}).get('sampling_sequence', {}) or {})
-        waypoint_cfg = self._get_waypoint_sampling_config(config, waypoint_seq)
+        waypoint_cfg = self._get_waypoint_sampling_config(
+            config, waypoint_seq if waypoint_index is None else waypoint_index)
         return {
             'steps': self._steps_without_legacy_pump(sampling_sequence.get('steps', [])),
             'loop_count': waypoint_cfg['loop_count'],
@@ -495,9 +501,9 @@ class MAVLinkTriggerNode(object):
         deadline = time.time() + self.stable_check_timeout
         rate = rospy.Rate(5)
         while not rospy.is_shutdown() and time.time() < deadline:
-            if self.mavros_state.mode and self.mavros_state.mode.upper() != 'HOLD':
-                rospy.logwarn("Vehicle left HOLD during stable wait: %s", self.mavros_state.mode)
-                return False, 'mode_left_hold'
+            if self.mavros_state.mode and self.mavros_state.mode.upper() != 'LOITER':
+                rospy.logwarn("Vehicle left LOITER during stable wait: %s", self.mavros_state.mode)
+                return False, 'mode_left_loiter'
 
             linear_ok = self.last_linear_speed <= self.stable_speed_threshold
             yaw_ok = self.last_yaw_rate <= self.stable_yaw_rate_threshold
@@ -756,7 +762,7 @@ class MAVLinkTriggerNode(object):
         source = str(sampling_context.get('source', 'waypoint') or 'waypoint')
         is_manual_sample = source == 'manual'
         rospy.loginfo("Handling sampling completion: success=%s reason=%s", success, reason)
-        wp_seq = self.current_waypoint
+        wp_seq = sampling_context.get('waypoint_seq', self.current_waypoint)
         if not (was_survey_sample and success and not cancelled):
             cleaned, superseded = self._cleanup_sampling_attempt(sampling_context, reason)
             if superseded:
@@ -785,7 +791,7 @@ class MAVLinkTriggerNode(object):
             if was_survey_sample:
                 self._publish_status('survey_stopped')
             self._set_mission_state(MissionState.HOLD_NO_MISSION if source == 'fcu' else MissionState.IDLE)
-            if source == 'fcu':
+            if source == 'fcu' and not sampling_context.get('fcu_token'):
                 self._request_fcu_hold()
             return
         if success:
@@ -973,7 +979,7 @@ class MAVLinkTriggerNode(object):
                 waypoint_cfg['retry_count'] = 0
         if on_fail_override is not None:
             on_fail = str(on_fail_override).strip().upper()
-            waypoint_cfg['on_fail'] = on_fail if on_fail in ('HOLD', 'SKIP', 'ABORT') else self.default_on_fail
+            waypoint_cfg['on_fail'] = on_fail if on_fail in ('LOITER', 'HOLD', 'SKIP', 'ABORT') else self.default_on_fail
         if not waypoint_cfg['enabled']:
             rospy.loginfo("Waypoint %d sampling disabled, skip and resume AUTO", waypoint_seq)
             self._set_waypoint_state(waypoint_seq, WaypointSamplingState.SKIPPED)
@@ -993,10 +999,10 @@ class MAVLinkTriggerNode(object):
         self._set_mission_state(MissionState.HOLDING, str(waypoint_seq))
         rospy.loginfo("Starting sampling sequence at waypoint %d", waypoint_seq)
 
-        if not self.set_mode('HOLD'):
+        if not self.set_mode('LOITER'):
             self._set_waypoint_state(waypoint_seq, WaypointSamplingState.FAILED)
-            self._set_mission_state(MissionState.FAILED, "{}:set_hold_failed".format(waypoint_seq))
-            self._handle_failure_action('set_hold_failed')
+            self._set_mission_state(MissionState.FAILED, "{}:set_loiter_failed".format(waypoint_seq))
+            self._handle_failure_action('set_loiter_failed')
             return False
 
         self._set_waypoint_state(waypoint_seq, WaypointSamplingState.WAITING_STABLE)
@@ -1117,7 +1123,7 @@ class MAVLinkTriggerNode(object):
         self._publish_status("sampling_stopped")
         if was_survey:
             self._publish_status('survey_stopped')
-        if source == 'fcu' and (request_hold or not stop_ok):
+        if source == 'fcu' and not sampling_context.get('fcu_token') and (request_hold or not stop_ok):
             self._request_fcu_hold()
         return stop_ok
 
@@ -1155,7 +1161,7 @@ class MAVLinkTriggerNode(object):
                 self._publish_sampling_result(ctx, 'failed', reason)
                 if on_fail == 'ABORT':
                     self._set_mission_state(MissionState.ABORTED, str(waypoint_seq))
-                if not self._request_fcu_hold():
+                if not ctx.get('fcu_token') and not self._request_fcu_hold():
                     rospy.logerr("FCU sampling failed; HOLD request failed, operator intervention required")
             return
 
@@ -1185,8 +1191,10 @@ class MAVLinkTriggerNode(object):
             self.set_mode('HOLD')
             return
 
-        rospy.logwarn("Sampling failed at waypoint %d, staying HOLD: %s", waypoint_seq, reason)
-        self.set_mode('HOLD')
+        mode = 'LOITER' if on_fail == 'LOITER' else 'HOLD'
+        rospy.logwarn("Sampling failed at waypoint %d, using %s: %s", waypoint_seq, mode, reason)
+        if not self.set_mode(mode) and mode == 'LOITER':
+            self.set_mode('HOLD')
 
     def _mavlink_from_cb(self, msg):
         """
@@ -1211,6 +1219,41 @@ class MAVLinkTriggerNode(object):
                                                    recover_only=data.get('recover_only', False)))
         except (ValueError, TypeError, KeyError):
             rospy.logwarn('Invalid payload command envelope')
+
+    def _fcu_sampling_cb(self, msg):
+        try:
+            command = json.loads(msg.data)
+            action, sample_id = command['action'], command['sample_id']
+            token = command.get('fcu_token')
+        except (ValueError, TypeError, AttributeError, KeyError):
+            return
+        if action == 'start' and token:
+            with self.state_lock:
+                if (self._fcu_request or {}).get('fcu_token') == token:
+                    return
+                self._fcu_request = command
+            self._enqueue_command_long(CMD_START_SAMPLING, 0, sample_id, 0, 0,
+                                       'FCU waypoint sampling', fcu=command)
+        elif action == 'cancel':
+            self._cancel_fcu_sample(sample_id, token, command.get('reason') or 'fcu_cancelled')
+
+    def _cancel_fcu_sample(self, sample_id, token, reason):
+        with self.state_lock:
+            for context in (self.current_sampling_context, self._fcu_request if token else None):
+                if (context and context.get('source') == 'fcu' and context.get('sample_id') == sample_id
+                        and context.get('fcu_token') == token):
+                    if context.get('cancel_reason'):
+                        return
+                    context['cancel_reason'] = reason
+                    context.setdefault('terminal_reason', reason)
+                    if context is not self.current_sampling_context:
+                        return
+                    break
+            else:
+                return
+        threading.Thread(target=self._stop_sampling_sequence, kwargs={
+            'expected_context': context, 'request_hold': False,
+        }, daemon=True).start()
 
     def _mavlink_cmd_rx_cb(self, msg):
         """兼容旧内部总线 /usv/mavlink_cmd_rx。"""
@@ -1299,12 +1342,17 @@ class MAVLinkTriggerNode(object):
             # pump cancellation before waiting on any old ordinary service.
             with self.state_lock:
                 context = self.current_sampling_context
-                active = self.is_sampling or self._survey_active or self._mavlink_calibration_active
+                fcu = self._fcu_request
+                active = ((self.is_sampling and not (context or {}).get('fcu_token'))
+                          or self._survey_active or self._mavlink_calibration_active)
                 if active and isinstance(context, dict):
                     context.setdefault('cancel_reason', 'transport_session_lost')
                     context.setdefault('terminal_reason', 'transport_session_lost')
+            for candidate in (context, fcu):
+                if candidate and candidate.get('fcu_token'):
+                    self._cancel_fcu_sample(candidate['sample_id'], candidate['fcu_token'], 'transport_session_lost')
             with self._command_dispatch_lock:
-                if self._command_lanes[False]['busy']:
+                if self._command_lanes[False]['busy'] and not self._command_lanes[False].get('fcu'):
                     self._command_lanes[False]['cancel_reason'] = 'transport_session_lost'
                     active = True
             # A Web manual pump or Web automation has no trigger-owned work.
@@ -1339,7 +1387,7 @@ class MAVLinkTriggerNode(object):
         self._send_command_ack(command, MAV_RESULT_IN_PROGRESS, sender_system, sender_component, ack_session)
 
     def _enqueue_command_long(self, command, param1, param2, sender_system, sender_component, log_prefix, request=None,
-                              cancel_reason=''):
+                              cancel_reason='', fcu=None):
         """Two bounded lanes: a blocked ordinary RPC cannot occupy STOP admission."""
         if not CMD_START_SAMPLING <= command <= CMD_SPECTROMETER_STOP:
             return
@@ -1384,9 +1432,10 @@ class MAVLinkTriggerNode(object):
             else:
                 lane['busy'] += 1
                 lane['command'] = command
+                lane['fcu'] = fcu
                 lane['cancel_reason'] = ''
                 lane['queue'].put_nowait((self._command_generation, time.monotonic(), request, ack_session, (
-                    command, param1, param2, sender_system, sender_component, log_prefix, cancel_reason)))
+                    command, param1, param2, sender_system, sender_component, log_prefix, cancel_reason, fcu)))
             if lane['thread'] is None and lane['busy']:
                 lane['thread'] = threading.Thread(
                     target=self._command_loop, args=(safety,), daemon=True,
@@ -1397,8 +1446,14 @@ class MAVLinkTriggerNode(object):
             # path so a retry replays this rejection instead of executing: the
             # rejection is a real correlated result, not a leftover reservation.
             self._emit_request_event(request, 'request', 'rejected', 'command_lane_busy')
-            self._send_command_ack(command, MAV_RESULT_TEMPORARILY_REJECTED,
-                                   sender_system, sender_component, ack_session)
+            if fcu is not None:
+                self._publish_sampling_result(fcu, 'failed', 'command_lane_busy')
+            else:
+                if request is None and not sender_system and command == CMD_START_SAMPLING and param2 > 0:
+                    self._publish_sampling_result({'source': 'fcu', 'sample_id': int(param2)},
+                                                  'failed', 'command_lane_busy')
+                self._send_command_ack(command, MAV_RESULT_TEMPORARILY_REJECTED,
+                                       sender_system, sender_component, ack_session)
 
     def _command_loop(self, safety):
         lane = self._command_lanes[safety]
@@ -1417,8 +1472,14 @@ class MAVLinkTriggerNode(object):
             self._command_context.ack_session = ack_session
             self._command_context.last_reason = ''
             self._command_context.cancel_reason = args[6]
+            fcu = args[7] if len(args) > 7 else None
             try:
-                if safety or generation == self._command_generation:
+                if fcu is not None:
+                    if generation == self._command_generation:
+                        self._do_fcu_sample(fcu['sample_id'], fcu)
+                    else:
+                        self._publish_sampling_result(fcu, 'cancelled', 'superseded_by_stop')
+                elif safety or generation == self._command_generation:
                     self._dispatch_command_long(*args[:6])
                 else:
                     self._emit_request_event(request, 'request', 'cancelled',
@@ -1426,6 +1487,11 @@ class MAVLinkTriggerNode(object):
                     self._send_command_ack(args[0], MAV_RESULT_FAILED, args[3], args[4])
             except Exception as exc:
                 rospy.logerr('Payload command worker failed: %s', exc)
+                if fcu is not None:
+                    if self.current_sampling_context is fcu:
+                        self._handle_completion(False, 'command_exception', expected_context=fcu)
+                    else:
+                        self._publish_sampling_result(fcu, 'failed', 'command_exception')
                 self._emit_request_event(request, 'request', 'failed', 'command_exception')
                 self._send_command_ack(args[0], MAV_RESULT_FAILED, args[3], args[4])
             finally:
@@ -1438,6 +1504,7 @@ class MAVLinkTriggerNode(object):
                     lane['busy'] -= 1
                     if not safety:
                         lane['command'] = None
+                        lane['fcu'] = None
                 lane['queue'].task_done()
 
     def _dispatch_command_long(self, command, param1, param2, sender_system, sender_component, log_prefix):
@@ -1835,13 +1902,17 @@ class MAVLinkTriggerNode(object):
 
     def _publish_sampling_result(self, context, outcome, reason):
         """Separate the FCU result contract from uncorrelated recording lifecycle."""
-        self._emit_request_event(context.get('mavlink_request'), 'terminal', outcome, reason,
-                                 attempt_id=context.get('attempt_id'),
-                                 preflight_phase=context.get('preflight_phase'),
-                                 cleanup_failed=bool(context.get('cleanup_failed')))
+        if outcome != 'accepted':
+            self._emit_request_event(context.get('mavlink_request'), 'terminal', outcome, reason,
+                                     attempt_id=context.get('attempt_id'),
+                                     preflight_phase=context.get('preflight_phase'),
+                                     cleanup_failed=bool(context.get('cleanup_failed')))
         msg = String()
         msg.data = json.dumps({
             'source': context.get('source', 'unknown'), 'sample_id': context.get('sample_id'),
+            'fcu_token': context.get('fcu_token'),
+            'loiter': outcome == 'failed' and context.get('on_fail') == 'LOITER'
+                      and not context.get('cleanup_failed'),
             'attempt_id': context.get('attempt_id'),
             'outcome': outcome, 'reason': str(reason),
             'preflight_phase': context.get('preflight_phase'),
@@ -1912,7 +1983,7 @@ class MAVLinkTriggerNode(object):
 
         if cmd_id == CMD_START_SAMPLING:
             if param2 > 0:
-                # 飞控原生触发（NAV_SCRIPT_TIME）：不切 HOLD、不判稳定
+                # 旧版飞控 NAV_SCRIPT_TIME 通知。
                 return self._do_fcu_sample(int(param2))
             else:
                 # QGC 手动按钮或 Web 触发
@@ -2029,48 +2100,65 @@ class MAVLinkTriggerNode(object):
         rospy.loginfo("Manual sampling started (no HOLD, no stable wait)")
         return True
 
-    def _do_fcu_sample(self, sample_id):
-        """飞控原生定点采样：飞控已暂停 mission（NavScriptTime），不切模式、不判稳定。
-
-        采样完成后 bridge 会通过 USV_DONE 通知飞控恢复 mission。
-        """
+    def _do_fcu_sample(self, sample_id, fcu=None):
+        """Execute once after the flight controller has settled at the waypoint."""
+        context = fcu if fcu is not None else {'source': 'fcu', 'sample_id': sample_id}
         if self.is_sampling or getattr(self, '_sampling_finishing', False):
             rospy.logwarn("Sampling already in progress")
-            self._publish_sampling_result(
-                {'source': 'fcu', 'sample_id': sample_id}, 'failed', 'sampling_busy')
+            self._publish_sampling_result(context, 'failed', 'sampling_busy')
             return False
+        if fcu is not None:
+            reason = fcu.get('cancel_reason') or self._fcu_cancellation_reason()
+            if reason:
+                self._publish_sampling_result(fcu, 'cancelled', reason)
+                return False
 
         config = self._load_config() or self._get_default_config()
         try:
             name = recording_name(config.get('recording', {}).get('mission_name'))
         except (TypeError, ValueError) as exc:
             self._record_command_reason(str(exc))
-            self._publish_sampling_result({'source': 'fcu', 'sample_id': sample_id}, 'failed', str(exc))
+            self._publish_sampling_result(context, 'failed', str(exc))
             return False
-        steps_data = self._build_steps_payload(config, self.current_waypoint)
-        context = {
-            'waypoint_seq': int(self.current_waypoint),
-            'source': 'fcu', 'sample_id': int(sample_id),
+        waypoint_seq = context.get('waypoint_seq', int(self.current_waypoint))
+        index = context.get('waypoint_index')
+        settings = self._get_waypoint_sampling_config(config, waypoint_seq if index is None else index)
+        if fcu is not None and not settings['enabled']:
+            self._publish_sampling_result(context, 'skipped', 'waypoint_disabled')
+            return True
+        steps_data = (self._build_steps_payload(config, waypoint_seq) if index is None
+                      else self._build_steps_payload(config, waypoint_seq, index))
+        context.update({
+            'waypoint_seq': waypoint_seq,
             'mission_name': name or None,
-            'on_fail': self.default_on_fail, 'started': False,
+            'on_fail': self.default_on_fail if fcu is None else settings['on_fail'], 'started': False,
             'attempt_id': uuid.uuid4().hex,
             'mavlink_request': getattr(self._command_context, 'request', None),
-        }
+        })
         with self.state_lock:
-            self.current_sampling_context = context
-            self.is_sampling = True
-            self._set_mission_state(MissionState.SAMPLING, str(self.current_waypoint))
-        self._bind_sample_position(context)
-        if self.current_sampling_context is not context:
-            self._cleanup_sampling_attempt(context, 'start_cancelled')
+            cancelled = context.get('cancel_reason')
+            busy = self.is_sampling or self._sampling_finishing
+            if not cancelled and not busy:
+                self.current_sampling_context = context
+                self.is_sampling = True
+                self._set_mission_state(MissionState.SAMPLING, str(waypoint_seq))
+        if cancelled or busy:
+            self._publish_sampling_result(context, 'cancelled' if cancelled else 'failed',
+                                          cancelled or 'sampling_busy')
             return False
+        self._bind_sample_position(context)
+        with self._sampling_control_lock:
+            if self.current_sampling_context is not context:
+                return False
+            self._prepare_automation_steps(steps_data)
+            started = self._start_prepared_automation()
 
-        self._prepare_automation_steps(steps_data)
-
-        if not self._start_prepared_automation():
+        if not started:
             self._handle_completion(False, 'fcu_sample_start_failed', expected_context=context)
             return False
-        rospy.loginfo("FCU-triggered sampling started (id=%d, no HOLD, no stable wait)", sample_id)
+        rospy.loginfo("FCU-triggered sampling started id=%d waypoint=%d", sample_id, waypoint_seq)
+        if fcu is not None:
+            self._publish_sampling_result(context, 'accepted', '')
         return True
 
     def _survey_gate_config(self, config=None):

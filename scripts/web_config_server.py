@@ -106,7 +106,7 @@ for _path in (REPO_ROOT, SCRIPT_DIR, MAP_RESOURCES_DIR):
 
 from preset_manager import PresetManager
 import map_tile_cache as mtc
-from mission_plan_service import MAV_CMD_NAV_WAYPOINT, build_mission_plan, upload_mission_plan
+from mission_plan_service import MAX_SAMPLE_TIMEOUT_S, MAV_CMD_NAV_WAYPOINT, build_mission_plan, upload_mission_plan
 from scripts.lib.lab_sim.coordinates import (
     Coordinate,
     CoordinateError,
@@ -613,7 +613,7 @@ def normalize_sampling_config(config):
     sample_timeout_s = _to_float_or_none(raw.get("sample_timeout_s", 0.0))
     if sample_timeout_s is None:
         sample_timeout_s = 0.0
-    return {"sample_timeout_s": max(0.0, min(3600.0, sample_timeout_s))}
+    return {"sample_timeout_s": int(max(0, min(MAX_SAMPLE_TIMEOUT_S, sample_timeout_s)))}
 
 
 def _point_in_polygon(lat, lng, polygon):
@@ -1608,7 +1608,7 @@ DEFAULT_CONFIG = {
             "loop_count": 1,
             "retry_count": 0,
             "hold_before_sampling_s": 3.0,
-            "on_fail": "HOLD"
+            "on_fail": "LOITER"
         }
     },
     "sampling": {
@@ -1756,16 +1756,16 @@ class ConfigManager(object):
             except (TypeError, ValueError):
                 retry_count = 0
             try:
-                hold_before_sampling_s = float(item.get('hold_before_sampling_s', 3.0) or 3.0)
+                hold_before_sampling_s = float(item.get('hold_before_sampling_s', 3.0))
             except (TypeError, ValueError):
                 hold_before_sampling_s = 3.0
-            on_fail = str(item.get('on_fail', 'HOLD') or 'HOLD').strip().upper()
+            on_fail = str(item.get('on_fail', 'LOITER') or 'LOITER').strip().upper()
             normalized[seq_key] = {
                 'enabled': bool(item.get('enabled', True)),
                 'loop_count': max(0, loop_count),
                 'retry_count': max(0, retry_count),
                 'hold_before_sampling_s': max(0.0, hold_before_sampling_s),
-                'on_fail': on_fail if on_fail in ('HOLD', 'SKIP', 'ABORT') else 'HOLD',
+                'on_fail': on_fail if on_fail in ('LOITER', 'HOLD', 'SKIP', 'ABORT') else 'HOLD',
             }
         return normalized
 
@@ -5061,14 +5061,13 @@ class WebConfigServer(object):
                 return jsonify(success=False, message=str(exc)), 400
             if mission_name and not self.config_manager.update({'recording': {'mission_name': mission_name}}):
                 return jsonify(success=False, message='任务名称保存失败'), 500
-            if "sample_timeout_s" in data:
-                self.config_manager.update({"sampling": {"sample_timeout_s": data.get("sample_timeout_s")}})
             config = self.config_manager.get()
             plan_payload = dict(data)
             plan_payload.pop('mission_name', None)
-            plan_payload.pop("sample_timeout_s", None)
             result = upload_mission_plan(plan_payload, sampling_config=config.get('waypoint_sampling', {}))
             if result.get("success"):
+                if "sample_timeout_s" in data:
+                    self.config_manager.update({"sampling": {"sample_timeout_s": data["sample_timeout_s"]}})
                 self._apply_uploaded_mission_route(result.get("data", {}).get("nav_waypoints", []))
                 return jsonify(result)
             status = 400 if not result.get("data", {}).get("valid", False) else 500
@@ -5184,63 +5183,23 @@ class WebConfigServer(object):
 
         @self.app.route('/api/waypoint-sampling/sync', methods=['POST'])
         def sync_waypoint_sampling_from_mavros():
-            """从飞控拉取 Mission 航点数量，自动补充默认采样配置。
-            三级回退策略:
-              1. MAVROS WaypointPull 服务
-              2. /mavros/mission/waypoints topic 缓存
-              3. pymavlink 直连 router TCP 向飞控请求 MISSION_COUNT
-            """
+            """按飞控任务中的导航航点顺序同步采样配置。"""
             if self.standalone:
                 return jsonify({"success": False, "message": "独立模式不支持飞控同步"}), 400
             try:
-                nav_seqs = []
-                pull_error = None
-
-                # --- 通道 1: MAVROS WaypointPull 服务 ---
-                try:
-                    from mavros_msgs.srv import WaypointPull
-                    rospy.wait_for_service('/mavros/mission/pull', timeout=5.0)
-                    pull_srv = rospy.ServiceProxy('/mavros/mission/pull', WaypointPull)
-                    resp = pull_srv()
-                    if resp.success and resp.wp_received > 0:
-                        nav_seqs = list(range(resp.wp_received))
-                    else:
-                        pull_error = "pull success=%s wp_received=%s" % (resp.success, resp.wp_received)
-                except Exception as e1:
-                    pull_error = "mavros pull: %s" % str(e1)
-
-                # --- 通道 2: MAVROS mission/waypoints topic 缓存 ---
-                if not nav_seqs:
-                    try:
-                        from mavros_msgs.msg import WaypointList
-                        waypoint_list = rospy.wait_for_message('/mavros/mission/waypoints', WaypointList, timeout=3.0)
-                        nav_seqs = list(range(len(waypoint_list.waypoints or [])))
-                    except Exception as e2:
-                        pull_error = "%s; cache: %s" % (pull_error or "", str(e2))
-
-                # --- 通道 3: pymavlink 直连 router TCP 请求 MISSION_COUNT ---
-                if not nav_seqs:
-                    try:
-                        from pymavlink import mavutil
-                        router_url = rospy.get_param('~router_url',
-                                     rospy.get_param('/mavlink_router_url', 'tcp:127.0.0.1:5760'))
-                        conn = mavutil.mavlink_connection(router_url, source_system=254, source_component=190,
-                                                         retries=1, timeout=5)
-                        conn.wait_heartbeat(timeout=3)
-                        target_sys = conn.target_system or 1
-                        target_comp = conn.target_component or 1
-                        conn.mav.mission_request_list_send(target_sys, target_comp)
-                        ack = conn.recv_match(type='MISSION_COUNT', blocking=True, timeout=5)
-                        if ack and ack.count > 0:
-                            nav_seqs = list(range(ack.count))
-                        else:
-                            pull_error = "%s; pymavlink: count=%s" % (pull_error or "", getattr(ack, 'count', None))
-                        conn.close()
-                    except Exception as e3:
-                        pull_error = "%s; pymavlink: %s" % (pull_error or "", str(e3))
-
-                if not nav_seqs:
-                    return jsonify({"success": False, "message": "拉取航点失败: %s" % (pull_error or "mission empty")}), 500
+                from mavros_msgs.msg import WaypointList
+                from mavros_msgs.srv import WaypointPull
+                rospy.wait_for_service('/mavros/mission/pull', timeout=5.0)
+                resp = rospy.ServiceProxy('/mavros/mission/pull', WaypointPull)()
+                if not resp.success:
+                    return jsonify(success=False, message="飞控任务拉取失败"), 500
+                waypoint_list = rospy.wait_for_message('/mavros/mission/waypoints', WaypointList, timeout=3.0)
+                if len(waypoint_list.waypoints) != resp.wp_received:
+                    return jsonify(success=False, message="飞控任务回读数量不一致"), 500
+                # Rover reserves item zero for Home.
+                nav_count = sum(wp.command == MAV_CMD_NAV_WAYPOINT for wp in waypoint_list.waypoints[1:])
+                if not nav_count:
+                    return jsonify(success=False, message="飞控任务没有导航航点"), 400
 
                 config = self.config_manager.get()
                 wp_cfg = dict(config.get('waypoint_sampling', {}))
@@ -5253,29 +5212,30 @@ class WebConfigServer(object):
                     ),
                     'retry_count': 0,
                     'hold_before_sampling_s': 3.0,
-                    'on_fail': 'HOLD',
+                    'on_fail': 'LOITER',
                 }
                 synced = 0
-                for seq in nav_seqs:
+                for seq in range(nav_count):
                     seq_key = str(seq)
                     if seq_key not in wp_cfg:
                         wp_cfg[seq_key] = dict(default_item)
                         synced += 1
 
-                valid_keys = set(str(s) for s in nav_seqs)
+                valid_keys = {str(seq) for seq in range(nav_count)}
                 removed_keys = [k for k in list(wp_cfg.keys()) if k not in valid_keys]
                 for k in removed_keys:
                     del wp_cfg[k]
 
                 normalized = ConfigManager._normalize_waypoint_sampling(wp_cfg)
-                self.config_manager.update({'waypoint_sampling': normalized})
-                self._add_log("已从飞控同步 %d 个航点采样配置" % len(nav_seqs), "success")
+                if not self.config_manager.update({'waypoint_sampling': normalized}):
+                    return jsonify(success=False, message="航点配置保存失败"), 500
+                self._add_log("已从飞控同步 %d 个航点采样配置" % nav_count, "success")
                 return jsonify({
                     "success": True,
-                    "message": "已同步 %d 个航点（新增 %d，移除 %d）" % (len(nav_seqs), synced, len(removed_keys)),
+                    "message": "已同步 %d 个航点（新增 %d，移除 %d）" % (nav_count, synced, len(removed_keys)),
                     "data": normalized,
                     "synced": synced,
-                    "total": len(nav_seqs),
+                    "total": nav_count,
                     "removed": len(removed_keys),
                 })
             except Exception as e:

@@ -26,7 +26,7 @@ const DEFAULT_ITEM: WaypointSamplingItem = {
   loop_count: 1,
   retry_count: 0,
   hold_before_sampling_s: 3.0,
-  on_fail: 'HOLD',
+  on_fail: 'LOITER',
 }
 
 export function WaypointSamplingCard({ saveRef, disabled = false }: {
@@ -73,8 +73,8 @@ export function WaypointSamplingCard({ saveRef, disabled = false }: {
 
   const addWaypoint = () => {
     const seq = newSeq.trim()
-    if (!seq || isNaN(Number(seq))) return
-    const key = String(parseInt(seq, 10))
+    if (!seq || !Number.isSafeInteger(Number(seq)) || Number(seq) < 0) return
+    const key = String(Number(seq))
     if (data[key]) { toast({ title: `航点 ${key} 已存在` }); return }
     setData({ ...data, [key]: { ...DEFAULT_ITEM } })
     setNewSeq('')
@@ -107,8 +107,8 @@ export function WaypointSamplingCard({ saveRef, disabled = false }: {
       <CardContent><fieldset disabled={!loaded || disabled} className="min-w-0 space-y-4">
         <div className="flex flex-col gap-2 sm:flex-row sm:items-end">
           <div className="min-w-0 flex-1 space-y-1">
-            <Label className="text-xs">新增航点编号</Label>
-            <Input value={newSeq} onChange={e => setNewSeq(e.target.value)} placeholder="例: 0" className="h-8" />
+            <Label className="text-xs">新增航点编号（从 0 开始）</Label>
+            <Input value={newSeq} onChange={e => setNewSeq(e.target.value)} placeholder="0" className="h-8" />
           </div>
           <Button size="sm" className="w-full sm:w-auto" onClick={addWaypoint}><Plus className="w-4 h-4 mr-1" />添加</Button>
         </div>
@@ -152,11 +152,11 @@ export function WaypointSamplingCard({ saveRef, disabled = false }: {
                           <NumericInput integer min={0} value={item.loop_count} onValueChange={v => updateField(key, 'loop_count', v)} className="h-7 text-xs" />
                         </div>
                         <div className="space-y-1">
-                          <Label className="text-xs text-muted-foreground">重试次数</Label>
+                          <Label className="text-xs text-muted-foreground">旧流程重试次数</Label>
                           <NumericInput integer min={0} value={item.retry_count} onValueChange={v => updateField(key, 'retry_count', v)} className="h-7 text-xs" />
                         </div>
                         <div className="space-y-1">
-                          <Label className="text-xs text-muted-foreground">稳定等待(s)</Label>
+                          <Label className="text-xs text-muted-foreground">旧流程稳定等待（秒）</Label>
                           <NumericInput min={0} value={item.hold_before_sampling_s} onValueChange={v => updateField(key, 'hold_before_sampling_s', v)} className="h-7 text-xs" />
                         </div>
                         <div className="space-y-1">
@@ -166,9 +166,10 @@ export function WaypointSamplingCard({ saveRef, disabled = false }: {
                             onChange={e => updateField(key, 'on_fail', e.target.value)}
                             className="h-7 text-xs w-full rounded-md border bg-background px-2"
                           >
-                            <option value="HOLD">保持(HOLD)</option>
-                            <option value="SKIP">跳过(SKIP)</option>
-                            <option value="ABORT">中止(ABORT)</option>
+                            <option value="LOITER">定点驻留（LOITER）</option>
+                            <option value="HOLD">停止推进（HOLD）</option>
+                            <option value="SKIP">跳过（SKIP）</option>
+                            <option value="ABORT">中止（ABORT）</option>
                           </select>
                         </div>
                       </div>

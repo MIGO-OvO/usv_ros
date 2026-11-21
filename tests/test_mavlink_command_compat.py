@@ -846,11 +846,14 @@ class MavlinkCommandCompatibilityTests(unittest.TestCase):
 
     def test_rover_nav_script_time_is_the_only_mission_sampling_trigger(self):
         workspace_root = _workspace_root()
-        mode_auto = (workspace_root / "ardupilot-usv" / "Rover" / "mode_auto.cpp").read_text(encoding="utf-8")
+        rover = workspace_root / "ardupilot-usv" / "Rover"
+        mode_auto = (rover / "mode_auto.cpp").read_text(encoding="utf-8")
 
         self.assertNotIn("case 31010:", mode_auto)
         self.assertIn("nav_scripting.command == 1", mode_auto)
-        self.assertIn('gcs().send_named_float("USV_SMPL"', mode_auto)
+        self.assertIn("start_usv_sampling(cmd);", mode_auto)
+        self.assertIn("sampling_message_type = 31021", (rover / "usv_sampling.cpp").read_text(encoding="utf-8"))
+
     def test_router_bridge_reconnects_and_keeps_payload_alive_after_socket_write_failure(self):
         module = _load_script("usv_mavlink_router_bridge_reconnect_payload_test", "scripts/usv_mavlink_router_bridge.py")
         bridge = module.USVMavlinkRouterBridge()

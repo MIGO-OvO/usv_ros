@@ -10,6 +10,7 @@ import math
 import threading
 import time
 import os
+import struct
 import sys
 from collections import deque, OrderedDict
 
@@ -21,6 +22,7 @@ from scripts.lib.mavlink_tcp_transport import MAVLinkTCPTransport, TCPWriteDefer
 from scripts.lib.payload_protocol import encode_event, next_transport_session, SAFETY_COMMANDS, RequestLedger, request_context
 from scripts.lib.automation_preflight import calibrated_offsets, relative_angles
 from scripts.lib.ros_radio import RosRadioServer, LocalWebAPI, MESSAGE_TYPE as ROS_RADIO_TYPE
+from scripts.lib import fcu_sampling
 
 import rospy
 from std_msgs.msg import String, Float32MultiArray
@@ -161,6 +163,11 @@ class USVMavlinkRouterBridge(object):
         self._pending_usv_fail = deque(maxlen=MAX_PENDING_SENDS)
         self._fcu_sample_id = 0          # current sampling id from FCU NAV_SCRIPT_TIME
         self._last_fcu_sample_id = 0     # suppress retransmitted triggers, including terminal ones
+        self._last_fcu_sample_boot_ms = None
+        self._fcu_offer = None
+        self._fcu_wire = None
+        self._fcu_reply = None
+        self._fcu_sampling_pub = rospy.Publisher('/usv/fcu_sampling', String, queue_size=10)
         self._cmd_rx_pub = rospy.Publisher("/usv/mavlink_cmd_rx", Float32MultiArray, queue_size=5)
         self._payload_command_pub = rospy.Publisher('/usv/payload_command', String, queue_size=20)
         self._radio_status_pub = rospy.Publisher("/usv/radio_status", String, queue_size=5)
@@ -251,6 +258,15 @@ class USVMavlinkRouterBridge(object):
             self._last_send_attempt = self._transport.last_attempt
         self._transport = None
         self._fcu_probe = None
+        with self._lock:
+            active_fcu = self._fcu_wire if self._fcu_sample_id else None
+            sample_id = self._fcu_sample_id
+            self._fcu_offer = self._fcu_wire = self._fcu_reply = None
+            self._fcu_sample_id = 0
+        if sample_id:
+            context = (fcu_sampling.context(active_fcu) if active_fcu is not None
+                       else {'source': 'fcu', 'sample_id': sample_id})
+            self._publish_fcu_command('cancel', context, 'transport_session_lost')
         message = Float32MultiArray()
         message.data = [0.0]
         self._session_pub.publish(message)
@@ -398,12 +414,25 @@ class USVMavlinkRouterBridge(object):
 
         with self._lock:
             self._apply_automation_status_locked(data_dict)
-            if (isinstance(data_dict, dict) and data_dict.get('controller_fault') == 'owner_lost'
-                    and data_dict.get('source') == 'fcu' and self._fcu_sample_id > 0
-                    and data_dict.get('sample_id') == self._fcu_sample_id):
-                self._pending_usv_fail.append(self._fcu_sample_id)
-                self._pending_usv_done.clear()
-                self._fcu_sample_id = 0
+        if not isinstance(data_dict, dict) or data_dict.get('source') != 'fcu':
+            return
+        context = data_dict.get('sampling_context')
+        token = context.get('fcu_token') if isinstance(context, dict) else None
+        if data_dict.get('controller_fault') == 'owner_lost':
+            self._record_fcu_result(dict(source='fcu', sample_id=data_dict.get('sample_id'),
+                                         fcu_token=token, outcome='failed', reason='owner_lost'))
+        elif token and (data_dict.get('running') or data_dict.get('paused')):
+            now = time.monotonic()
+            issued = data_dict.get('source_monotonic')
+            if not isinstance(issued, (int, float)) or not 0 <= now - issued <= 3.0:
+                return
+            with self._lock:
+                reply = self._fcu_reply
+                if reply is not None:
+                    kind, identity, next_send, _ = reply
+                    if (kind == fcu_sampling.Message.ACCEPTED and token == str(identity[0])
+                            and data_dict.get('sample_id') == identity[1]):
+                        self._fcu_reply = (kind, identity, next_send, issued + 3.0)
 
     def _apply_automation_status_locked(self, data_dict):
         if not isinstance(data_dict, dict) or not data_dict:
@@ -509,11 +538,14 @@ class USVMavlinkRouterBridge(object):
                 self._pending_statustexts.append(("USV: Calibrating", mavutil.mavlink.MAV_SEVERITY_NOTICE))
 
     def _sampling_result_cb(self, msg):
-        """Only a matching, explicit FCU success/skip may release NAV_SCRIPT_TIME."""
         try:
             result = json.loads(msg.data)
         except (TypeError, ValueError):
             return
+        self._record_fcu_result(result)
+
+    def _record_fcu_result(self, result):
+        """Only a matching, explicit FCU success/skip may release NAV_SCRIPT_TIME."""
         if not isinstance(result, dict) or result.get("source") != "fcu":
             return
         sample_id = result.get("sample_id")
@@ -522,18 +554,38 @@ class USVMavlinkRouterBridge(object):
             return
         labels = {"succeeded": "Completed", "failed": "Failed",
                   "cancelled": "Cancelled", "skipped": "Skipped"}
-        if not isinstance(outcome, str) or outcome not in labels:
+        if not isinstance(outcome, str) or outcome not in (*labels, 'accepted'):
             return
         with self._lock:
             if sample_id != self._fcu_sample_id:
                 return  # stale, duplicate, or unrelated sampling result
-            self._fcu_sample_id = 0
-            if outcome in ("succeeded", "skipped"):
+            identity = self._fcu_wire
+            if identity is not None:
+                if result.get('fcu_token') != str(identity[0]):
+                    return
+                code = {
+                    'accepted': fcu_sampling.Message.ACCEPTED,
+                    'succeeded': fcu_sampling.Message.DONE,
+                    'skipped': fcu_sampling.Message.SKIP,
+                }.get(outcome)
+                if code is None:
+                    code = (fcu_sampling.Message.FAILED_LOITER
+                            if result.get('loiter') is True else fcu_sampling.Message.FAILED_HOLD)
+                self._fcu_reply = (code, identity, 0.0, time.monotonic() + 3.0)
+            elif result.get('fcu_token') is not None or outcome == 'accepted':
+                return
+            elif outcome in ("succeeded", "skipped"):
                 self._pending_usv_done.append(sample_id)
             else:
                 self._pending_usv_fail.append(sample_id)
+            if outcome == 'accepted':
+                return
+            self._fcu_sample_id = 0
+            reason = str(result.get('reason', ''))
+            text = ("USV WP%d %s %s" % (identity[2], labels[outcome], reason) if identity is not None
+                    else "USV: Sampling %s id=%d" % (labels[outcome], sample_id))
             self._pending_statustexts.append((
-                "USV: Sampling %s id=%d" % (labels[outcome], sample_id),
+                text,
                 mavutil.mavlink.MAV_SEVERITY_NOTICE))
         rospy.loginfo("FCU sampling result id=%d outcome=%s reason=%s",
                       sample_id, outcome, str(result.get("reason", ""))[:120])
@@ -812,7 +864,68 @@ class USVMavlinkRouterBridge(object):
             self._diag_tx_named += 1
         return sent
 
+    def _publish_fcu_command(self, action, context, reason=''):
+        msg = String()
+        msg.data = json.dumps(dict(context, action=action, reason=reason))
+        self._fcu_sampling_pub.publish(msg)
+
+    def _send_fcu_message(self, kind, identity):
+        payload = fcu_sampling.encode(kind, identity)
+        return self._mav_send_with_retry(
+            lambda: self._conn.mav.v2_extension_send(0, self._sys_id, 1, fcu_sampling.MESSAGE_TYPE, payload),
+            'FCU sampling ' + kind.name)
+
+    def _receive_fcu_message(self, msg):
+        if (msg.get_srcSystem(), msg.get_srcComponent(), msg.target_system, msg.target_component) != (
+                self._sys_id, 1, self._sys_id, self._comp_id):
+            return
+        try:
+            kind, identity = fcu_sampling.decode(msg.payload)
+        except (ValueError, TypeError, struct.error):
+            return
+        now = time.monotonic()
+        if kind == fcu_sampling.Message.OFFER:
+            with self._lock:
+                if self._fcu_sample_id or self._fcu_wire == identity:
+                    return
+                self._fcu_offer = (identity, now)
+                # Writes run after begin_cycle(), including the first READY.
+                self._fcu_reply = (fcu_sampling.Message.READY, identity, now, now + 3.0)
+        elif kind == fcu_sampling.Message.START:
+            with self._lock:
+                offer = self._fcu_offer
+                if (self._fcu_sample_id or not offer or offer[0] != identity or now - offer[1] > 10.0):
+                    return
+                self._fcu_offer = None
+                self._fcu_wire = identity
+                self._fcu_sample_id = identity[1]
+                self._fcu_reply = None
+            self._publish_fcu_command('start', fcu_sampling.context(identity))
+        elif kind == fcu_sampling.Message.CANCEL:
+            with self._lock:
+                if self._fcu_wire != identity or not self._fcu_sample_id:
+                    return
+                self._fcu_sample_id = 0
+                self._fcu_reply = None
+            self._publish_fcu_command('cancel', fcu_sampling.context(identity), 'fcu_cancelled')
+
+    def _flush_fcu_reply(self):
+        now = time.monotonic()
+        with self._lock:
+            reply = self._fcu_reply
+            if reply is None:
+                return
+            kind, identity, next_send, expires = reply
+            if now >= expires:
+                self._fcu_reply = None
+                return
+        if now >= next_send and self._send_fcu_message(kind, identity):
+            with self._lock:
+                if self._fcu_reply is reply:
+                    self._fcu_reply = (kind, identity, now + 0.5, expires)
+
     def _flush_pending_sends(self):
+        self._flush_fcu_reply()
         for pending, sender in ((self._pending_usv_fail, self._send_usv_fail),
                                 (self._pending_usv_done, self._send_usv_done),
                                 (self._pending_acks, lambda item: self._send_command_ack(*item)),
@@ -854,7 +967,9 @@ class USVMavlinkRouterBridge(object):
 
             msg_type = msg.get_type()
             if msg_type == 'V2_EXTENSION':
-                if (int(msg.message_type) == ROS_RADIO_TYPE
+                if int(msg.message_type) == fcu_sampling.MESSAGE_TYPE:
+                    self._receive_fcu_message(msg)
+                elif (int(msg.message_type) == ROS_RADIO_TYPE
                         and int(msg.target_system) == self._sys_id
                         and int(msg.target_component) == self._comp_id):
                     if self._ros_radio is None:
@@ -910,19 +1025,21 @@ class USVMavlinkRouterBridge(object):
                     name = msg.name.rstrip('\x00')
                     if name == 'USV_FAIL':
                         sample_id = int(msg.value)
-                        if msg.value != sample_id or sample_id != self._fcu_sample_id or sample_id <= 0:
+                        if (self._fcu_wire is not None or msg.value != sample_id
+                                or sample_id != self._fcu_sample_id or sample_id <= 0):
                             continue
-                        rx = Float32MultiArray()
-                        rx.data = [31011.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-                        self._cmd_rx_pub.publish(rx)
+                        self._publish_fcu_command('cancel', {'source': 'fcu', 'sample_id': sample_id}, 'fcu_cancelled')
                     elif name == "USV_SMPL":
                         sample_id = int(msg.value)
                         if msg.value != sample_id or not 1 <= sample_id <= 65535:
                             continue
                         with self._lock:
-                            if sample_id == self._last_fcu_sample_id:
+                            boot_ms = getattr(msg, 'time_boot_ms', None)
+                            if self._fcu_wire is not None or (sample_id == self._last_fcu_sample_id
+                                                             and boot_ms == self._last_fcu_sample_boot_ms):
                                 continue
                             self._last_fcu_sample_id = sample_id
+                            self._last_fcu_sample_boot_ms = boot_ms
                             self._fcu_sample_id = sample_id
                             # A newer script supersedes any not-yet-sent old completion.
                             self._pending_usv_done.clear()

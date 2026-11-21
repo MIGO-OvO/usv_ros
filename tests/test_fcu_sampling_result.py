@@ -1,5 +1,7 @@
 """Safety regression: only an explicit, matching FCU result may release a script."""
 import json
+import threading
+import time
 import types
 import unittest
 from unittest.mock import patch
@@ -7,6 +9,7 @@ from unittest.mock import patch
 from test_mavlink_command_compat import _load_script, FakeConnection, RecordingMav
 from gps_fixtures import gps_position
 from command_fixtures import wait_commands
+from scripts.lib import fcu_sampling
 
 
 class ForwardPublisher:
@@ -39,6 +42,8 @@ class FCUSamplingResultTests(unittest.TestCase):
         self.node.status_pub = ForwardPublisher(self.bridge._trigger_status_cb)
         self.node.sampling_result_pub = ForwardPublisher(
             lambda msg: self.bridge._sampling_result_cb(msg))
+        self.bridge._fcu_sampling_pub = ForwardPublisher(self.node._fcu_sampling_cb)
+        self.frames = []
 
     def trigger(self, sample_id=42):
         msg = types.SimpleNamespace(name='USV_SMPL', value=sample_id,
@@ -51,6 +56,158 @@ class FCUSamplingResultTests(unittest.TestCase):
 
     def results(self):
         return [json.loads(msg.data) for msg in self.node.sampling_result_pub.messages]
+
+    def frame(self, kind, identity, system=1, component=1, target=191):
+        msg = types.SimpleNamespace(
+            message_type=fcu_sampling.MESSAGE_TYPE,
+            payload=fcu_sampling.encode(kind, identity),
+            get_srcSystem=lambda: system, get_srcComponent=lambda: component,
+            target_system=1, target_component=target, get_type=lambda: 'V2_EXTENSION')
+        self.bridge._conn = FakeConnection([msg])
+        self.bridge._conn.mav = types.SimpleNamespace(v2_extension_send=self.record_frame)
+        self.bridge._receive_mavlink_messages()
+
+    def record_frame(self, network, system, component, message_type, payload):
+        self.assertEqual((network, system, component, message_type), (0, 1, 1, 31021))
+        self.frames.append(fcu_sampling.decode(payload))
+
+    def test_native_offer_then_single_start_releases_only_matching_attempt(self):
+        m = fcu_sampling.Message
+        identity = (2**63 + 5, 42, 3, 1)
+        self.node._build_steps_payload = self.trigger_module.MAVLinkTriggerNode._build_steps_payload.__get__(self.node)
+        self.node._load_config = lambda: {
+            'sampling_sequence': {'steps': [{'name': 'test'}]},
+            'waypoint_sampling': {'1': {'loop_count': 4, 'on_fail': 'LOITER'}, '3': {'loop_count': 2}},
+        }
+        starts = []
+        self.node._call_automation_service = lambda action: starts.append(action) or True
+        self.frame(m.START, identity)
+        self.frame(m.OFFER, identity, target=190)
+        self.bridge._flush_fcu_reply()
+        self.assertEqual(self.frames, [])
+        self.frame(m.OFFER, identity)
+        self.assertEqual(self.frames, [])
+        self.bridge._flush_fcu_reply()
+        self.assertEqual(self.frames, [(m.READY, identity)])
+        self.assertEqual(starts, [])
+        self.frame(m.START, identity)
+        self.frame(m.START, identity)
+        wait_commands(self.node)
+        self.assertEqual(starts, ['start'])
+        self.assertEqual(self.node.current_sampling_context['waypoint_seq'], 3)
+        prepared = json.loads(self.node.steps_pub.messages[-1].data)
+        self.assertEqual(prepared['loop_count'], 4)
+        self.bridge._flush_fcu_reply()
+        self.assertEqual(self.frames[-1], (m.ACCEPTED, identity))
+        self.assertEqual([r['outcome'] for r in self.results()], ['accepted'])
+        self.frame(m.CANCEL, (identity[0] - 1, *identity[1:]))
+        self.assertTrue(self.node.is_sampling)
+        self.node._handle_completion(True)
+        self.bridge._flush_fcu_reply()
+        self.assertEqual(self.frames[-1], (m.DONE, identity))
+        self.assert_no_legacy_result()
+
+        newer = (identity[0] + 1, *identity[1:])
+        self.frame(m.OFFER, newer)
+        self.bridge._flush_fcu_reply()
+        self.frame(m.START, newer)
+        wait_commands(self.node)
+        self.assertEqual(starts, ['start', 'start'])
+        self.bridge._record_fcu_result(dict(fcu_sampling.context(identity), outcome='succeeded'))
+        self.assertEqual(self.bridge._fcu_reply[:2], (m.ACCEPTED, newer))
+        self.node._handle_completion(False, 'preflight_failed')
+        self.bridge._flush_fcu_reply()
+        self.assertEqual(self.frames[-1], (m.FAILED_LOITER, newer))
+        self.assertEqual(self.modes, [])
+
+    def test_native_busy_reports_hold_without_stopping_other_owner(self):
+        m = fcu_sampling.Message
+        identity = (11, 42, 3, 1)
+        owner = {'source': 'manual', 'attempt_id': 'existing'}
+        self.node.current_sampling_context = owner
+        self.node.is_sampling = True
+        with patch.object(self.node, '_call_control_transaction') as control:
+            self.frame(m.OFFER, identity)
+            self.bridge._flush_fcu_reply()
+            self.frame(m.START, identity)
+            wait_commands(self.node)
+            self.bridge._flush_fcu_reply()
+            self.frame(m.CANCEL, identity)
+            control.assert_not_called()
+        self.assertIs(self.node.current_sampling_context, owner)
+        self.assertEqual(self.frames[-1], (m.FAILED_HOLD, identity))
+        self.assertEqual(self.results()[-1]['reason'], 'sampling_busy')
+
+    def test_retired_transport_cleans_only_blocked_native_start(self):
+        m = fcu_sampling.Message
+        identity = (31, 42, 3, 1)
+        entered = threading.Event()
+        release = threading.Event()
+        cleanup = threading.Event()
+        calls = []
+
+        def start(action):
+            calls.append(action)
+            entered.set()
+            return release.wait(3)
+
+        def control(action, payload):
+            calls.append((action, payload.get('attempt_id')))
+            cleanup.set()
+            return True, {'cleanup': 'stopped', 'attempt_id': payload['attempt_id']}
+
+        self.node._call_automation_service = start
+        self.node._call_control_transaction = control
+        self.node._mavlink_tcp_session = 7
+        self.bridge._session_pub = ForwardPublisher(self.node._mavlink_session_cb)
+        self.frame(m.OFFER, identity)
+        self.bridge._flush_fcu_reply()
+        self.frame(m.START, identity)
+        try:
+            self.assertTrue(entered.wait(2))
+            attempt = self.node.current_sampling_context['attempt_id']
+            self.bridge._retire_router('test transport retirement')
+            self.assertTrue(cleanup.wait(2))
+            self.assertEqual(calls[:2], ['start', ('automation_cleanup', attempt)])
+        finally:
+            release.set()
+        wait_commands(self.node)
+        deadline = time.monotonic() + 2
+        while self.node.is_sampling and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertFalse(self.node.is_sampling)
+        self.assertIsNone(self.bridge._fcu_reply)
+        self.frame(m.START, identity)
+        wait_commands(self.node)
+        self.assertEqual(calls.count('start'), 1)
+        self.assertEqual(self.modes, [])
+        self.assert_no_legacy_result()
+
+    def test_native_owner_fault_and_activity_follow_the_token(self):
+        m = fcu_sampling.Message
+        identity = (41, 42, 3, 1)
+        self.frame(m.OFFER, identity)
+        self.bridge._flush_fcu_reply()
+        self.frame(m.START, identity)
+        wait_commands(self.node)
+        status = {
+            'source': 'fcu', 'sample_id': identity[1], 'running': True,
+            'source_monotonic': time.monotonic(), 'sampling_context': {'fcu_token': '40'},
+        }
+        reply = self.bridge._fcu_reply
+        self.bridge._automation_status_cb(types.SimpleNamespace(data=json.dumps(status)))
+        self.assertIs(self.bridge._fcu_reply, reply)
+        status['sampling_context']['fcu_token'] = str(identity[0])
+        self.bridge._automation_status_cb(types.SimpleNamespace(data=json.dumps(status)))
+        self.assertEqual(self.bridge._fcu_reply[3], status['source_monotonic'] + 3)
+        status['controller_fault'] = 'owner_lost'
+        self.bridge._automation_status_cb(types.SimpleNamespace(data=json.dumps(status)))
+        self.bridge._flush_fcu_reply()
+        self.assertEqual(self.frames[-1], (m.FAILED_HOLD, identity))
+
+    def assert_no_legacy_result(self):
+        self.assertEqual(list(self.bridge._pending_usv_done), [])
+        self.assertEqual(list(self.bridge._pending_usv_fail), [])
 
     def assert_no_done(self):
         self.assertEqual(list(self.bridge._pending_usv_done), [])

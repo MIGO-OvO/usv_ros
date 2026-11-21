@@ -77,7 +77,7 @@ Windows 需要 OpenSSH Client（`scp`）。该入口下载已经由 `usvlogs pac
 
 终态通过结构化 `automation_status` 的 attempt/source/sample_id 关联，快任务提前终态缓存到启动确认后消费。内部清理通过 `ControlCommand.automation_cleanup` 在同一控制锁内校验 attempt 并停止全部输出，结果为 `stopped/failed/superseded`；旧 owner 清理不能干扰新任务。失败或已锁存的会话故障不算清理成功，人工 31011/STOPALL 仍为全局停止。走航间隔保持采样 owner 续约、进样关闭，停止会取消整个调度，MANUAL/RTL 接管不被迟到失败覆盖。
 
-飞控需更新为采样超时默认 HOLD、支持 `USV_FAIL` 的匹配版本。当前 26 个显示遥测字段，31010..31019 命令号不变；分光超过 2 秒未更新时置无效。`USV_DONE/USV_FAIL` 尚无端到端 ACK 或跨飞控重启会话保证，不能以本地发送成功当作船态证明。
+航线采样使用配套 ArduRover 的 `V2_EXTENSION 31021`。更新时停下任务，部署飞控并一起重启 bridge、trigger、pump 和 Web。26 个显示遥测字段和手动载荷命令 31010..31019 沿用既有接口。分光数据超过 2 秒即失效。
 
 船载热点/LAN 的 API 写操作默认无需登录，现有前端可直接进行分光、泵控和自动采样；跨源/跨站写请求仍拒绝。仅设置进程环境 `USV_WEB_REQUIRE_AUTH=1` 才启用认证，并必须同时配置 `USV_WEB_CONTROL_TOKEN`（至少 16 字符，否则服务拒绝启动）；仅设置 token 不启用认证。认证模式下本机和远程写操作均需 Bearer 或 HTTP Basic（用户名 `operator`，密码为令牌），浏览器先访问 `/api/control/auth`。环境变更后重启 Web 服务。不把令牌保存到源码或配置 JSON。默认模式下任何可达客户端都可调用控制 API，同源检查不能替代身份认证；非可信网络应启用认证并通过 HTTPS/VPN 和网络访问隔离保护。
 
@@ -912,29 +912,17 @@ FCU 采样触发、waypoint、走航和 lab_real。GPS 不再是载荷采样的�
 更新后成套重启 ROS 服务，在无 fix 时点击 QGC 点采样，硬件预检通过后应看到 `sampling_started` 和
 `/usv/mavlink_cmd_ack` 的 `[31010,0,...]`，记录坐标为 null；旧配置即使保留 `require_gps=true` 也不得拒绝启动。
 
-航线定点采样使用飞控原生 `MAV_CMD_NAV_SCRIPT_TIME`：
+### 航点定点采样
 
-- `param1=1`：USV 定点采样。
-- `param2=1..255`：超时保护秒数，QGC 默认 255。
-- `param3..param6=0`：v1 保留。
+在采样航点后添加 `MAV_CMD_NAV_SCRIPT_TIME(42702, param1=1)`。正整数 `param3` 设定稳定准备、采样和清理的总时限，范围 1–2048 秒，新任务默认 1800 秒。既有任务 `param3=0` 时沿用 `param2`，两者均为 0 时使用 255 秒。
 
-bridge 兼容飞控以 `NAMED_VALUE_FLOAT` 发出的原生任务触发：
+- 飞控在 AUTO 内以采样航点为目标驻留。进入 `LOIT_RADIUS` 后，地速和偏航角速度持续达标 3 秒，才发起 `OFFER → READY → START`。ROS bridge 先记录关联身份，再向 `/usv/fcu_sampling` 投递一次 START。
+- trigger 按从 0 开始的导航航点编号应用采样轮次、启用状态和失败策略。Web 同步以飞控回读的导航项为准。原生任务的稳定判定和启动时限由飞控执行。
+- 泵控承接步骤后，trigger 发布匹配 `fcu_token` 和 `sample_id` 的 `accepted`。运行和准备期间，同次尝试的泵控状态持续续约。Web 用匹配的最终结果关窗，保留启动拒绝原因、准备阶段和清理结果。
+- `DONE` 和明确的 `SKIP` 可以推进任务。清理确认后，失败按配置驻留或停止推进。超时、失联、未确认启动、取消或清理失败进入 HOLD。切出 AUTO 时飞控取消对应采样，操作者选择的模式继续生效。
+- 旧飞控仍可使用 `USV_SMPL/USV_DONE/USV_FAIL` 兼容路径。更新后的飞控要求新版 bridge、trigger 和 pump 配套。手动走航开关仍为 `USV_SURV=1/0`。
 
-- `USV_SMPL=<sample_id>`：触发一次定点采样；只有匹配 ID 的成功结果或明确 SKIP，bridge 才发送 `USV_DONE=<sample_id>`。
-
-### FCU 采样结果与安全边界
-
-- trigger 通过 `/usv/sampling_result`（`std_msgs/String` JSON，非 latched）发布 `source=fcu`、`sample_id`（整数 1..65535）、`outcome`、`reason`。
-- `outcome=succeeded` 表示正常完成；`skipped` 仅由 FCU 采样失败且 `sampling_on_fail=SKIP` 产生。二者允许 bridge 发送匹配 ID 的 `USV_DONE`，但 SKIP 提示为 Skipped，不冒充成功。
-- `failed` / `cancelled` 不发送 `USV_DONE`。HOLD/ABORT 失败策略、FCU 主动取消请求 HOLD；启动失败同样进入失败策略。FCU 忙碌拒绝只报告失败，不中断正在运行的其他采样。
-- `sampling_stopped` 与 pump `finished` 不作为真实任务成功或飞控放行依据。Web 真实窗口等待匹配 `/usv/sampling_result` 最终结果后关窗，保留真实首因和清理结果。自动化引擎正常结束报 `finished`，直接停止报 `stopped`，失败报 `failed`。
-- bridge 在下发内部命令前登记 ID；忽略最近同 ID 重复触发、重复结果、ID 不匹配结果、非 FCU 结果和非法结果。新 ID 会清除尚未发送的旧完成通知。
-- FCU 采样仍不启用旧 waypoint 自动重试路径，避免重试丢失脚本 ID；成功完成不由 ROS 延迟切换模式。命令号保持不变，本轮 26 字段与关联协议需匹配新版固件和 QGC。
-- **部署要求**：停止系统后，成套更新并重启 trigger、bridge 和 pump（自动化引擎），不要混用新旧进程。旧 bridge 仍会把 `sampling_stopped` 当成完成；新 bridge 配旧 trigger 则不会发送完成通知。
-- **剩余边界**：HOLD 请求不是模式确认；飞控 `NAV_SCRIPT_TIME` 自身超时仍可结束等待，本修复不修改该 P1 行为。结果队列不保证端到端可靠送达；飞控重启/16 位 ID 回绕没有跨启动会话标识，重启后应协调重启 ROS 并重新确认任务，不将本修复视为完整的跨重启事务协议。
-
-离线回归：`python3 -m unittest discover -s tests -p 'test_fcu_sampling_result.py'`。现场必须验证成功、启动失败、PID 超时、QGC/Web 停止、HOLD/ABORT/SKIP、重复和迟到消息，并同时采集 `/usv/sampling_result`、`/usv/trigger_status`、`/mavros/state` 与 MAVLink 日志。
-- `USV_SURV=1/0`：开启或停止走航采样。
+离线回归运行 `python3 -m unittest discover -s tests -p 'test_fcu_sampling_result.py'`。台架并行记录 `/usv/fcu_sampling`、`/usv/sampling_result`、`/usv/automation_status`、`/mavros/state` 与 MAVLink 日志，核对正常完成、显式跳过、启动拒绝、断链与停止时的船态和设备输出。
 
 ### 上行遥测
 
@@ -978,7 +966,7 @@ rostopic echo /usv/radio_status
 
 ## 实验仿真与坐标 Schema v2
 
-实验模式（Lab）在无飞控/检测装置硬件时做半实物仿真，源码集中在 `scripts/lib/lab_sim/`、`scripts/lab_sim_node.py`、`scripts/mavlink_trigger_node.py` 与 `scripts/web_config_server.py`，不改变 MAVLink 命令号和 `USV_SMPL/USV_DONE` 语义；当前载荷字段清单为上文 26 项。lab_real 不能使用仿真或机械调试豁免绕过真实测量门禁。
+实验模式（Lab）在无飞控或检测装置时做半实物仿真，源码位于 `scripts/lib/lab_sim/`、`scripts/lab_sim_node.py`、`scripts/mavlink_trigger_node.py` 和 `scripts/web_config_server.py`。lab_real 使用真实测量门禁。
 
 ### 坐标 Schema v2 与 CRS 边界
 
@@ -1112,7 +1100,7 @@ curl http://127.0.0.1:5000/api/map/live > live_map_snapshot.json
 | `valid_gps_points` / `excluded_points` | 进入 GeoJSON/IDW 的有效 GPS 点数与被质量门控剔除点数 |
 | `surface_grid` | IDW 网格大小，如 `80x80`，以及 `power` 参数 |
 | `screenshot_path` | Web 地图 16:9 桌面截图路径 |
-| `USV_SMPL/USV_DONE` | bridge 或 roslaunch 日志中 mission script 采样闭环片段 |
+| `V2_EXTENSION 31021` | 同一采样身份的飞控握手、ROS 结果和航点推进记录 |
 
 ## 验证
 

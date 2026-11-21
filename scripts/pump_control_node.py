@@ -3850,7 +3850,8 @@ class PumpControlNode(object):
                     'attempt_id': data.get('attempt_id'),
                     'mavlink_request': data.get('mavlink_request'),
                 }
-                for key in ('record_id', 'timestamp_start', 'gps_snapshot', 'simulated', 'sample_name', 'mission_name'):
+                for key in ('record_id', 'timestamp_start', 'gps_snapshot', 'simulated', 'sample_name', 'mission_name',
+                            'fcu_token', 'waypoint_index'):
                     if key in data:
                         self.sampling_context[key] = copy.deepcopy(data[key])
             self._owner_last_seen = time.monotonic()
