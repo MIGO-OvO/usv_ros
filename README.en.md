@@ -130,9 +130,9 @@ usv_ros/
 ├── TESTING.md
 ├── config/
 │   └── usv_params.yaml              # ROS parameter baseline loaded by launch
-├── docs/current/
-│   ├── overview.md                  # Repository-level architecture summary
-│   └── roadmap.md                   # Follow-up roadmap
+├── docs/
+│   ├── current/adr/                 # Architecture decisions
+│   └── archive/                     # Historical overview, plan and roadmap
 ├── launch/
 │   └── usv_bringup.launch           # Main bringup entry
 ├── scripts/
@@ -769,7 +769,7 @@ More field test procedures are documented in [TESTING.md](TESTING.md).
 - Windows is usually used for code editing and logic verification. Real Jetson, Pixhawk, and ESP32 runtime
   validation must be done on field hardware.
 - When changing Web APIs, ROS topics/services, or MAVLink fields, update this README, [TESTING.md](TESTING.md),
-  and the workspace-level `docs/current/INTERFACE.md`.
+  and the workspace-level `docs/current/40_interfaces.md`.
 
 ## License
 

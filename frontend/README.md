@@ -1,32 +1,26 @@
-# USV 水质监测系统 - 前端界面
+# USV Web 控制台
 
-基于 React + TypeScript + Vite 开发的无人船 (USV) 水质监测系统前端界面。
+控制台使用 React、TypeScript 和 Vite。页面服务于现场操作，优先保证按钮和状态可扫读，并检查窄屏上的控制区与数据表格。
 
-## 项目特点
+## 开发和构建
 
-- **实时监控**: 实时显示传感器数据和系统状态。
-- **任务管理**: 配置和管理自动化采样任务。
-- **现代化 UI**: 使用 Tailwind CSS 和 Shadcn UI 构建的 Apple 风格界面。
-- **响应式设计**: 适配桌面端和移动端访问。
-
-## 开发指南
-
-### 启动开发服务器
+在 `frontend/` 安装依赖并启动开发服务器。
 
 ```bash
 npm install
 npm run dev
 ```
 
-### 构建生产版本
+前端改动完成后执行 `npm run build`。Vite 将产物写到 `../static/dist/`，由 Flask 提供。
 
-```bash
-npm run build
-```
+## 源码入口
 
-## 目录结构
+| 改动 | 入口 |
+|---|---|
+| 路由与公用组件 | `src/App.tsx`、`src/components/ui/` |
+| 监控与健康状态 | `src/pages/Monitor.tsx`、`src/components/system-health-card.tsx` |
+| 载荷手动控制与自动化 | `src/pages/Manual.tsx`、`src/pages/Automation.tsx` |
+| 数据中心、地图与实验航线 | `src/pages/Data.tsx`、`src/pages/Map.tsx`、`src/pages/Lab.tsx` |
+| 全局状态 | `src/store.ts` |
 
-- `src/components`: UI 组件
-- `src/pages`: 页面视图 (监控、自动化、数据、设置)
-- `src/store.ts`: 全局状态管理 (Zustand)
-- `public/usv-logo.svg`: 项目图标
+API 和 Socket.IO 的字段以 `../scripts/web_config_server.py` 为准，修改时同步核对前端调用和测试。系统健康由 `/usv/system_health` 汇总，经 Socket.IO `system_health` 送到前端。污染物热力图由 Web 地图页面展示。

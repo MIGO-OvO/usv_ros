@@ -273,9 +273,9 @@ usv_ros/
 ├── TESTING.md
 ├── config/
 │   └── usv_params.yaml              # launch 加载的 ROS 参数基线
-├── docs/current/
-│   ├── overview.md                  # 本仓库架构摘要
-│   └── roadmap.md                   # 后续路线规划
+├── docs/
+│   ├── current/adr/                 # 架构决策
+│   └── archive/                     # 旧概览、实施计划和路线图
 ├── launch/
 │   └── usv_bringup.launch           # 主启动入口
 ├── scripts/
