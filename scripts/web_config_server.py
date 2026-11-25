@@ -45,6 +45,7 @@ try:
     from flask import Flask, request, jsonify, send_file, send_from_directory, abort, Response
     from flask_cors import CORS
     from flask_socketio import SocketIO, emit
+    from werkzeug.serving import make_server
     FLASK_AVAILABLE = True
 except ImportError:
     FLASK_AVAILABLE = False
@@ -1068,6 +1069,7 @@ class MissionDataManager(object):
         self.current_mission_file = None
         self.current_mission_data = []
         self._write_lock = threading.RLock()
+        self._mission_list_lock = threading.Lock()
         self._mission_list_cache = None
         self._mission_cache = OrderedDict()
         self._mission_files = {}
@@ -1075,6 +1077,13 @@ class MissionDataManager(object):
         # File bytes are a proxy, not the decoded Python heap size.
         self._cache_max_bytes = max(0, int(cache_max_bytes))
         self._ensure_dir()
+        self._mission_list_path = os.path.join(self.data_dir, ".mission-list-v1.json")
+        try:
+            with open(self._mission_list_path, "r", encoding="utf-8") as index_file:
+                index = json.load(index_file)
+        except (OSError, ValueError):
+            index = {}
+        self._mission_list_index = index if isinstance(index, dict) else {}
         self._recover_incomplete_missions()
 
     def _ensure_dir(self):
@@ -1109,6 +1118,34 @@ class MissionDataManager(object):
             if os.path.exists(temp_path):
                 os.remove(temp_path)
 
+    @staticmethod
+    def _has_closed_mission_header(file_obj):
+        # Files written by this manager put end_time before the large arrays.
+        header = file_obj.read(4096).lstrip()
+        if not header.startswith("{"):
+            return False
+        field_text = header[1:].lstrip()
+        decoder = json.JSONDecoder()
+        try:
+            while field_text.startswith('"'):
+                field, end = decoder.raw_decode(field_text)
+                rest = field_text[end:].lstrip()
+                if not rest.startswith(":"):
+                    break
+                value_text = rest[1:].lstrip()
+                if value_text.startswith(("[", "{")):
+                    break
+                value, end = decoder.raw_decode(value_text)
+                rest = value_text[end:].lstrip()
+                if field == "end_time" and rest.startswith((",", "}")):
+                    return value is not None
+                if not rest.startswith(","):
+                    break
+                field_text = rest[1:].lstrip()
+        except ValueError:
+            pass
+        return False
+
     def _recover_incomplete_missions(self):
         recovered_at = datetime.now().isoformat()
         for filename in os.listdir(self.data_dir):
@@ -1117,6 +1154,9 @@ class MissionDataManager(object):
             path = os.path.join(self.data_dir, filename)
             try:
                 with open(path, "r", encoding="utf-8") as file_obj:
+                    if self._has_closed_mission_header(file_obj):
+                        continue
+                    file_obj.seek(0)
                     data = json.load(file_obj)
                 if not isinstance(data, dict) or data.get("end_time") is not None:
                     continue
@@ -1375,7 +1415,7 @@ class MissionDataManager(object):
         return result
 
     def _mission_list_fingerprint(self):
-        """返回任务文件的 (名称, mtime, size) 摘要，用于列表缓存失效判断。"""
+        """返回任务文件版本，用于列表缓存失效判断。"""
         if not os.path.isdir(self.data_dir):
             return None
         try:
@@ -1387,53 +1427,66 @@ class MissionDataManager(object):
                     continue
                 files[mission_id] = name
                 stat = os.stat(os.path.join(self.data_dir, name))
-                entries.append((name, stat.st_mtime_ns, stat.st_size))
+                entries.append((name, stat.st_mtime_ns, stat.st_size, stat.st_ino))
             self._mission_files = files
             return tuple(sorted(entries))
         except OSError:
             return None
 
     def list_missions(self):
-        """列出所有任务。任务文件未变化时返回缓存，避免重复加载大 JSON。"""
-        with self._write_lock:
+        """Use saved list rows for unchanged files, including after a restart."""
+        with self._mission_list_lock:
             return self._list_missions_locked()
 
     def _list_missions_locked(self):
-        fingerprint = self._mission_list_fingerprint()
-        if fingerprint is not None:
-            if self._mission_list_cache is not None and self._mission_list_cache[0] == fingerprint:
-                return self._mission_list_cache[1]
+        with self._write_lock:
+            fingerprint = self._mission_list_fingerprint()
+        if fingerprint is None:
+            return []
+        if self._mission_list_cache is not None and self._mission_list_cache[0] == fingerprint:
+            return self._mission_list_cache[1]
 
         missions = []
-        if not os.path.exists(self.data_dir):
-            return []
+        new_index = {}
 
         # Load newest last so likely first-page selections remain in the LRU.
-        for f in sorted(os.listdir(self.data_dir)):
-            if mission_file_id(f) is not None:
+        for filename, mtime_ns, size, inode in fingerprint:
+            version = [mtime_ns, size, inode]
+            cached = self._mission_list_index.get(filename)
+            if isinstance(cached, dict) and cached.get("version") == version and isinstance(cached.get("row"), dict):
+                row = cached["row"]
+            else:
                 try:
-                    data = self.get_mission(mission_file_id(f))
+                    data = self.get_mission(mission_file_id(filename))
                     if not isinstance(data, dict):
                         continue
                     summary = data["summary"]
-                    mission = {
-                        "id": data.get("mission_id", f),
-                        "name": data.get("name", f),
-                        "file_stem": data.get('file_stem'),
+                    row = {
+                        "id": data.get("mission_id", filename),
+                        "name": data.get("name", filename),
+                        "file_stem": data.get("file_stem"),
                         "state": data.get("state"),
                         "start_time": data.get("start_time"),
                         "end_time": data.get("end_time"),
-                        "point_count": len(data.get("data_points", [])),
                         "track_count": len(data.get("track_points", [])),
                         "route_count": len(data.get("route_waypoints", [])),
                         "summary": summary,
+                        **summary,
                     }
-                    mission.update(summary)
-                    missions.append(mission)
-                except Exception:
+                except (OSError, ValueError, TypeError):
                     continue
+            missions.append(row)
+            new_index[filename] = {"version": version, "row": row}
+
+        if new_index != self._mission_list_index:
+            try:
+                self._atomic_write_json(self._mission_list_path, new_index)
+            except OSError as exc:
+                rospy.logwarn("Could not persist mission list: %s", exc)
+            self._mission_list_index = new_index
+
         # 按时间倒序
-        missions = sorted(missions, key=lambda x: x["start_time"] or "", reverse=True)
+        missions.sort(key=lambda row: str(row.get("start_time") or ""), reverse=True)
         self._mission_list_cache = (fingerprint, missions)
         return missions
 
@@ -2128,6 +2181,7 @@ class WebConfigServer(object):
         self.config_manager.load()
         self.preset_manager = PresetManager()
         self.data_manager = MissionDataManager(self.mission_data_dir)
+        self._mission_list_builder = None
         self.sample_storage = SampleRecordingStorage(self.data_manager.data_dir)
         self.current_sample_window = None
         self.calibration_manager = CalibrationManager()
@@ -5656,6 +5710,8 @@ class WebConfigServer(object):
         # ================= 任务数据 API =================
         @self.app.route('/api/data/missions', methods=['GET'])
         def list_missions():
+            if self._mission_list_builder is not None and self._mission_list_builder.is_alive():
+                return jsonify({"success": False, "message": "正在生成采样记录索引，请稍后刷新"}), 503, {"Retry-After": "5"}
             return jsonify({"success": True, "data": self.data_manager.list_missions()})
 
         @self.app.route('/api/data/mission/<mission_id>', methods=['GET'])
@@ -6733,15 +6789,19 @@ class WebConfigServer(object):
         mission_recording_thread.daemon = True
         mission_recording_thread.start()
 
-        # 启动 SocketIO 服务器
+        # Socket.IO uses the Flask WSGI app in threading mode. A bounded
+        # request loop lets the ROS SIGINT/shutdown handler release the port.
         try:
-            self.socketio.run(
-                self.app,
-                host=self.host,
-                port=self.port,
-                use_reloader=False,
-                allow_unsafe_werkzeug=True
-            )
+            if rospy.is_shutdown():
+                return
+            with make_server(self.host, self.port, self.app, threaded=True) as server:
+                self._mission_list_builder = threading.Thread(
+                    target=self.data_manager.list_missions, name="MissionListIndex", daemon=True,
+                )
+                self._mission_list_builder.start()
+                server.timeout = 0.5
+                while not rospy.is_shutdown():
+                    server.handle_request()
         except Exception as e:
             rospy.logerr(f"Server error: {e}")
         except KeyboardInterrupt:

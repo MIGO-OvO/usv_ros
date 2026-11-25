@@ -216,7 +216,7 @@ QGroundControl / 定制 USV 面板
   |  NAMED_VALUE_FLOAT 载荷字段
   v
 数传电台 -> Pixhawk 6C / 定制 ArduRover
-  |  TELEM2, MAVLink2, 921600 bps
+  |  TELEM2, MAVLink2, 460800 bps
   v
 mavlink-routerd  (Jetson Nano)
   |-- UDP 127.0.0.1:14550 -> MAVROS
@@ -465,12 +465,14 @@ cd ~/usv_ws
 ./src/usv_ros/scripts/status_usv_all.sh
 ```
 
-默认 router 参数来自 `scripts/common_env.sh`：
+开机服务与 `usvon`、`usvrestart` 从 `scripts/common_env.sh` 读取同一套 router 默认值。
+飞控 TELEM2 使用 MAVLink2（`SERIAL2_PROTOCOL=2`），飞控参数 `SERIAL2_BAUD=460` 对应 Jetson 的 `460800`。改飞控参数后需保存、重启飞控并回读。
 
 | 环境变量 | 默认值 | 说明 |
 |---|---|---|
 | `FCU_UART_DEVICE` | `/dev/ttyTHS1` | Jetson 接 Pixhawk TELEM2 的串口 |
-| `FCU_UART_BAUD` | `921600` | 飞控 MAVLink 串口波特率 |
+| `FCU_UART_BAUD` | `460800` | 飞控 MAVLink 串口波特率 |
+| `MAVLINK_ROUTERD_BIN` | `mavlink-routerd` | router 可执行文件 |
 | `ROUTER_MAVROS_UDP` | `127.0.0.1:14550` | MAVROS UDP 端点 |
 | `ROUTER_BRIDGE_UDP` | `127.0.0.1:14551` | 预留 bridge UDP 端点 |
 | `ROUTER_TCP_PORT` | `5760` | bridge 默认 TCP 端点 |
@@ -480,8 +482,11 @@ cd ~/usv_ws
 
 ```bash
 cd ~/usv_ws
-FCU_UART_DEVICE=/dev/ttyUSB1 FCU_UART_BAUD=921600 ./src/usv_ros/scripts/start_usv_all.sh
+FCU_UART_DEVICE=/dev/ttyUSB1 ./src/usv_ros/scripts/start_usv_all.sh
 ```
+
+需长期覆盖时，把变量放在管理员维护的 `/etc/default/usv-ros-router`。启动脚本会读取此文件，文件中的赋值优先。
+已在 systemd drop-in 中指定路由修复版的船，可将 `MAVLINK_ROUTERD_BIN` 的同一绝对路径写入此文件，让手动重启也选用该版本。
 
 脚本也会透传 launch 参数：
 
@@ -626,8 +631,9 @@ ssh -N -L 5000:127.0.0.1:5000 jetson@<Jetson_IP>
 
 1. 默认跳过热点；`USV_ENABLE_HOTSPOT=true` 时创建/恢复热点。
 2. 以安装脚本调用者作为运行用户启动 `start_usv_all.sh`。
-3. 等待 Web、ROS 节点、MAVROS 和 bridge 诊断就绪；启用热点时额外等待热点就绪。
-4. 自检结果写入 `~/usv_ws/.usv_run/logs/boot_check.log`。
+3. 等待 ROS Master、router 监听以及本轮 Web 进程的 HTTP 接口就绪。
+4. 自检记录 ROS 节点、MAVROS 和 bridge 状态。MAVROS 未连接时，ROS 和 Web 继续运行，等待链路恢复。
+5. 自检结果写入 `~/usv_ws/.usv_run/logs/boot_check.log`。
 
 常用命令：
 
@@ -786,6 +792,10 @@ rosservice call /usv/pump_stop
 Web 后端是 `scripts/web_config_server.py`，默认监听 `0.0.0.0:5000`。它既提供前端静态文件，也提供
 REST API 和 Socket.IO 实时事件。
 
+采样记录、原始帧和导出文件走 HTTP，网页实时电压走 Socket.IO。可通过热点、局域网或 Jetson 的 USB 网络访问同一个 Web 服务。使用数传时，地面站可读取有效的电压和吸光度遥测以及载荷状态。采样数据中心仍使用设置中的 ROS Web 地址。
+
+首次启动会在后台为旧任务文件生成列表索引。构建期间，任务列表返回 HTTP 503 和重试提示。后续启动复用索引，任务文件变化时只重新读取变动的条目。
+
 自动化页面在修改全局配置、启动前准备、序列步骤或航点采样规则后自动保存；连续输入合并为一次写入，失败时显示重试入口。启动与导出前会等待保存完成。泵手动模式下点击网页启动，控制器先确认全部泵停止，再退出手动模式并进入准备流程。相对零点在设置页校准，自动化页显示泵组实时角度。
 
 监控页的参考基线固定取启动分光后 20 秒内的有效电压平均值，窗口结束后写入参考电压。
@@ -872,7 +882,7 @@ curl -X POST http://127.0.0.1:5000/api/hardware/apply \
 
 | 端点 | 默认值 | 用途 |
 |---|---|---|
-| Pixhawk UART | `/dev/ttyTHS1:921600` | Jetson 与飞控 TELEM2 物理链路 |
+| Pixhawk UART | `/dev/ttyTHS1:460800` | Jetson 与飞控 TELEM2 物理链路 |
 | MAVROS | `udp://127.0.0.1:14550@` | 状态、任务、模式切换 |
 | bridge | `tcp:127.0.0.1:5760` | 自定义遥测、命令、ACK |
 
@@ -1178,7 +1188,7 @@ curl http://127.0.0.1:5000/api/diagnostics/system
 | Web 串口测试失败 | `POST /api/hardware/test-pump-port` 返回的 `identity` / 错误信息 |
 | 分光无数据 | `/usv/spectrometer_status`、`ADSSTART`、I2C 映射、检测装置固件状态 |
 | 系统健康无数据 | `/usv/system_health`、`/usv/detector_health`、`/api/diagnostics/system` |
-| MAVROS 断开 | 飞控串口线序、`SERIAL2_PROTOCOL=2`、`SERIAL2_BAUD=921`、`mavlink_router.log` |
+| MAVROS 断开 | 飞控串口线序、`SERIAL2_PROTOCOL=2`、`SERIAL2_BAUD=460`、`mavlink_router.log` |
 | QGC 指令不到 ROS | `/usv/mavlink_cmd_rx`、router TCP 端点、QGC target sys/comp |
 | QGC 面板无遥测 | `/usv/bridge_diagnostics` 的 `tx_named_value`、定制 ArduPilot/QGC 是否匹配 |
 | stop 后担心误杀 | 当前脚本会校验 PID 命令行，只停止 `roscore`、`roslaunch`、`mavlink-router`、USV 相关 Python |

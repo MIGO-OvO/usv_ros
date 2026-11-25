@@ -10,21 +10,28 @@ RUN_DIR="$WS_DIR/.usv_run"
 LOG_DIR="$RUN_DIR/logs"
 ROUTER_PID_FILE="$RUN_DIR/mavlink_router.pid"
 ROUTER_LOG_FILE="$LOG_DIR/mavlink_router.log"
+
+# Site settings shared by systemd and the interactive commands.
+if [[ -r /etc/default/usv-ros-router ]]; then
+    # shellcheck disable=SC1091
+    source /etc/default/usv-ros-router
+fi
 MAVLINK_ROUTERD_BIN="${MAVLINK_ROUTERD_BIN:-mavlink-routerd}"
 FCU_UART_DEVICE="${FCU_UART_DEVICE:-/dev/ttyTHS1}"
-FCU_UART_BAUD="${FCU_UART_BAUD:-921600}"
+FCU_UART_BAUD="${FCU_UART_BAUD:-460800}"
 ROUTER_MAVROS_UDP="${ROUTER_MAVROS_UDP:-127.0.0.1:14550}"
 ROUTER_BRIDGE_UDP="${ROUTER_BRIDGE_UDP:-127.0.0.1:14551}"
 ROUTER_TCP_PORT="${ROUTER_TCP_PORT:-5760}"
 
 start_mavlink_router() {
     ensure_run_dirs
+    local router_pid
     if [[ -f "$ROUTER_PID_FILE" ]]; then
-        local old_pid
-        old_pid="$(cat "$ROUTER_PID_FILE")"
-        if is_pid_running "$old_pid"; then
-            log "mavlink-router 已在运行 (pid=$old_pid)"
-            return 0
+        router_pid="$(<"$ROUTER_PID_FILE")"
+        if is_pid_running "$router_pid" && is_pid_owned_by "$router_pid" "mavlink-router"; then
+            log "mavlink-router 已在运行 (pid=$router_pid)"
+            wait_for_router "$router_pid"
+            return
         fi
         rm -f "$ROUTER_PID_FILE"
     fi
@@ -32,11 +39,23 @@ start_mavlink_router() {
         log "缺少 mavlink-routerd，请先安装或设置 MAVLINK_ROUTERD_BIN"
         exit 1
     fi
-    cleanup_port_process "$ROUTER_TCP_PORT"
-    log "启动 mavlink-router: uart=$FCU_UART_DEVICE:$FCU_UART_BAUD tcp=$ROUTER_TCP_PORT udp=$ROUTER_MAVROS_UDP,$ROUTER_BRIDGE_UDP"
-    start_background_process "$ROUTER_PID_FILE" "$ROUTER_LOG_FILE" bash "$SCRIPT_DIR/mavlink-router-supervisor.sh" "$MAVLINK_ROUTERD_BIN" -e "$ROUTER_MAVROS_UDP" -e "$ROUTER_BRIDGE_UDP" "$FCU_UART_DEVICE:$FCU_UART_BAUD"
+    require_free_tcp_port "$ROUTER_TCP_PORT"
+    log "启动 mavlink-router: bin=$(command -v "$MAVLINK_ROUTERD_BIN") uart=$FCU_UART_DEVICE:$FCU_UART_BAUD tcp=$ROUTER_TCP_PORT udp=$ROUTER_MAVROS_UDP,$ROUTER_BRIDGE_UDP"
+    start_background_process "$ROUTER_PID_FILE" "$ROUTER_LOG_FILE" \
+        bash "$SCRIPT_DIR/mavlink-router-supervisor.sh" "$MAVLINK_ROUTERD_BIN" \
+        -t "$ROUTER_TCP_PORT" -e "$ROUTER_MAVROS_UDP" -e "$ROUTER_BRIDGE_UDP" "$FCU_UART_DEVICE:$FCU_UART_BAUD"
+    wait_for_router "$(<"$ROUTER_PID_FILE")"
 }
 
+wait_for_router() {
+    if [[ "$ROUTER_TCP_PORT" == 0 ]]; then
+        return
+    fi
+    if ! wait_until 10 listener_belongs_to "$ROUTER_TCP_PORT" "$1"; then
+        log "mavlink-router 未在 TCP $ROUTER_TCP_PORT 监听，查看 $ROUTER_LOG_FILE"
+        return 1
+    fi
+}
 
 log() {
     echo "[usv-startup] $*"
@@ -54,6 +73,44 @@ ensure_file() {
 
 ensure_run_dirs() {
     mkdir -p "$RUN_DIR" "$LOG_DIR"
+}
+
+lock_runtime() {
+    if [[ "${USV_RUNTIME_LOCKED:-}" != 1 ]]; then
+        ensure_run_dirs
+        exec flock --close --timeout 60 "$RUN_DIR/lifecycle.lock" \
+            env USV_RUNTIME_LOCKED=1 bash "$0" "$@"
+    fi
+}
+
+wait_until() {
+    local deadline=$((SECONDS + $1))
+    shift
+    until "$@"; do
+        (( SECONDS < deadline )) || return 1
+        sleep 1
+    done
+}
+
+require_free_tcp_port() {
+    local port="$1" listeners
+    [[ "$port" != 0 ]] || return 0
+    listeners="$(ss -H -ltnp "sport = :$port")"
+    if [[ -n "$listeners" ]]; then
+        log "TCP $port 已被占用"
+        printf '%s\n' "$listeners" >&2
+        return 1
+    fi
+}
+
+listener_belongs_to() {
+    local port="$1" parent="$2" listeners pid
+    listeners="$(ss -H -ltnp "sport = :$port")" || return 1
+    [[ -n "$listeners" ]] || return 1
+    for pid in "$parent" $(ps -o pid= --ppid "$parent"); do
+        [[ "$listeners" == *"pid=$pid,"* ]] && return 0
+    done
+    return 1
 }
 
 load_ros_env() {
@@ -88,8 +145,14 @@ print_workspace_info() {
 }
 
 is_pid_running() {
-    local pid="$1"
-    [[ -n "$pid" ]] && kill -0 "$pid" >/dev/null 2>&1
+    local pid="$1" state
+    [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+    state="$(ps -o stat= -p "$pid")" || return 1
+    [[ -n "$state" && "$state" != Z* ]]
+}
+
+pid_has_exited() {
+    ! is_pid_running "$1"
 }
 
 # 校验 PID 对应的进程命令行是否包含预期关键字
@@ -106,6 +169,7 @@ is_pid_owned_by() {
 stop_pid_file() {
     local pid_file="$1"
     local process_name="$2"
+    local shutdown_timeout="${3:-25}"
 
     if [[ ! -f "$pid_file" ]]; then
         return 0
@@ -121,51 +185,44 @@ stop_pid_file() {
             return 0
         fi
         log "停止 $process_name (pid=$pid)"
-        kill "$pid"
-        for _ in {1..20}; do
-            if ! is_pid_running "$pid"; then
-                break
-            fi
-            sleep 0.5
-        done
-        if is_pid_running "$pid"; then
-            log "$process_name 未在超时内退出，执行强制停止"
-            kill -9 "$pid"
+        kill -TERM "$pid" 2>/dev/null || pid_has_exited "$pid"
+        if ! wait_until "$shutdown_timeout" pid_has_exited "$pid"; then
+            log "$process_name 尚未退出 (pid=$pid)，请查看 $LOG_DIR 后重试"
+            return 1
         fi
     fi
 
     rm -f "$pid_file"
 }
 
-cleanup_port_process() {
-    local port="$1"
+is_orphaned_web() {
+    local pid="$1" arg
+    local -a args
+    [[ "$(ps -o ppid= -p "$pid" | tr -d ' ')" == 1 ]] || return 1
+    mapfile -d '' -t args 2>/dev/null < "/proc/$pid/cmdline" || return 1
+    for arg in "${args[@]}"; do
+        case "$arg" in
+            "$SCRIPT_DIR/web_config_server.py"|"$WS_DIR/devel/lib/usv_ros/web_config_server.py"|"$WS_DIR/install/lib/usv_ros/web_config_server.py")
+                [[ " ${args[*]} " == *" __name:=web_config_server "* ]]
+                return
+                ;;
+        esac
+    done
+    return 1
+}
 
-    if command -v lsof >/dev/null 2>&1; then
-        local pids
-        pids="$(lsof -ti tcp:"$port" 2>/dev/null || true)"
-        if [[ -n "$pids" ]]; then
-            # 安全过滤：只杀 USV 相关进程（python/roslaunch/roscore/mavlink），不误杀 ssh/vscode
-            local safe_pids=()
-            for pid in $pids; do
-                if is_pid_owned_by "$pid" "python\|roslaunch\|roscore\|mavlink"; then
-                    safe_pids+=("$pid")
-                else
-                    log "跳过端口 $port 上的非 USV 进程 pid=$pid"
-                fi
-            done
-            if [[ ${#safe_pids[@]} -gt 0 ]]; then
-                log "清理占用端口 $port 的 USV 进程: ${safe_pids[*]}"
-                kill "${safe_pids[@]}" >/dev/null 2>&1 || true
-                sleep 1
-                for pid in "${safe_pids[@]}"; do
-                    if is_pid_running "$pid"; then
-                        log "端口 $port 进程未退出，强制停止 pid=$pid"
-                        kill -9 "$pid" >/dev/null 2>&1 || true
-                    fi
-                done
-            fi
+stop_orphaned_web() {
+    local pid
+    while read -r pid; do
+        is_orphaned_web "$pid" || continue
+        log "停止旧 roslaunch 遗留的 Web 节点 (pid=$pid)"
+        kill -TERM "$pid" 2>/dev/null || pid_has_exited "$pid"
+        if ! wait_until 3 pid_has_exited "$pid"; then
+            is_orphaned_web "$pid" || continue
+            kill -KILL "$pid" 2>/dev/null || pid_has_exited "$pid"
+            wait_until 3 pid_has_exited "$pid" || return 1
         fi
-    fi
+    done < <(pgrep -u "$(id -u)" -P 1 -f '[w]eb_config_server\.py' || true)
 }
 
 start_background_process() {
@@ -185,7 +242,7 @@ start_background_process() {
     fi
 
     log "后台启动: $*"
-    nohup "$@" >>"$log_file" 2>&1 &
+    env -u USV_RUNTIME_LOCKED nohup "$@" </dev/null >>"$log_file" 2>&1 &
     local bg_pid=$!
     echo "$bg_pid" > "$pid_file"
     log "已启动 pid=$bg_pid, log=$log_file"

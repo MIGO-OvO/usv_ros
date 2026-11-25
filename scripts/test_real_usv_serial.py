@@ -9,7 +9,7 @@ NAMED_VALUE_FLOAT，验证 Jetson/Nano -> FCU -> telemetry radio -> QGC 是否�
 
 用法示例：
   python3 src/usv_ros/scripts/test_real_usv_serial.py
-  python3 src/usv_ros/scripts/test_real_usv_serial.py --device /dev/ttyTHS1 --baud 921600
+  python3 src/usv_ros/scripts/test_real_usv_serial.py --device /dev/ttyTHS1 --baud 460800
   python3 src/usv_ros/scripts/test_real_usv_serial.py --sysid 1 --compid 0 --rate 2
 """
 
@@ -22,7 +22,7 @@ import time
 from pymavlink import mavutil
 
 DEFAULT_DEVICE = "/dev/ttyTHS1"
-DEFAULT_BAUD = 921600
+DEFAULT_BAUD = 460800
 DEFAULT_RATE_HZ = 2.0
 DEFAULT_SYSID = 1
 DEFAULT_COMPID = 0

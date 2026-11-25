@@ -1,11 +1,15 @@
 import copy
 import json
 import os
+import socket
 import tempfile
+import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest import mock
+from urllib.error import HTTPError
+from urllib.request import urlopen
 
 from scripts.lib.sample_recording.downsampling import MinMaxSeries
 from scripts.lib.sample_recording.storage import SampleRecordingStorage
@@ -121,6 +125,25 @@ class HistoryCacheTest(unittest.TestCase):
         self.assertEqual(full["data_points"][-1], overview["data_points"][-1])
 
 
+    def test_closed_history_is_not_reparsed_at_boot_or_after_one_file_changes(self):
+        paths = [self.path, self.path.with_name("mission_other.json")]
+        for path in paths:
+            mission_id = path.stem[len("mission_"):]
+            path.write_text(json.dumps(fixture(mission_id), indent=2), encoding="utf-8")
+        original = self.manager.list_missions()
+        with mock.patch("scripts.web_config_server.json.load", wraps=json.load) as load:
+            restarted = MissionDataManager(self.tmp.name)
+            self.assertEqual(original, restarted.list_missions())
+            self.assertTrue(all(Path(call.args[0].name) not in paths for call in load.call_args_list))
+            paths[1].write_text(json.dumps(fixture("other", 2), indent=2), encoding="utf-8")
+            self.assertEqual({"history": 10000, "other": 2}, {
+                item["id"]: item["point_count"] for item in restarted.list_missions()
+            })
+            reads = [Path(call.args[0].name) for call in load.call_args_list]
+            self.assertNotIn(paths[0], reads)
+            self.assertEqual(1, reads.count(paths[1]))
+
+
 class SinglePassSeriesTest(unittest.TestCase):
     def test_single_scan_filter_endpoints_peaks_and_protocol(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -168,6 +191,47 @@ class SinglePassSeriesTest(unittest.TestCase):
 
 @unittest.skipUnless(FLASK_AVAILABLE, "Flask unavailable")
 class HistoryApiTest(unittest.TestCase):
+    def test_web_responds_during_index_build_and_releases_port_on_ros_shutdown(self):
+        from werkzeug.serving import make_server
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"USV_MISSION_DATA_DIR": tmp}):
+            app = WebConfigServer(standalone=True)
+            app.host, app.port = "127.0.0.1", 0
+            bound = threading.Event()
+            shutdown = threading.Event()
+            index_ready = threading.Event()
+            http_server = None
+
+            def bind(*args, **kwargs):
+                nonlocal http_server
+                http_server = make_server(*args, **kwargs)
+                bound.set()
+                return http_server
+
+            with mock.patch("scripts.web_config_server.make_server", side_effect=bind), \
+                    mock.patch("scripts.web_config_server.rospy.is_shutdown", side_effect=shutdown.is_set), \
+                    mock.patch.object(app.data_manager, "list_missions", side_effect=index_ready.wait):
+                worker = threading.Thread(target=app.run, daemon=True)
+                worker.start()
+                try:
+                    self.assertTrue(bound.wait(3))
+                    base = f"http://127.0.0.1:{http_server.server_port}"
+                    with urlopen(base + "/socket.io/?EIO=4&transport=polling", timeout=2) as result:
+                        self.assertTrue(result.read().startswith(b'0{"sid"'))
+                    with self.assertRaises(HTTPError) as error:
+                        urlopen(base + "/api/data/missions", timeout=2)
+                    self.addCleanup(error.exception.close)
+                    self.assertEqual(error.exception.code, 503)
+                    with urlopen(base + "/api/data/voltage", timeout=2) as result:
+                        self.assertTrue(json.load(result)["success"])
+                finally:
+                    index_ready.set()
+                    shutdown.set()
+                    worker.join(3)
+                self.assertFalse(worker.is_alive())
+                with socket.socket() as probe:
+                    self.assertNotEqual(probe.connect_ex(("127.0.0.1", http_server.server_port)), 0)
+
     def test_manual_save_does_not_detach_running_sample_window(self):
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, {"USV_MISSION_DATA_DIR": tmp}):
             server = WebConfigServer(standalone=True)

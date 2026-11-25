@@ -47,7 +47,7 @@ pip3 install pyserial flask flask-cors flask-socketio eventlet
 | 项 | 期望值 | 检查命令/位置 |
 |---|---|---|
 | ESP32 泵控串口 | `/dev/ttyUSB0` 或现场配置值 | `ls /dev/ttyUSB*` |
-| Pixhawk TELEM2 | Jetson `/dev/ttyTHS1:921600` | 飞控参数 + 物理接线 |
+| Pixhawk TELEM2 | Jetson `/dev/ttyTHS1:460800` | 飞控参数 + 物理接线 |
 | MAVROS | `/mavros/state connected: True` | `rostopic echo -n 1 /mavros/state` |
 | Web UI | `static/dist/index.html` 或 `static/index.html` | `curl http://127.0.0.1:5000/api/ui/debug` |
 | Wi-Fi AP | `wlan1` 支持 AP 模式和 5 GHz | `nmcli dev wifi list ifname wlan1` |
@@ -111,7 +111,7 @@ ssh -N -L 5000:127.0.0.1:5000 jetson@<Jetson_IP>
 | `HOTSPOT_ALLOW_INTERNET_IFACE` | `false` | 是否允许热点复用当前默认路由网卡；双网卡部署保持默认 |
 | `WEB_PORT` | `5000` | Web 服务端口 |
 | `USV_BOOT_WAIT_SECONDS` | `90` | 热点/Web 等待超时 |
-| `USV_STRICT_SELF_CHECK` | `true` | 严格自检，要求 ROS 节点和 MAVROS 均正常 |
+| `USV_STRICT_SELF_CHECK` | `true` | 要求预期 ROS 节点已注册。MAVROS 连接状态由自检单独报告 |
 
 无 Pixhawk、台架无飞控、只想验证热点/Web 时，先放宽严格自检：
 
@@ -397,7 +397,7 @@ ip route show default
 | 项 | 期望值 |
 |---|---|
 | `SERIAL2_PROTOCOL` | `2`，MAVLink2 |
-| `SERIAL2_BAUD` | `921`，921600 bps |
+| `SERIAL2_BAUD` | `460`，460800 bps |
 | `SYSID_THISMAV` | `1` |
 | Jetson 串口 | `/dev/ttyTHS1` 接飞控 `TELEM2` |
 | 串口占用 | `mavlink-routerd` 独占，MAVROS 走 UDP `127.0.0.1:14550` |

@@ -74,7 +74,7 @@ QGroundControl / custom USV panel
   |  NAMED_VALUE_FLOAT payload fields
   v
 Telemetry radio -> Pixhawk 6C / custom ArduRover
-  |  TELEM2, MAVLink2, 921600 bps
+  |  TELEM2, MAVLink2, 460800 bps
   v
 mavlink-routerd  (Jetson Nano)
   |-- UDP 127.0.0.1:14550 -> MAVROS
@@ -234,7 +234,8 @@ Default router settings come from `scripts/common_env.sh`:
 | Environment Variable | Default | Purpose |
 |---|---|---|
 | `FCU_UART_DEVICE` | `/dev/ttyTHS1` | Jetson serial port connected to Pixhawk TELEM2 |
-| `FCU_UART_BAUD` | `921600` | Flight-controller MAVLink serial baud rate |
+| `FCU_UART_BAUD` | `460800` | Flight-controller MAVLink serial baud rate (`SERIAL2_BAUD=460`) |
+| `MAVLINK_ROUTERD_BIN` | `mavlink-routerd` | Router executable |
 | `ROUTER_MAVROS_UDP` | `127.0.0.1:14550` | MAVROS UDP endpoint |
 | `ROUTER_BRIDGE_UDP` | `127.0.0.1:14551` | Reserved bridge UDP endpoint |
 | `ROUTER_TCP_PORT` | `5760` | Default bridge TCP endpoint |
@@ -244,8 +245,10 @@ Override the flight-controller serial port if the field wiring differs:
 
 ```bash
 cd ~/usv_ws
-FCU_UART_DEVICE=/dev/ttyUSB1 FCU_UART_BAUD=921600 ./src/usv_ros/scripts/start_usv_all.sh
+FCU_UART_DEVICE=/dev/ttyUSB1 ./src/usv_ros/scripts/start_usv_all.sh
 ```
+
+Put site-specific router settings in `/etc/default/usv-ros-router`. Both the boot service and the interactive scripts read this file. Use the same absolute executable path as the systemd drop-in if the vessel has a custom router build.
 
 Launch arguments are forwarded:
 
@@ -383,9 +386,9 @@ Open `http://127.0.0.1:5000` in the browser. If local port 5000 is already in us
 
 Service startup sequence:
 
-1. Create or restore the hotspot by default; skip it when `USV_ENABLE_HOTSPOT=false`.
+1. Create or restore the hotspot when `USV_ENABLE_HOTSPOT=true`.
 2. Start `start_usv_all.sh` as the user that ran the installer.
-3. Wait for Web, ROS nodes, MAVROS, and bridge diagnostics; when enabled, also wait for hotspot readiness.
+3. Wait for the ROS master, router, and the new Web process to be ready. ROS and Web stay up while a disconnected MAVROS link recovers.
 4. Write self-check output to `~/usv_ws/.usv_run/logs/boot_check.log`.
 
 Common commands:
@@ -566,7 +569,7 @@ curl -X POST http://127.0.0.1:5000/api/hardware/apply \
 
 | Endpoint | Default | Purpose |
 |---|---|---|
-| Pixhawk UART | `/dev/ttyTHS1:921600` | Physical Jetson to Pixhawk TELEM2 link |
+| Pixhawk UART | `/dev/ttyTHS1:460800` | Physical Jetson to Pixhawk TELEM2 link |
 | MAVROS | `udp://127.0.0.1:14550@` | State, mission, and mode services |
 | Bridge | `tcp:127.0.0.1:5760` | Custom telemetry, commands, and ACKs |
 
@@ -753,7 +756,7 @@ More field test procedures are documented in [TESTING.md](TESTING.md).
 | Pump node fails to start | Serial path, permissions, ESP32 power, and `DET_ID:USV_DETECTOR` handshake |
 | Web serial test fails | `POST /api/hardware/test-pump-port` identity or error response |
 | No spectrometer data | `/usv/spectrometer_status`, `ADSSTART`, I2C mapping, and detector firmware state |
-| MAVROS disconnected | Flight-controller serial wiring, `SERIAL2_PROTOCOL=2`, `SERIAL2_BAUD=921`, and `mavlink_router.log` |
+| MAVROS disconnected | Flight-controller serial wiring, `SERIAL2_PROTOCOL=2`, `SERIAL2_BAUD=460`, and `mavlink_router.log` |
 | QGC command does not reach ROS | `/usv/mavlink_cmd_rx`, router TCP endpoint, and QGC target sys/comp |
 | QGC panel shows no telemetry | `/usv/bridge_diagnostics` `tx_named_value`, and matching custom ArduPilot/QGC builds |
 | Concern about stop script killing unrelated processes | The scripts verify PID command lines and only stop `roscore`, `roslaunch`, `mavlink-router`, and USV-related Python processes |

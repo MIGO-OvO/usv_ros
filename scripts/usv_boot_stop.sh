@@ -48,12 +48,12 @@ main() {
     prepare_boot_log
     log_boot "boot stop"
 
-    run_as_usv_user "$SCRIPT_DIR/stop_usv_all.sh" | tee -a "$BOOT_CHECK_LOG_FILE" || true
+    run_as_usv_user bash "$SCRIPT_DIR/stop_usv_all.sh" | tee -a "$BOOT_CHECK_LOG_FILE"
 
     if ! is_hotspot_enabled; then
         log_boot "skip hotspot stop: disabled"
     elif [[ "$(id -u)" -eq 0 ]]; then
-        "$SCRIPT_DIR/stop_hotspot.sh" | tee -a "$BOOT_CHECK_LOG_FILE" || true
+        bash "$SCRIPT_DIR/stop_hotspot.sh" | tee -a "$BOOT_CHECK_LOG_FILE" || true
     else
         log_boot "skip hotspot stop: root required"
     fi

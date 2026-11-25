@@ -64,11 +64,11 @@ class BootServiceScriptTests(unittest.TestCase):
         self.assertLess(ros_index, check_index)
         self.assertIn("boot_check.log", text)
         self.assertIn("wait_for_hotspot", text)
-        self.assertIn("wait_for_web", text)
+        self.assertIn('run_as_usv_user bash "$SCRIPT_DIR/start_usv_all.sh"', text)
         self.assertIn("run_as_usv_user", text)
         self.assertIn("require_command nmcli", text)
         self.assertIn("require_command ip", text)
-        self.assertIn("require_command mavlink-routerd", text)
+        self.assertIn('require_command "$MAVLINK_ROUTERD_BIN"', text)
 
     def test_boot_start_can_skip_hotspot_when_disabled(self):
         text = self._read_script("usv_boot_start.sh")

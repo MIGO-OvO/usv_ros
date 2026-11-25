@@ -11,5 +11,5 @@ start_mavlink_router
 print_workspace_info
 
 log "启动 usv_ros 主系统 (router 已就绪)"
-exec roslaunch usv_ros usv_bringup.launch "$@"
+exec roslaunch usv_ros usv_bringup.launch "mavlink_router_url:=tcp:127.0.0.1:$ROUTER_TCP_PORT" "$@"
 

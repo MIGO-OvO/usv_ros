@@ -69,12 +69,13 @@ run_as_usv_user() {
         "HOTSPOT_BAND=$HOTSPOT_BAND"
         "HOTSPOT_CHANNEL=$HOTSPOT_CHANNEL"
         "HOTSPOT_ALLOW_INTERNET_IFACE=$HOTSPOT_ALLOW_INTERNET_IFACE"
-        "MAVLINK_ROUTERD_BIN=${MAVLINK_ROUTERD_BIN:-mavlink-routerd}"
-        "FCU_UART_DEVICE=${FCU_UART_DEVICE:-/dev/ttyTHS1}"
-        "FCU_UART_BAUD=${FCU_UART_BAUD:-921600}"
-        "ROUTER_MAVROS_UDP=${ROUTER_MAVROS_UDP:-127.0.0.1:14550}"
-        "ROUTER_BRIDGE_UDP=${ROUTER_BRIDGE_UDP:-127.0.0.1:14551}"
-        "ROUTER_TCP_PORT=${ROUTER_TCP_PORT:-5760}"
+        "USV_BOOT_WAIT_SECONDS=$USV_BOOT_WAIT_SECONDS"
+        "MAVLINK_ROUTERD_BIN=$MAVLINK_ROUTERD_BIN"
+        "FCU_UART_DEVICE=$FCU_UART_DEVICE"
+        "FCU_UART_BAUD=$FCU_UART_BAUD"
+        "ROUTER_MAVROS_UDP=$ROUTER_MAVROS_UDP"
+        "ROUTER_BRIDGE_UDP=$ROUTER_BRIDGE_UDP"
+        "ROUTER_TCP_PORT=$ROUTER_TCP_PORT"
     )
 
     if [[ "$(id -u)" -eq 0 && "$USV_RUN_USER" != "root" ]]; then
@@ -152,26 +153,9 @@ wait_for_hotspot() {
     return 1
 }
 
-wait_for_web() {
-    log_boot "wait web port=$WEB_PORT"
-    for _ in $(seq 1 "$USV_BOOT_WAIT_SECONDS"); do
-        if command -v ss >/dev/null 2>&1 && ss -ltn 2>/dev/null | grep -Eq "[.:]${WEB_PORT}[[:space:]]"; then
-            log_boot "web port listening"
-            return 0
-        fi
-        if command -v curl >/dev/null 2>&1 && curl -fsS "http://127.0.0.1:${WEB_PORT}/api/ui/debug" >/dev/null 2>&1; then
-            log_boot "web api ready"
-            return 0
-        fi
-        sleep 1
-    done
-    log_boot "ERROR: web port not ready"
-    return 1
-}
-
 append_status_snapshot() {
     log_boot "status snapshot begin"
-    run_as_usv_user "$SCRIPT_DIR/status_usv_all.sh" | tee -a "$BOOT_CHECK_LOG_FILE"
+    run_as_usv_user bash "$SCRIPT_DIR/status_usv_all.sh" | tee -a "$BOOT_CHECK_LOG_FILE"
     log_boot "status snapshot end"
 }
 
@@ -195,9 +179,11 @@ run_self_check() {
 
     if [[ "$USV_STRICT_SELF_CHECK" == "true" ]]; then
         require_status_line "ros_nodes: ALL_OK" "ROS nodes"
-        require_status_line "mavros_link: CONNECTED" "MAVROS link"
     else
-        log_boot "strict self-check disabled; ROS node and MAVROS diagnostics are informational"
+        log_boot "strict self-check disabled; ROS node check is informational"
+    fi
+    if ! grep -Fq "mavros_link: CONNECTED" "$BOOT_CHECK_LOG_FILE"; then
+        log_boot "MAVROS 尚未连通，保留 ROS 和 Web 等待链路恢复"
     fi
 }
 
@@ -214,10 +200,10 @@ cleanup_on_error() {
     local exit_code=$?
     log_boot "ERROR: boot start failed, cleanup begin (exit=$exit_code)"
     if [[ "$STARTED_ROS" == "true" ]]; then
-        run_as_usv_user "$SCRIPT_DIR/stop_usv_all.sh" | tee -a "$BOOT_CHECK_LOG_FILE" || true
+        run_as_usv_user bash "$SCRIPT_DIR/stop_usv_all.sh" | tee -a "$BOOT_CHECK_LOG_FILE" || true
     fi
     if [[ "$HOTSPOT_ATTEMPTED" == "true" ]]; then
-        "$SCRIPT_DIR/stop_hotspot.sh" | tee -a "$BOOT_CHECK_LOG_FILE" || true
+        bash "$SCRIPT_DIR/stop_hotspot.sh" | tee -a "$BOOT_CHECK_LOG_FILE" || true
     fi
     log_boot "ERROR: boot start failed, cleanup end"
     exit "$exit_code"
@@ -237,21 +223,20 @@ main() {
         require_command ip
     fi
     require_command runuser
-    require_command mavlink-routerd
+    require_command "$MAVLINK_ROUTERD_BIN"
 
     configure_internet_wifi_band
 
     if is_hotspot_enabled; then
         HOTSPOT_ATTEMPTED="true"
-        "$SCRIPT_DIR/setup_hotspot.sh" "$USV_HOTSPOT_SSID" "$USV_HOTSPOT_PASSWORD" | tee -a "$BOOT_CHECK_LOG_FILE"
+        bash "$SCRIPT_DIR/setup_hotspot.sh" "$USV_HOTSPOT_SSID" "$USV_HOTSPOT_PASSWORD" | tee -a "$BOOT_CHECK_LOG_FILE"
         wait_for_hotspot
     else
         log_boot "skip hotspot setup: disabled"
     fi
 
-    run_as_usv_user "$SCRIPT_DIR/start_usv_all.sh"
+    run_as_usv_user bash "$SCRIPT_DIR/start_usv_all.sh"
     STARTED_ROS="true"
-    wait_for_web
     run_self_check
 
     log_boot "boot start complete"
