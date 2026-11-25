@@ -3891,17 +3891,23 @@ class WebConfigServer(object):
         return output.getvalue()
 
     @staticmethod
-    def _raw_csv_columns(include_sample_id=False):
+    def _raw_csv_columns(sample_id_first=False):
         columns = [
             "frame_index", "received_at", "received_at_ms", "source_timestamp_ms",
             "timestamp_ms", "seq", "tca_channel", "voltage", "absorbance",
             "raw_code", "valid", "status", "i2c_error", "not_configured", "saturated",
         ]
-        return (["sample_id"] + columns) if include_sample_id else columns
+        sample_columns = [
+            "mission_id", "sample_name", "sample_started_at", "wgs84_lat", "wgs84_lng",
+            "position_source", "simulated", "sample_outcome",
+        ]
+        if sample_id_first:
+            return ["sample_id"] + columns + sample_columns
+        return columns + ["sample_id"] + sample_columns
 
     @staticmethod
-    def _raw_csv_row(frame, frame_index, sample_id=None):
-        row = [
+    def _raw_csv_row(frame, frame_index):
+        return [
             frame_index,
             frame.get("received_at"),
             frame.get("received_at_ms"),
@@ -3918,34 +3924,46 @@ class WebConfigServer(object):
             frame.get("not_configured"),
             frame.get("saturated"),
         ]
-        return ([sample_id] + row) if sample_id is not None else row
 
-    def _iter_raw_csv_chunks(self, mission_id, sample_id):
+    @staticmethod
+    def _raw_csv_sample_values(mission_id, window):
+        start = window.get("gps_start")
+        start = start if isinstance(start, dict) else {}
+        lat = finite(window.get("latitude", start.get("lat")))
+        lng = finite(window.get("longitude", start.get("lng")))
+        if lat is None or lng is None or not (-90 <= lat <= 90 and -180 <= lng <= 180):
+            lat = lng = None
+        source = window.get("position_source") or start.get("position_source")
+        return [
+            mission_id, window.get("sample_name"), window.get("start_time") or window.get("timestamp_start"), lat, lng,
+            source, bool(window.get("simulated")) or source == "lab_sim",
+            window.get("outcome") or ("running" if window.get("state") == "open" else "unknown"),
+        ]
+
+    def _iter_raw_csv_chunks(self, mission_id, windows, sample_id_first=False):
         output = io.StringIO()
         writer = csv.writer(output)
-        writer.writerow(self._raw_csv_columns())
+        writer.writerow(self._raw_csv_columns(sample_id_first))
         yield output.getvalue()
-        for index, frame in enumerate(self.sample_storage.iter_raw_frames(mission_id, sample_id)):
-            output.seek(0)
-            output.truncate(0)
-            writer.writerow(self._raw_csv_row(frame, index))
-            yield output.getvalue()
-
-    def _iter_mission_raw_csv_chunks(self, data):
-        mission_id = safe_id(data.get("mission_id"), "mission")
-        output = io.StringIO()
-        writer = csv.writer(output)
-        writer.writerow(self._raw_csv_columns(include_sample_id=True))
-        yield output.getvalue()
-        for window in self.sample_storage.list_windows(data):
+        for window in windows:
             sample_id = safe_id(window.get("sample_id"), "sample")
             if sample_id != str(window.get("sample_id")):
                 continue
+            sample_values = self._raw_csv_sample_values(mission_id, window)
             for index, frame in enumerate(self.sample_storage.iter_raw_frames(mission_id, sample_id)):
                 output.seek(0)
                 output.truncate(0)
-                writer.writerow(self._raw_csv_row(frame, index, sample_id=sample_id))
+                row = self._raw_csv_row(frame, index)
+                row = [sample_id] + row if sample_id_first else row + [sample_id]
+                writer.writerow(row + sample_values)
                 yield output.getvalue()
+
+    def _iter_mission_raw_csv_chunks(self, data):
+        return self._iter_raw_csv_chunks(
+            safe_id(data.get("mission_id"), "mission"),
+            self.sample_storage.list_windows(data),
+            sample_id_first=True,
+        )
 
     def _build_mission_archive(self, data):
         mission_id = safe_id(data.get("mission_id"), "mission")
@@ -3983,7 +4001,7 @@ class WebConfigServer(object):
                         if os.path.isfile(raw_path):
                             archive.write(raw_path, root + "/raw/%s.jsonl" % stem)
                     with archive.open(root + "/raw_csv/%s.csv" % stem, "w") as csv_file:
-                        for chunk in self._iter_raw_csv_chunks(mission_id, sample_id):
+                        for chunk in self._iter_raw_csv_chunks(mission_id, [window]):
                             csv_file.write(chunk.encode("utf-8"))
             archive_file.seek(0)
             return archive_file
@@ -5802,7 +5820,7 @@ class WebConfigServer(object):
                 return jsonify({"success": False, "error": "采样窗口不存在"}), 404
 
             return Response(
-                self._iter_raw_csv_chunks(mission_id, sample_id),
+                self._iter_raw_csv_chunks(mission_id, [window]),
                 mimetype="text/csv",
                 headers={"Content-Disposition": attachment_header((window.get('file_stem') or sample_id) + '.csv')},
             )

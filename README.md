@@ -1068,7 +1068,9 @@ Web 的 `POST /api/hardware/test-pump-port` 使用同一握手逻辑，不能只
 | `~/usv_ws/data/missions/mission_*.json` | 任务采样数据和 `sample_windows[]` 摘要 |
 | `~/usv_ws/data/missions/raw/<mission_id>/<sample_id>.jsonl` | 采样窗口原始分光帧，一行一帧 |
 
-原始分光帧独立于地图/前端摘要写入，配置和运行时上行频率均强制不低于 20 Hz；前端图表可按需降采样，但应从数据中心的“高频原始分光 CSV”下载完整帧。
+原始分光帧独立于地图和前端摘要写入。配置和运行时上行频率均强制不低于 20 Hz，完整帧可在数据中心下载“高频原始分光 CSV”。
+
+全任务和单采样窗口的原始分光 CSV 都随帧导出 `sample_id`、`mission_id`、`sample_name`、`sample_started_at`、`wgs84_lat`、`wgs84_lng`、`position_source`、`simulated` 和 `sample_outcome`。经纬度取采样开始时保存的 WGS84 定位，缺失时留空。全任务文件可以按 `sample_id` 分析各采样窗口。任务 ZIP 中的原始 CSV 使用同一格式。
 
 `web_config_server` 默认使用上述任务目录，也可通过 roslaunch 参数
 `data_dir:=/absolute/path/to/missions` 显式覆盖；直接运行 Web 节点或独立模式时也可使用

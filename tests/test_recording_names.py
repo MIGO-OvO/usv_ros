@@ -1,6 +1,7 @@
 """Named acquisition through the production lifecycle, storage and export APIs."""
-import io
 import copy
+import csv
+import io
 import json
 import os
 import struct
@@ -44,6 +45,53 @@ class RecordingNameApiTests(unittest.TestCase):
         self.addCleanup(self.server.sample_storage.close)
         self.server.config_manager = ConfigManager(os.path.join(self.tmp.name, 'config', 'config.json'))
         self.client = self.server.app.test_client()
+
+    def test_raw_csv_uses_each_sample_start_in_window_mission_and_zip(self):
+        manager = self.server.data_manager
+        storage = self.server.sample_storage
+        manager.start_mission('湖心测绘')
+        mission = manager.current_mission_data
+        mission_id = mission['mission_id']
+        starts = [
+            {'lat': 25.1, 'lng': 110.2, 'position_source': 'gps'},
+            {'position_source': 'web_no_gps'},
+        ]
+        for index, snapshot in enumerate(starts):
+            window = storage.start_window(mission, {
+                'record_id': 'record-%d' % index,
+                'sample_name': '采样-%d' % index,
+                'gps_snapshot': snapshot,
+            })
+            storage.append_raw_frame(window, {'voltage': 1.25, 'timestamp_ms': 42, 'valid': True})
+            window['outcome'] = 'succeeded'
+            storage.close_window(mission, window, {'lat': 26.3, 'lng': 111.4})
+        manager.stop_mission()
+
+        base = '/api/data/mission/' + mission_id
+        task = self.client.get(base + '/raw.csv')
+        self.assertEqual(task.status_code, 200)
+        rows = list(csv.DictReader(io.StringIO(task.get_data(as_text=True))))
+        self.assertEqual([row['sample_id'] for row in rows], ['record-0', 'record-1'])
+        self.assertEqual([(row['wgs84_lat'], row['wgs84_lng']) for row in rows], [('25.1', '110.2'), ('', '')])
+        self.assertEqual([row['position_source'] for row in rows], ['gps', 'web_no_gps'])
+        self.assertEqual(rows[0]['mission_id'], mission_id)
+        self.assertEqual(rows[0]['sample_name'], '采样-0')
+        self.assertEqual(rows[0]['sample_started_at'], mission['sample_windows'][0]['start_time'])
+        self.assertEqual(rows[0]['sample_outcome'], 'succeeded')
+        self.assertEqual(rows[0]['timestamp_ms'], '42')
+
+        raw = self.client.get(base + '/sample/record-0/raw.csv')
+        self.assertEqual(raw.status_code, 200)
+        self.assertEqual(list(csv.DictReader(io.StringIO(raw.get_data(as_text=True)))), rows[:1])
+        archive = self.client.get(base + '/archive')
+        self.addCleanup(archive.close)
+        self.assertEqual(archive.status_code, 200)
+        with zipfile.ZipFile(io.BytesIO(archive.get_data())) as zipped:
+            stacked = next(name for name in zipped.namelist() if name.endswith('/raw.csv'))
+            single = next(name for name in zipped.namelist() if name.endswith(
+                '/raw_csv/' + mission['sample_windows'][0]['file_stem'] + '.csv'))
+            self.assertEqual(zipped.read(stacked), task.get_data())
+            self.assertEqual(zipped.read(single), raw.get_data())
 
     def test_prepared_tokens_are_immutable_float32_exact_and_persisted(self):
         def prepare(index):
