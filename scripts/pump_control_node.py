@@ -3487,11 +3487,23 @@ class PumpControlNode(object):
             command = self.command_generator.generate_command(step, mode="manual")
             if not command:
                 return False, "Manual command did not generate a serial command", {"step": step}
-            success = self.send_command(command)
-            return success, "Manual pump command sent" if success else "Manual pump command send failed", {
+            # Firmware replies in command order. Drain earlier generic CMD_OK
+            # replies before opening the waiter for this pump command.
+            synced, reply = self._send_and_wait_text('PIDQUERY', ('PIDPARAM:',), ())
+            if not synced:
+                return False, '控制板查询未完成，泵指令未发送（%s）' % reply, {}
+            success, reply = self._send_and_wait_text(
+                command, ('CMD_OK',), ('CMD_ERR:', 'BUSY:', 'WATCHDOG_ERR:'))
+            result = {
                 "command": command.strip(),
                 "step": step,
+                "controller_reply": reply,
             }
+            if success and reply == 'CMD_OK':
+                return True, '控制板已接收泵指令', result
+            if reply == 'timeout':
+                return False, '控制板回执超时，泵状态待确认。请先全泵停止。', result
+            return False, '控制板未确认泵指令（%s）' % reply, result
 
         if action == "manual_stop_all":
             success = self._auto_stop_locked(None, confirm_stop=payload.get('confirm_stop') is True).success

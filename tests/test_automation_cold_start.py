@@ -38,9 +38,15 @@ class AutomationColdStartTests(unittest.TestCase):
 
     def test_mechanical_debug_uses_explicit_manual_control_without_sample_success(self):
         self.node.manual_mode_enabled = True
-        ok, _, _ = self.node._execute_control_action('manual_step', {'step': self.step})
+        def ack(command):
+            reply = 'PIDPARAM:0.14,0.015,0.06,1,8' if command == 'PIDQUERY' else 'CMD_OK'
+            self.node._on_text_received(reply)
+            return True
+
+        self.node.send_command.side_effect = ack
+        ok, _, result = self.node._execute_control_action('manual_step', {'step': self.step})
         self.assertTrue(ok)
-        self.node.send_command.assert_called_once()
+        self.assertEqual(result['controller_reply'], 'CMD_OK')
         statuses = [json.loads(m.data) for m in self.publishers['/usv/automation_status'].messages]
         self.assertFalse(any(s['status'] == 'finished' for s in statuses))
 

@@ -63,6 +63,64 @@ class FieldTransactionTests(unittest.TestCase):
         self.addCleanup(self.node.disconnect)
         self.addCleanup(self.node.injection_pump_worker.stop)
 
+    def test_manual_step_reports_the_current_command_reply(self):
+        port = FakeSerial()
+        port.open()
+        self.node.serial_conn = port
+        self.node.manual_mode_enabled = True
+        step_command = b'XEFV8JG\r\n'
+
+        for reply in ('BUSY:TESTING', 'CMD_OK', 'timeout'):
+            with self.subTest(reply=reply):
+                port.writes.clear()
+
+                def respond(data):
+                    if data == b'PIDQUERY\r\n':
+                        self.node._on_text_received('CMD_OK')  # delayed from earlier work
+                        self.node._on_text_received('PIDPARAM:0.14,0.015,0.06,1,8')
+                    elif data == step_command and reply != 'timeout':
+                        self.node._on_text_received(reply)
+
+                port.on_write = respond
+                ok, message, result = self.node._execute_control_action(
+                    'manual_step', {'axis': 'X', 'speed_rpm': 8, 'continuous': True})
+                self.assertEqual(ok, reply == 'CMD_OK', message)
+                self.assertEqual(result['controller_reply'], reply)
+                self.assertEqual([data for _, data, _ in port.writes], [b'PIDQUERY\r\n', step_command])
+
+    def test_stop_cancels_a_manual_step_waiting_for_its_reply(self):
+        port = FakeSerial()
+        port.open()
+        self.node.serial_conn = port
+        self.node.manual_mode_enabled = True
+        step_written = threading.Event()
+
+        def respond(data):
+            if data == b'PIDQUERY\r\n':
+                self.node._on_text_received('PIDPARAM:0.14,0.015,0.06,1,8')
+            elif data == b'XEFV8JG\r\n':
+                step_written.set()
+            elif data == b'STOPALL\r\n':
+                self.node._on_text_received('CMD_OK')  # the pending step's late ACK
+                self.node._on_text_received('STOPALL_OK')
+
+        port.on_write = respond
+        result = []
+        worker = threading.Thread(target=lambda: result.append(self.node._execute_control_action(
+            'manual_step', {'axis': 'X', 'speed_rpm': 8, 'continuous': True})))
+        worker.start()
+        try:
+            self.assertTrue(step_written.wait(1))
+            stopped = self.node._execute_control_action('manual_stop_all', {'confirm_stop': True})
+            self.assertTrue(stopped[0], stopped[1])
+        finally:
+            worker.join(3)
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(result[0][0])
+        self.assertEqual(result[0][2]['controller_reply'], 'cancelled')
+        self.assertEqual([data for _, data, _ in port.writes][:3],
+                         [b'PIDQUERY\r\n', b'XEFV8JG\r\n', b'STOPALL\r\n'])
+
     def serial_environment(self):
         ports = []
 

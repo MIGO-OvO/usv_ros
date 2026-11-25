@@ -3302,7 +3302,13 @@ class HardwareRuntimeSyncTests(unittest.TestCase):
         node = module.PumpControlNode()
         node.inject_pump_speed = 0
         sent = []
-        node.send_command = lambda cmd: sent.append(cmd) or True
+
+        def reply(cmd):
+            sent.append(cmd)
+            node._on_text_received('PIDPARAM:0.14,0.015,0.06,1,8' if cmd == 'PIDQUERY' else 'CMD_OK')
+            return True
+
+        node.send_command = reply
 
         def request(action, payload=None, command_id="cmd-1"):
             return types.SimpleNamespace(
