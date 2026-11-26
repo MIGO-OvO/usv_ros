@@ -915,7 +915,7 @@ export default function MapPage() {
                   />
                 </label>
                 <div className="space-y-2">
-                  <span className="text-muted-foreground block text-xs">采样总时限（秒，0 使用默认 1800 秒）</span>
+                  <span className="text-muted-foreground block text-xs">旧固件采样时限（秒，0 使用 1800 秒）</span>
                   <input
                     type="number"
                     min={0}

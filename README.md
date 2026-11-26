@@ -924,12 +924,12 @@ FCU 采样触发、waypoint、走航和 lab_real。GPS 不再是载荷采样的�
 
 ### 航点定点采样
 
-在采样航点后添加 `MAV_CMD_NAV_SCRIPT_TIME(42702, param1=1)`。正整数 `param3` 设定稳定准备、采样和清理的总时限，范围 1–2048 秒，新任务默认 1800 秒。既有任务 `param3=0` 时沿用 `param2`，两者均为 0 时使用 255 秒。
+在采样航点后添加 `MAV_CMD_NAV_SCRIPT_TIME(42702, param1=1)`。新版飞控在驻留期间等待本次采样终态。规划器为旧固件保留时限字段，`param3` 的有效范围为 1 至 2048 秒，新任务写入 1800 秒默认值。旧固件在 `param3=0` 时读取 `param2`，两者均为 0 时使用 255 秒。
 
 - 飞控在 AUTO 内以采样航点为目标驻留。进入 `LOIT_RADIUS` 后，地速和偏航角速度持续达标 3 秒，才发起 `OFFER → READY → START`。ROS bridge 先记录关联身份，再向 `/usv/fcu_sampling` 投递一次 START。
 - trigger 按从 0 开始的导航航点编号应用采样轮次、启用状态和失败策略。Web 同步以飞控回读的导航项为准。原生任务的稳定判定和启动时限由飞控执行。
 - 泵控承接步骤后，trigger 发布匹配 `fcu_token` 和 `sample_id` 的 `accepted`。运行和准备期间，同次尝试的泵控状态持续续约。Web 用匹配的最终结果关窗，保留启动拒绝原因、准备阶段和清理结果。
-- `DONE` 和明确的 `SKIP` 可以推进任务。清理确认后，失败按配置驻留或停止推进。超时、失联、未确认启动、取消或清理失败进入 HOLD。切出 AUTO 时飞控取消对应采样，操作者选择的模式继续生效。
+- `DONE` 和明确的 `SKIP` 可以推进任务。清理确认后，失败按配置驻留或停止推进。稳船失败、启动未确认、通信中断或清理失败进入 HOLD。切出 AUTO 时飞控取消对应采样，操作者选择的模式继续生效。
 - 旧飞控仍可使用 `USV_SMPL/USV_DONE/USV_FAIL` 兼容路径。更新后的飞控要求新版 bridge、trigger 和 pump 配套。手动走航开关仍为 `USV_SURV=1/0`。
 
 离线回归运行 `python3 -m unittest discover -s tests -p 'test_fcu_sampling_result.py'`。台架并行记录 `/usv/fcu_sampling`、`/usv/sampling_result`、`/usv/automation_status`、`/mavros/state` 与 MAVLink 日志，核对正常完成、显式跳过、启动拒绝、断链与停止时的船态和设备输出。
